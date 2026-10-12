@@ -91,6 +91,15 @@ debug:
 release:
 	@$(MAKE) MODE=release all
 
+# Execution helpers
+run: debug
+	@echo -e "\033[0;32m==> Running Debug Engine...\033[0m"
+	@./build/debug/bin/engine
+
+run-release: release
+	@echo -e "\033[0;32m==> Running Release Engine...\033[0m"
+	@./build/release/bin/engine
+
 # GitHub Release Bump Targets
 release-patch:
 	@./scripts/bump_version.sh patch
@@ -104,9 +113,55 @@ release-major:
 	@./scripts/bump_version.sh major
 	@$(MAKE) MODE=release all
 
-# Clean removes the entire build directory (both debug & release)
+# Diagnostics & Info
+info: $(CONFIG_MK)
+	@echo -e "\033[0;34m=== Engine Build Configuration ===\033[0m"
+	@echo "  Target Binary:    $(TARGET)"
+	@echo "  Active Mode:      $(MODE)"
+	@echo "  Base SemVer:      $(BASE_VERSION)"
+	@echo "  Full Version:     $(FULL_VERSION)"
+	@echo "  Compiler:         $(CC) ($(C23_FLAGS))"
+	@echo "  Kernel Version:   $(KERNEL_VERSION)"
+	@echo "  Vulkan Header:    $(VULKAN_HEADER) (v$(VULKAN_VERSION))"
+	@echo "  Vulkan Library:   $(VULKAN_LIB)"
+	@echo "  Wayland Protocols:$(WAYLAND_PROTOCOLS_VERSION) ($(WAYLAND_PROTOCOLS_DIR))"
+	@echo "  Slang Compiler:   $(SLANG_BIN)"
+	@echo -e "\033[0;34m==================================\033[0m"
+
+# Help manual
+help:
+	@echo -e "\033[0;36mModular C23 Engine - Build Commands:\033[0m"
+	@echo ""
+	@echo -e "  \033[1mBuild & Run:\033[0m"
+	@echo "    make               Build debug binary (-O0 -g3, default)"
+	@echo "    make debug         Explicit alias for make"
+	@echo "    make release       Build optimized release binary (-O3 -flto -DNDEBUG)"
+	@echo "    make run           Build and execute debug binary"
+	@echo "    make run-release   Build and execute release binary"
+	@echo ""
+	@echo -e "  \033[1mCleanup & Cache:\033[0m"
+	@echo "    make clean         Remove build/ directory (preserves prerequisite cache)"
+	@echo "    make clear         Alias for make clean"
+	@echo "    make recheck       Re-run environment probing & refresh .dependencies/"
+	@echo "    make distclean     Remove build/ AND .dependencies/ cache"
+	@echo ""
+	@echo -e "  \033[1mRelease Bumping (GitHub):\033[0m"
+	@echo "    make release-patch Increment patch (0.0.1), tag git, and compile release"
+	@echo "    make release-minor Increment minor (0.1.0), tag git, and compile release"
+	@echo "    make release-major Increment major (1.0.0), tag git, and compile release"
+	@echo ""
+	@echo -e "  \033[1mDiagnostics:\033[0m"
+	@echo "    make info          Print current build settings, paths, and toolchains"
+	@echo "    make help          Print this guide"
+
+# Cleanup
 clean:
-	rm -rf build
+	@echo "Cleaning build outputs..."
+	@rm -rf build
+	@echo "Build directory cleared."
+
+# clear is an explicit alias for clean
+clear: clean
 
 recheck:
 	rm -rf $(DEPS_CACHE_DIR)
@@ -115,4 +170,4 @@ recheck:
 distclean: clean
 	rm -rf $(DEPS_CACHE_DIR)
 
-.PHONY: all debug release release-patch release-minor release-major clean recheck distclean
+.PHONY: all debug release run run-release release-patch release-minor release-major info help clean clear recheck distclean

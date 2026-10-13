@@ -1,5 +1,6 @@
 #include "init/vulkan_init/vulkan_init.h"
 #include "init/vulkan_init/vulkan_instance.h"
+#include "init/vulkan_init/vulkan_device.h"
 #include <stdio.h>
 
 VulkanResult vulkan_context_init(VulkanContext *ctx) {
@@ -17,7 +18,40 @@ VulkanResult vulkan_context_init(VulkanContext *ctx) {
         return res;
     }
 
-    printf("hello init from vulkan (instance created, validation: %s)\n",
+    // Step 3: Physical device scoring, queue discovery, and logical device creation
+    res = vulkan_device_create(ctx);
+    if (res != VULKAN_SUCCESS) {
+        fprintf(stderr, "[Vulkan Error] Device creation failed: %s\n",
+                vulkan_result_to_str(res));
+        vulkan_instance_destroy(ctx);
+        return res;
+    }
+
+    printf("[Vulkan] Hardware: %s (Driver v%u.%u.%u, API v%u.%u.%u)\n",
+           ctx->device_info.name,
+           VK_API_VERSION_MAJOR(ctx->device_info.driver_version),
+           VK_API_VERSION_MINOR(ctx->device_info.driver_version),
+           VK_API_VERSION_PATCH(ctx->device_info.driver_version),
+           VK_API_VERSION_MAJOR(ctx->device_info.api_version),
+           VK_API_VERSION_MINOR(ctx->device_info.api_version),
+           VK_API_VERSION_PATCH(ctx->device_info.api_version));
+
+    printf("[Vulkan] Queues: Graphics=%u, Compute=%u (dedicated: %s), Transfer=%u (dedicated: %s)\n",
+           ctx->queues.graphics_family_index,
+           ctx->queues.compute_family_index,
+           ctx->queues.has_dedicated_compute ? "yes" : "no",
+           ctx->queues.transfer_family_index,
+           ctx->queues.has_dedicated_transfer ? "yes" : "no");
+
+    printf("[Vulkan] Capabilities: DMA-BUF=%s, DRM-Modifiers=%s, Syncobj=%s, BDA=%s, DynRender=%s, Sync2=%s\n",
+           ctx->device_info.supports_dma_buf ? "yes" : "no",
+           ctx->device_info.supports_drm_format_modifiers ? "yes" : "no",
+           ctx->device_info.supports_external_syncobj ? "yes" : "no",
+           ctx->device_info.supports_buffer_device_address ? "yes" : "no",
+           ctx->device_info.supports_dynamic_rendering ? "yes" : "no",
+           ctx->device_info.supports_synchronization2 ? "yes" : "no");
+
+    printf("hello init from vulkan (device active, validation: %s)\n",
            ctx->validation_enabled ? "enabled" : "disabled");
 
     ctx->is_initialized = true;
@@ -26,9 +60,13 @@ VulkanResult vulkan_context_init(VulkanContext *ctx) {
 
 void vulkan_context_shutdown(VulkanContext *ctx) {
     if (ctx != nullptr && ctx->is_initialized) {
-        // Step 2 symmetric destruction:
+        // Step 3 symmetric destruction (device wait idle + destroy):
+        vulkan_device_destroy(ctx);
+
+        // Step 2 symmetric destruction (debug messenger + instance):
         vulkan_instance_destroy(ctx);
-        printf("goodbye from vulkan (instance destroyed)\n");
+
+        printf("goodbye from vulkan (device & instance destroyed)\n");
         ctx->is_initialized = false;
     }
 }

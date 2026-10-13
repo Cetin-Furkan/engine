@@ -27,5 +27,10 @@ int main(void) {
         printf("[C23 Engine] All active subsystems initialized successfully.\n");
     }
 
+    // Symmetric reverse teardown
+    engine_subsystem_shutdown();
+    vulkan_shutdown();
+    wayland_shutdown();
+
     return 0;
 }

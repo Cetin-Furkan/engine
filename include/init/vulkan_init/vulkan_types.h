@@ -116,6 +116,7 @@ typedef struct VulkanContext {
     VkDebugUtilsMessengerEXT debug_messenger;
     VkPhysicalDevice         physical_device;
     VkDevice                 device;
+    VkCommandPool            cmd_pool;
 
     VulkanQueueInfo          queues;
     VulkanDeviceInfo         device_info;

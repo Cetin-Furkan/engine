@@ -23,7 +23,12 @@ GIT_DIRTY    := $(shell git diff --quiet 2>/dev/null || echo "-dirty")
 MODE ?= debug
 
 ifeq ($(MODE),release)
-  OPT_FLAGS := -O3 -DNDEBUG -march=native -flto -DENGINE_RELEASE=1
+  ifeq ($(NATIVE),1)
+    ARCH_FLAG := -march=native
+  else
+    ARCH_FLAG := -march=x86-64-v3
+  endif
+  OPT_FLAGS := -O3 -DNDEBUG $(ARCH_FLAG) -flto -DENGINE_RELEASE=1
   FULL_VERSION := $(BASE_VERSION)
 else
   OPT_FLAGS := -O0 -g3 -DENGINE_DEBUG=1

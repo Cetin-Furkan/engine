@@ -14,14 +14,26 @@ VulkanResult vulkan_find_memory_type(
     }
 
     const VkPhysicalDeviceMemoryProperties *mem_props = &ctx->device_info.memory_properties;
+    int32_t best_index = -1;
+    VkDeviceSize largest_heap_size = 0;
 
-    // Bitwise search across available hardware memory types
+    // Search across hardware memory types, prioritizing largest heap capacity (main VRAM vs ReBAR)
     for (uint32_t i = 0; i < mem_props->memoryTypeCount; ++i) {
         if ((type_filter & (1u << i)) &&
             (mem_props->memoryTypes[i].propertyFlags & required_flags) == required_flags) {
-            *out_type_index = i;
-            return VULKAN_SUCCESS;
+            uint32_t heap_idx = mem_props->memoryTypes[i].heapIndex;
+            VkDeviceSize heap_size = mem_props->memoryHeaps[heap_idx].size;
+
+            if (heap_size > largest_heap_size || best_index == -1) {
+                largest_heap_size = heap_size;
+                best_index = (int32_t)i;
+            }
         }
+    }
+
+    if (best_index >= 0) {
+        *out_type_index = (uint32_t)best_index;
+        return VULKAN_SUCCESS;
     }
 
     return VULKAN_ERROR_MEMORY_TYPE_NOT_FOUND;
@@ -40,7 +52,22 @@ VulkanResult vulkan_create_exportable_image(
 
     *out_image = (VulkanExportableImage){.dmabuf_fd = -1};
 
-    // 1. External memory image configuration for Linux DMA-BUF export
+    // 1. Check format feature capabilities for linear tiling
+    VkFormatProperties format_props;
+    vkGetPhysicalDeviceFormatProperties(ctx->physical_device, format, &format_props);
+
+    VkImageTiling tiling = VK_IMAGE_TILING_LINEAR;
+    VkImageUsageFlags usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                              VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                              VK_IMAGE_USAGE_SAMPLED_BIT;
+
+    // NVIDIA hardware does not support rendering (COLOR_ATTACHMENT) to linear tiling.
+    // Only include COLOR_ATTACHMENT_BIT if driver explicitly reports linear support.
+    if (format_props.linearTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) {
+        usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    }
+
+    // External memory image configuration for Linux DMA-BUF export
     VkExternalMemoryImageCreateInfo ext_image_info = {
         .sType       = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
         .pNext       = nullptr,
@@ -57,11 +84,8 @@ VulkanResult vulkan_create_exportable_image(
         .mipLevels     = 1,
         .arrayLayers   = 1,
         .samples       = VK_SAMPLE_COUNT_1_BIT,
-        .tiling        = VK_IMAGE_TILING_LINEAR,
-        .usage         = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
-                         VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
-                         VK_IMAGE_USAGE_TRANSFER_DST_BIT |
-                         VK_IMAGE_USAGE_SAMPLED_BIT,
+        .tiling        = tiling,
+        .usage         = usage,
         .sharingMode   = VK_SHARING_MODE_EXCLUSIVE,
         .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
     };

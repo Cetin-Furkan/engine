@@ -22,16 +22,23 @@ GIT_DIRTY    := $(shell git diff --quiet 2>/dev/null || echo "-dirty")
 # Build Mode: debug (default) or release
 MODE ?= debug
 
+# Baseline x86-64 unless ARCH= or NATIVE=1 is set. This machine's glibc crt
+# was built with an x86-64-v4 "needed" note (AVX-512). The linker copies that
+# note into every executable, and glibc then refuses to start it on CPUs
+# without AVX-512: "CPU ISA level is lower than required". That happens
+# before main. The note is removed after link except for NATIVE=1.
+ARCH_FLAG := -march=x86-64
+ifneq ($(ARCH),)
+  ARCH_FLAG := -march=$(ARCH)
+else ifeq ($(NATIVE),1)
+  ARCH_FLAG := -march=native
+endif
+
 ifeq ($(MODE),release)
-  ifeq ($(NATIVE),1)
-    ARCH_FLAG := -march=native
-  else
-    ARCH_FLAG := -march=x86-64-v3
-  endif
   OPT_FLAGS := -O3 -DNDEBUG $(ARCH_FLAG) -flto -DENGINE_RELEASE=1
   FULL_VERSION := $(BASE_VERSION)
 else
-  OPT_FLAGS := -O0 -g3 -DENGINE_DEBUG=1
+  OPT_FLAGS := -O0 -g3 $(ARCH_FLAG) -DENGINE_DEBUG=1
   FULL_VERSION := $(BASE_VERSION)-dev+$(GIT_HASH)$(GIT_DIRTY)
 endif
 
@@ -67,23 +74,17 @@ SRCS := main.c $(shell find src -name '*.c')
 OBJS := $(SRCS:%.c=$(OBJ_DIR)/%.o)
 DEPS := $(SRCS:%.c=$(DEP_DIR)/%.d)
 
-# Query headers used by main.c to detect unreferenced modules during compilation
-MAIN_INCLUDES := $(shell $(CC) $(C23_FLAGS) -D_GNU_SOURCE $(INCLUDES) -MM main.c 2>/dev/null)
-
 all: $(TARGET)
 
 $(TARGET): $(OBJS)
 	@mkdir -p $(BIN_DIR)
 	$(CC) $(CFLAGS) -o $@ $(OBJS) $(LDFLAGS)
+ifneq ($(NATIVE),1)
+	objcopy --remove-section .note.gnu.property $@
+endif
 
 $(OBJ_DIR)/%.o: %.c $(CONFIG_MK) VERSION
 	@mkdir -p $(dir $@) $(dir $(DEP_DIR)/$*.d)
-	@if [ "$<" != "main.c" ]; then \
-		base=$$(basename "$<" .c); \
-		if ! echo "$(MAIN_INCLUDES)" | grep -qE "(^|[ /])$${base}\.h"; then \
-			echo -e "  \033[1;33m[Warning]\033[0m $< is not used in main.c, but compiled (linker will dead-strip)"; \
-		fi; \
-	fi
 	$(CC) $(CFLAGS) -MMD -MP -MF $(DEP_DIR)/$*.d -c $< -o $@
 
 # Include all generated header dependency rules (.d files)
@@ -140,7 +141,9 @@ help:
 	@echo -e "  \033[1mBuild & Run:\033[0m"
 	@echo "    make               Build debug binary (-O0 -g3, default)"
 	@echo "    make debug         Explicit alias for make"
-	@echo "    make release       Build optimized release binary (-O3 -flto -DNDEBUG)"
+	@echo "    make release       Portable release binary (-O3 -flto -DNDEBUG, baseline x86-64)"
+	@echo "    make release NATIVE=1    Same, with -march=native (do not copy this binary to other PCs)"
+	@echo "    make release ARCH=x86-64-v3    Same, with an explicit -march"
 	@echo "    make run           Build and execute debug binary"
 	@echo "    make run-release   Build and execute release binary"
 	@echo ""

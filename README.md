@@ -33,8 +33,11 @@ make
 
 ### Production Release
 ```bash
-# Build optimized release binary (-O3 -flto -march=native -DNDEBUG)
+# Build a portable release binary (-O3 -flto -DNDEBUG, baseline x86-64)
 make release
+
+# Optional: tune for this CPU only. Do not copy that binary to other PCs.
+# make release NATIVE=1
 
 # Run release binary
 ./build/release/bin/engine
@@ -50,4 +53,18 @@ make release-minor
 
 # Bump major (0.1.0 -> 1.0.0), creates git tag v1.0.0, and builds release
 make release-major
+```
+
+## Runtime
+
+The binary requires Vulkan 1.4 on the loader and on the selected device. The instance is WSI-free. A frame leaves the GPU as a Linux DMA-BUF.
+
+Boot order is system, Wayland, Vulkan, ring, then engine. A failed stage skips every stage after it. Shutdown runs in reverse, and only for stages that initialized.
+
+```bash
+# Pick a device by the probe index printed at startup
+ENGINE_GPU_INDEX=0 ./build/debug/bin/engine
+
+# Or by a case-insensitive ASCII substring of the vendor, device type, or device name
+ENGINE_GPU=NVIDIA ./build/debug/bin/engine
 ```

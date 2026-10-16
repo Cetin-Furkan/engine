@@ -5,7 +5,7 @@
  * @brief Initializes core engine components.
  * @return 0 on success, non-zero on failure.
  */
-int engine_init(void);
+[[nodiscard]] int engine_init(void);
 
 /**
  * @brief Cleans up and shuts down core engine components.

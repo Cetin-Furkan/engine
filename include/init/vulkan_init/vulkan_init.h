@@ -9,7 +9,11 @@ extern "C" {
 
 /**
  * @brief Initializes the Vulkan 1.4 subsystem and populates the given context.
- * @param ctx Pointer to an uninitialized VulkanContext structure.
+ *
+ * ctx must be zero-initialized, or a context previously passed to
+ * vulkan_context_init / vulkan_context_shutdown. A live context is shut down
+ * before it is initialized again.
+ *
  * @return VULKAN_SUCCESS on success, or a descriptive VulkanResult error code.
  */
 [[nodiscard]] VulkanResult vulkan_context_init(VulkanContext *ctx);
@@ -23,12 +27,17 @@ void vulkan_context_shutdown(VulkanContext *ctx);
 /**
  * @brief Standalone convenience init wrapper.
  */
-int vulkan_init(void);
+[[nodiscard]] int vulkan_init(void);
 
 /**
  * @brief Standalone convenience shutdown wrapper.
  */
 void vulkan_shutdown(void);
+
+/**
+ * @brief Returns a pointer to the active global VulkanContext.
+ */
+[[nodiscard]] VulkanContext *vulkan_get_context(void);
 
 #ifdef __cplusplus
 }

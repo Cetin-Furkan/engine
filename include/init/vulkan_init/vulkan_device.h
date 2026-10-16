@@ -11,14 +11,17 @@ extern "C" {
  * @brief Selects the optimal physical device and creates the Vulkan logical device.
  *
  * Implements:
- * - Multi-factor GPU scoring (Discrete > Integrated > Virtual/CPU).
- * - Vulkan 1.4 baseline enforcement on candidate physical devices.
- * - Dynamic queue family discovery (finds Graphics, Compute, and Transfer families).
- * - Safe queue creation with explicit 1.0f priority and family de-duplication.
- * - Pre-creation hardware capability queries via vkGetPhysicalDeviceFeatures2.
- * - Modern feature chaining via pNext (dynamicRendering, synchronization2, BDA, timelineSemaphore).
- * - Probing and activation of Linux DMA-BUF and DRM syncobj extensions.
- * - Dynamic resolution of device-level extension function pointers.
+ * - Scores discrete above integrated above virtual. Rejects CPU / llvmpipe devices.
+ * - Requires a Vulkan 1.4 device, a graphics queue, and a compute queue.
+ * - Requires dynamic rendering, synchronization2, buffer device address, and timeline semaphores.
+ * - Requires VK_KHR_external_memory_fd and VK_EXT_external_memory_dma_buf.
+ * - Enables DRM-modifier and syncobj extensions only when that device lists them.
+ * - Enables maintenance5, maintenance6, and pushDescriptor only when supported.
+ * - Prefers a pure transfer family, then another non-graphics transfer family,
+ *   then the graphics family.
+ * - On a shared family, requests one queue per role when queueCount allows it.
+ *   Otherwise the roles share one VkQueue and submission_aliased is set.
+ * - Loads extension entry points with vkGetDeviceProcAddr and rejects a null vkGetMemoryFdKHR.
  *
  * @param ctx Pointer to the initialized VulkanContext (instance must be created).
  * @return VULKAN_SUCCESS on success, or a descriptive VulkanResult error code.

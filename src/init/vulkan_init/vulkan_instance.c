@@ -2,6 +2,62 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+
+#if defined(ENGINE_DEBUG)
+// Two installs of VkLayer_khronos_validation.json make the loader emit a
+// warning through the debug messenger. VK_LAYER_PATH replaces the explicit
+// manifest search. Implicit layers stay on their own path.
+static void prefer_one_validation_manifest(void) {
+    if (getenv("VK_LAYER_PATH") != nullptr) {
+        return;
+    }
+
+    const char *local_dir = "/usr/local/share/vulkan/explicit_layer.d";
+    const char *local_json = "/usr/local/share/vulkan/explicit_layer.d/VkLayer_khronos_validation.json";
+    const char *distro_json = "/usr/share/vulkan/explicit_layer.d/VkLayer_khronos_validation.json";
+    if (access(local_json, R_OK) != 0 || access(distro_json, R_OK) != 0) {
+        return;
+    }
+
+    char path[512];
+    size_t used = 0;
+    path[0] = '\0';
+
+    const char *home = getenv("HOME");
+    char home_dir[256];
+    if (home != nullptr && home[0] != '\0') {
+        int n = snprintf(home_dir, sizeof home_dir, "%s/.config/vulkan/explicit_layer.d", home);
+        if (n > 0 && (size_t)n < sizeof home_dir && access(home_dir, R_OK) == 0) {
+            int wrote = snprintf(path + used, sizeof path - used, "%s%s",
+                                 used == 0 ? "" : ":", home_dir);
+            if (wrote > 0 && (size_t)wrote < sizeof path - used) {
+                used += (size_t)wrote;
+            }
+        }
+    }
+
+    const char *keep[] = {
+        "/etc/vulkan/explicit_layer.d",
+        local_dir,
+    };
+    for (size_t i = 0; i < sizeof keep / sizeof keep[0]; ++i) {
+        if (access(keep[i], R_OK) != 0) {
+            continue;
+        }
+        int wrote = snprintf(path + used, sizeof path - used, "%s%s",
+                             used == 0 ? "" : ":", keep[i]);
+        if (wrote < 0 || (size_t)wrote >= sizeof path - used) {
+            return;
+        }
+        used += (size_t)wrote;
+    }
+
+    if (used > 0) {
+        setenv("VK_LAYER_PATH", path, 0);
+    }
+}
+#endif
 
 #if defined(ENGINE_DEBUG)
 /**
@@ -19,6 +75,7 @@ static bool is_layer_supported(const char *layer_name) {
 
     VkLayerProperties *available_layers = malloc(sizeof(VkLayerProperties) * layer_count);
     if (available_layers == nullptr) {
+        fprintf(stderr, "[Vulkan Error] Out of host memory while probing instance layers\n");
         return false;
     }
 
@@ -54,6 +111,7 @@ static bool is_extension_supported(const char *extension_name) {
 
     VkExtensionProperties *available_exts = malloc(sizeof(VkExtensionProperties) * extension_count);
     if (available_exts == nullptr) {
+        fprintf(stderr, "[Vulkan Error] Out of host memory while probing instance extensions\n");
         return false;
     }
 
@@ -139,17 +197,25 @@ VulkanResult vulkan_instance_create(VulkanContext *ctx) {
         return VULKAN_ERROR_INVALID_ARGUMENT;
     }
 
+#if defined(ENGINE_DEBUG)
+    prefer_one_validation_manifest();
+#endif
+
     // 1. Verify host loader supports Vulkan 1.4+
     uint32_t loader_version = 0;
-    if (vkEnumerateInstanceVersion(&loader_version) == VK_SUCCESS) {
-        if (loader_version < VK_API_VERSION_1_4) {
-            fprintf(stderr,
-                    "[Vulkan Error] Host loader reports version %u.%u.%u, but engine requires Vulkan 1.4+\n",
-                    VK_API_VERSION_MAJOR(loader_version),
-                    VK_API_VERSION_MINOR(loader_version),
-                    VK_API_VERSION_PATCH(loader_version));
-            return VULKAN_ERROR_INSTANCE_CREATION_FAILED;
-        }
+    VkResult version_res = vkEnumerateInstanceVersion(&loader_version);
+    if (version_res != VK_SUCCESS) {
+        fprintf(stderr, "[Vulkan Error] vkEnumerateInstanceVersion failed: %s (%d)\n",
+                vulkan_vkresult_to_str(version_res), (int)version_res);
+        return VULKAN_ERROR_INSTANCE_CREATION_FAILED;
+    }
+    if (loader_version < VK_API_VERSION_1_4) {
+        fprintf(stderr,
+                "[Vulkan Error] Host loader reports version %u.%u.%u, but engine requires Vulkan 1.4+\n",
+                VK_API_VERSION_MAJOR(loader_version),
+                VK_API_VERSION_MINOR(loader_version),
+                VK_API_VERSION_PATCH(loader_version));
+        return VULKAN_ERROR_INSTANCE_CREATION_FAILED;
     }
 
     // 2. Configure application descriptor
@@ -157,9 +223,9 @@ VulkanResult vulkan_instance_create(VulkanContext *ctx) {
         .sType              = VK_STRUCTURE_TYPE_APPLICATION_INFO,
         .pNext              = nullptr,
         .pApplicationName   = "Antigravity Engine",
-        .applicationVersion = VK_MAKE_VERSION(0, 1, 0),
+        .applicationVersion = VK_MAKE_API_VERSION(0, 0, 1, 0),
         .pEngineName        = "Antigravity",
-        .engineVersion      = VK_MAKE_VERSION(0, 1, 0),
+        .engineVersion      = VK_MAKE_API_VERSION(0, 0, 1, 0),
         .apiVersion         = VK_API_VERSION_1_4,
     };
 
@@ -216,8 +282,16 @@ VulkanResult vulkan_instance_create(VulkanContext *ctx) {
     // 6. Create the instance
     VkResult result = vkCreateInstance(&instance_info, nullptr, &ctx->instance);
     if (result != VK_SUCCESS) {
-        fprintf(stderr, "[Vulkan Error] vkCreateInstance failed with code %d\n", result);
-        return VULKAN_ERROR_INSTANCE_CREATION_FAILED;
+        fprintf(stderr, "[Vulkan Error] vkCreateInstance failed: %s (%d)\n",
+                vulkan_vkresult_to_str(result), (int)result);
+        if (result == VK_ERROR_LAYER_NOT_PRESENT) {
+            return VULKAN_ERROR_LAYER_NOT_SUPPORTED;
+        }
+        if (result == VK_ERROR_EXTENSION_NOT_PRESENT) {
+            return VULKAN_ERROR_REQUIRED_EXTENSION_MISSING;
+        }
+        VulkanResult mapped = vulkan_result_from_vkresult(result);
+        return mapped == VULKAN_ERROR_UNKNOWN ? VULKAN_ERROR_INSTANCE_CREATION_FAILED : mapped;
     }
 
     ctx->validation_enabled = enable_validation;

@@ -41,6 +41,7 @@ typedef struct GpuCandidate {
     bool                             supports_dma_buf;
     bool                             supports_drm_modifiers;
     bool                             supports_syncobj;
+    bool                             supports_queue_family_foreign;
     bool                             supports_physical_device_drm;
     bool                             supports_bda;
     bool                             supports_scalar_layout;
@@ -458,6 +459,8 @@ static VulkanResult evaluate_device(GpuCandidate *candidate) {
         &extensions, VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME);
     candidate->supports_syncobj = device_extension_list_has(
         &extensions, VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME);
+    candidate->supports_queue_family_foreign = device_extension_list_has(
+        &extensions, VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME);
     candidate->supports_physical_device_drm = device_extension_list_has(
         &extensions, VK_EXT_PHYSICAL_DEVICE_DRM_EXTENSION_NAME);
     candidate->extensions_probed = true;
@@ -586,11 +589,12 @@ static void print_candidate(uint32_t index, const GpuCandidate *candidate) {
             snprintf(drm_node_info, sizeof drm_node_info, "no");
         }
 
-        printf("      Extensions: external-memory-fd=%s, DMA-BUF=%s, DRM-Modifiers=%s, Syncobj=%s, DRM-Node=%s\n",
+        printf("      Extensions: external-memory-fd=%s, DMA-BUF=%s, DRM-Modifiers=%s, Syncobj=%s, ForeignQueue=%s, DRM-Node=%s\n",
                candidate->supports_external_memory_fd ? "yes" : "no",
                candidate->supports_dma_buf ? "yes" : "no",
                candidate->supports_drm_modifiers ? "yes" : "no",
                candidate->supports_syncobj ? "yes" : "no",
+               candidate->supports_queue_family_foreign ? "yes" : "no",
                drm_node_info);
     }
 
@@ -798,6 +802,7 @@ VulkanResult vulkan_device_create(VulkanContext *ctx) {
     ctx->device_info.supports_dma_buf = best.supports_dma_buf;
     ctx->device_info.supports_drm_format_modifiers = best.supports_drm_modifiers;
     ctx->device_info.supports_external_syncobj = best.supports_syncobj;
+    ctx->device_info.supports_queue_family_foreign = best.supports_queue_family_foreign;
     ctx->device_info.supports_buffer_device_address = best.supports_bda;
     ctx->device_info.supports_scalar_block_layout = best.supports_scalar_layout;
     ctx->device_info.supports_sampler_anisotropy = best.supports_anisotropy;
@@ -871,6 +876,11 @@ VulkanResult vulkan_device_create(VulkanContext *ctx) {
     if (best.supports_syncobj &&
         !append_extension(device_extensions, &device_extension_count, 8,
                           VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME)) {
+        return VULKAN_ERROR_INITIALIZATION_FAILED;
+    }
+    if (best.supports_queue_family_foreign &&
+        !append_extension(device_extensions, &device_extension_count, 8,
+                          VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME)) {
         return VULKAN_ERROR_INITIALIZATION_FAILED;
     }
     if (best.supports_physical_device_drm &&

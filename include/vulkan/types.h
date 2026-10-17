@@ -126,6 +126,7 @@ typedef struct VulkanDeviceInfo {
     bool supports_dma_buf;
     bool supports_drm_format_modifiers;
     bool supports_external_syncobj;
+    bool supports_queue_family_foreign;
     bool supports_buffer_device_address;
     bool supports_scalar_block_layout;
     bool supports_sampler_anisotropy;

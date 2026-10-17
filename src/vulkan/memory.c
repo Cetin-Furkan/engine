@@ -209,6 +209,7 @@ static VulkanResult collect_export_modifiers_filtered(
     VkImageUsageFlags     usage,
     const uint64_t       *filter_modifiers,
     uint32_t              filter_count,
+    bool                  prefer_linear,
     uint64_t            **out_modifiers,
     uint32_t             *out_count
 ) {
@@ -294,7 +295,13 @@ static VulkanResult collect_export_modifiers_filtered(
         return fatal;
     }
 
-    if (tiled_count > 0) {
+    // List order is not a preference. On a cross-GPU handoff the other device
+    // cannot read this GPU's tiled layout, so linear is the only entry offered.
+    if (prefer_linear && linear_count > 0) {
+        *out_modifiers = linear;
+        *out_count = linear_count;
+        free(tiled);
+    } else if (tiled_count > 0) {
         *out_modifiers = tiled;
         *out_count = tiled_count;
         free(linear);
@@ -319,6 +326,7 @@ static VulkanResult create_bound_export_image(
     VkImageTiling          tiling,
     const uint64_t        *modifiers,
     uint32_t               modifier_count,
+    bool                   allow_shared_memory,
     VulkanExportableImage *out_image
 ) {
     const bool modifier_tiling = tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
@@ -365,10 +373,24 @@ static VulkanResult create_bound_export_image(
     vkGetImageMemoryRequirements(ctx->device, image, &mem_reqs);
 
     uint32_t memory_type_index = 0;
-    VulkanResult mem_type_res = vulkan_find_memory_type(
-        ctx, mem_reqs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &memory_type_index);
+    VulkanResult mem_type_res = VULKAN_ERROR_MEMORY_TYPE_NOT_FOUND;
+    // A linear buffer read by another GPU is often placed in host-visible
+    // memory. Same-GPU images stay on a device-local type only.
+    if (allow_shared_memory) {
+        mem_type_res = vulkan_find_memory_type(
+            ctx, mem_reqs.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, &memory_type_index);
+    }
     if (mem_type_res != VULKAN_SUCCESS) {
-        fprintf(stderr, "[Vulkan Error] Could not find device-local memory type for DMA-BUF image\n");
+        mem_type_res = vulkan_find_memory_type(
+            ctx, mem_reqs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &memory_type_index);
+    }
+    if (allow_shared_memory && mem_type_res != VULKAN_SUCCESS) {
+        mem_type_res = vulkan_find_memory_type(
+            ctx, mem_reqs.memoryTypeBits, 0, &memory_type_index);
+    }
+    if (mem_type_res != VULKAN_SUCCESS) {
+        fprintf(stderr, "[Vulkan Error] Could not find %s memory type for DMA-BUF image\n",
+                allow_shared_memory ? "compatible" : "device-local");
         vkDestroyImage(ctx->device, image, nullptr);
         return mem_type_res;
     }
@@ -521,7 +543,7 @@ static VulkanResult try_fixed_tiling(
 
     *tried = true;
     return create_bound_export_image(ctx, width, height, format, usage, tiling,
-                                     nullptr, 0, out_image);
+                                     nullptr, 0, false, out_image);
 }
 
 VulkanResult vulkan_create_exportable_image_with_modifiers(
@@ -532,6 +554,7 @@ VulkanResult vulkan_create_exportable_image_with_modifiers(
     VkImageUsageFlags      usage,
     const uint64_t        *allowed_modifiers,
     uint32_t               allowed_modifier_count,
+    bool                   prefer_linear,
     VulkanExportableImage *out_image
 ) {
     if (ctx == nullptr || out_image == nullptr || width == 0 || height == 0 ||
@@ -555,6 +578,7 @@ VulkanResult vulkan_create_exportable_image_with_modifiers(
     VulkanResult collected = collect_export_modifiers_filtered(
         ctx, format, required_features, usage,
         allowed_modifiers, allowed_modifier_count,
+        prefer_linear,
         &modifiers, &modifier_count);
     if (collected != VULKAN_SUCCESS) {
         return collected;
@@ -566,7 +590,7 @@ VulkanResult vulkan_create_exportable_image_with_modifiers(
 
     VulkanResult created = create_bound_export_image(
         ctx, width, height, format, usage, VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
-        modifiers, modifier_count, out_image);
+        modifiers, modifier_count, prefer_linear, out_image);
     free(modifiers);
     if (created != VULKAN_SUCCESS) {
         return created;
@@ -627,7 +651,8 @@ VulkanResult vulkan_create_exportable_image(
         uint64_t *modifiers = nullptr;
         uint32_t modifier_count = 0;
         VulkanResult collected = collect_export_modifiers_filtered(
-            ctx, format, required_features, usage, nullptr, 0, &modifiers, &modifier_count);
+            ctx, format, required_features, usage, nullptr, 0, false,
+            &modifiers, &modifier_count);
         if (collected != VULKAN_SUCCESS) {
             return collected;
         }
@@ -635,7 +660,7 @@ VulkanResult vulkan_create_exportable_image(
             tried_modifier = true;
             VulkanResult created = create_bound_export_image(
                 ctx, width, height, format, usage, VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
-                modifiers, modifier_count, out_image);
+                modifiers, modifier_count, false, out_image);
             free(modifiers);
             if (created == VULKAN_SUCCESS || result_is_memory_error(created) ||
                 created == VULKAN_ERROR_FUNCTION_POINTER_MISSING) {

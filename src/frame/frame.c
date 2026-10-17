@@ -16,8 +16,9 @@
 #include <sys/signalfd.h>
 #include <unistd.h>
 
-static constexpr uint64_t k_acquire_point = 1;
-static constexpr uint64_t k_release_point = 1;
+static constexpr uint64_t k_acquire_point     = 1;
+static constexpr uint64_t k_release_point     = 1;
+static constexpr uint64_t k_ud_signal_cancel  = UINT64_MAX;
 
 typedef struct EngineFrameState {
     VulkanExportableImage image;
@@ -159,7 +160,7 @@ static int record_and_submit_clear(VulkanContext *vk, EngineFrameState *frame, V
     vkCmdBeginRendering(frame->cmd_buf, &rendering_info);
     vkCmdEndRendering(frame->cmd_buf);
 
-    // Barrier 2: COLOR_ATTACHMENT_OPTIMAL -> GENERAL for DMA-BUF compositor sampling/scanout
+    // Barrier 2: COLOR_ATTACHMENT_OPTIMAL -> GENERAL + Queue Family Release to EXTERNAL
     VkImageMemoryBarrier2 to_general = {
         .sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
         .pNext               = nullptr,
@@ -169,8 +170,8 @@ static int record_and_submit_clear(VulkanContext *vk, EngineFrameState *frame, V
         .dstAccessMask       = VK_ACCESS_2_NONE,
         .oldLayout           = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
         .newLayout           = VK_IMAGE_LAYOUT_GENERAL,
-        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .srcQueueFamilyIndex = vk->queues.graphics_family_index,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL,
         .image               = frame->image.image,
         .subresourceRange    = {
             .aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
@@ -430,11 +431,12 @@ int engine_subsystem_init(void) {
         return 1;
     }
 
-    // 3. Image, view, clear (prefer scanout tranche modifiers first, then all tranches for device)
+    // 3. Image, view, clear. Scanout tranches are same-GPU only. A prime handoff
+    //    uses the compositor's import list and asks for a linear modifier.
     VulkanResult img_res = VULKAN_ERROR_FORMAT_NOT_SUPPORTED;
-    const char *tranche_kind = "general";
+    const char *tranche_kind = wl->feedback_prime ? "prime" : "general";
 
-    if (wl->scanout_modifier_count > 0) {
+    if (!wl->feedback_prime && wl->scanout_modifier_count > 0) {
         img_res = vulkan_create_exportable_image_with_modifiers(
             vk,
             width,
@@ -443,6 +445,7 @@ int engine_subsystem_init(void) {
             VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
             wl->scanout_modifiers,
             wl->scanout_modifier_count,
+            false,
             &s_frame.image);
         if (img_res == VULKAN_SUCCESS) {
             tranche_kind = "scanout";
@@ -458,12 +461,28 @@ int engine_subsystem_init(void) {
             VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
             wl->all_modifiers,
             wl->all_modifier_count,
+            wl->feedback_prime,
             &s_frame.image);
     }
 
     if (img_res != VULKAN_SUCCESS || !s_frame.image.has_drm_format_modifier) {
         fprintf(stderr, "[Engine Error] Failed to allocate modifier-backed DMA-BUF image: %s\n",
                 vulkan_result_to_str(img_res));
+        (void)engine_subsystem_shutdown();
+        return 1;
+    }
+
+    // The driver pitch is the linux-dmabuf stride. A short or empty pitch is
+    // what shows up as torn rows. Tiled images may be wider than width * 4.
+    const uint64_t min_stride = (uint64_t)s_frame.image.width * 4ull;
+    if (s_frame.image.row_pitch < min_stride ||
+        s_frame.image.row_pitch > 0xffffffffu ||
+        s_frame.image.offset > 0xffffffffu) {
+        fprintf(stderr,
+                "[Engine Error] DMA-BUF layout is not importable (stride=%llu offset=%llu width=%u)\n",
+                (unsigned long long)s_frame.image.row_pitch,
+                (unsigned long long)s_frame.image.offset,
+                s_frame.image.width);
         (void)engine_subsystem_shutdown();
         return 1;
     }
@@ -646,23 +665,28 @@ int engine_subsystem_run(void) {
            s_frame.image.width, s_frame.image.height);
     fflush(stdout);
 
-    bool     send_in_flight = false;
-    uint32_t pending_serial = 0;
-    bool     got_signal     = false;
-    int      signo          = 0;
-    int      run_rc         = 0;
-    const char *why         = "idle wait ended";
+    bool     signal_poll_armed = true;
+    bool     cancel_in_flight  = false;
+    bool     send_in_flight    = false;
+    uint32_t pending_serial    = 0;
+    bool     got_signal        = false;
+    int      signo             = 0;
+    int      run_rc            = 0;
+    const char *why            = "idle wait ended";
 
     for (;;) {
         struct io_uring_cqe cqe;
         while (ring_peek(ring, &cqe)) {
             if (cqe.user_data == ENG_UD_SIGNAL) {
-                struct signalfd_siginfo info;
-                ssize_t nread = read(signal_fd, &info, sizeof info);
-                if (nread == (ssize_t)sizeof info) {
-                    signo = (int)info.ssi_signo;
+                signal_poll_armed = false;
+                if (cqe.res >= 0) {
+                    struct signalfd_siginfo info;
+                    ssize_t nread = read(signal_fd, &info, sizeof info);
+                    if (nread == (ssize_t)sizeof info) {
+                        signo = (int)info.ssi_signo;
+                    }
+                    got_signal = true;
                 }
-                got_signal = true;
             } else if (cqe.user_data == ENG_UD_WL_SEND) {
                 send_in_flight = false;
                 if (wayland_note_send_cqe(wl, &cqe, pending_serial) < 0) {
@@ -688,12 +712,9 @@ int engine_subsystem_run(void) {
         }
 
         if (!send_in_flight && wl->configure_serial != wl->acked_configure_serial) {
-            uint32_t width  = s_frame.image.width;
-            uint32_t height = s_frame.image.height;
-            if (wl->configure_width > 0 && wl->configure_height > 0) {
-                width  = wl->configure_width;
-                height = wl->configure_height;
-            }
+            // Keep geometry matched to the single allocated buffer while idle.
+            const uint32_t width  = s_frame.image.width;
+            const uint32_t height = s_frame.image.height;
             pending_serial = wl->configure_serial;
             int queued = wayland_queue_configure_ack(wl, pending_serial, width, height);
             if (queued == 0) {
@@ -721,12 +742,25 @@ int engine_subsystem_run(void) {
         }
     }
 
-    // The ack sendmsg still points at the Wayland send buffer. Drain it
-    // before shutdown reuses that buffer.
-    uint64_t send_deadline = ring_mono_ns() + 3000000000ull;
-    while (send_in_flight && !wl->failed) {
-        if (ring_mono_ns() > send_deadline) {
-            fprintf(stderr, "[Engine Error] Configure ack send did not complete\n");
+    // If we exited via toplevel close rather than a signal, remove the armed
+    // poll on signal_fd before closing it.
+    if (signal_poll_armed) {
+        struct io_uring_sqe *cancel_sqe = ring_sqe(ring);
+        if (cancel_sqe != nullptr) {
+            cancel_sqe->opcode    = IORING_OP_POLL_REMOVE;
+            cancel_sqe->addr      = ENG_UD_SIGNAL;
+            cancel_sqe->user_data = k_ud_signal_cancel;
+            cancel_in_flight      = true;
+        }
+    }
+
+    // Drain any in-flight configure ack send, xdg_wm_base pong send, or signal poll cancel
+    // before closing signal_fd or reusing the Wayland send buffer during shutdown.
+    uint64_t drain_deadline = ring_mono_ns() + 3000000000ull;
+    while ((send_in_flight || wl->pong_in_flight || signal_poll_armed || cancel_in_flight) &&
+           !wl->failed) {
+        if (ring_mono_ns() > drain_deadline) {
+            fprintf(stderr, "[Engine Error] Idle teardown drain timed out\n");
             run_rc = 1;
             break;
         }
@@ -745,7 +779,11 @@ int engine_subsystem_run(void) {
             if (wayland_note_send_cqe(wl, &cqe, pending_serial) < 0) {
                 run_rc = 1;
             }
-        } else if (cqe.user_data != ENG_UD_SIGNAL) {
+        } else if (cqe.user_data == ENG_UD_SIGNAL) {
+            signal_poll_armed = false;
+        } else if (cqe.user_data == k_ud_signal_cancel) {
+            cancel_in_flight = false;
+        } else {
             wayland_on_cqe(wl, &cqe);
         }
     }

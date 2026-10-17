@@ -65,8 +65,11 @@ typedef struct VulkanExportableImage {
  * @brief Allocates a single-plane DRM-modifier exportable VkImage restricted to an explicit modifier list.
  *
  * Intersects the physical device's single-plane exportable modifiers for (format, usage)
- * with allowed_modifiers. Rejects optimal tiling (no modifier) and any chosen modifier
- * not present in allowed_modifiers.
+ * with allowed_modifiers. The driver may pick any modifier in the list; order is not
+ * a preference. When prefer_linear is true and DRM_FORMAT_MOD_LINEAR is in that
+ * intersection, the image is created with only that modifier. If it is not, the
+ * remaining intersection is used. prefer_linear also tries host-visible memory before
+ * device-local memory, then any type in the image's memoryTypeBits.
  */
 [[nodiscard]] VulkanResult vulkan_create_exportable_image_with_modifiers(
     VulkanContext         *ctx,
@@ -76,6 +79,7 @@ typedef struct VulkanExportableImage {
     VkImageUsageFlags      usage,
     const uint64_t        *allowed_modifiers,
     uint32_t               allowed_modifier_count,
+    bool                   prefer_linear,
     VulkanExportableImage *out_image);
 
 /**

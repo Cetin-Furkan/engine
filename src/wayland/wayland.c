@@ -889,6 +889,9 @@ int wayland_query_surface_dmabuf_feedback(
             printf(" or %lld:%lld", (long long)alt_major, (long long)alt_minor);
         }
         printf("; using %u import modifier(s)", w->all_modifier_count);
+        for (uint32_t i = 0; i < w->all_modifier_count; ++i) {
+            printf(" 0x%llx", (unsigned long long)w->all_modifiers[i]);
+        }
         if (w->feedback_has_main_dev) {
             printf(" (compositor main_device %lld:%lld)",
                    (long long)w->feedback_main_major,

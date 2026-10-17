@@ -25,6 +25,10 @@ typedef struct EngineFrameState {
     VkImageView           image_view;
     VkCommandBuffer       cmd_buf;
     VkSemaphore           acquire_semaphore;
+    // Optimal color target used only when the exported image cannot be rendered
+    // to. The clear is copied into the linear DMA-BUF before the queue release.
+    VkImage               copy_src;
+    VkDeviceMemory        copy_src_memory;
     int                   drm_fd;
     uint32_t              release_handle;
     int                   release_eventfd;
@@ -40,11 +44,14 @@ static EngineFrameState s_frame = {
 };
 
 static int record_and_submit_clear(VulkanContext *vk, EngineFrameState *frame, VkSemaphore acquire) {
+    const bool copy_out = frame->copy_src != VK_NULL_HANDLE;
+    const VkImage render_image = copy_out ? frame->copy_src : frame->image.image;
+
     VkImageViewCreateInfo view_info = {
         .sType    = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
         .pNext    = nullptr,
         .flags    = 0,
-        .image    = frame->image.image,
+        .image    = render_image,
         .viewType = VK_IMAGE_VIEW_TYPE_2D,
         .format   = frame->image.format,
         .components = {
@@ -110,7 +117,7 @@ static int record_and_submit_clear(VulkanContext *vk, EngineFrameState *frame, V
         .newLayout           = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
         .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
         .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .image               = frame->image.image,
+        .image               = render_image,
         .subresourceRange    = {
             .aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
             .baseMipLevel   = 0,
@@ -160,35 +167,120 @@ static int record_and_submit_clear(VulkanContext *vk, EngineFrameState *frame, V
     vkCmdBeginRendering(frame->cmd_buf, &rendering_info);
     vkCmdEndRendering(frame->cmd_buf);
 
-    // Barrier 2: COLOR_ATTACHMENT_OPTIMAL -> GENERAL + Queue Family Release to EXTERNAL
-    VkImageMemoryBarrier2 to_general = {
-        .sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
-        .pNext               = nullptr,
-        .srcStageMask        = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-        .srcAccessMask       = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
-        .dstStageMask        = VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT,
-        .dstAccessMask       = VK_ACCESS_2_NONE,
-        .oldLayout           = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-        .newLayout           = VK_IMAGE_LAYOUT_GENERAL,
-        .srcQueueFamilyIndex = vk->queues.graphics_family_index,
-        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL,
-        .image               = frame->image.image,
-        .subresourceRange    = {
-            .aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
-            .baseMipLevel   = 0,
-            .levelCount     = 1,
-            .baseArrayLayer = 0,
-            .layerCount     = 1,
-        },
+    VkImageSubresourceRange color_range = {
+        .aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
+        .baseMipLevel   = 0,
+        .levelCount     = 1,
+        .baseArrayLayer = 0,
+        .layerCount     = 1,
     };
-    VkDependencyInfo dep_to_general = {
-        .sType                   = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
-        .pNext                   = nullptr,
-        .dependencyFlags         = 0,
-        .imageMemoryBarrierCount = 1,
-        .pImageMemoryBarriers    = &to_general,
-    };
-    vkCmdPipelineBarrier2(frame->cmd_buf, &dep_to_general);
+
+    if (!copy_out) {
+        // COLOR_ATTACHMENT_OPTIMAL -> GENERAL, and release to the compositor.
+        VkImageMemoryBarrier2 to_general = {
+            .sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+            .pNext               = nullptr,
+            .srcStageMask        = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+            .srcAccessMask       = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+            .dstStageMask        = VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT,
+            .dstAccessMask       = VK_ACCESS_2_NONE,
+            .oldLayout           = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            .newLayout           = VK_IMAGE_LAYOUT_GENERAL,
+            .srcQueueFamilyIndex = vk->queues.graphics_family_index,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL,
+            .image               = frame->image.image,
+            .subresourceRange    = color_range,
+        };
+        VkDependencyInfo dep_to_general = {
+            .sType                   = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+            .pNext                   = nullptr,
+            .dependencyFlags         = 0,
+            .imageMemoryBarrierCount = 1,
+            .pImageMemoryBarriers    = &to_general,
+        };
+        vkCmdPipelineBarrier2(frame->cmd_buf, &dep_to_general);
+    } else {
+        VkImageMemoryBarrier2 pre_copy[2] = {
+            {
+                .sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+                .srcStageMask        = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                .srcAccessMask       = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                .dstStageMask        = VK_PIPELINE_STAGE_2_COPY_BIT,
+                .dstAccessMask       = VK_ACCESS_2_TRANSFER_READ_BIT,
+                .oldLayout           = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                .newLayout           = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .image               = frame->copy_src,
+                .subresourceRange    = color_range,
+            },
+            {
+                .sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+                .srcStageMask        = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
+                .srcAccessMask       = VK_ACCESS_2_NONE,
+                .dstStageMask        = VK_PIPELINE_STAGE_2_COPY_BIT,
+                .dstAccessMask       = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                .oldLayout           = VK_IMAGE_LAYOUT_UNDEFINED,
+                .newLayout           = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .image               = frame->image.image,
+                .subresourceRange    = color_range,
+            },
+        };
+        VkDependencyInfo dep_pre_copy = {
+            .sType                   = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+            .imageMemoryBarrierCount = 2,
+            .pImageMemoryBarriers    = pre_copy,
+        };
+        vkCmdPipelineBarrier2(frame->cmd_buf, &dep_pre_copy);
+
+        VkImageCopy region = {
+            .srcSubresource = {
+                .aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
+                .mipLevel       = 0,
+                .baseArrayLayer = 0,
+                .layerCount     = 1,
+            },
+            .srcOffset = {0, 0, 0},
+            .dstSubresource = {
+                .aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
+                .mipLevel       = 0,
+                .baseArrayLayer = 0,
+                .layerCount     = 1,
+            },
+            .dstOffset = {0, 0, 0},
+            .extent = {
+                .width  = frame->image.width,
+                .height = frame->image.height,
+                .depth  = 1,
+            },
+        };
+        vkCmdCopyImage(frame->cmd_buf,
+                       frame->copy_src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       frame->image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                       1, &region);
+
+        VkImageMemoryBarrier2 to_general = {
+            .sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+            .srcStageMask        = VK_PIPELINE_STAGE_2_COPY_BIT,
+            .srcAccessMask       = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+            .dstStageMask        = VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT,
+            .dstAccessMask       = VK_ACCESS_2_NONE,
+            .oldLayout           = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            .newLayout           = VK_IMAGE_LAYOUT_GENERAL,
+            .srcQueueFamilyIndex = vk->queues.graphics_family_index,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL,
+            .image               = frame->image.image,
+            .subresourceRange    = color_range,
+        };
+        VkDependencyInfo dep_to_general = {
+            .sType                   = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+            .imageMemoryBarrierCount = 1,
+            .pImageMemoryBarriers    = &to_general,
+        };
+        vkCmdPipelineBarrier2(frame->cmd_buf, &dep_to_general);
+    }
 
     res = vkEndCommandBuffer(frame->cmd_buf);
     if (res != VK_SUCCESS) {
@@ -357,6 +449,179 @@ static int wait_gpu_release(RingContext *ring, WaylandContext *wl) {
     }
 }
 
+static void destroy_copy_source(VulkanContext *vk) {
+    if (vk == nullptr || vk->device == VK_NULL_HANDLE) {
+        s_frame.copy_src = VK_NULL_HANDLE;
+        s_frame.copy_src_memory = VK_NULL_HANDLE;
+        return;
+    }
+    if (s_frame.copy_src != VK_NULL_HANDLE) {
+        vkDestroyImage(vk->device, s_frame.copy_src, nullptr);
+        s_frame.copy_src = VK_NULL_HANDLE;
+    }
+    if (s_frame.copy_src_memory != VK_NULL_HANDLE) {
+        vkFreeMemory(vk->device, s_frame.copy_src_memory, nullptr);
+        s_frame.copy_src_memory = VK_NULL_HANDLE;
+    }
+}
+
+static int create_copy_source(VulkanContext *vk, uint32_t width, uint32_t height, VkFormat format) {
+    destroy_copy_source(vk);
+
+    VkImageCreateInfo image_info = {
+        .sType         = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        .imageType     = VK_IMAGE_TYPE_2D,
+        .format        = format,
+        .extent        = { .width = width, .height = height, .depth = 1 },
+        .mipLevels     = 1,
+        .arrayLayers   = 1,
+        .samples       = VK_SAMPLE_COUNT_1_BIT,
+        .tiling        = VK_IMAGE_TILING_OPTIMAL,
+        .usage         = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+        .sharingMode   = VK_SHARING_MODE_EXCLUSIVE,
+        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+    };
+
+    VkImage image = VK_NULL_HANDLE;
+    VkResult img_res = vkCreateImage(vk->device, &image_info, nullptr, &image);
+    if (img_res != VK_SUCCESS) {
+        fprintf(stderr, "[Vulkan Error] vkCreateImage for copy source failed: %s (%d)\n",
+                vulkan_vkresult_to_str(img_res), (int)img_res);
+        return -1;
+    }
+
+    VkMemoryRequirements reqs;
+    vkGetImageMemoryRequirements(vk->device, image, &reqs);
+    uint32_t memory_type = 0;
+    if (vulkan_find_memory_type(vk, reqs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                                &memory_type) != VULKAN_SUCCESS) {
+        vkDestroyImage(vk->device, image, nullptr);
+        return -1;
+    }
+
+    VkMemoryAllocateInfo alloc_info = {
+        .sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .allocationSize  = reqs.size,
+        .memoryTypeIndex = memory_type,
+    };
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkResult alloc_res = vkAllocateMemory(vk->device, &alloc_info, nullptr, &memory);
+    if (alloc_res != VK_SUCCESS) {
+        fprintf(stderr, "[Vulkan Error] vkAllocateMemory for copy source failed: %s (%d)\n",
+                vulkan_vkresult_to_str(alloc_res), (int)alloc_res);
+        vkDestroyImage(vk->device, image, nullptr);
+        return -1;
+    }
+    if (vkBindImageMemory(vk->device, image, memory, 0) != VK_SUCCESS) {
+        vkFreeMemory(vk->device, memory, nullptr);
+        vkDestroyImage(vk->device, image, nullptr);
+        return -1;
+    }
+
+    s_frame.copy_src = image;
+    s_frame.copy_src_memory = memory;
+    return 0;
+}
+
+static bool present_image_layout_ok(const VulkanExportableImage *image) {
+    const uint64_t min_stride = (uint64_t)image->width * 4ull;
+    return image->has_drm_format_modifier &&
+           image->row_pitch >= min_stride &&
+           image->row_pitch <= 0xffffffffu &&
+           image->offset <= 0xffffffffu;
+}
+
+static bool keep_present_image(VulkanResult result) {
+    if (result == VULKAN_SUCCESS && present_image_layout_ok(&s_frame.image)) {
+        return true;
+    }
+    if (result == VULKAN_SUCCESS) {
+        vulkan_destroy_exportable_image(vulkan_get_context(), &s_frame.image);
+    }
+    return false;
+}
+
+// B8G8R8A8_SRGB and B8G8R8A8_UNORM are the same DRM_FORMAT_ARGB8888 byte order.
+// SRGB is tried first. UNORM is the same pixels when a driver cannot export SRGB.
+static const VkFormat k_argb_formats[] = {
+    VK_FORMAT_B8G8R8A8_SRGB,
+    VK_FORMAT_B8G8R8A8_UNORM,
+};
+
+static int allocate_present_image(VulkanContext *vk, WaylandContext *wl,
+                                  uint32_t width, uint32_t height,
+                                  const char **tranche_kind) {
+    VulkanResult img_res = VULKAN_ERROR_FORMAT_NOT_SUPPORTED;
+    *tranche_kind = wl->feedback_prime ? "prime" : "general";
+
+    if (!wl->feedback_prime && wl->scanout_modifier_count > 0) {
+        img_res = vulkan_create_exportable_image_with_modifiers(
+            vk, width, height, VK_FORMAT_B8G8R8A8_SRGB,
+            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+            wl->scanout_modifiers, wl->scanout_modifier_count,
+            false, &s_frame.image);
+        if (keep_present_image(img_res)) {
+            *tranche_kind = "scanout";
+            return 0;
+        }
+    }
+
+    img_res = vulkan_create_exportable_image_with_modifiers(
+        vk, width, height, VK_FORMAT_B8G8R8A8_SRGB,
+        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+        wl->all_modifiers, wl->all_modifier_count,
+        wl->feedback_prime, &s_frame.image);
+    if (keep_present_image(img_res)) {
+        return 0;
+    }
+
+    if (!wl->feedback_prime) {
+        fprintf(stderr, "[Engine Error] Failed to allocate modifier-backed DMA-BUF image: %s\n",
+                vulkan_result_to_str(img_res));
+        return -1;
+    }
+
+    // The compositor's modifiers belong to its own GPU. This GPU stays selected.
+    // A linear buffer is the layout the other device can import.
+    printf("[Engine] Selected GPU cannot export the compositor modifiers. "
+           "Allocating DRM_FORMAT_MOD_LINEAR on that GPU.\n");
+
+    const uint64_t linear_modifier = 0;
+    for (size_t i = 0; i < sizeof k_argb_formats / sizeof k_argb_formats[0]; ++i) {
+        const VkFormat format = k_argb_formats[i];
+
+        img_res = vulkan_create_exportable_image_with_modifiers(
+            vk, width, height, format, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+            &linear_modifier, 1, true, &s_frame.image);
+        if (keep_present_image(img_res)) {
+            *tranche_kind = "prime-linear";
+            return 0;
+        }
+
+        img_res = vulkan_create_exportable_linear_dmabuf(
+            vk, width, height, format, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, &s_frame.image);
+        if (keep_present_image(img_res)) {
+            *tranche_kind = "prime-linear";
+            return 0;
+        }
+
+        img_res = vulkan_create_exportable_linear_dmabuf(
+            vk, width, height, format, VK_IMAGE_USAGE_TRANSFER_DST_BIT, &s_frame.image);
+        if (keep_present_image(img_res)) {
+            if (create_copy_source(vk, width, height, format) == 0) {
+                *tranche_kind = "prime-copy";
+                return 0;
+            }
+            vulkan_destroy_exportable_image(vk, &s_frame.image);
+        }
+    }
+
+    fprintf(stderr,
+            "[Engine Error] Selected GPU cannot export a DMA-BUF the compositor can import: %s\n",
+            vulkan_result_to_str(img_res));
+    return -1;
+}
+
 int engine_subsystem_init(void) {
     RingContext    *ring = ring_get_context();
     WaylandContext *wl   = wayland_get_context();
@@ -431,58 +696,11 @@ int engine_subsystem_init(void) {
         return 1;
     }
 
-    // 3. Image, view, clear. Scanout tranches are same-GPU only. A prime handoff
-    //    uses the compositor's import list and asks for a linear modifier.
-    VulkanResult img_res = VULKAN_ERROR_FORMAT_NOT_SUPPORTED;
-    const char *tranche_kind = wl->feedback_prime ? "prime" : "general";
-
-    if (!wl->feedback_prime && wl->scanout_modifier_count > 0) {
-        img_res = vulkan_create_exportable_image_with_modifiers(
-            vk,
-            width,
-            height,
-            VK_FORMAT_B8G8R8A8_SRGB,
-            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
-            wl->scanout_modifiers,
-            wl->scanout_modifier_count,
-            false,
-            &s_frame.image);
-        if (img_res == VULKAN_SUCCESS) {
-            tranche_kind = "scanout";
-        }
-    }
-
-    if (img_res != VULKAN_SUCCESS) {
-        img_res = vulkan_create_exportable_image_with_modifiers(
-            vk,
-            width,
-            height,
-            VK_FORMAT_B8G8R8A8_SRGB,
-            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
-            wl->all_modifiers,
-            wl->all_modifier_count,
-            wl->feedback_prime,
-            &s_frame.image);
-    }
-
-    if (img_res != VULKAN_SUCCESS || !s_frame.image.has_drm_format_modifier) {
-        fprintf(stderr, "[Engine Error] Failed to allocate modifier-backed DMA-BUF image: %s\n",
-                vulkan_result_to_str(img_res));
-        (void)engine_subsystem_shutdown();
-        return 1;
-    }
-
-    // The driver pitch is the linux-dmabuf stride. A short or empty pitch is
-    // what shows up as torn rows. Tiled images may be wider than width * 4.
-    const uint64_t min_stride = (uint64_t)s_frame.image.width * 4ull;
-    if (s_frame.image.row_pitch < min_stride ||
-        s_frame.image.row_pitch > 0xffffffffu ||
-        s_frame.image.offset > 0xffffffffu) {
-        fprintf(stderr,
-                "[Engine Error] DMA-BUF layout is not importable (stride=%llu offset=%llu width=%u)\n",
-                (unsigned long long)s_frame.image.row_pitch,
-                (unsigned long long)s_frame.image.offset,
-                s_frame.image.width);
+    // 3. Image on the already selected GPU. Same-GPU uses the compositor's
+    //    tiled modifiers. A different DRM node gets a linear buffer that node
+    //    can import. The GPU is not switched.
+    const char *tranche_kind = "general";
+    if (allocate_present_image(vk, wl, width, height, &tranche_kind) < 0) {
         (void)engine_subsystem_shutdown();
         return 1;
     }
@@ -821,6 +1039,7 @@ int engine_subsystem_shutdown(void) {
             vkDestroyImageView(vk->device, s_frame.image_view, nullptr);
             s_frame.image_view = VK_NULL_HANDLE;
         }
+        destroy_copy_source(vk);
     }
 
     // The compositor signals the release point when it drops the buffer.

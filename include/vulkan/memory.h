@@ -83,6 +83,21 @@ typedef struct VulkanExportableImage {
     VulkanExportableImage *out_image);
 
 /**
+ * @brief Allocates a VK_IMAGE_TILING_LINEAR DMA-BUF and reports it as DRM_FORMAT_MOD_LINEAR.
+ *
+ * Used when the selected GPU and the compositor do not share a tiled modifier.
+ * Host-visible memory is tried first so another device can read the buffer.
+ * The result has has_drm_format_modifier set and drm_format_modifier 0.
+ */
+[[nodiscard]] VulkanResult vulkan_create_exportable_linear_dmabuf(
+    VulkanContext         *ctx,
+    uint32_t               width,
+    uint32_t               height,
+    VkFormat               format,
+    VkImageUsageFlags      usage,
+    VulkanExportableImage *out_image);
+
+/**
  * @brief Destroys an exportable image, frees its dedicated memory, and closes its DMA-BUF file descriptor.
  */
 void vulkan_destroy_exportable_image(

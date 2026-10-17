@@ -605,6 +605,55 @@ VulkanResult vulkan_create_exportable_image_with_modifiers(
     return VULKAN_SUCCESS;
 }
 
+VulkanResult vulkan_create_exportable_linear_dmabuf(
+    VulkanContext         *ctx,
+    uint32_t               width,
+    uint32_t               height,
+    VkFormat               format,
+    VkImageUsageFlags      usage,
+    VulkanExportableImage *out_image
+) {
+    if (ctx == nullptr || out_image == nullptr || width == 0 || height == 0 ||
+        ctx->device == VK_NULL_HANDLE) {
+        return VULKAN_ERROR_INVALID_ARGUMENT;
+    }
+
+    VkFormatFeatureFlags required_features = 0;
+    if (!usage_to_required_features(usage, &required_features)) {
+        return VULKAN_ERROR_INVALID_ARGUMENT;
+    }
+
+    *out_image = (VulkanExportableImage){ .dmabuf_fd = -1 };
+
+    VkFormatProperties format_props;
+    vkGetPhysicalDeviceFormatProperties(ctx->physical_device, format, &format_props);
+    if (!features_cover(format_props.linearTilingFeatures, required_features)) {
+        return VULKAN_ERROR_FORMAT_NOT_SUPPORTED;
+    }
+
+    VulkanResult exportable = image_is_exportable(
+        ctx, format, usage, VK_IMAGE_TILING_LINEAR, false, 0);
+    if (exportable != VULKAN_SUCCESS) {
+        return exportable;
+    }
+
+    VulkanResult created = create_bound_export_image(
+        ctx, width, height, format, usage, VK_IMAGE_TILING_LINEAR,
+        nullptr, 0, true, out_image);
+    if (created != VULKAN_SUCCESS) {
+        return created;
+    }
+
+    // Linear tiling is row-major. linux-dmabuf names that DRM_FORMAT_MOD_LINEAR.
+    out_image->has_drm_format_modifier = true;
+    out_image->drm_format_modifier = 0;
+    if (out_image->row_pitch == 0) {
+        vulkan_destroy_exportable_image(ctx, out_image);
+        return VULKAN_ERROR_FORMAT_NOT_SUPPORTED;
+    }
+    return VULKAN_SUCCESS;
+}
+
 VulkanResult vulkan_create_exportable_image(
     VulkanContext         *ctx,
     uint32_t               width,

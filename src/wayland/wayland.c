@@ -150,14 +150,8 @@ static bool tranche_device_is_gpu(const WaylandContext *w) {
 }
 
 static void commit_feedback_tranche(WaylandContext *w) {
-    // A tranche for the selected GPU is zero-copy. Any other target is a device
-    // the compositor can import from, which is the cross-GPU path.
-    if (w->tranche_has_dev && w->feedback_table != nullptr) {
-        const bool is_gpu = tranche_device_is_gpu(w);
-        const bool is_scanout = is_gpu && ((w->tranche_flags & 1u) != 0u);
-        uint64_t *dest = is_gpu ? w->all_modifiers : w->import_modifiers;
-        uint32_t *dest_count = is_gpu ? &w->all_modifier_count : &w->import_modifier_count;
-
+    if (tranche_device_is_gpu(w) && w->feedback_table != nullptr) {
+        const bool is_scanout = (w->tranche_flags & 1u) != 0u;
         for (uint32_t i = 0; i < w->tranche_index_count; ++i) {
             uint16_t idx = w->tranche_indices[i];
             if (idx >= w->feedback_table_count) {
@@ -172,7 +166,8 @@ static void commit_feedback_tranche(WaylandContext *w) {
                 push_unique_modifier(w->scanout_modifiers, &w->scanout_modifier_count,
                                      ENG_WL_MAX_MODIFIERS, entry->modifier);
             }
-            push_unique_modifier(dest, dest_count, ENG_WL_MAX_MODIFIERS, entry->modifier);
+            push_unique_modifier(w->all_modifiers, &w->all_modifier_count,
+                                 ENG_WL_MAX_MODIFIERS, entry->modifier);
         }
     }
 
@@ -841,8 +836,6 @@ int wayland_query_surface_dmabuf_feedback(
     w->tranche_index_count    = 0;
     w->scanout_modifier_count = 0;
     w->all_modifier_count     = 0;
-    w->import_modifier_count  = 0;
-    w->feedback_prime         = false;
     w->send_len               = 0;
 
     // zwp_linux_dmabuf_v1.get_surface_feedback (request 3)
@@ -873,31 +866,6 @@ int wayland_query_surface_dmabuf_feedback(
     if (w->failed || !w->feedback_done) {
         fprintf(stderr, "[Wayland Error] Surface DMA-BUF feedback failed: %s\n", w->err);
         return -EIO;
-    }
-
-    // The selected GPU is unchanged. If the compositor only advertised tranches
-    // for another device, those modifiers are what that device can import.
-    if (w->all_modifier_count == 0 && w->import_modifier_count > 0) {
-        for (uint32_t i = 0; i < w->import_modifier_count; ++i) {
-            w->all_modifiers[i] = w->import_modifiers[i];
-        }
-        w->all_modifier_count = w->import_modifier_count;
-        w->feedback_prime = true;
-        printf("[Wayland] No tranches target GPU %lld:%lld",
-               (long long)target_major, (long long)target_minor);
-        if (has_alt) {
-            printf(" or %lld:%lld", (long long)alt_major, (long long)alt_minor);
-        }
-        printf("; using %u import modifier(s)", w->all_modifier_count);
-        for (uint32_t i = 0; i < w->all_modifier_count; ++i) {
-            printf(" 0x%llx", (unsigned long long)w->all_modifiers[i]);
-        }
-        if (w->feedback_has_main_dev) {
-            printf(" (compositor main_device %lld:%lld)",
-                   (long long)w->feedback_main_major,
-                   (long long)w->feedback_main_minor);
-        }
-        printf("\n");
     }
 
     if (w->all_modifier_count == 0) {

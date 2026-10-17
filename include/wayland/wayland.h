@@ -111,17 +111,11 @@ typedef struct WaylandContext {
     uint16_t tranche_indices[ENG_WL_MAX_INDICES];
     uint32_t tranche_index_count;
 
-    // DRM_FORMAT_ARGB8888 modifiers from surface feedback.
-    // scanout and all match the selected GPU. import matches every other tranche.
-    // feedback_prime is set when the selected GPU got no tranche and the import
-    // list was adopted: the GPU renders, and another device composites.
+    // Collected DRM_FORMAT_ARGB8888 modifiers for the matched GPU DRM node
     uint64_t scanout_modifiers[ENG_WL_MAX_MODIFIERS];
     uint32_t scanout_modifier_count;
     uint64_t all_modifiers[ENG_WL_MAX_MODIFIERS];
     uint32_t all_modifier_count;
-    uint64_t import_modifiers[ENG_WL_MAX_MODIFIERS];
-    uint32_t import_modifier_count;
-    bool     feedback_prime;
 
     // Receive state
     uint32_t      control_reserve;
@@ -179,11 +173,10 @@ void wayland_on_cqe(WaylandContext *w, const struct io_uring_cqe *cqe);
     uint32_t       *out_serial);
 
 /**
- * @brief Requests zwp_linux_dmabuf_v1.get_surface_feedback for the active wl_surface.
- *        Tranches for the render node, or the primary node when has_alt is set,
- *        fill scanout_modifiers and all_modifiers. Every other tranche fills
- *        import_modifiers. If the selected GPU received none, those import
- *        modifiers are adopted and feedback_prime is set.
+ * @brief Requests zwp_linux_dmabuf_v1.get_surface_feedback for the active wl_surface,
+ *        matches tranches against the render node and, when has_alt is set,
+ *        the primary node of the same GPU, and populates w->scanout_modifiers
+ *        and w->all_modifiers for DRM_FORMAT_ARGB8888.
  */
 [[nodiscard]] int wayland_query_surface_dmabuf_feedback(
     WaylandContext *w,

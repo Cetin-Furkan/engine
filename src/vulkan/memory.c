@@ -1,4 +1,4 @@
-#include "init/vulkan_init/vulkan_memory.h"
+#include "vulkan/memory.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -120,6 +120,18 @@ static bool features_cover(VkFormatFeatureFlags have, VkFormatFeatureFlags requi
     return (have & required) == required;
 }
 
+static bool modifier_list_contains(const uint64_t *list, uint32_t count, uint64_t modifier) {
+    if (list == nullptr) {
+        return false;
+    }
+    for (uint32_t i = 0; i < count; ++i) {
+        if (list[i] == modifier) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static const char *image_tiling_name(VkImageTiling tiling) {
     switch (tiling) {
         case VK_IMAGE_TILING_LINEAR: return "linear";
@@ -189,11 +201,14 @@ static VulkanResult image_is_exportable(
 }
 
 // DRM_FORMAT_MODIFIER_LINEAR is 0. Any other single-plane modifier is treated as tiled.
-static VulkanResult collect_export_modifiers(
+// When filter_modifiers != nullptr, only modifiers present in filter_modifiers are collected.
+static VulkanResult collect_export_modifiers_filtered(
     const VulkanContext  *ctx,
     VkFormat              format,
     VkFormatFeatureFlags  required_features,
     VkImageUsageFlags     usage,
+    const uint64_t       *filter_modifiers,
+    uint32_t              filter_count,
     uint64_t            **out_modifiers,
     uint32_t             *out_count
 ) {
@@ -244,6 +259,10 @@ static VulkanResult collect_export_modifiers(
     VulkanResult fatal = VULKAN_SUCCESS;
     for (uint32_t i = 0; i < written; ++i) {
         if (props[i].drmFormatModifierPlaneCount != 1) {
+            continue;
+        }
+        if (filter_modifiers != nullptr &&
+            !modifier_list_contains(filter_modifiers, filter_count, props[i].drmFormatModifier)) {
             continue;
         }
         if (!features_cover(props[i].drmFormatModifierTilingFeatures, required_features)) {
@@ -409,6 +428,13 @@ static VulkanResult create_bound_export_image(
             destroy_unexported_image(ctx->device, image, memory);
             return map_image_vkresult(modifier_res);
         }
+        if (!modifier_list_contains(modifiers, modifier_count, modifier_props.drmFormatModifier)) {
+            fprintf(stderr,
+                    "[Vulkan Error] Driver picked DRM modifier 0x%llx which was not in the requested list\n",
+                    (unsigned long long)modifier_props.drmFormatModifier);
+            destroy_unexported_image(ctx->device, image, memory);
+            return VULKAN_ERROR_FORMAT_NOT_SUPPORTED;
+        }
         has_modifier = true;
         chosen_modifier = modifier_props.drmFormatModifier;
     }
@@ -498,6 +524,63 @@ static VulkanResult try_fixed_tiling(
                                      nullptr, 0, out_image);
 }
 
+VulkanResult vulkan_create_exportable_image_with_modifiers(
+    VulkanContext         *ctx,
+    uint32_t               width,
+    uint32_t               height,
+    VkFormat               format,
+    VkImageUsageFlags      usage,
+    const uint64_t        *allowed_modifiers,
+    uint32_t               allowed_modifier_count,
+    VulkanExportableImage *out_image
+) {
+    if (ctx == nullptr || out_image == nullptr || width == 0 || height == 0 ||
+        ctx->device == VK_NULL_HANDLE || allowed_modifiers == nullptr || allowed_modifier_count == 0) {
+        return VULKAN_ERROR_INVALID_ARGUMENT;
+    }
+    if (!ctx->device_info.supports_drm_format_modifiers ||
+        ctx->dispatch.vkGetImageDrmFormatModifierPropertiesEXT == nullptr) {
+        return VULKAN_ERROR_FORMAT_NOT_SUPPORTED;
+    }
+
+    VkFormatFeatureFlags required_features = 0;
+    if (!usage_to_required_features(usage, &required_features)) {
+        return VULKAN_ERROR_INVALID_ARGUMENT;
+    }
+
+    *out_image = (VulkanExportableImage){ .dmabuf_fd = -1 };
+
+    uint64_t *modifiers = nullptr;
+    uint32_t modifier_count = 0;
+    VulkanResult collected = collect_export_modifiers_filtered(
+        ctx, format, required_features, usage,
+        allowed_modifiers, allowed_modifier_count,
+        &modifiers, &modifier_count);
+    if (collected != VULKAN_SUCCESS) {
+        return collected;
+    }
+    if (modifier_count == 0) {
+        free(modifiers);
+        return VULKAN_ERROR_FORMAT_NOT_SUPPORTED;
+    }
+
+    VulkanResult created = create_bound_export_image(
+        ctx, width, height, format, usage, VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
+        modifiers, modifier_count, out_image);
+    free(modifiers);
+    if (created != VULKAN_SUCCESS) {
+        return created;
+    }
+
+    if (!out_image->has_drm_format_modifier ||
+        !modifier_list_contains(allowed_modifiers, allowed_modifier_count, out_image->drm_format_modifier)) {
+        vulkan_destroy_exportable_image(ctx, out_image);
+        return VULKAN_ERROR_FORMAT_NOT_SUPPORTED;
+    }
+
+    return VULKAN_SUCCESS;
+}
+
 VulkanResult vulkan_create_exportable_image(
     VulkanContext         *ctx,
     uint32_t               width,
@@ -543,8 +626,8 @@ VulkanResult vulkan_create_exportable_image(
         ctx->dispatch.vkGetImageDrmFormatModifierPropertiesEXT != nullptr) {
         uint64_t *modifiers = nullptr;
         uint32_t modifier_count = 0;
-        VulkanResult collected = collect_export_modifiers(
-            ctx, format, required_features, usage, &modifiers, &modifier_count);
+        VulkanResult collected = collect_export_modifiers_filtered(
+            ctx, format, required_features, usage, nullptr, 0, &modifiers, &modifier_count);
         if (collected != VULKAN_SUCCESS) {
             return collected;
         }

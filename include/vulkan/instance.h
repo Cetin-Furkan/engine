@@ -1,7 +1,7 @@
-#ifndef VULKAN_INSTANCE_H
-#define VULKAN_INSTANCE_H
+#ifndef ENGINE_VULKAN_INSTANCE_H
+#define ENGINE_VULKAN_INSTANCE_H
 
-#include "init/vulkan_init/vulkan_types.h"
+#include "vulkan/types.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -38,4 +38,4 @@ void vulkan_instance_destroy(VulkanContext *ctx);
 }
 #endif
 
-#endif /* VULKAN_INSTANCE_H */
+#endif /* ENGINE_VULKAN_INSTANCE_H */

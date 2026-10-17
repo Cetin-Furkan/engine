@@ -1,6 +1,4 @@
-/* === FILE: ./src/init/ring_init/ring_init.c === */
-
-#include "init/ring_init/ring_init.h"
+#include "ring/ring.h"
 
 #include <errno.h>
 #include <stdio.h>
@@ -230,6 +228,21 @@ void ring_context_shutdown(RingContext *r) {
         munmap(r->arena, r->arena_len);
     }
     *r = (RingContext){ .fd = -1 };
+}
+
+int ring_arm_poll(RingContext *r, int fd, uint32_t poll_mask, uint64_t user_data) {
+    if (r == nullptr || !r->is_initialized || fd < 0) {
+        return -EINVAL;
+    }
+    struct io_uring_sqe *sqe = ring_sqe(r);
+    if (sqe == nullptr) {
+        return -ENOSPC;
+    }
+    sqe->opcode         = IORING_OP_POLL_ADD;
+    sqe->fd             = fd;
+    sqe->poll32_events  = poll_mask;
+    sqe->user_data      = user_data;
+    return 0;
 }
 
 struct io_uring_sqe *ring_sqe(RingContext *r) {

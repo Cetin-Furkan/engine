@@ -1,4 +1,4 @@
-#include "init/vulkan_init/vulkan_device.h"
+#include "vulkan/device.h"
 #include <errno.h>
 #include <stdint.h>
 #include <stdio.h>

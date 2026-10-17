@@ -1,7 +1,5 @@
-/* === FILE: ./src/init/system_init/system_init.c === */
-
-#include "init/system_init/system_init.h"
-#include "init/helpers/fmt.h"
+#include "system/system.h"
+#include "util/fmt.h"
 
 #include <errno.h>
 #include <linux/io_uring.h>

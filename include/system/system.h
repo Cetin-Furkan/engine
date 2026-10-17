@@ -1,7 +1,5 @@
-/* === FILE: ./include/init/system_init/system_init.h === */
-
-#ifndef SYSTEM_INIT_H
-#define SYSTEM_INIT_H
+#ifndef ENGINE_SYSTEM_H
+#define ENGINE_SYSTEM_H
 
 #include <stdint.h>
 
@@ -21,4 +19,4 @@ typedef struct SystemCapabilities {
 void system_shutdown(void);
 [[nodiscard]] const SystemCapabilities *system_get_capabilities(void);
 
-#endif /* SYSTEM_INIT_H */
+#endif /* ENGINE_SYSTEM_H */

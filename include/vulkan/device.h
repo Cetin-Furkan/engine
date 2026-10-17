@@ -1,7 +1,7 @@
-#ifndef VULKAN_DEVICE_H
-#define VULKAN_DEVICE_H
+#ifndef ENGINE_VULKAN_DEVICE_H
+#define ENGINE_VULKAN_DEVICE_H
 
-#include "init/vulkan_init/vulkan_types.h"
+#include "vulkan/types.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -42,4 +42,4 @@ void vulkan_device_destroy(VulkanContext *ctx);
 }
 #endif
 
-#endif /* VULKAN_DEVICE_H */
+#endif /* ENGINE_VULKAN_DEVICE_H */

@@ -1,7 +1,5 @@
-/* === FILE: ./include/init/ring_init/ring_init.h === */
-
-#ifndef RING_INIT_H
-#define RING_INIT_H
+#ifndef ENGINE_RING_H
+#define ENGINE_RING_H
 
 #include <linux/io_uring.h>
 #include <stddef.h>
@@ -22,8 +20,11 @@ enum : uint64_t {
     ENG_UD_WL_CONNECT = 2,
     ENG_UD_WL_SEND    = 3,
     ENG_UD_WL_RECV    = 4,
-    ENG_UD_SYNCOBJ_FD = 5,
-    ENG_UD_MSG_RING   = 6,
+    ENG_UD_SYNCOBJ_FD  = 5,
+    ENG_UD_MSG_RING    = 6,
+    ENG_UD_WL_PONG     = 7,
+    ENG_UD_GPU_RELEASE = 8,
+    ENG_UD_SIGNAL      = 9,
 };
 
 typedef struct RingContext {
@@ -38,19 +39,19 @@ typedef struct RingContext {
     size_t   bufs_off;
     size_t   wait_off;
 
-    void                    *rings;
-    void                    *sqes_mem;
+    void                     *rings;
+    void                     *sqes_mem;
     struct io_uring_reg_wait *wait;
 
-    struct io_uring_sqe     *sqes;
-    struct io_uring_cqe     *cqes;
-    uint32_t                *sq_khead;
-    uint32_t                *sq_ktail;
-    uint32_t                *sq_kflags;
-    uint32_t                *sq_kdropped;
-    uint32_t                *cq_khead;
-    uint32_t                *cq_ktail;
-    uint32_t                *cq_koverflow;
+    struct io_uring_sqe      *sqes;
+    struct io_uring_cqe      *cqes;
+    uint32_t                 *sq_khead;
+    uint32_t                 *sq_ktail;
+    uint32_t                 *sq_kflags;
+    uint32_t                 *sq_kdropped;
+    uint32_t                 *cq_khead;
+    uint32_t                 *cq_ktail;
+    uint32_t                 *cq_koverflow;
 
     uint32_t sq_mask;
     uint32_t cq_mask;
@@ -75,6 +76,7 @@ typedef struct RingContext {
 void ring_context_shutdown(RingContext *r);
 
 [[nodiscard]] struct io_uring_sqe *ring_sqe(RingContext *r);
+[[nodiscard]] int ring_arm_poll(RingContext *r, int fd, uint32_t poll_mask, uint64_t user_data);
 unsigned ring_submit(RingContext *r);
 [[nodiscard]] int ring_enter(RingContext *r, unsigned submit, unsigned min_complete, int timeout_ms);
 [[nodiscard]] bool ring_peek(RingContext *r, struct io_uring_cqe *out);
@@ -86,4 +88,4 @@ void ring_pbuf_recycle(RingContext *r, uint16_t bid);
 void ring_shutdown(void);
 [[nodiscard]] RingContext *ring_get_context(void);
 
-#endif /* RING_INIT_H */
+#endif /* ENGINE_RING_H */

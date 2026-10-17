@@ -25,8 +25,8 @@ build/
 # Logs & debugging
 *.log
 vgcore.*
-core
-core.*
+/core
+/core.*
 compile_commands.json
 
 # Documentation temporary files

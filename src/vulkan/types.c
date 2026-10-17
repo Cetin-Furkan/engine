@@ -1,4 +1,4 @@
-#include "init/vulkan_init/vulkan_types.h"
+#include "vulkan/types.h"
 #include <stdio.h>
 
 const char *vulkan_result_to_str(VulkanResult res) {

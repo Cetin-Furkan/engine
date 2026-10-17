@@ -59,7 +59,7 @@ make release-major
 
 The binary requires Vulkan 1.4 on the loader and on the selected device. The instance is WSI-free. A frame leaves the GPU as a Linux DMA-BUF.
 
-Boot order is system, Wayland, Vulkan, ring, then engine. A failed stage skips every stage after it. Shutdown runs in reverse, and only for stages that initialized.
+Boot order is system, ring, Wayland, Vulkan, then engine. A failed stage skips every stage after it. Shutdown runs in reverse, and only for stages that initialized. After the first frame the process blocks in io_uring until the window is closed or it receives SIGINT, SIGTERM, or SIGHUP.
 
 ```bash
 # Pick a device by the probe index printed at startup

@@ -1,7 +1,7 @@
-#include "init/vulkan_init/vulkan_init.h"
-#include "init/vulkan_init/vulkan_instance.h"
-#include "init/vulkan_init/vulkan_device.h"
-#include "init/vulkan_init/vulkan_memory.h"
+#include "vulkan/core.h"
+#include "vulkan/instance.h"
+#include "vulkan/device.h"
+#include "vulkan/memory.h"
 #include <stdio.h>
 
 static const char *queue_place(uint32_t graphics_family, uint32_t graphics_index,
@@ -13,15 +13,6 @@ static const char *queue_place(uint32_t graphics_family, uint32_t graphics_index
         return "distinct queue";
     }
     return "aliased";
-}
-
-static const char *export_tiling_name(VkImageTiling tiling) {
-    switch (tiling) {
-        case VK_IMAGE_TILING_LINEAR: return "linear";
-        case VK_IMAGE_TILING_OPTIMAL: return "optimal";
-        case VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT: return "drm-modifier";
-        default: return "other";
-    }
 }
 
 VulkanResult vulkan_context_init(VulkanContext *ctx) {
@@ -114,37 +105,6 @@ VulkanResult vulkan_context_init(VulkanContext *ctx) {
                ctx->device_info.has_drm_render_node ? "yes" : "no",
                (long long)ctx->device_info.drm_render_major,
                (long long)ctx->device_info.drm_render_minor);
-    }
-
-    // Live Test of Dedicated DMA-BUF Image Allocation (Commandment #7)
-    if (ctx->device_info.supports_dma_buf) {
-        VulkanExportableImage test_image = {0};
-        const VkImageUsageFlags test_usage =
-            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
-        VulkanResult img_res = vulkan_create_exportable_image(
-            ctx, 1920, 1080, VK_FORMAT_B8G8R8A8_SRGB, test_usage,
-            VULKAN_EXPORT_TILING_AUTO, &test_image);
-        if (img_res == VULKAN_SUCCESS) {
-            char modifier_text[32];
-            if (test_image.has_drm_format_modifier) {
-                snprintf(modifier_text, sizeof modifier_text, "0x%llx",
-                         (unsigned long long)test_image.drm_format_modifier);
-            } else {
-                snprintf(modifier_text, sizeof modifier_text, "n/a");
-            }
-            printf("[Vulkan DMA-BUF] Allocated 1920x1080 exportable image: VRAM=%zu bytes, offset=%zu, stride=%zu, Linux DMA-BUF FD=%d, tiling=%s, modifier=%s\n",
-                   (size_t)test_image.allocation_size,
-                   (size_t)test_image.offset,
-                   (size_t)test_image.row_pitch,
-                   test_image.dmabuf_fd,
-                   export_tiling_name(test_image.tiling),
-                   modifier_text);
-            vulkan_destroy_exportable_image(ctx, &test_image);
-            printf("[Vulkan DMA-BUF] Verified dedicated export & FD closure cleanly.\n");
-        } else {
-            fprintf(stderr, "[Vulkan Warn] Test DMA-BUF image allocation returned: %s\n",
-                    vulkan_result_to_str(img_res));
-        }
     }
 
     printf("hello init from vulkan (device & command pool active, validation: %s)\n",

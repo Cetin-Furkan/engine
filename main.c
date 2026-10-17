@@ -1,11 +1,10 @@
-/* === FILE: ./main.c === */
-
+#include <signal.h>
 #include <stdio.h>
-#include "init/system_init/system_init.h"
-#include "init/ring_init/ring_init.h"
-#include "init/wayland_init/wayland_init.h"
-#include "init/vulkan_init/vulkan_init.h"
-#include "init/engine_init/engine_init.h"
+#include "system/system.h"
+#include "ring/ring.h"
+#include "wayland/wayland.h"
+#include "vulkan/core.h"
+#include "frame/frame.h"
 
 #ifndef ENGINE_VERSION_STR
 #define ENGINE_VERSION_STR "0.0.0-unknown"
@@ -26,6 +25,19 @@ static void format_stage(int rc, char *buf, size_t buf_size) {
 }
 
 int main(void) {
+    // Block before any subsystem starts a thread. Later threads inherit the
+    // mask, so SIGINT, SIGTERM, and SIGHUP stay pending for the signalfd
+    // instead of killing a driver thread.
+    sigset_t blocked;
+    sigemptyset(&blocked);
+    sigaddset(&blocked, SIGINT);
+    sigaddset(&blocked, SIGTERM);
+    sigaddset(&blocked, SIGHUP);
+    if (sigprocmask(SIG_BLOCK, &blocked, nullptr) != 0) {
+        perror("[C23 Engine] sigprocmask");
+        return 1;
+    }
+
     printf("[C23 Engine] Version: %s (%s mode, C standard: %ld)\n",
            ENGINE_VERSION_STR, ENGINE_BUILD_MODE, __STDC_VERSION__);
 
@@ -52,8 +64,10 @@ int main(void) {
 
     const bool ok = system_rc == 0 && ring_rc == 0 && wayland_rc == 0 &&
                     vulkan_rc == 0 && engine_rc == 0;
+    int engine_run_rc = 0;
     if (ok) {
         printf("[C23 Engine] All active subsystems initialized successfully.\n");
+        engine_run_rc = engine_subsystem_run();
     } else {
         char system_status[32];
         char ring_status[32];
@@ -70,8 +84,9 @@ int main(void) {
                 system_status, ring_status, wayland_status, vulkan_status, engine_status);
     }
 
+    int engine_shutdown_rc = 0;
     if (engine_rc == 0) {
-        engine_subsystem_shutdown();
+        engine_shutdown_rc = engine_subsystem_shutdown();
     }
     if (vulkan_rc == 0) {
         vulkan_shutdown();
@@ -86,5 +101,5 @@ int main(void) {
         system_shutdown();
     }
 
-    return ok ? 0 : 1;
+    return (ok && engine_run_rc == 0 && engine_shutdown_rc == 0) ? 0 : 1;
 }

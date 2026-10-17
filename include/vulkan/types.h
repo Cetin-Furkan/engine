@@ -1,5 +1,5 @@
-#ifndef VULKAN_TYPES_H
-#define VULKAN_TYPES_H
+#ifndef ENGINE_VULKAN_TYPES_H
+#define ENGINE_VULKAN_TYPES_H
 
 #include <stdint.h>
 #include <stddef.h>
@@ -170,4 +170,4 @@ typedef struct VulkanContext {
 }
 #endif
 
-#endif /* VULKAN_TYPES_H */
+#endif /* ENGINE_VULKAN_TYPES_H */

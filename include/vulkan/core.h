@@ -1,7 +1,7 @@
-#ifndef VULKAN_INIT_H
-#define VULKAN_INIT_H
+#ifndef ENGINE_VULKAN_CORE_H
+#define ENGINE_VULKAN_CORE_H
 
-#include "init/vulkan_init/vulkan_types.h"
+#include "vulkan/types.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -43,4 +43,4 @@ void vulkan_shutdown(void);
 }
 #endif
 
-#endif /* VULKAN_INIT_H */
+#endif /* ENGINE_VULKAN_CORE_H */

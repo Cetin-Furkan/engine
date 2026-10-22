@@ -1,5 +1,4 @@
 #include "ring/ring.h"
-
 #include <errno.h>
 #include <stdio.h>
 #include <string.h>
@@ -63,7 +62,6 @@ int ring_context_init(RingContext *r, const char *name, bool with_pbuf) {
     if (r == nullptr) {
         return -EINVAL;
     }
-
     *r = (RingContext){ .fd = -1 };
     if (name != nullptr) {
         snprintf(r->name, sizeof r->name, "%s", name);
@@ -155,6 +153,7 @@ int ring_context_init(RingContext *r, const char *name, bool with_pbuf) {
         ring_context_shutdown(r);
         return (int)rc;
     }
+    r->wait_reg_on = true;
 
     if (with_pbuf) {
         r->pbuf_mask = ENG_PBUF_ENTRIES - 1u;
@@ -205,7 +204,7 @@ int ring_context_init(RingContext *r, const char *name, bool with_pbuf) {
     }
 
     r->is_initialized = true;
-    printf("[Ring] Initialized '%s' (fd=%d, SQ=%u, CQ=%u, PBUF=%ux%uB, FixedFiles=%u, NO_MMAP+SINGLE_ISSUER+DEFER_TASKRUN)\n",
+    printf("[Ring] Initialized '%s' (fd=%d, SQ=%u, CQ=%u, PBUF=%ux%uB, FixedFiles=%u, NO_MMAP+SINGLE_ISSUER+DEFER_TASKRUN+REG_WAIT)\n",
            r->name,
            r->fd,
            r->sq_entries,
@@ -230,6 +229,19 @@ void ring_context_shutdown(RingContext *r) {
     *r = (RingContext){ .fd = -1 };
 }
 
+int ring_update_file(RingContext *r, uint32_t slot, int fd) {
+    if (r == nullptr || !r->is_initialized || slot >= ENG_FIXED_FILES) {
+        return -EINVAL;
+    }
+    struct io_uring_files_update up = {
+        .offset = slot,
+        .resv   = 0,
+        .fds    = (uint64_t)(uintptr_t)&fd,
+    };
+    long rc = sys6(__NR_io_uring_register, r->fd, IORING_REGISTER_FILES_UPDATE, (long)&up, 1, 0, 0);
+    return (rc < 0) ? (int)rc : 0;
+}
+
 int ring_arm_poll(RingContext *r, int fd, uint32_t poll_mask, uint64_t user_data) {
     if (r == nullptr || !r->is_initialized || fd < 0) {
         return -EINVAL;
@@ -238,10 +250,26 @@ int ring_arm_poll(RingContext *r, int fd, uint32_t poll_mask, uint64_t user_data
     if (sqe == nullptr) {
         return -ENOSPC;
     }
-    sqe->opcode         = IORING_OP_POLL_ADD;
-    sqe->fd             = fd;
-    sqe->poll32_events  = poll_mask;
-    sqe->user_data      = user_data;
+    sqe->opcode        = IORING_OP_POLL_ADD;
+    sqe->fd            = fd;
+    sqe->poll32_events = poll_mask;
+    sqe->user_data     = user_data;
+    return 0;
+}
+
+int ring_arm_poll_fixed(RingContext *r, uint32_t slot, uint32_t poll_mask, uint64_t user_data) {
+    if (r == nullptr || !r->is_initialized || slot >= ENG_FIXED_FILES) {
+        return -EINVAL;
+    }
+    struct io_uring_sqe *sqe = ring_sqe(r);
+    if (sqe == nullptr) {
+        return -ENOSPC;
+    }
+    sqe->opcode        = IORING_OP_POLL_ADD;
+    sqe->flags         = IOSQE_FIXED_FILE;
+    sqe->fd            = (int32_t)slot;
+    sqe->poll32_events = poll_mask;
+    sqe->user_data     = user_data;
     return 0;
 }
 
@@ -270,22 +298,41 @@ unsigned ring_submit(RingContext *r) {
 }
 
 int ring_enter(RingContext *r, unsigned submit, unsigned min_complete, int timeout_ms) {
-    struct __kernel_timespec ts = {0};
-    struct io_uring_getevents_arg garg = {0};
     unsigned flags = 0;
     void *arg      = nullptr;
     size_t argz    = 0;
+    struct __kernel_timespec fallback_ts = {0};
+    struct io_uring_getevents_arg fallback_garg = {0};
 
     if (min_complete > 0) {
         flags |= IORING_ENTER_GETEVENTS;
     }
-    if (timeout_ms >= 0) {
-        ts.tv_sec  = timeout_ms / 1000;
-        ts.tv_nsec = (long)(timeout_ms % 1000) * 1000000L;
-        garg.ts    = (uint64_t)(uintptr_t)&ts;
-        flags     |= IORING_ENTER_GETEVENTS | IORING_ENTER_EXT_ARG;
-        arg        = &garg;
-        argz       = sizeof(garg);
+    uint32_t sq_flags = __atomic_load_n(r->sq_kflags, __ATOMIC_ACQUIRE);
+    if ((sq_flags & IORING_SQ_TASKRUN) != 0) {
+        flags |= IORING_ENTER_GETEVENTS;
+    }
+    if (timeout_ms >= 0 && r->wait_reg_on && r->wait != nullptr) {
+        r->wait[0] = (struct io_uring_reg_wait){
+            .ts = {
+                .tv_sec  = timeout_ms / 1000,
+                .tv_nsec = (long)(timeout_ms % 1000) * 1000000L,
+            },
+            .min_wait_usec = 0,
+            .flags         = IORING_REG_WAIT_TS,
+            .sigmask       = 0,
+            .sigmask_sz    = 0,
+        };
+        __atomic_thread_fence(__ATOMIC_RELEASE);
+        flags |= IORING_ENTER_GETEVENTS | IORING_ENTER_EXT_ARG | IORING_ENTER_EXT_ARG_REG;
+        arg    = (void *)(uintptr_t)0u;
+        argz   = sizeof(struct io_uring_reg_wait);
+    } else if (timeout_ms >= 0) {
+        fallback_ts.tv_sec  = timeout_ms / 1000;
+        fallback_ts.tv_nsec = (long)(timeout_ms % 1000) * 1000000L;
+        fallback_garg.ts    = (uint64_t)(uintptr_t)&fallback_ts;
+        flags              |= IORING_ENTER_GETEVENTS | IORING_ENTER_EXT_ARG;
+        arg                 = &fallback_garg;
+        argz                = sizeof(fallback_garg);
     }
     if ((flags & IORING_ENTER_GETEVENTS) != 0) {
         flags |= r->wait_flags;
@@ -296,6 +343,13 @@ int ring_enter(RingContext *r, unsigned submit, unsigned min_complete, int timeo
 bool ring_peek(RingContext *r, struct io_uring_cqe *out) {
     uint32_t tail = __atomic_load_n(r->cq_ktail, __ATOMIC_ACQUIRE);
     uint32_t head = r->cq_head;
+    if (head == tail) {
+        uint32_t sq_flags = __atomic_load_n(r->sq_kflags, __ATOMIC_ACQUIRE);
+        if ((sq_flags & IORING_SQ_TASKRUN) != 0) {
+            (void)ring_enter_retry(r, 0, 0, IORING_ENTER_GETEVENTS | r->wait_flags, 0, 0);
+            tail = __atomic_load_n(r->cq_ktail, __ATOMIC_ACQUIRE);
+        }
+    }
     if (head == tail) {
         return false;
     }

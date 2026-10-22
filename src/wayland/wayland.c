@@ -1,5 +1,5 @@
 #include "wayland/wayland.h"
-
+#include "input/pointer.h"
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -11,12 +11,15 @@
 #include <unistd.h>
 
 static constexpr uint64_t k_drm_format_mod_invalid = 0x00ffffffffffffffULL;
-
 static WaylandContext s_wl_ctx = { .feedback_table_fd = -1 };
 
 static void wl_fail(WaylandContext *w, const char *msg) {
     snprintf(w->err, sizeof w->err, "%s", msg);
     w->failed = true;
+}
+
+void wayland_fail(WaylandContext *w, const char *msg) {
+    wl_fail(w, msg);
 }
 
 static void wl_fail_err(WaylandContext *w, const char *what, int err) {
@@ -170,7 +173,6 @@ static void commit_feedback_tranche(WaylandContext *w) {
                                  ENG_WL_MAX_MODIFIERS, entry->modifier);
         }
     }
-
     w->tranche_has_dev     = false;
     w->tranche_major       = 0;
     w->tranche_minor       = 0;
@@ -178,8 +180,8 @@ static void commit_feedback_tranche(WaylandContext *w) {
     w->tranche_index_count = 0;
 }
 
-static bool append_raw_msg(WaylandContext *w, uint32_t obj_id, uint16_t opcode,
-                           const void *payload, uint16_t payload_len) {
+bool wayland_put_raw(WaylandContext *w, uint32_t obj_id, uint16_t opcode,
+                     const void *payload, uint16_t payload_len) {
     uint32_t total = 8u + (uint32_t)payload_len;
     if ((total & 3u) != 0u || w->send_len + total > sizeof(w->send_bytes)) {
         wl_fail(w, "send buffer overflow while encoding wayland request");
@@ -200,7 +202,6 @@ static bool append_string_req(WaylandContext *w, uint32_t obj_id, uint16_t opcod
     uint32_t slen = (uint32_t)strlen(str) + 1u;
     uint32_t pad  = (4u - (slen & 3u)) & 3u;
     uint32_t size = 8u + 4u + slen + pad;
-
     if (w->send_len + size > sizeof(w->send_bytes)) {
         wl_fail(w, "send buffer overflow while encoding string request");
         return false;
@@ -218,12 +219,21 @@ static bool append_string_req(WaylandContext *w, uint32_t obj_id, uint16_t opcod
     return true;
 }
 
+void wayland_rewind_send(WaylandContext *w, uint32_t mark) {
+    if (w == nullptr) {
+        return;
+    }
+    if (mark < w->send_off) {
+        mark = w->send_off;
+    }
+    w->send_len = mark;
+}
+
 static bool append_registry_bind(WaylandContext *w, uint32_t global_name,
                                  const char *iface, uint32_t version, uint32_t new_id) {
     uint32_t slen = (uint32_t)strlen(iface) + 1u;
     uint32_t pad  = (4u - (slen & 3u)) & 3u;
     uint32_t size = 8u + 4u + 4u + slen + pad + 4u + 4u;
-
     if (w->send_len + size > sizeof(w->send_bytes)) {
         wl_fail(w, "send buffer overflow while encoding wl_registry.bind");
         return false;
@@ -248,7 +258,27 @@ static bool append_registry_bind(WaylandContext *w, uint32_t global_name,
 
 static bool append_display_sync(WaylandContext *w, uint32_t sync_id) {
     uint32_t payload = sync_id;
-    return append_raw_msg(w, w->display_id, 0u, &payload, sizeof(payload));
+    return wayland_put_raw(w, w->display_id, 0u, &payload, sizeof(payload));
+}
+
+static int arm_pong_send(WaylandContext *w) {
+    if (w->pong_off > 12u) {
+        return -EIO;
+    }
+    struct io_uring_sqe *sqe = ring_sqe(w->ring);
+    if (sqe == nullptr) {
+        return -ENOSPC;
+    }
+    sqe->opcode    = IORING_OP_SEND;
+    sqe->flags     = IOSQE_FIXED_FILE;
+    sqe->ioprio    = IORING_RECVSEND_POLL_FIRST;
+    sqe->fd        = ENG_WL_SOCK_SLOT;
+    sqe->addr      = (uint64_t)(uintptr_t)(w->pong_bytes + w->pong_off);
+    sqe->len       = 12u - w->pong_off;
+    sqe->msg_flags = MSG_NOSIGNAL;
+    sqe->user_data = ENG_UD_WL_PONG;
+    w->pong_in_flight = true;
+    return 0;
 }
 
 static void queue_xdg_pong(WaylandContext *w, uint32_t serial) {
@@ -259,32 +289,14 @@ static void queue_xdg_pong(WaylandContext *w, uint32_t serial) {
         wl_fail(w, "xdg_wm_base.ping received while pong is already in flight");
         return;
     }
-    struct io_uring_sqe *sqe = ring_sqe(w->ring);
-    if (sqe == nullptr) {
-        wl_fail(w, "SQ full while queuing xdg_wm_base.pong");
-        return;
-    }
-
     put_u32(w->pong_bytes + 0, w->xdg_wm_base_id);
     put_u16(w->pong_bytes + 4, 3u); // xdg_wm_base.pong opcode = 3
     put_u16(w->pong_bytes + 6, 12u);
     put_u32(w->pong_bytes + 8, serial);
-
-    w->pong_iov.iov_base       = w->pong_bytes;
-    w->pong_iov.iov_len        = 12u;
-    w->pong_msg.msg_iov        = &w->pong_iov;
-    w->pong_msg.msg_iovlen     = 1u;
-    w->pong_msg.msg_control    = nullptr;
-    w->pong_msg.msg_controllen = 0u;
-
-    sqe->opcode    = IORING_OP_SENDMSG;
-    sqe->flags     = IOSQE_FIXED_FILE;
-    sqe->fd        = ENG_WL_SOCK_SLOT;
-    sqe->addr      = (uint64_t)(uintptr_t)&w->pong_msg;
-    sqe->msg_flags = MSG_NOSIGNAL;
-    sqe->user_data = ENG_UD_WL_PONG;
-
-    w->pong_in_flight = true;
+    w->pong_off = 0;
+    if (arm_pong_send(w) != 0) {
+        wl_fail(w, "SQ full while queuing xdg_wm_base.pong");
+    }
 }
 
 static void park_fds(WaylandContext *w, const unsigned char *control, uint32_t controllen) {
@@ -312,9 +324,6 @@ static void note_key_global(WaylandContext *w, uint32_t name, const char *iface,
     if (strcmp(iface, "wl_compositor") == 0) {
         w->compositor_global_name = name;
         w->compositor_version     = version;
-    } else if (strcmp(iface, "wl_subcompositor") == 0) {
-        w->subcompositor_global_name = name;
-        w->subcompositor_version     = version;
     } else if (strcmp(iface, "xdg_wm_base") == 0) {
         w->xdg_wm_base_global_name = name;
         w->xdg_wm_base_version     = version;
@@ -324,13 +333,24 @@ static void note_key_global(WaylandContext *w, uint32_t name, const char *iface,
     } else if (strcmp(iface, "wp_linux_drm_syncobj_manager_v1") == 0) {
         w->drm_syncobj_global_name = name;
         w->drm_syncobj_version     = version;
+    } else if (strcmp(iface, "wl_seat") == 0 && w->seat_global_name == 0) {
+        w->seat_global_name = name;
+        w->seat_version     = version;
+    } else if (strcmp(iface, "wl_shm") == 0 && w->shm_global_name == 0) {
+        w->shm_global_name = name;
+        w->shm_version     = version;
+    } else if (strcmp(iface, "wp_cursor_shape_manager_v1") == 0 && w->cursor_shape_global_name == 0) {
+        w->cursor_shape_global_name = name;
+        w->cursor_shape_version     = version;
+    } else if (strcmp(iface, "wp_viewporter") == 0 && w->viewporter_global_name == 0) {
+        w->viewporter_global_name = name;
+        w->viewporter_version     = version;
     }
 }
 
 static void parse_stream(WaylandContext *w) {
     uint32_t offset = 0;
     const unsigned char *stream_end = w->stream + w->stream_len;
-
     while (w->stream_len - offset >= 8u && !w->failed) {
         const unsigned char *msg_start = w->stream + offset;
         const unsigned char *p         = msg_start;
@@ -414,7 +434,11 @@ static void parse_stream(WaylandContext *w) {
                 wl_fail(w, "truncated frame wl_callback.done");
                 break;
             }
+            w->frame_time_ms = timestamp_ms;
+            w->frame_stamp_valid = true;
             w->frame_done = true;
+            // delete_id returns this id. Clear the slot so the next commit can arm one.
+            w->frame_cb_id = 0;
         } else if (w->xdg_toplevel_id != 0 && object == w->xdg_toplevel_id) {
             if (opcode == 0u) {
                 int32_t width = 0, height = 0;
@@ -429,6 +453,19 @@ static void parse_stream(WaylandContext *w) {
                     wl_fail(w, "xdg_toplevel.configure state array out of bounds");
                     break;
                 }
+                bool resizing = false;
+                uint32_t left = states_len;
+                const unsigned char *sp = p;
+                while (left >= 4u) {
+                    uint32_t st = 0;
+                    memcpy(&st, sp, 4);
+                    if (st == 3u) {
+                        resizing = true;
+                    }
+                    sp += 4;
+                    left -= 4u;
+                }
+                w->configure_resizing  = resizing;
                 w->configure_width     = (width > 0) ? (uint32_t)width : 0u;
                 w->configure_height    = (height > 0) ? (uint32_t)height : 0u;
                 w->toplevel_configured = true;
@@ -498,9 +535,6 @@ static void parse_stream(WaylandContext *w) {
                     wl_fail(w, "truncated zwp_linux_dmabuf_feedback_v1.tranche_target_device");
                     break;
                 }
-                // A new target device starts a tranche. Formats for it arrive after this.
-                w->tranche_flags       = 0;
-                w->tranche_index_count = 0;
                 w->tranche_has_dev = decode_dev_array(
                     p, arr_len, &w->tranche_major, &w->tranche_minor);
             } else if (opcode == 5u) {
@@ -530,6 +564,8 @@ static void parse_stream(WaylandContext *w) {
             break;
         } else if (w->buffer_id != 0 && object == w->buffer_id && opcode == 0u) {
             w->buffer_released = true;
+        } else {
+            (void)pointer_dispatch(w, object, opcode, msg_start + 8, (uint16_t)(size - 8u));
         }
 
         offset += size;
@@ -562,34 +598,54 @@ static void arm_recv(WaylandContext *w) {
 }
 
 int wayland_ensure_recv(WaylandContext *w) {
-    if (w->failed)     return -EIO;
+    if (w->failed) return -EIO;
+    if (w->recv_msg.msg_iov == nullptr) return -EINVAL;
     if (w->recv_armed) return 0;
     arm_recv(w);
     return w->failed ? -EIO : 0;
 }
 
 void wayland_on_cqe(WaylandContext *w, const struct io_uring_cqe *cqe) {
+    if (cqe->user_data == ENG_UD_SIGNAL) {
+        w->noted_signal = true;
+        return;
+    }
     if (cqe->user_data == ENG_UD_WL_PONG) {
         w->pong_in_flight = false;
-        if (cqe->res < 0) {
-            wl_fail_err(w, "xdg_wm_base.pong sendmsg", cqe->res);
-        } else if (cqe->res != 12) {
-            wl_fail(w, "xdg_wm_base.pong short write");
+        uint32_t left = (w->pong_off < 12u) ? (12u - w->pong_off) : 0u;
+        if (cqe->res == -EAGAIN || cqe->res == -EINTR || cqe->res == 0) {
+            if (arm_pong_send(w) != 0) {
+                wl_fail(w, "SQ full while retrying xdg_wm_base.pong");
+            }
+            return;
         }
+        if (cqe->res < 0 || (uint32_t)cqe->res > left) {
+            wl_fail_err(w, "xdg_wm_base.pong send", cqe->res);
+            return;
+        }
+        w->pong_off += (uint32_t)cqe->res;
+        if (w->pong_off < 12u) {
+            if (arm_pong_send(w) != 0) {
+                wl_fail(w, "SQ full while retrying xdg_wm_base.pong");
+            }
+            return;
+        }
+        w->pong_off = 0;
         return;
     }
     if (cqe->user_data != ENG_UD_WL_RECV) {
         return;
     }
-
     w->recv_cqes++;
     w->recv_armed = (cqe->flags & IORING_CQE_F_MORE) != 0;
 
     if (cqe->res < 0) {
         w->recv_armed = false;
-        if (cqe->res != -ENOBUFS) {
-            wl_fail_err(w, "recvmsg", cqe->res);
+        if (cqe->res == -ENOBUFS) {
+            (void)wayland_ensure_recv(w);
+            return;
         }
+        wl_fail_err(w, "recvmsg", cqe->res);
         return;
     }
     if ((cqe->flags & IORING_CQE_F_BUFFER) == 0) {
@@ -647,6 +703,9 @@ static int submit_and_wait_tag(WaylandContext *w, uint64_t tag, struct io_uring_
             wl_fail(w, "wayland io_uring operation timed out");
             return -ETIMEDOUT;
         }
+        if (w->recv_msg.msg_iov != nullptr && !w->recv_armed) {
+            (void)wayland_ensure_recv(w);
+        }
         unsigned n = ring_submit(w->ring);
         int rc = ring_enter(w->ring, n, 1, 200);
         if (rc < 0 && rc != -ETIME) {
@@ -656,14 +715,58 @@ static int submit_and_wait_tag(WaylandContext *w, uint64_t tag, struct io_uring_
     }
 }
 
+static int note_send_progress(WaylandContext *w, int32_t res) {
+    if (w->send_off > w->send_len) {
+        wl_fail(w, "wayland send cursor past the buffer");
+        w->send_len = 0;
+        w->send_off = 0;
+        w->send_tracks_ack = false;
+        return -EIO;
+    }
+    uint32_t remaining = w->send_len - w->send_off;
+    if (remaining == 0) {
+        w->send_len = 0;
+        w->send_off = 0;
+        return 0;
+    }
+    if (res < 0) {
+        if (res == -EAGAIN || res == -EINTR) {
+            return 1;
+        }
+        wl_fail_err(w, "wayland send", res);
+        w->send_len = 0;
+        w->send_off = 0;
+        w->send_tracks_ack = false;
+        return -EIO;
+    }
+    if ((uint32_t)res > remaining) {
+        wl_fail(w, "wayland send wrote past the buffer");
+        w->send_len = 0;
+        w->send_off = 0;
+        w->send_tracks_ack = false;
+        return -EIO;
+    }
+    if (res == 0) {
+        return 1;
+    }
+    w->send_off += (uint32_t)res;
+    if (w->send_off < w->send_len) {
+        return 1;
+    }
+    w->send_len = 0;
+    w->send_off = 0;
+    return 0;
+}
+
 static int send_wire_batch_with_fd(WaylandContext *w, int fd_to_send) {
-    if (w->send_len == 0) {
+    if (w->send_off >= w->send_len) {
+        w->send_len = 0;
+        w->send_off = 0;
         return 0;
     }
     if (w->failed) {
         return -EIO;
     }
-
     int dup_fd = -1;
     if (fd_to_send >= 0) {
         dup_fd = dup(fd_to_send);
@@ -673,67 +776,118 @@ static int send_wire_batch_with_fd(WaylandContext *w, int fd_to_send) {
         }
     }
 
-    struct io_uring_sqe *sqe = ring_sqe(w->ring);
-    if (sqe == nullptr) {
-        if (dup_fd >= 0) {
-            close(dup_fd);
+    for (;;) {
+        uint32_t remaining = w->send_len - w->send_off;
+        struct io_uring_sqe *sqe = ring_sqe(w->ring);
+        if (sqe == nullptr) {
+            if (dup_fd >= 0) {
+                close(dup_fd);
+            }
+            wl_fail(w, "SQ full while sending wire batch");
+            return -ENOSPC;
         }
-        wl_fail(w, "SQ full while sending wire batch");
-        return -ENOSPC;
+
+        if (dup_fd >= 0) {
+            w->send_iov.iov_base   = w->send_bytes + w->send_off;
+            w->send_iov.iov_len    = remaining;
+            w->send_msg.msg_iov    = &w->send_iov;
+            w->send_msg.msg_iovlen = 1u;
+
+            memset(w->send_control, 0, sizeof(w->send_control));
+            w->send_msg.msg_control    = w->send_control;
+            w->send_msg.msg_controllen = sizeof(w->send_control);
+
+            struct cmsghdr *cmsg = CMSG_FIRSTHDR(&w->send_msg);
+            cmsg->cmsg_level = SOL_SOCKET;
+            cmsg->cmsg_type  = SCM_RIGHTS;
+            cmsg->cmsg_len   = CMSG_LEN(sizeof(int));
+            memcpy(CMSG_DATA(cmsg), &dup_fd, sizeof(int));
+
+            sqe->opcode    = IORING_OP_SENDMSG;
+            sqe->flags     = IOSQE_FIXED_FILE;
+            sqe->ioprio    = IORING_RECVSEND_POLL_FIRST;
+            sqe->fd        = ENG_WL_SOCK_SLOT;
+            sqe->addr      = (uint64_t)(uintptr_t)&w->send_msg;
+            sqe->msg_flags = MSG_NOSIGNAL;
+            sqe->user_data = ENG_UD_WL_SEND;
+        } else {
+            w->send_msg.msg_control    = nullptr;
+            w->send_msg.msg_controllen = 0u;
+
+            sqe->opcode    = IORING_OP_SEND;
+            sqe->flags     = IOSQE_FIXED_FILE;
+            sqe->ioprio    = IORING_RECVSEND_POLL_FIRST;
+            sqe->fd        = ENG_WL_SOCK_SLOT;
+            sqe->addr      = (uint64_t)(uintptr_t)(w->send_bytes + w->send_off);
+            sqe->len       = remaining;
+            sqe->msg_flags = MSG_NOSIGNAL;
+            sqe->user_data = ENG_UD_WL_SEND;
+        }
+
+        struct io_uring_cqe cqe = {0};
+        int rc = submit_and_wait_tag(w, ENG_UD_WL_SEND, &cqe);
+        if (rc < 0) {
+            if (dup_fd >= 0) {
+                close(dup_fd);
+            }
+            w->send_msg.msg_control    = nullptr;
+            w->send_msg.msg_controllen = 0u;
+            return rc;
+        }
+        if (cqe.res > 0 && dup_fd >= 0) {
+            close(dup_fd);
+            dup_fd = -1;
+        }
+        int progress = note_send_progress(w, cqe.res);
+        if (progress < 0) {
+            if (dup_fd >= 0) {
+                close(dup_fd);
+            }
+            w->send_msg.msg_control    = nullptr;
+            w->send_msg.msg_controllen = 0u;
+            return progress;
+        }
+        if (progress == 0) {
+            break;
+        }
     }
 
-    w->send_iov.iov_base   = w->send_bytes;
-    w->send_iov.iov_len    = w->send_len;
-    w->send_msg.msg_iov    = &w->send_iov;
-    w->send_msg.msg_iovlen = 1u;
-
-    if (dup_fd >= 0) {
-        memset(w->send_control, 0, sizeof(w->send_control));
-        w->send_msg.msg_control    = w->send_control;
-        w->send_msg.msg_controllen = sizeof(w->send_control);
-
-        struct cmsghdr *cmsg = CMSG_FIRSTHDR(&w->send_msg);
-        cmsg->cmsg_level = SOL_SOCKET;
-        cmsg->cmsg_type  = SCM_RIGHTS;
-        cmsg->cmsg_len   = CMSG_LEN(sizeof(int));
-        memcpy(CMSG_DATA(cmsg), &dup_fd, sizeof(int));
-    } else {
-        w->send_msg.msg_control    = nullptr;
-        w->send_msg.msg_controllen = 0u;
-    }
-
-    sqe->opcode    = IORING_OP_SENDMSG;
-    sqe->flags     = IOSQE_FIXED_FILE;
-    sqe->fd        = ENG_WL_SOCK_SLOT;
-    sqe->addr      = (uint64_t)(uintptr_t)&w->send_msg;
-    sqe->msg_flags = MSG_NOSIGNAL;
-    sqe->user_data = ENG_UD_WL_SEND;
-
-    struct io_uring_cqe cqe = {0};
-    int rc = submit_and_wait_tag(w, ENG_UD_WL_SEND, &cqe);
     if (dup_fd >= 0) {
         close(dup_fd);
     }
     w->send_msg.msg_control    = nullptr;
     w->send_msg.msg_controllen = 0u;
-
-    if (rc < 0) {
-        return rc;
-    }
-    if (cqe.res != (int32_t)w->send_len) {
-        if (cqe.res < 0) {
-            wl_fail_err(w, "IORING_OP_SENDMSG", cqe.res);
-        } else {
-            wl_fail(w, "IORING_OP_SENDMSG short write on Wayland socket");
-        }
-        return -EIO;
-    }
-    w->send_len = 0;
     return 0;
 }
 
 static int send_wire_batch(WaylandContext *w) {
     return send_wire_batch_with_fd(w, -1);
+}
+
+static int flush_if_pending(WaylandContext *w) {
+    if (w->send_len == 0) {
+        return 0;
+    }
+    return send_wire_batch(w);
+}
+
+int wayland_send_batch(WaylandContext *w) {
+    return send_wire_batch(w);
+}
+
+static int finish_batch_and_roundtrip(WaylandContext *w, int fd_to_send);
+
+int wayland_roundtrip_batch(WaylandContext *w, int fd_to_send) {
+    return finish_batch_and_roundtrip(w, fd_to_send);
+}
+
+static bool put_toplevel_min_size(WaylandContext *w, int32_t width, int32_t height) {
+    if (w->xdg_toplevel_id == 0 || width <= 0 || height <= 0) {
+        return false;
+    }
+    int32_t sz[2] = { width, height };
+    // xdg_toplevel.set_min_size is request 8. A zero argument means no bound.
+    return wayland_put_raw(w, w->xdg_toplevel_id, 8u, sz, sizeof sz);
 }
 
 int wayland_create_toplevel_and_configure(
@@ -748,7 +902,9 @@ int wayland_create_toplevel_and_configure(
         out_height == nullptr || out_serial == nullptr) {
         return -EINVAL;
     }
-
+    if (flush_if_pending(w) < 0) {
+        return -EIO;
+    }
     w->surface_id             = wayland_alloc_id(w);
     w->xdg_surface_id         = wayland_alloc_id(w);
     w->xdg_toplevel_id        = wayland_alloc_id(w);
@@ -757,24 +913,39 @@ int wayland_create_toplevel_and_configure(
     w->configure_width        = 0;
     w->configure_height       = 0;
     w->configure_serial       = 0;
-    w->send_len               = 0;
 
     // 1. wl_compositor.create_surface (request 0)
-    (void)append_raw_msg(w, w->compositor_id, 0u, &w->surface_id, sizeof(w->surface_id));
+    (void)wayland_put_raw(w, w->compositor_id, 0u, &w->surface_id, sizeof(w->surface_id));
 
     // 2. xdg_wm_base.get_xdg_surface (request 2)
     uint32_t get_xdg_payload[2] = { w->xdg_surface_id, w->surface_id };
-    (void)append_raw_msg(w, w->xdg_wm_base_id, 2u, get_xdg_payload, sizeof(get_xdg_payload));
+    (void)wayland_put_raw(w, w->xdg_wm_base_id, 2u, get_xdg_payload, sizeof(get_xdg_payload));
 
     // 3. xdg_surface.get_toplevel (request 1)
-    (void)append_raw_msg(w, w->xdg_surface_id, 1u, &w->xdg_toplevel_id, sizeof(w->xdg_toplevel_id));
+    (void)wayland_put_raw(w, w->xdg_surface_id, 1u, &w->xdg_toplevel_id, sizeof(w->xdg_toplevel_id));
 
     // 4. xdg_toplevel.set_title (request 2) and set_app_id (request 3)
     (void)append_string_req(w, w->xdg_toplevel_id, 2u, title != nullptr ? title : "Antigravity");
     (void)append_string_req(w, w->xdg_toplevel_id, 3u, app_id != nullptr ? app_id : "antigravity");
 
+    if (w->viewporter_id != 0) {
+        w->viewport_id = wayland_alloc_id(w);
+        uint32_t viewport_payload[2] = { w->viewport_id, w->surface_id };
+        // wp_viewporter.get_viewport is request 1.
+        if (w->viewport_id == 0 ||
+            !wayland_put_raw(w, w->viewporter_id, 1u, viewport_payload, sizeof viewport_payload)) {
+            w->viewport_id = 0;
+        }
+    }
+
+    if (w->min_width > 0 && w->min_height > 0 &&
+        !put_toplevel_min_size(w, w->min_width, w->min_height)) {
+        fprintf(stderr, "[Wayland Error] Toplevel minimum encode failed: %s\n", w->err);
+        return -EIO;
+    }
+
     // 5. wl_surface.commit (request 6) with empty body
-    (void)append_raw_msg(w, w->surface_id, 6u, nullptr, 0u);
+    (void)wayland_put_raw(w, w->surface_id, 6u, nullptr, 0u);
 
     if (send_wire_batch(w) < 0) {
         fprintf(stderr, "[Wayland Error] Failed to send toplevel creation batch: %s\n", w->err);
@@ -821,7 +992,9 @@ int wayland_query_surface_dmabuf_feedback(
                 w->linux_dmabuf_bound_version);
         return -ENOTSUP;
     }
-
+    if (flush_if_pending(w) < 0) {
+        return -EIO;
+    }
     close_feedback_table(w);
     w->feedback_id            = wayland_alloc_id(w);
     w->feedback_target_major  = target_major;
@@ -836,11 +1009,10 @@ int wayland_query_surface_dmabuf_feedback(
     w->tranche_index_count    = 0;
     w->scanout_modifier_count = 0;
     w->all_modifier_count     = 0;
-    w->send_len               = 0;
 
     // zwp_linux_dmabuf_v1.get_surface_feedback (request 3)
     uint32_t fb_payload[2] = { w->feedback_id, w->surface_id };
-    (void)append_raw_msg(w, w->linux_dmabuf_id, 3u, fb_payload, sizeof(fb_payload));
+    (void)wayland_put_raw(w, w->linux_dmabuf_id, 3u, fb_payload, sizeof(fb_payload));
 
     if (send_wire_batch(w) < 0) {
         fprintf(stderr, "[Wayland Error] get_surface_feedback send failed: %s\n", w->err);
@@ -857,8 +1029,7 @@ int wayland_query_surface_dmabuf_feedback(
 
     // Destroy feedback object (request 0) and release mapped format table
     if (!w->failed && w->feedback_id != 0) {
-        w->send_len = 0;
-        (void)append_raw_msg(w, w->feedback_id, 0u, nullptr, 0u);
+        (void)wayland_put_raw(w, w->feedback_id, 0u, nullptr, 0u);
         (void)send_wire_batch(w);
     }
     close_feedback_table(w);
@@ -896,24 +1067,25 @@ int wayland_import_dmabuf_immed(
     if (w == nullptr || !w->is_initialized || dmabuf_fd < 0 || out_buffer_id == nullptr) {
         return -EINVAL;
     }
-
+    if (flush_if_pending(w) < 0) {
+        return -EIO;
+    }
     w->buffer_params_id = wayland_alloc_id(w);
     w->buffer_id        = wayland_alloc_id(w);
     w->buffer_released  = false;
-    w->send_len         = 0;
 
     // 1. zwp_linux_dmabuf_v1.create_params (request 1)
-    (void)append_raw_msg(w, w->linux_dmabuf_id, 1u, &w->buffer_params_id, sizeof(w->buffer_params_id));
+    (void)wayland_put_raw(w, w->linux_dmabuf_id, 1u, &w->buffer_params_id, sizeof(w->buffer_params_id));
 
     // 2. zwp_linux_buffer_params_v1.add (request 1, carries 1 SCM_RIGHTS fd)
     uint32_t add_payload[5] = {
-        0u,                                     // plane_idx = 0
-        offset,                                 // offset = 0
-        stride,                                 // stride = row_pitch
-        (uint32_t)(modifier >> 32u),            // modifier_hi
-        (uint32_t)(modifier & 0xffffffffu),     // modifier_lo
+        0u,                                 // plane_idx = 0
+        offset,                             // offset = 0
+        stride,                             // stride = row_pitch
+        (uint32_t)(modifier >> 32u),        // modifier_hi
+        (uint32_t)(modifier & 0xffffffffu), // modifier_lo
     };
-    (void)append_raw_msg(w, w->buffer_params_id, 1u, add_payload, sizeof(add_payload));
+    (void)wayland_put_raw(w, w->buffer_params_id, 1u, add_payload, sizeof(add_payload));
 
     // 3. zwp_linux_buffer_params_v1.create_immed (request 3)
     uint32_t immed_payload[5] = {
@@ -923,10 +1095,10 @@ int wayland_import_dmabuf_immed(
         drm_fourcc,
         0u, // flags = 0
     };
-    (void)append_raw_msg(w, w->buffer_params_id, 3u, immed_payload, sizeof(immed_payload));
+    (void)wayland_put_raw(w, w->buffer_params_id, 3u, immed_payload, sizeof(immed_payload));
 
     // 4. zwp_linux_buffer_params_v1.destroy (request 0)
-    (void)append_raw_msg(w, w->buffer_params_id, 0u, nullptr, 0u);
+    (void)wayland_put_raw(w, w->buffer_params_id, 0u, nullptr, 0u);
 
     if (send_wire_batch_with_fd(w, dmabuf_fd) < 0) {
         fprintf(stderr, "[Wayland Error] DMA-BUF create_immed batch failed: %s\n", w->err);
@@ -978,14 +1150,15 @@ int wayland_import_syncobj_timeline(
         syncobj_fd < 0 || out_timeline_id == nullptr) {
         return -EINVAL;
     }
-
+    if (flush_if_pending(w) < 0) {
+        return -EIO;
+    }
     uint32_t id = wayland_alloc_id(w);
     if (id == 0) {
         return -EIO;
     }
-    w->send_len = 0;
     // wp_linux_drm_syncobj_manager_v1.import_timeline (request 2). The fd is SCM_RIGHTS.
-    if (!append_raw_msg(w, w->drm_syncobj_id, 2u, &id, sizeof id)) {
+    if (!wayland_put_raw(w, w->drm_syncobj_id, 2u, &id, sizeof id)) {
         fprintf(stderr, "[Wayland Error] syncobj import encode failed: %s\n", w->err);
         return -EIO;
     }
@@ -1004,15 +1177,16 @@ int wayland_bind_explicit_sync(WaylandContext *w) {
     if (w->explicit_sync_id != 0) {
         return 0;
     }
-
+    if (flush_if_pending(w) < 0) {
+        return -EIO;
+    }
     uint32_t id = wayland_alloc_id(w);
     if (id == 0) {
         return -EIO;
     }
     uint32_t payload[2] = { id, w->surface_id };
-    w->send_len = 0;
     // wp_linux_drm_syncobj_manager_v1.get_surface (request 1)
-    if (!append_raw_msg(w, w->drm_syncobj_id, 1u, payload, sizeof payload)) {
+    if (!wayland_put_raw(w, w->drm_syncobj_id, 1u, payload, sizeof payload)) {
         fprintf(stderr, "[Wayland Error] explicit sync bind encode failed: %s\n", w->err);
         return -EIO;
     }
@@ -1040,58 +1214,97 @@ int wayland_present_single_frame_and_wait(
         acquire_timeline == release_timeline) {
         return -EINVAL;
     }
+    // Flush a batch already queued ahead of this present when the buffer is close to full.
+    if (w->send_len + 256u > sizeof(w->send_bytes)) {
+        if (send_wire_batch(w) < 0) {
+            return -EIO;
+        }
+    }
 
-    w->frame_cb_id = wayland_alloc_id(w);
-    w->frame_done  = false;
-    w->send_len    = 0;
+    w->frame_done = false;
 
-    // 1. xdg_surface.ack_configure (request 4)
-    (void)append_raw_msg(w, w->xdg_surface_id, 4u, &configure_serial, sizeof(configure_serial));
+    if (w->lock_toplevel_size) {
+        int32_t sz[2] = { w->lock_width, w->lock_height };
+        // set_max_size is request 7, set_min_size is request 8. Applied on commit.
+        if (!wayland_put_raw(w, w->xdg_toplevel_id, 7u, sz, sizeof sz) ||
+            !wayland_put_raw(w, w->xdg_toplevel_id, 8u, sz, sizeof sz)) {
+            fprintf(stderr, "[Wayland Error] Toplevel size lock encode failed: %s\n", w->err);
+            return -EIO;
+        }
+    } else if (w->min_width > 0 && w->min_height > 0 &&
+               !put_toplevel_min_size(w, w->min_width, w->min_height)) {
+        fprintf(stderr, "[Wayland Error] Toplevel minimum encode failed: %s\n", w->err);
+        return -EIO;
+    }
+
+    // Ack only a serial we have not already accepted. Repeating one is invalid_serial.
+    // acked_configure_serial starts at 0, so the flag distinguishes "never acked".
+    bool did_ack = false;
+    if (!w->configure_ack_valid || configure_serial != w->acked_configure_serial) {
+        if (!wayland_put_raw(w, w->xdg_surface_id, 4u, &configure_serial, sizeof configure_serial)) {
+            fprintf(stderr, "[Wayland Error] ack_configure encode failed: %s\n", w->err);
+            return -EIO;
+        }
+        did_ack = true;
+    }
 
     // 2. xdg_surface.set_window_geometry (request 3)
     int32_t geom_payload[4] = { 0, 0, (int32_t)width, (int32_t)height };
-    (void)append_raw_msg(w, w->xdg_surface_id, 3u, geom_payload, sizeof(geom_payload));
+    (void)wayland_put_raw(w, w->xdg_surface_id, 3u, geom_payload, sizeof(geom_payload));
 
-    // 3. wl_surface.frame (request 3) -> frame_cb_id (distinct from sync_id)
-    (void)append_raw_msg(w, w->surface_id, 3u, &w->frame_cb_id, sizeof(w->frame_cb_id));
-
-    // 4. set_acquire_point (request 1) and set_release_point (request 2) on this commit
+    // 3. set_acquire_point (request 1) and set_release_point (request 2) on this commit
     uint32_t acquire_payload[3];
     uint32_t release_payload[3];
     put_timeline_point(acquire_payload, acquire_timeline, acquire_point);
     put_timeline_point(release_payload, release_timeline, release_point);
-    (void)append_raw_msg(w, w->explicit_sync_id, 1u, acquire_payload, sizeof acquire_payload);
-    (void)append_raw_msg(w, w->explicit_sync_id, 2u, release_payload, sizeof release_payload);
+    (void)wayland_put_raw(w, w->explicit_sync_id, 1u, acquire_payload, sizeof acquire_payload);
+    (void)wayland_put_raw(w, w->explicit_sync_id, 2u, release_payload, sizeof release_payload);
 
-    // 5. wl_surface.attach (request 1) at (0, 0)
+    // 4. wl_surface.attach (request 1) at (0, 0)
     uint32_t attach_payload[3] = { buffer_id, 0u, 0u };
-    (void)append_raw_msg(w, w->surface_id, 1u, attach_payload, sizeof(attach_payload));
+    (void)wayland_put_raw(w, w->surface_id, 1u, attach_payload, sizeof(attach_payload));
 
     // damage_buffer is request 9 since wl_surface v4. Older surfaces use damage (request 2).
     uint16_t damage_opcode = (w->compositor_bound_version >= 4u) ? 9u : 2u;
     int32_t damage_payload[4] = { 0, 0, (int32_t)width, (int32_t)height };
-    (void)append_raw_msg(w, w->surface_id, damage_opcode, damage_payload, sizeof(damage_payload));
+    (void)wayland_put_raw(w, w->surface_id, damage_opcode, damage_payload, sizeof(damage_payload));
 
-    // 6. wl_surface.commit (request 6)
-    (void)append_raw_msg(w, w->surface_id, 6u, nullptr, 0u);
+    if (w->viewport_id != 0) {
+        int32_t drop_dest[2] = { -1, -1 };
+        // wp_viewport.set_destination is request 2. -1,-1 clears the scale.
+        (void)wayland_put_raw(w, w->viewport_id, 2u, drop_dest, sizeof drop_dest);
+    }
+
+    // 5. wl_surface.commit (request 6)
+    (void)wayland_put_raw(w, w->surface_id, 6u, nullptr, 0u);
+
+    // 6. wl_display.sync guarantees the compositor processed commit even if occluded.
+    // No standing wl_surface.frame callback is armed.
+    w->synced  = false;
+    w->sync_id = wayland_alloc_id(w);
+    (void)append_display_sync(w, w->sync_id);
 
     if (send_wire_batch(w) < 0) {
         fprintf(stderr, "[Wayland Error] Present commit batch failed: %s\n", w->err);
         return -EIO;
     }
-    w->acked_configure_serial = configure_serial;
+    if (did_ack) {
+        w->acked_configure_serial = configure_serial;
+        w->configure_ack_valid = true;
+    }
 
     struct io_uring_cqe cqe = {0};
-    while (!w->frame_done && !w->failed) {
+    while (!w->synced && !w->failed) {
         if (submit_and_wait_tag(w, ENG_UD_WL_RECV, &cqe) < 0) {
             break;
         }
         wayland_on_cqe(w, &cqe);
     }
-    if (w->failed || !w->frame_done) {
-        fprintf(stderr, "[Wayland Error] Frame callback wait failed: %s\n", w->err);
+    if (w->failed || !w->synced) {
+        fprintf(stderr, "[Wayland Error] Present sync wait failed: %s\n", w->err);
         return -EIO;
     }
+    w->frame_done = true;
 
     if (w->ring->sq_pending > 0) {
         unsigned n = ring_submit(w->ring);
@@ -1105,7 +1318,8 @@ int wayland_queue_configure_ack(
     WaylandContext *w,
     uint32_t        serial,
     uint32_t        width,
-    uint32_t        height
+    uint32_t        height,
+    int32_t         viewport_mode
 ) {
     if (w == nullptr || !w->is_initialized || w->failed ||
         w->surface_id == 0 || w->xdg_surface_id == 0 || width == 0 || height == 0) {
@@ -1114,33 +1328,163 @@ int wayland_queue_configure_ack(
     if (w->send_len != 0) {
         return -EBUSY;
     }
-
+    uint32_t mark = w->send_len;
     int32_t geom[4] = { 0, 0, (int32_t)width, (int32_t)height };
-    if (!append_raw_msg(w, w->xdg_surface_id, 4u, &serial, sizeof serial) ||
-        !append_raw_msg(w, w->xdg_surface_id, 3u, geom, sizeof geom) ||
-        !append_raw_msg(w, w->surface_id, 6u, nullptr, 0u)) {
-        w->send_len = 0;
+    if (!wayland_put_raw(w, w->xdg_surface_id, 4u, &serial, sizeof serial) ||
+        !wayland_put_raw(w, w->xdg_surface_id, 3u, geom, sizeof geom)) {
+        wayland_rewind_send(w, mark);
         return -EIO;
     }
+    if (w->viewport_id != 0 && viewport_mode == ENG_VIEWPORT_UNSET) {
+        int32_t dest[2] = { -1, -1 };
+        if (!wayland_put_raw(w, w->viewport_id, 2u, dest, sizeof dest)) {
+            wayland_rewind_send(w, mark);
+            return -EIO;
+        }
+    }
+    if (!wayland_put_raw(w, w->surface_id, 6u, nullptr, 0u)) {
+        wayland_rewind_send(w, mark);
+        return -EIO;
+    }
+    return wayland_queue_send(w, true);
+}
 
-    struct io_uring_sqe *sqe = ring_sqe(w->ring);
-    if (sqe == nullptr) {
-        w->send_len = 0;
-        wl_fail(w, "SQ full while queuing configure ack");
-        return -ENOSPC;
+int wayland_queue_turn_commit(
+    WaylandContext *w,
+    uint32_t        buffer_id,
+    uint32_t        width,
+    uint32_t        height,
+    uint32_t        acquire_timeline,
+    uint64_t        acquire_point,
+    uint32_t        release_timeline,
+    uint64_t        release_point,
+    bool            arm_frame,
+    bool            with_configure,
+    uint32_t        configure_serial
+) {
+    if (w == nullptr || !w->is_initialized || w->failed || w->surface_id == 0) {
+        return -EINVAL;
+    }
+    if (w->send_len != 0) {
+        return -EBUSY;
+    }
+    if (buffer_id == 0 && !arm_frame) {
+        return -EINVAL;
+    }
+    if (with_configure && buffer_id == 0) {
+        return -EINVAL;
+    }
+    if (buffer_id != 0 &&
+        (width == 0 || height == 0 || w->explicit_sync_id == 0 ||
+         acquire_timeline == 0 || release_timeline == 0 ||
+         acquire_timeline == release_timeline ||
+         acquire_point == 0 || release_point == 0)) {
+        return -EINVAL;
+    }
+    if (arm_frame && w->frame_cb_id != 0) {
+        return -EALREADY;
     }
 
-    w->send_iov.iov_base       = w->send_bytes;
-    w->send_iov.iov_len        = w->send_len;
-    w->send_msg.msg_iov        = &w->send_iov;
-    w->send_msg.msg_iovlen     = 1u;
+    uint32_t mark = w->send_len;
+    uint32_t cb = 0;
+    if (arm_frame) {
+        cb = wayland_alloc_id(w);
+        if (cb == 0) {
+            return -EIO;
+        }
+    }
+
+    bool did_ack = false;
+    bool ok = true;
+    if (with_configure) {
+        if (w->xdg_surface_id == 0 || w->xdg_toplevel_id == 0) {
+            ok = false;
+        } else if (w->lock_toplevel_size) {
+            int32_t sz[2] = { w->lock_width, w->lock_height };
+            // set_max_size is request 7, set_min_size is request 8. Applied on commit.
+            ok = wayland_put_raw(w, w->xdg_toplevel_id, 7u, sz, sizeof sz) &&
+                 wayland_put_raw(w, w->xdg_toplevel_id, 8u, sz, sizeof sz);
+        } else if (w->min_width > 0 && w->min_height > 0) {
+            ok = put_toplevel_min_size(w, w->min_width, w->min_height);
+        }
+        // Repeating an acked serial is invalid_serial. A new one has to ride this commit.
+        if (ok && (!w->configure_ack_valid || configure_serial != w->acked_configure_serial)) {
+            ok = wayland_put_raw(w, w->xdg_surface_id, 4u, &configure_serial, sizeof configure_serial);
+            did_ack = ok;
+        }
+        if (ok) {
+            int32_t geom[4] = { 0, 0, (int32_t)width, (int32_t)height };
+            ok = wayland_put_raw(w, w->xdg_surface_id, 3u, geom, sizeof geom);
+        }
+        if (ok && w->viewport_id != 0) {
+            int32_t drop_dest[2] = { -1, -1 };
+            ok = wayland_put_raw(w, w->viewport_id, 2u, drop_dest, sizeof drop_dest);
+        }
+    }
+    if (ok && buffer_id != 0) {
+        uint32_t acquire_payload[3];
+        uint32_t release_payload[3];
+        put_timeline_point(acquire_payload, acquire_timeline, acquire_point);
+        put_timeline_point(release_payload, release_timeline, release_point);
+        uint32_t attach_payload[3] = { buffer_id, 0u, 0u };
+        uint16_t damage_opcode = (w->compositor_bound_version >= 4u) ? 9u : 2u;
+        int32_t damage_payload[4] = { 0, 0, (int32_t)width, (int32_t)height };
+        ok = wayland_put_raw(w, w->explicit_sync_id, 1u, acquire_payload, sizeof acquire_payload) &&
+             wayland_put_raw(w, w->explicit_sync_id, 2u, release_payload, sizeof release_payload) &&
+             wayland_put_raw(w, w->surface_id, 1u, attach_payload, sizeof attach_payload) &&
+             wayland_put_raw(w, w->surface_id, damage_opcode, damage_payload, sizeof damage_payload);
+    }
+    if (ok && cb != 0) {
+        // wl_surface.frame is request 3. It applies to the commit below.
+        ok = wayland_put_raw(w, w->surface_id, 3u, &cb, sizeof cb);
+    }
+    if (ok) {
+        ok = wayland_put_raw(w, w->surface_id, 6u, nullptr, 0u);
+    }
+    if (!ok) {
+        wayland_rewind_send(w, mark);
+        if (cb != 0) {
+            free_id(w, cb);
+        }
+        fprintf(stderr, "[Wayland Error] Queued commit encode failed: %s\n", w->err);
+        return -EIO;
+    }
+    int queued = wayland_queue_send(w, did_ack);
+    if (queued != 0) {
+        wayland_rewind_send(w, mark);
+        if (cb != 0) {
+            free_id(w, cb);
+        }
+        return queued;
+    }
+    if (cb != 0) {
+        w->frame_cb_id = cb;
+    }
+    return 0;
+}
+
+int wayland_queue_send(WaylandContext *w, bool tracks_ack) {
+    if (w == nullptr || !w->is_initialized || w->failed || w->send_len == 0) {
+        return -EINVAL;
+    }
+    if (w->send_off >= w->send_len) {
+        return -EINVAL;
+    }
+    struct io_uring_sqe *sqe = ring_sqe(w->ring);
+    if (sqe == nullptr) {
+        wl_fail(w, "SQ full while queuing wayland send");
+        return -ENOSPC;
+    }
+    w->send_tracks_ack = tracks_ack;
     w->send_msg.msg_control    = nullptr;
     w->send_msg.msg_controllen = 0u;
 
-    sqe->opcode    = IORING_OP_SENDMSG;
+    sqe->opcode    = IORING_OP_SEND;
     sqe->flags     = IOSQE_FIXED_FILE;
+    sqe->ioprio    = IORING_RECVSEND_POLL_FIRST;
     sqe->fd        = ENG_WL_SOCK_SLOT;
-    sqe->addr      = (uint64_t)(uintptr_t)&w->send_msg;
+    sqe->addr      = (uint64_t)(uintptr_t)(w->send_bytes + w->send_off);
+    sqe->len       = w->send_len - w->send_off;
     sqe->msg_flags = MSG_NOSIGNAL;
     sqe->user_data = ENG_UD_WL_SEND;
     return 0;
@@ -1154,17 +1498,16 @@ int wayland_note_send_cqe(
     if (w == nullptr || cqe == nullptr) {
         return -EINVAL;
     }
-    if (cqe->res != (int32_t)w->send_len) {
-        if (cqe->res < 0) {
-            wl_fail_err(w, "configure ack sendmsg", cqe->res);
-        } else {
-            wl_fail(w, "configure ack short write");
-        }
-        w->send_len = 0;
-        return -EIO;
+    int progress = note_send_progress(w, cqe->res);
+    if (progress != 0) {
+        return progress;
     }
-    w->send_len = 0;
-    w->acked_configure_serial = acked_serial;
+    bool track = w->send_tracks_ack;
+    w->send_tracks_ack = false;
+    if (track) {
+        w->acked_configure_serial = acked_serial;
+        w->configure_ack_valid = true;
+    }
     return 0;
 }
 
@@ -1172,13 +1515,14 @@ int wayland_detach_buffer(WaylandContext *w) {
     if (w == nullptr || !w->is_initialized || w->surface_id == 0 || w->failed) {
         return -EINVAL;
     }
-
-    w->send_len = 0;
+    if (flush_if_pending(w) < 0) {
+        return -EIO;
+    }
     // A null wl_buffer unmaps the surface. Acquire and release points are
     // required only on a commit that attaches a non-null buffer.
     uint32_t attach_payload[3] = { 0u, 0u, 0u };
-    if (!append_raw_msg(w, w->surface_id, 1u, attach_payload, sizeof attach_payload) ||
-        !append_raw_msg(w, w->surface_id, 6u, nullptr, 0u)) {
+    if (!wayland_put_raw(w, w->surface_id, 1u, attach_payload, sizeof attach_payload) ||
+        !wayland_put_raw(w, w->surface_id, 6u, nullptr, 0u)) {
         fprintf(stderr, "[Wayland Error] buffer detach encode failed: %s\n", w->err);
         return -EIO;
     }
@@ -1193,34 +1537,41 @@ void wayland_destroy_frame_objects(WaylandContext *w) {
     if (w == nullptr || !w->is_initialized) {
         return;
     }
-
+    if (!w->failed && w->send_len > 0) {
+        (void)send_wire_batch(w);
+    }
     w->send_len = 0;
+    w->send_off = 0;
+    if (w->viewport_id != 0) {
+        (void)wayland_put_raw(w, w->viewport_id, 0u, nullptr, 0u);
+        w->viewport_id = 0;
+    }
     if (w->explicit_sync_id != 0) {
-        (void)append_raw_msg(w, w->explicit_sync_id, 0u, nullptr, 0u);
+        (void)wayland_put_raw(w, w->explicit_sync_id, 0u, nullptr, 0u);
         w->explicit_sync_id = 0;
     }
     if (w->acquire_timeline_id != 0) {
-        (void)append_raw_msg(w, w->acquire_timeline_id, 0u, nullptr, 0u);
+        (void)wayland_put_raw(w, w->acquire_timeline_id, 0u, nullptr, 0u);
         w->acquire_timeline_id = 0;
     }
     if (w->release_timeline_id != 0) {
-        (void)append_raw_msg(w, w->release_timeline_id, 0u, nullptr, 0u);
+        (void)wayland_put_raw(w, w->release_timeline_id, 0u, nullptr, 0u);
         w->release_timeline_id = 0;
     }
     if (w->xdg_toplevel_id != 0) {
-        (void)append_raw_msg(w, w->xdg_toplevel_id, 0u, nullptr, 0u);
+        (void)wayland_put_raw(w, w->xdg_toplevel_id, 0u, nullptr, 0u);
         w->xdg_toplevel_id = 0;
     }
     if (w->xdg_surface_id != 0) {
-        (void)append_raw_msg(w, w->xdg_surface_id, 0u, nullptr, 0u);
+        (void)wayland_put_raw(w, w->xdg_surface_id, 0u, nullptr, 0u);
         w->xdg_surface_id = 0;
     }
     if (w->surface_id != 0) {
-        (void)append_raw_msg(w, w->surface_id, 0u, nullptr, 0u);
+        (void)wayland_put_raw(w, w->surface_id, 0u, nullptr, 0u);
         w->surface_id = 0;
     }
     if (w->buffer_id != 0) {
-        (void)append_raw_msg(w, w->buffer_id, 0u, nullptr, 0u);
+        (void)wayland_put_raw(w, w->buffer_id, 0u, nullptr, 0u);
         w->buffer_id = 0;
     }
 
@@ -1247,7 +1598,6 @@ int wayland_init(void) {
         fprintf(stderr, "[Wayland Error] Primary io_uring must be initialized before wayland_init\n");
         return 1;
     }
-
     WaylandContext *w = &s_wl_ctx;
     *w = (WaylandContext){
         .ring              = r,
@@ -1302,13 +1652,14 @@ int wayland_init(void) {
     sqe->addr2     = w->addr_len;
     sqe->user_data = ENG_UD_WL_CONNECT;
     if (submit_and_wait_tag(w, ENG_UD_WL_CONNECT, &cqe) < 0 || cqe.res < 0) {
-        fprintf(stderr, "[Wayland Error] IORING_OP_CONNECT failed\n");
+        fprintf(stderr, "[Wayland Error] IORING_OP_CONNECT failed: %s (%d)\n",
+                strerror(-cqe.res), cqe.res);
         return 1;
     }
 
     // 3. Send wl_display.get_registry (opcode 1) + wl_display.sync (opcode 0)
     w->send_len = 0;
-    (void)append_raw_msg(w, w->display_id, 1u, &w->registry_id, sizeof(w->registry_id));
+    (void)wayland_put_raw(w, w->display_id, 1u, &w->registry_id, sizeof(w->registry_id));
     (void)append_display_sync(w, w->sync_id);
 
     w->control_reserve         = 256u;
@@ -1351,17 +1702,11 @@ int wayland_init(void) {
         return 1;
     }
 
-    // 5. Bind the 5 core interfaces and verify with a second wl_display.sync roundtrip
+    // 5. Bind the core interfaces and verify with a second wl_display.sync roundtrip
     w->compositor_id            = wayland_alloc_id(w);
     w->compositor_bound_version = min_u32(w->compositor_version, 6u);
     (void)append_registry_bind(w, w->compositor_global_name, "wl_compositor",
                                w->compositor_bound_version, w->compositor_id);
-
-    if (w->subcompositor_global_name != 0) {
-        w->subcompositor_id = wayland_alloc_id(w);
-        (void)append_registry_bind(w, w->subcompositor_global_name, "wl_subcompositor",
-                                   1u, w->subcompositor_id);
-    }
 
     w->xdg_wm_base_id = wayland_alloc_id(w);
     (void)append_registry_bind(w, w->xdg_wm_base_global_name, "xdg_wm_base",
@@ -1376,6 +1721,30 @@ int wayland_init(void) {
         w->drm_syncobj_id = wayland_alloc_id(w);
         (void)append_registry_bind(w, w->drm_syncobj_global_name, "wp_linux_drm_syncobj_manager_v1",
                                    1u, w->drm_syncobj_id);
+    }
+
+    if (w->seat_global_name != 0) {
+        w->seat_id = wayland_alloc_id(w);
+        w->seat_bound_version = min_u32(w->seat_version, 9u);
+        (void)append_registry_bind(w, w->seat_global_name, "wl_seat",
+                                   w->seat_bound_version, w->seat_id);
+    }
+    // The bar is cleared into the dma-buf. wl_shm is only the cursor fallback.
+    if (w->cursor_shape_global_name == 0 && w->shm_global_name != 0) {
+        w->shm_id = wayland_alloc_id(w);
+        (void)append_registry_bind(w, w->shm_global_name, "wl_shm",
+                                   min_u32(w->shm_version, 1u), w->shm_id);
+    }
+    if (w->cursor_shape_global_name != 0) {
+        w->cursor_shape_manager_id = wayland_alloc_id(w);
+        w->cursor_shape_bound_version = min_u32(w->cursor_shape_version, 2u);
+        (void)append_registry_bind(w, w->cursor_shape_global_name, "wp_cursor_shape_manager_v1",
+                                   w->cursor_shape_bound_version, w->cursor_shape_manager_id);
+    }
+    if (w->viewporter_global_name != 0) {
+        w->viewporter_id = wayland_alloc_id(w);
+        (void)append_registry_bind(w, w->viewporter_global_name, "wp_viewporter",
+                                   min_u32(w->viewporter_version, 1u), w->viewporter_id);
     }
 
     w->synced  = false;
@@ -1403,15 +1772,21 @@ int wayland_init(void) {
         (void)ring_enter(r, n, 0, -1);
     }
 
+    w->send_len = 0;
+    if (pointer_open_devices(w) != 0) {
+        return 1;
+    }
+
     w->is_initialized = true;
     printf("[Wayland] Wire connected (fixed slot 0: %s) | Globals: %u\n",
            w->path, w->globals_seen);
-    printf("[Wayland] Bound Object IDs: wl_compositor=%u, wl_subcompositor=%u, xdg_wm_base=%u, linux_dmabuf=%u, drm_syncobj=%u\n",
+    printf("[Wayland] Bound Object IDs: wl_compositor=%u, xdg_wm_base=%u, linux_dmabuf=%u, drm_syncobj=%u\n",
            w->compositor_id,
-           w->subcompositor_id,
            w->xdg_wm_base_id,
            w->linux_dmabuf_id,
            w->drm_syncobj_id);
+    printf("[Wayland] Input Object IDs: wl_seat=%u, wl_shm=%u, cursor_shape=%u, viewporter=%u\n",
+           w->seat_id, w->shm_id, w->cursor_shape_manager_id, w->viewporter_id);
     return 0;
 }
 
@@ -1420,6 +1795,7 @@ void wayland_shutdown(void) {
     if (!w->is_initialized) {
         return;
     }
+    pointer_shutdown(w);
     close_feedback_table(w);
     for (uint32_t i = 0; i < w->nparked; ++i) {
         close(w->parked_fds[i]);

@@ -52,7 +52,6 @@ typedef enum VulkanResult {
 
 /**
  * @brief Writes a driver version into buf.
- *
  * NVIDIA packs driverVersion differently from VK_API_VERSION_*. Other vendors
  * use the Khronos packing.
  */
@@ -61,7 +60,6 @@ void vulkan_format_driver_version(uint32_t vendor_id, uint32_t driver_version,
 
 /**
  * @brief Table of dynamically resolved non-static Vulkan extension function pointers.
- *
  * These function pointers are loaded via vkGetInstanceProcAddr or vkGetDeviceProcAddr
  * to ensure bulletproof portability and prevent unresolved symbol errors or
  * null-pointer crashes across different Vulkan loader implementations.
@@ -85,7 +83,6 @@ typedef struct VulkanDispatchTable {
 
 /**
  * @brief Queue handles and queue family indices discovered on the hardware.
- *
  * A role keeps its own queue index when its family has one queue per role.
  * submission_aliased is set when two roles still received the same VkQueue.
  * Those handles are externally synchronized: do not submit them at once.
@@ -94,15 +91,12 @@ typedef struct VulkanQueueInfo {
     VkQueue  graphics_queue;
     uint32_t graphics_family_index;
     uint32_t graphics_queue_index;
-
     VkQueue  compute_queue;
     uint32_t compute_family_index;
     uint32_t compute_queue_index;
-
     VkQueue  transfer_queue;
     uint32_t transfer_family_index;
     uint32_t transfer_queue_index;
-
     bool     has_dedicated_compute;
     bool     has_dedicated_transfer;
     bool     submission_aliased;
@@ -112,13 +106,12 @@ typedef struct VulkanQueueInfo {
  * @brief Hardware identity and verified capability flags for the selected physical device.
  */
 typedef struct VulkanDeviceInfo {
-    char                   name[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE];
-    VkPhysicalDeviceType   type;
-    uint32_t               vendor_id;
-    uint32_t               device_id;
-    uint32_t               driver_version;
-    uint32_t               api_version;
-
+    char                             name[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE];
+    VkPhysicalDeviceType             type;
+    uint32_t                         vendor_id;
+    uint32_t                         device_id;
+    uint32_t                         driver_version;
+    uint32_t                         api_version;
     VkPhysicalDeviceMemoryProperties memory_properties;
 
     // Features and extensions enabled on the logical device. A true flag was
@@ -136,6 +129,11 @@ typedef struct VulkanDeviceInfo {
     bool supports_maintenance5;
     bool supports_maintenance6;
     bool supports_push_descriptors;
+    bool supports_host_image_copy;
+    bool supports_dynamic_rendering_local_read;
+    bool supports_shader_int16;
+    bool supports_shader_int64;
+    bool supports_storage_buffer_16bit;
 
     // Linux DRM device node identity (VK_EXT_physical_device_drm) for Wayland matching.
     bool    has_drm_primary_node;
@@ -148,7 +146,6 @@ typedef struct VulkanDeviceInfo {
 
 /**
  * @brief Master Vulkan subsystem state context.
- *
  * Encapsulates all Vulkan handles, queue dispatches, device properties,
  * and dynamic function pointers required for the engine.
  */
@@ -158,11 +155,9 @@ typedef struct VulkanContext {
     VkPhysicalDevice         physical_device;
     VkDevice                 device;
     VkCommandPool            cmd_pool;
-
     VulkanQueueInfo          queues;
     VulkanDeviceInfo         device_info;
     VulkanDispatchTable      dispatch;
-
     bool                     validation_enabled;
     bool                     is_initialized;
 } VulkanContext;

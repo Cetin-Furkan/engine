@@ -1,0 +1,42 @@
+# Window chrome. This file is the design. The engine reads it once at startup.
+# Change it and start again. There is no second copy of these values in the code.
+#
+# Search order: $ENGINE_CHROME, then ./chrome/window.chrome, then chrome/window.chrome
+# next to the executable, walking up at most four directories.
+#
+# resize = off locks the toplevel to the first size (min = max).
+# resize = on allows edge drags of resize.band pixels. The toplevel minimum
+# is the bar thickness by the widest control, so a drag cannot reach 1px.
+# Each configure whose size differs records a new buffer, and the bar stays
+# at thickness pixels for the whole drag. The band is ignored while resize
+# is off, and it is still required so turning resize on does not invent a width.
+#
+# Layers are drawn by a fragment shader into the Vulkan dma-buf, bottom to top. There is no wl_shm bar.
+# thickness is the layer's cross size in buffer pixels. span = full means the window width.
+# A control's span is its width along the bar. Its height is the layer thickness.
+# Omit a layer or a control and it is not painted.
+
+window.title = Antigravity
+window.app_id = antigravity
+
+cursor.shape = default
+
+resize = on
+resize.band = 6
+
+layer
+name = bar
+edge = top
+thickness = 32
+span = full
+color = #1c1e22
+
+control
+name = close
+layer = bar
+action = close
+align = end
+span = 32
+color = #c4453c
+glyph = #f4f1ea
+cursor = pointer

@@ -1,6 +1,5 @@
 #include "system/system.h"
 #include "util/fmt.h"
-
 #include <errno.h>
 #include <linux/io_uring.h>
 #include <linux/io_uring/query.h>
@@ -31,13 +30,10 @@ static long sys_uring_register_raw(int fd, unsigned int opcode, const void *arg,
 static int raise_memlock_64m(uint64_t *out_cur) {
     struct rlimit rl = {0};
     constexpr rlim_t want = 64ull * 1024ull * 1024ull;
-
     if (getrlimit(RLIMIT_MEMLOCK, &rl) != 0) {
         return -errno;
     }
 
-    // Raising rlim_max above the current ceiling fails the whole setrlimit
-    // for an unprivileged process, and the soft limit stays where it was.
     rlim_t target = want;
     if (rl.rlim_max != RLIM_INFINITY && rl.rlim_max < want) {
         struct rlimit raised = {
@@ -72,7 +68,6 @@ static int probe_io_uring_kernel(SystemCapabilities *caps) {
         .query_op   = IO_URING_QUERY_OPCODES,
         .size       = sizeof(opcodes),
     };
-
     long rc = sys_uring_register_raw(-1, IORING_REGISTER_QUERY, &hdr, 0);
     if (rc < 0) {
         return (int)rc;
@@ -87,6 +82,10 @@ static int probe_io_uring_kernel(SystemCapabilities *caps) {
     if ((opcodes.feature_flags & IORING_FEAT_NODROP) == 0) {
         return -ENOTSUP;
     }
+    if (opcodes.nr_request_opcodes <= IORING_OP_SOCKET ||
+        opcodes.nr_register_opcodes <= IORING_REGISTER_MEM_REGION) {
+        return -ENOTSUP;
+    }
 
     caps->uring_setup_flags         = opcodes.ring_setup_flags;
     caps->uring_feature_flags       = opcodes.feature_flags;
@@ -98,7 +97,6 @@ static int probe_io_uring_kernel(SystemCapabilities *caps) {
 
 int system_init(void) {
     s_sys_caps = (SystemCapabilities){0};
-
     struct utsname uts = {0};
     if (uname(&uts) != 0) {
         log_err_raw("[System Error] uname syscall failed\n");

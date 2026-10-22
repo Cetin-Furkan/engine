@@ -8,20 +8,6 @@ extern "C" {
 #endif
 
 /**
- * @brief Tiling search used by vulkan_create_exportable_image().
- *
- * AUTO tries a single-plane DRM format modifier, then linear, then optimal.
- * The other values try only that tiling. Optimal has no DRM modifier, so the
- * file descriptor is not a Wayland linux-dmabuf import layout.
- */
-typedef enum VulkanExportTiling {
-    VULKAN_EXPORT_TILING_AUTO = 0,
-    VULKAN_EXPORT_TILING_DRM_MODIFIER,
-    VULKAN_EXPORT_TILING_LINEAR,
-    VULKAN_EXPORT_TILING_OPTIMAL
-} VulkanExportTiling;
-
-/**
  * @brief Represents an image allocated with dedicated memory and an exported Linux DMA-BUF FD.
  */
 typedef struct VulkanExportableImage {
@@ -48,18 +34,6 @@ typedef struct VulkanExportableImage {
     uint32_t               type_filter,
     VkMemoryPropertyFlags  required_flags,
     uint32_t              *out_type_index);
-
-/**
- * @brief Allocates an exportable VkImage with dedicated memory and exports a Linux DMA-BUF FD.
- */
-[[nodiscard]] VulkanResult vulkan_create_exportable_image(
-    VulkanContext         *ctx,
-    uint32_t               width,
-    uint32_t               height,
-    VkFormat               format,
-    VkImageUsageFlags      usage,
-    VulkanExportTiling     tiling,
-    VulkanExportableImage *out_image);
 
 /**
  * @brief Allocates a single-plane DRM-modifier exportable VkImage restricted to an explicit modifier list.

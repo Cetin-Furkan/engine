@@ -8,6 +8,10 @@
 static const char *k_required_device_extensions[] = {
     VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
     VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME,
+    VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME,
+    VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME,
+    VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME,
+    VK_EXT_PHYSICAL_DEVICE_DRM_EXTENSION_NAME,
 };
 
 typedef struct DeviceExtensionList {
@@ -22,7 +26,6 @@ typedef struct GpuCandidate {
     uint32_t                         score;
     bool                             is_disqualified;
     char                             disqualification_reason[256];
-
     bool                             queues_probed;
     bool                             features_probed;
     bool                             extensions_probed;
@@ -52,6 +55,11 @@ typedef struct GpuCandidate {
     bool                             supports_maintenance5;
     bool                             supports_maintenance6;
     bool                             supports_push_descriptors;
+    bool                             supports_host_image_copy;
+    bool                             supports_dynamic_rendering_local_read;
+    bool                             supports_shader_int16;
+    bool                             supports_shader_int64;
+    bool                             supports_storage_buffer_16bit;
 
     bool                             has_drm_primary;
     bool                             has_drm_render;
@@ -73,7 +81,6 @@ static void device_extension_list_free(DeviceExtensionList *list) {
 static VulkanResult device_extension_list_load(VkPhysicalDevice device, DeviceExtensionList *list) {
     list->items = nullptr;
     list->count = 0;
-
     uint32_t count = 0;
     VkResult res = vkEnumerateDeviceExtensionProperties(device, nullptr, &count, nullptr);
     if (res != VK_SUCCESS) {
@@ -115,24 +122,24 @@ static bool device_extension_list_has(const DeviceExtensionList *list, const cha
 
 static const char *get_vendor_name(uint32_t vendor_id) {
     switch (vendor_id) {
-        case 0x10DE: return "NVIDIA";
-        case 0x8086: return "Intel";
-        case 0x1002: return "AMD";
-        case 0x13B5: return "ARM";
-        case 0x5143: return "Qualcomm";
-        case 0x1010: return "ImgTec";
-        case 0x10005: return "Mesa";
-        default:     return "Unknown";
+    case 0x10DE: return "NVIDIA";
+    case 0x8086: return "Intel";
+    case 0x1002: return "AMD";
+    case 0x13B5: return "ARM";
+    case 0x5143: return "Qualcomm";
+    case 0x1010: return "ImgTec";
+    case 0x10005: return "Mesa";
+    default:     return "Unknown";
     }
 }
 
 static const char *get_device_type_str(VkPhysicalDeviceType type) {
     switch (type) {
-        case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU:   return "Discrete GPU";
-        case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU: return "Integrated GPU";
-        case VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU:    return "Virtual GPU";
-        case VK_PHYSICAL_DEVICE_TYPE_CPU:            return "CPU (Software)";
-        default:                                     return "Other";
+    case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU:   return "Discrete GPU";
+    case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU: return "Integrated GPU";
+    case VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU:    return "Virtual GPU";
+    case VK_PHYSICAL_DEVICE_TYPE_CPU:            return "CPU (Software)";
+    default:                                     return "Other";
     }
 }
 
@@ -151,7 +158,6 @@ static bool ascii_contains_ci(const char *haystack, const char *needle) {
     if (*needle == '\0') {
         return true;
     }
-
     for (const char *start = haystack; *start != '\0'; ++start) {
         const char *left = start;
         const char *right = needle;
@@ -171,7 +177,6 @@ static bool parse_gpu_index(const char *text, uint32_t *out_index) {
     if (text == nullptr || *text == '\0' || out_index == nullptr) {
         return false;
     }
-
     errno = 0;
     char *end = nullptr;
     long value = strtol(text, &end, 10);
@@ -193,7 +198,6 @@ static void measure_memory(GpuCandidate *candidate) {
     const VkPhysicalDeviceMemoryProperties *mem = &candidate->memory_properties;
     uint64_t device_local = 0;
     uint64_t dedicated = 0;
-
     for (uint32_t heap = 0; heap < mem->memoryHeapCount; ++heap) {
         if ((mem->memoryHeaps[heap].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) == 0) {
             continue;
@@ -232,7 +236,6 @@ static VulkanResult discover_queue_families(GpuCandidate *candidate) {
     candidate->graphics_queue_count = 0;
     candidate->compute_queue_count = 0;
     candidate->transfer_queue_count = 0;
-
     uint32_t count = 0;
     vkGetPhysicalDeviceQueueFamilyProperties(candidate->device, &count, nullptr);
     if (count == 0) {
@@ -344,17 +347,18 @@ static VulkanResult discover_queue_families(GpuCandidate *candidate) {
 static uint32_t score_candidate(const GpuCandidate *candidate) {
     uint32_t score = 1000;
     switch (candidate->properties.deviceType) {
-        case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU:   score += 100000; break;
-        case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU: score += 40000; break;
-        case VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU:    score += 10000; break;
-        default:                                     score += 1000; break;
+    case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU:   score += 100000; break;
+    case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU: score += 40000; break;
+    case VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU:    score += 10000; break;
+    default:                                     score += 1000; break;
     }
-
-    if (candidate->has_dedicated_compute)  score += 1000;
-    if (candidate->has_dedicated_transfer) score += 500;
-    if (candidate->supports_drm_modifiers) score += 1000;
-    if (candidate->supports_syncobj)       score += 1000;
-    if (candidate->supports_maintenance5)  score += 500;
+    if (candidate->has_dedicated_compute)                  score += 1000;
+    if (candidate->has_dedicated_transfer)                 score += 500;
+    if (candidate->supports_drm_modifiers)                 score += 1000;
+    if (candidate->supports_syncobj)                       score += 1000;
+    if (candidate->supports_maintenance5)                  score += 500;
+    if (candidate->supports_host_image_copy)               score += 500;
+    if (candidate->supports_dynamic_rendering_local_read)  score += 500;
 
     // Dedicated VRAM can break ties inside a class. It cannot outrank a discrete GPU
     // with system memory that an integrated GPU reports as device-local.
@@ -370,7 +374,6 @@ static VulkanResult evaluate_device(GpuCandidate *candidate) {
     vkGetPhysicalDeviceProperties(candidate->device, &candidate->properties);
     vkGetPhysicalDeviceMemoryProperties(candidate->device, &candidate->memory_properties);
     measure_memory(candidate);
-
     if (candidate->properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU) {
         disqualify(candidate, "Software rasterizer (CPU device) is not used");
         return VULKAN_SUCCESS;
@@ -415,32 +418,43 @@ static VulkanResult evaluate_device(GpuCandidate *candidate) {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
         .pNext = &feat13,
     };
+    VkPhysicalDeviceVulkan11Features feat11 = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
+        .pNext = &feat12,
+    };
     VkPhysicalDeviceFeatures2 features2 = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
-        .pNext = &feat12,
+        .pNext = &feat11,
     };
     vkGetPhysicalDeviceFeatures2(candidate->device, &features2);
 
-    candidate->supports_dyn_render = (feat13.dynamicRendering == VK_TRUE);
-    candidate->supports_sync2 = (feat13.synchronization2 == VK_TRUE);
-    candidate->supports_bda = (feat12.bufferDeviceAddress == VK_TRUE);
-    candidate->supports_scalar_layout = (feat12.scalarBlockLayout == VK_TRUE);
-    candidate->supports_timeline = (feat12.timelineSemaphore == VK_TRUE);
-    candidate->supports_anisotropy = (features2.features.samplerAnisotropy == VK_TRUE);
-    candidate->supports_maintenance5 = (feat14.maintenance5 == VK_TRUE);
-    candidate->supports_maintenance6 = (feat14.maintenance6 == VK_TRUE);
-    candidate->supports_push_descriptors = (feat14.pushDescriptor == VK_TRUE);
-    candidate->features_probed = true;
+    candidate->supports_dyn_render                   = (feat13.dynamicRendering == VK_TRUE);
+    candidate->supports_sync2                        = (feat13.synchronization2 == VK_TRUE);
+    candidate->supports_bda                          = (feat12.bufferDeviceAddress == VK_TRUE);
+    candidate->supports_scalar_layout                = (feat12.scalarBlockLayout == VK_TRUE);
+    candidate->supports_timeline                     = (feat12.timelineSemaphore == VK_TRUE);
+    candidate->supports_anisotropy                   = (features2.features.samplerAnisotropy == VK_TRUE);
+    candidate->supports_maintenance5                 = (feat14.maintenance5 == VK_TRUE);
+    candidate->supports_maintenance6                 = (feat14.maintenance6 == VK_TRUE);
+    candidate->supports_push_descriptors             = (feat14.pushDescriptor == VK_TRUE);
+    candidate->supports_host_image_copy              = (feat14.hostImageCopy == VK_TRUE);
+    candidate->supports_dynamic_rendering_local_read = (feat14.dynamicRenderingLocalRead == VK_TRUE);
+    candidate->supports_shader_int16                 = (features2.features.shaderInt16 == VK_TRUE);
+    candidate->supports_shader_int64                 = (features2.features.shaderInt64 == VK_TRUE);
+    candidate->supports_storage_buffer_16bit         = (feat11.storageBuffer16BitAccess == VK_TRUE);
+    candidate->features_probed                       = true;
 
     if (!candidate->supports_dyn_render || !candidate->supports_sync2 ||
         !candidate->supports_bda || !candidate->supports_timeline ||
-        !candidate->supports_scalar_layout) {
+        !candidate->supports_scalar_layout || !candidate->supports_shader_int16 ||
+        !candidate->supports_shader_int64 || !candidate->supports_storage_buffer_16bit) {
         char reason[256];
         snprintf(reason, sizeof reason,
-                 "Missing required feature (DynRender=%d, Sync2=%d, BDA=%d, Timeline=%d, ScalarLayout=%d)",
+                 "Missing required feature (DynRender=%d, Sync2=%d, BDA=%d, Timeline=%d, ScalarLayout=%d, Int16=%d, Int64=%d, Storage16=%d)",
                  candidate->supports_dyn_render, candidate->supports_sync2,
                  candidate->supports_bda, candidate->supports_timeline,
-                 candidate->supports_scalar_layout);
+                 candidate->supports_scalar_layout, candidate->supports_shader_int16,
+                 candidate->supports_shader_int64, candidate->supports_storage_buffer_16bit);
         disqualify(candidate, reason);
         return VULKAN_SUCCESS;
     }
@@ -482,7 +496,7 @@ static VulkanResult evaluate_device(GpuCandidate *candidate) {
         candidate->drm_render_minor  = drm_props.renderMinor;
     }
 
-    char missing[192];
+    char missing[256];
     size_t used = 0;
     missing[0] = '\0';
     for (size_t i = 0; i < sizeof k_required_device_extensions / sizeof k_required_device_extensions[0]; ++i) {
@@ -505,6 +519,36 @@ static VulkanResult evaluate_device(GpuCandidate *candidate) {
         return VULKAN_SUCCESS;
     }
 
+    if (!candidate->has_drm_render) {
+        disqualify(candidate, "Device lacks Linux DRM render node");
+        return VULKAN_SUCCESS;
+    }
+
+    // Probe timeline semaphore export AND import with VkSemaphoreTypeCreateInfo in pNext.
+    VkSemaphoreTypeCreateInfo timeline_type_info = {
+        .sType         = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
+        .pNext         = nullptr,
+        .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE,
+        .initialValue  = 0,
+    };
+    VkPhysicalDeviceExternalSemaphoreInfo ext_info = {
+        .sType      = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_SEMAPHORE_INFO,
+        .pNext      = &timeline_type_info,
+        .handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT,
+    };
+    VkExternalSemaphoreProperties ext_props = {
+        .sType = VK_STRUCTURE_TYPE_EXTERNAL_SEMAPHORE_PROPERTIES,
+        .pNext = nullptr,
+    };
+    vkGetPhysicalDeviceExternalSemaphoreProperties(candidate->device, &ext_info, &ext_props);
+    const VkExternalSemaphoreFeatureFlags req_sem_flags =
+        VK_EXTERNAL_SEMAPHORE_FEATURE_EXPORTABLE_BIT |
+        VK_EXTERNAL_SEMAPHORE_FEATURE_IMPORTABLE_BIT;
+    if ((ext_props.externalSemaphoreFeatures & req_sem_flags) != req_sem_flags) {
+        disqualify(candidate, "Timeline semaphore opaque-fd export/import is not supported");
+        return VULKAN_SUCCESS;
+    }
+
     candidate->is_disqualified = false;
     candidate->score = score_candidate(candidate);
     return VULKAN_SUCCESS;
@@ -515,7 +559,6 @@ static void print_candidate(uint32_t index, const GpuCandidate *candidate) {
     vulkan_format_driver_version(candidate->properties.vendorID,
                                  candidate->properties.driverVersion,
                                  driver_version, sizeof driver_version);
-
     printf("  [%u] %s (%s | Vendor: %s [0x%04x] | DeviceID: 0x%04x)\n",
            index,
            candidate->properties.deviceName,
@@ -561,8 +604,9 @@ static void print_candidate(uint32_t index, const GpuCandidate *candidate) {
     if (!candidate->features_probed) {
         printf("      Features: not probed\n");
     } else {
-        printf("      Features: DynRender=%s, Sync2=%s, BDA=%s, ScalarLayout=%s, Timeline=%s, Anisotropy=%s, Maint5=%s, Maint6=%s, PushDesc=%s\n",
+        printf("      Features: DynRender=%s, LocalRead=%s, Sync2=%s, BDA=%s, ScalarLayout=%s, Timeline=%s, Anisotropy=%s, Maint5=%s, Maint6=%s, PushDesc=%s, HostImageCopy=%s, Int16=%s, Int64=%s, Storage16=%s\n",
                candidate->supports_dyn_render ? "yes" : "no",
+               candidate->supports_dynamic_rendering_local_read ? "yes" : "no",
                candidate->supports_sync2 ? "yes" : "no",
                candidate->supports_bda ? "yes" : "no",
                candidate->supports_scalar_layout ? "yes" : "no",
@@ -570,7 +614,11 @@ static void print_candidate(uint32_t index, const GpuCandidate *candidate) {
                candidate->supports_anisotropy ? "yes" : "no",
                candidate->supports_maintenance5 ? "yes" : "no",
                candidate->supports_maintenance6 ? "yes" : "no",
-               candidate->supports_push_descriptors ? "yes" : "no");
+               candidate->supports_push_descriptors ? "yes" : "no",
+               candidate->supports_host_image_copy ? "yes" : "no",
+               candidate->supports_shader_int16 ? "yes" : "no",
+               candidate->supports_shader_int64 ? "yes" : "no",
+               candidate->supports_storage_buffer_16bit ? "yes" : "no");
     }
 
     if (!candidate->extensions_probed) {
@@ -655,6 +703,11 @@ static uint32_t family_plan_take(FamilyPlan *plans, uint32_t count, uint32_t fam
 }
 
 static bool append_extension(const char **names, uint32_t *count, uint32_t capacity, const char *name) {
+    for (uint32_t i = 0; i < *count; ++i) {
+        if (strcmp(names[i], name) == 0) {
+            return true;
+        }
+    }
     if (*count >= capacity) {
         return false;
     }
@@ -666,7 +719,6 @@ VulkanResult vulkan_device_create(VulkanContext *ctx) {
     if (ctx == nullptr || ctx->instance == VK_NULL_HANDLE) {
         return VULKAN_ERROR_INVALID_ARGUMENT;
     }
-
     uint32_t device_count = 0;
     VkResult enum_res = vkEnumeratePhysicalDevices(ctx->instance, &device_count, nullptr);
     if (enum_res != VK_SUCCESS) {
@@ -812,6 +864,11 @@ VulkanResult vulkan_device_create(VulkanContext *ctx) {
     ctx->device_info.supports_maintenance5 = best.supports_maintenance5;
     ctx->device_info.supports_maintenance6 = best.supports_maintenance6;
     ctx->device_info.supports_push_descriptors = best.supports_push_descriptors;
+    ctx->device_info.supports_host_image_copy = best.supports_host_image_copy;
+    ctx->device_info.supports_dynamic_rendering_local_read = best.supports_dynamic_rendering_local_read;
+    ctx->device_info.supports_shader_int16 = best.supports_shader_int16;
+    ctx->device_info.supports_shader_int64 = best.supports_shader_int64;
+    ctx->device_info.supports_storage_buffer_16bit = best.supports_storage_buffer_16bit;
     ctx->device_info.has_drm_primary_node = best.has_drm_primary;
     ctx->device_info.has_drm_render_node = best.has_drm_render;
     ctx->device_info.drm_primary_major = best.drm_primary_major;
@@ -861,39 +918,21 @@ VulkanResult vulkan_device_create(VulkanContext *ctx) {
         };
     }
 
-    const char *device_extensions[8] = {0};
+    const char *device_extensions[16] = {0};
     uint32_t device_extension_count = 0;
     for (size_t i = 0; i < sizeof k_required_device_extensions / sizeof k_required_device_extensions[0]; ++i) {
-        if (!append_extension(device_extensions, &device_extension_count, 8, k_required_device_extensions[i])) {
+        if (!append_extension(device_extensions, &device_extension_count, 16, k_required_device_extensions[i])) {
             return VULKAN_ERROR_INITIALIZATION_FAILED;
         }
     }
-    if (best.supports_drm_modifiers &&
-        !append_extension(device_extensions, &device_extension_count, 8,
-                          VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME)) {
-        return VULKAN_ERROR_INITIALIZATION_FAILED;
-    }
-    if (best.supports_syncobj &&
-        !append_extension(device_extensions, &device_extension_count, 8,
-                          VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME)) {
-        return VULKAN_ERROR_INITIALIZATION_FAILED;
-    }
-    if (best.supports_queue_family_foreign &&
-        !append_extension(device_extensions, &device_extension_count, 8,
-                          VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME)) {
-        return VULKAN_ERROR_INITIALIZATION_FAILED;
-    }
-    if (best.supports_physical_device_drm &&
-        !append_extension(device_extensions, &device_extension_count, 8,
-                          VK_EXT_PHYSICAL_DEVICE_DRM_EXTENSION_NAME)) {
-        return VULKAN_ERROR_INITIALIZATION_FAILED;
-    }
 
     VkPhysicalDeviceVulkan14Features feat14 = {
-        .sType          = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_4_FEATURES,
-        .maintenance5   = best.supports_maintenance5 ? VK_TRUE : VK_FALSE,
-        .maintenance6   = best.supports_maintenance6 ? VK_TRUE : VK_FALSE,
-        .pushDescriptor = best.supports_push_descriptors ? VK_TRUE : VK_FALSE,
+        .sType                     = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_4_FEATURES,
+        .maintenance5              = best.supports_maintenance5 ? VK_TRUE : VK_FALSE,
+        .maintenance6              = best.supports_maintenance6 ? VK_TRUE : VK_FALSE,
+        .pushDescriptor            = best.supports_push_descriptors ? VK_TRUE : VK_FALSE,
+        .hostImageCopy             = best.supports_host_image_copy ? VK_TRUE : VK_FALSE,
+        .dynamicRenderingLocalRead = best.supports_dynamic_rendering_local_read ? VK_TRUE : VK_FALSE,
     };
     VkPhysicalDeviceVulkan13Features feat13 = {
         .sType            = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
@@ -908,11 +947,18 @@ VulkanResult vulkan_device_create(VulkanContext *ctx) {
         .bufferDeviceAddress = VK_TRUE,
         .timelineSemaphore   = VK_TRUE,
     };
+    VkPhysicalDeviceVulkan11Features feat11 = {
+        .sType                     = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
+        .pNext                     = &feat12,
+        .storageBuffer16BitAccess  = best.supports_storage_buffer_16bit ? VK_TRUE : VK_FALSE,
+    };
     VkPhysicalDeviceFeatures2 features2 = {
         .sType    = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
-        .pNext    = &feat12,
+        .pNext    = &feat11,
         .features = {
             .samplerAnisotropy = best.supports_anisotropy ? VK_TRUE : VK_FALSE,
+            .shaderInt16       = best.supports_shader_int16 ? VK_TRUE : VK_FALSE,
+            .shaderInt64       = best.supports_shader_int64 ? VK_TRUE : VK_FALSE,
         },
     };
 
@@ -974,19 +1020,13 @@ VulkanResult vulkan_device_create(VulkanContext *ctx) {
     ctx->dispatch.vkImportSemaphoreFdKHR =
         (PFN_vkImportSemaphoreFdKHR)vkGetDeviceProcAddr(ctx->device, "vkImportSemaphoreFdKHR");
 
-    if (ctx->dispatch.vkGetMemoryFdKHR == nullptr) {
+    if (ctx->dispatch.vkGetMemoryFdKHR == nullptr ||
+        ctx->dispatch.vkGetImageDrmFormatModifierPropertiesEXT == nullptr ||
+        ctx->dispatch.vkGetSemaphoreFdKHR == nullptr ||
+        ctx->dispatch.vkImportSemaphoreFdKHR == nullptr) {
         fprintf(stderr,
-                "[Vulkan Error] vkGetMemoryFdKHR resolved to null after enabling %s\n",
-                VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME);
-        vkDestroyDevice(ctx->device, nullptr);
-        ctx->device = VK_NULL_HANDLE;
-        ctx->queues.graphics_queue = VK_NULL_HANDLE;
-        ctx->queues.compute_queue = VK_NULL_HANDLE;
-        ctx->queues.transfer_queue = VK_NULL_HANDLE;
-        ctx->queues.graphics_queue_index = 0;
-        ctx->queues.compute_queue_index = 0;
-        ctx->queues.transfer_queue_index = 0;
-        ctx->queues.submission_aliased = false;
+                "[Vulkan Error] Required device extension dispatch pointers resolved to null\n");
+        vulkan_device_destroy(ctx);
         return VULKAN_ERROR_FUNCTION_POINTER_MISSING;
     }
 
@@ -997,7 +1037,6 @@ void vulkan_device_destroy(VulkanContext *ctx) {
     if (ctx == nullptr || ctx->device == VK_NULL_HANDLE) {
         return;
     }
-
     vkDeviceWaitIdle(ctx->device);
     vkDestroyDevice(ctx->device, nullptr);
     ctx->device = VK_NULL_HANDLE;

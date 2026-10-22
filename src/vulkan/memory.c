@@ -1,6 +1,7 @@
 #include "vulkan/memory.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 
 VulkanResult vulkan_find_memory_type(
@@ -12,7 +13,6 @@ VulkanResult vulkan_find_memory_type(
     if (ctx == nullptr || out_type_index == nullptr) {
         return VULKAN_ERROR_INVALID_ARGUMENT;
     }
-
     const VkPhysicalDeviceMemoryProperties *mem_props = &ctx->device_info.memory_properties;
     int32_t best_index = -1;
     int best_rank = -1;
@@ -79,7 +79,6 @@ static bool usage_to_required_features(VkImageUsageFlags usage, VkFormatFeatureF
     if (usage == 0 || out_features == nullptr) {
         return false;
     }
-
     VkImageUsageFlags known = 0;
     VkFormatFeatureFlags features = 0;
 
@@ -134,10 +133,10 @@ static bool modifier_list_contains(const uint64_t *list, uint32_t count, uint64_
 
 static const char *image_tiling_name(VkImageTiling tiling) {
     switch (tiling) {
-        case VK_IMAGE_TILING_LINEAR: return "linear";
-        case VK_IMAGE_TILING_OPTIMAL: return "optimal";
-        case VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT: return "drm-modifier";
-        default: return "other";
+    case VK_IMAGE_TILING_LINEAR: return "linear";
+    case VK_IMAGE_TILING_OPTIMAL: return "optimal";
+    case VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT: return "drm-modifier";
+    default: return "other";
     }
 }
 
@@ -150,23 +149,40 @@ static void destroy_unexported_image(VkDevice device, VkImage image, VkDeviceMem
     }
 }
 
+static bool format_uses_bgra8_view_list(VkFormat format) {
+    return format == VK_FORMAT_B8G8R8A8_UNORM || format == VK_FORMAT_B8G8R8A8_SRGB;
+}
+
 static VulkanResult image_is_exportable(
     const VulkanContext *ctx,
     VkFormat             format,
     VkImageUsageFlags    usage,
     VkImageTiling        tiling,
     bool                 with_modifier,
-    uint64_t             modifier
+    uint64_t             modifier,
+    bool                 mutable_bgra8
 ) {
+    const VkFormat view_formats[2] = {
+        VK_FORMAT_B8G8R8A8_UNORM,
+        VK_FORMAT_B8G8R8A8_SRGB,
+    };
+    VkImageFormatListCreateInfo format_list = {
+        .sType           = VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO,
+        .pNext           = nullptr,
+        .viewFormatCount = 2u,
+        .pViewFormats    = view_formats,
+    };
     VkPhysicalDeviceImageDrmFormatModifierInfoEXT modifier_info = {
         .sType             = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT,
-        .pNext             = nullptr,
+        .pNext             = mutable_bgra8 ? (const void *)&format_list : nullptr,
         .drmFormatModifier = modifier,
         .sharingMode       = VK_SHARING_MODE_EXCLUSIVE,
     };
     VkPhysicalDeviceExternalImageFormatInfo external_format = {
         .sType      = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO,
-        .pNext      = with_modifier ? &modifier_info : nullptr,
+        .pNext      = with_modifier
+            ? (const void *)&modifier_info
+            : (mutable_bgra8 ? (const void *)&format_list : nullptr),
         .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
     };
     VkPhysicalDeviceImageFormatInfo2 format_info = {
@@ -176,7 +192,7 @@ static VulkanResult image_is_exportable(
         .type   = VK_IMAGE_TYPE_2D,
         .tiling = tiling,
         .usage  = usage,
-        .flags  = 0,
+        .flags  = mutable_bgra8 ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0u,
     };
     VkExternalImageFormatProperties external_props = {
         .sType = VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES,
@@ -185,7 +201,6 @@ static VulkanResult image_is_exportable(
         .sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2,
         .pNext = &external_props,
     };
-
     VkResult format_res = vkGetPhysicalDeviceImageFormatProperties2(
         ctx->physical_device, &format_info, &format_props2);
     if (format_res != VK_SUCCESS) {
@@ -209,12 +224,12 @@ static VulkanResult collect_export_modifiers_filtered(
     VkImageUsageFlags     usage,
     const uint64_t       *filter_modifiers,
     uint32_t              filter_count,
+    bool                  mutable_bgra8,
     uint64_t            **out_modifiers,
     uint32_t             *out_count
 ) {
     *out_modifiers = nullptr;
     *out_count = 0;
-
     VkDrmFormatModifierPropertiesListEXT list = {
         .sType = VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT,
     };
@@ -271,7 +286,7 @@ static VulkanResult collect_export_modifiers_filtered(
 
         VulkanResult exportable = image_is_exportable(
             ctx, format, usage, VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
-            true, props[i].drmFormatModifier);
+            true, props[i].drmFormatModifier, mutable_bgra8);
         if (result_is_memory_error(exportable)) {
             fatal = exportable;
             break;
@@ -294,14 +309,24 @@ static VulkanResult collect_export_modifiers_filtered(
         return fatal;
     }
 
-    if (tiled_count > 0) {
-        *out_modifiers = tiled;
-        *out_count = tiled_count;
-        free(linear);
-    } else if (linear_count > 0) {
-        *out_modifiers = linear;
-        *out_count = linear_count;
+    if (tiled_count > 0 || linear_count > 0) {
+        uint64_t *combined = calloc(tiled_count + linear_count, sizeof(*combined));
+        if (combined == nullptr) {
+            free(tiled);
+            free(linear);
+            free(props);
+            return VULKAN_ERROR_OUT_OF_HOST_MEMORY;
+        }
+        if (tiled_count > 0) {
+            memcpy(combined, tiled, tiled_count * sizeof(uint64_t));
+        }
+        if (linear_count > 0) {
+            memcpy(combined + tiled_count, linear, linear_count * sizeof(uint64_t));
+        }
+        *out_modifiers = combined;
+        *out_count     = tiled_count + linear_count;
         free(tiled);
+        free(linear);
     } else {
         free(tiled);
         free(linear);
@@ -319,28 +344,40 @@ static VulkanResult create_bound_export_image(
     VkImageTiling          tiling,
     const uint64_t        *modifiers,
     uint32_t               modifier_count,
+    bool                   mutable_bgra8,
     VulkanExportableImage *out_image
 ) {
     const bool modifier_tiling = tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
     if (modifier_tiling && (modifiers == nullptr || modifier_count == 0)) {
         return VULKAN_ERROR_INVALID_ARGUMENT;
     }
-
+    const VkFormat view_formats[2] = {
+        VK_FORMAT_B8G8R8A8_UNORM,
+        VK_FORMAT_B8G8R8A8_SRGB,
+    };
+    VkImageFormatListCreateInfo format_list = {
+        .sType           = VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO,
+        .pNext           = nullptr,
+        .viewFormatCount = 2u,
+        .pViewFormats    = view_formats,
+    };
     VkImageDrmFormatModifierListCreateInfoEXT modifier_list = {
         .sType                  = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT,
-        .pNext                  = nullptr,
+        .pNext                  = mutable_bgra8 ? (const void *)&format_list : nullptr,
         .drmFormatModifierCount = modifier_count,
         .pDrmFormatModifiers    = modifiers,
     };
     VkExternalMemoryImageCreateInfo ext_image_info = {
         .sType       = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
-        .pNext       = modifier_tiling ? &modifier_list : nullptr,
+        .pNext       = modifier_tiling
+            ? (const void *)&modifier_list
+            : (mutable_bgra8 ? (const void *)&format_list : nullptr),
         .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
     };
     VkImageCreateInfo image_info = {
         .sType         = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
         .pNext         = &ext_image_info,
-        .flags         = 0,
+        .flags         = mutable_bgra8 ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0u,
         .imageType     = VK_IMAGE_TYPE_2D,
         .format        = format,
         .extent        = {.width = width, .height = height, .depth = 1},
@@ -361,12 +398,21 @@ static VulkanResult create_bound_export_image(
         return map_image_vkresult(img_res);
     }
 
-    VkMemoryRequirements mem_reqs;
-    vkGetImageMemoryRequirements(ctx->device, image, &mem_reqs);
+    VkImageMemoryRequirementsInfo2 mem_reqs_info = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2,
+        .pNext = nullptr,
+        .image = image,
+    };
+    VkMemoryRequirements2 mem_reqs2 = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2,
+        .pNext = nullptr,
+    };
+    vkGetImageMemoryRequirements2(ctx->device, &mem_reqs_info, &mem_reqs2);
+    const VkMemoryRequirements *mem_reqs = &mem_reqs2.memoryRequirements;
 
     uint32_t memory_type_index = 0;
     VulkanResult mem_type_res = vulkan_find_memory_type(
-        ctx, mem_reqs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &memory_type_index);
+        ctx, mem_reqs->memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &memory_type_index);
     if (mem_type_res != VULKAN_SUCCESS) {
         fprintf(stderr, "[Vulkan Error] Could not find device-local memory type for DMA-BUF image\n");
         vkDestroyImage(ctx->device, image, nullptr);
@@ -387,7 +433,7 @@ static VulkanResult create_bound_export_image(
     VkMemoryAllocateInfo alloc_info = {
         .sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
         .pNext           = &dedicated_info,
-        .allocationSize  = mem_reqs.size,
+        .allocationSize  = mem_reqs->size,
         .memoryTypeIndex = memory_type_index,
     };
 
@@ -400,9 +446,16 @@ static VulkanResult create_bound_export_image(
         return map_image_vkresult(alloc_res);
     }
 
-    VkResult bind_res = vkBindImageMemory(ctx->device, image, memory, 0);
+    VkBindImageMemoryInfo bind_info = {
+        .sType        = VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_INFO,
+        .pNext        = nullptr,
+        .image        = image,
+        .memory       = memory,
+        .memoryOffset = 0,
+    };
+    VkResult bind_res = vkBindImageMemory2(ctx->device, 1u, &bind_info);
     if (bind_res != VK_SUCCESS) {
-        fprintf(stderr, "[Vulkan Error] vkBindImageMemory failed: %s (%d)\n",
+        fprintf(stderr, "[Vulkan Error] vkBindImageMemory2 failed: %s (%d)\n",
                 vulkan_vkresult_to_str(bind_res), (int)bind_res);
         destroy_unexported_image(ctx->device, image, memory);
         return map_image_vkresult(bind_res);
@@ -442,17 +495,34 @@ static VulkanResult create_bound_export_image(
     VkDeviceSize plane_offset = 0;
     VkDeviceSize plane_row_pitch = 0;
     if (modifier_tiling || tiling == VK_IMAGE_TILING_LINEAR) {
-        VkImageSubresource subres = {
-            .aspectMask = modifier_tiling
-                ? VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT
-                : VK_IMAGE_ASPECT_COLOR_BIT,
-            .mipLevel   = 0,
-            .arrayLayer = 0,
+        VkImageSubresource2 subres2 = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_SUBRESOURCE_2,
+            .pNext = nullptr,
+            .imageSubresource = {
+                .aspectMask = modifier_tiling
+                    ? VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT
+                    : VK_IMAGE_ASPECT_COLOR_BIT,
+                .mipLevel   = 0,
+                .arrayLayer = 0,
+            },
         };
-        VkSubresourceLayout layout = {0};
-        vkGetImageSubresourceLayout(ctx->device, image, &subres, &layout);
-        plane_offset = layout.offset;
-        plane_row_pitch = layout.rowPitch;
+        VkSubresourceLayout2 layout2 = {
+            .sType = VK_STRUCTURE_TYPE_SUBRESOURCE_LAYOUT_2,
+            .pNext = nullptr,
+        };
+        if (ctx->device_info.supports_maintenance5 && !modifier_tiling) {
+            VkDeviceImageSubresourceInfo dev_subres_info = {
+                .sType       = VK_STRUCTURE_TYPE_DEVICE_IMAGE_SUBRESOURCE_INFO,
+                .pNext       = nullptr,
+                .pCreateInfo = &image_info,
+                .pSubresource = &subres2,
+            };
+            vkGetDeviceImageSubresourceLayout(ctx->device, &dev_subres_info, &layout2);
+        } else {
+            vkGetImageSubresourceLayout2(ctx->device, image, &subres2, &layout2);
+        }
+        plane_offset    = layout2.subresourceLayout.offset;
+        plane_row_pitch = layout2.subresourceLayout.rowPitch;
     }
 
     if (ctx->dispatch.vkGetMemoryFdKHR == nullptr) {
@@ -491,37 +561,10 @@ static VulkanResult create_bound_export_image(
     out_image->tiling = tiling;
     out_image->drm_format_modifier = chosen_modifier;
     out_image->has_drm_format_modifier = has_modifier;
-    out_image->allocation_size = mem_reqs.size;
+    out_image->allocation_size = mem_reqs->size;
     out_image->offset = plane_offset;
     out_image->row_pitch = plane_row_pitch;
     return VULKAN_SUCCESS;
-}
-
-static VulkanResult try_fixed_tiling(
-    VulkanContext         *ctx,
-    uint32_t               width,
-    uint32_t               height,
-    VkFormat               format,
-    VkImageUsageFlags      usage,
-    VkFormatFeatureFlags   format_features,
-    VkFormatFeatureFlags   required_features,
-    VkImageTiling          tiling,
-    VulkanExportableImage *out_image,
-    bool                  *tried
-) {
-    *tried = false;
-    if (!features_cover(format_features, required_features)) {
-        return VULKAN_ERROR_FORMAT_NOT_SUPPORTED;
-    }
-
-    VulkanResult exportable = image_is_exportable(ctx, format, usage, tiling, false, 0);
-    if (exportable != VULKAN_SUCCESS) {
-        return exportable;
-    }
-
-    *tried = true;
-    return create_bound_export_image(ctx, width, height, format, usage, tiling,
-                                     nullptr, 0, out_image);
 }
 
 VulkanResult vulkan_create_exportable_image_with_modifiers(
@@ -542,7 +585,6 @@ VulkanResult vulkan_create_exportable_image_with_modifiers(
         ctx->dispatch.vkGetImageDrmFormatModifierPropertiesEXT == nullptr) {
         return VULKAN_ERROR_FORMAT_NOT_SUPPORTED;
     }
-
     VkFormatFeatureFlags required_features = 0;
     if (!usage_to_required_features(usage, &required_features)) {
         return VULKAN_ERROR_INVALID_ARGUMENT;
@@ -550,14 +592,29 @@ VulkanResult vulkan_create_exportable_image_with_modifiers(
 
     *out_image = (VulkanExportableImage){ .dmabuf_fd = -1 };
 
+    const bool can_try_mutable = format_uses_bgra8_view_list(format);
+    bool use_mutable = can_try_mutable;
     uint64_t *modifiers = nullptr;
     uint32_t modifier_count = 0;
+
     VulkanResult collected = collect_export_modifiers_filtered(
         ctx, format, required_features, usage,
-        allowed_modifiers, allowed_modifier_count,
+        allowed_modifiers, allowed_modifier_count, use_mutable,
         &modifiers, &modifier_count);
     if (collected != VULKAN_SUCCESS) {
         return collected;
+    }
+    if (modifier_count == 0 && use_mutable) {
+        free(modifiers);
+        modifiers = nullptr;
+        use_mutable = false;
+        collected = collect_export_modifiers_filtered(
+            ctx, format, required_features, usage,
+            allowed_modifiers, allowed_modifier_count, false,
+            &modifiers, &modifier_count);
+        if (collected != VULKAN_SUCCESS) {
+            return collected;
+        }
     }
     if (modifier_count == 0) {
         free(modifiers);
@@ -566,7 +623,7 @@ VulkanResult vulkan_create_exportable_image_with_modifiers(
 
     VulkanResult created = create_bound_export_image(
         ctx, width, height, format, usage, VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
-        modifiers, modifier_count, out_image);
+        modifiers, modifier_count, use_mutable, out_image);
     free(modifiers);
     if (created != VULKAN_SUCCESS) {
         return created;
@@ -581,106 +638,6 @@ VulkanResult vulkan_create_exportable_image_with_modifiers(
     return VULKAN_SUCCESS;
 }
 
-VulkanResult vulkan_create_exportable_image(
-    VulkanContext         *ctx,
-    uint32_t               width,
-    uint32_t               height,
-    VkFormat               format,
-    VkImageUsageFlags      usage,
-    VulkanExportTiling     tiling_policy,
-    VulkanExportableImage *out_image
-) {
-    if (ctx == nullptr || out_image == nullptr || width == 0 || height == 0 ||
-        ctx->device == VK_NULL_HANDLE) {
-        return VULKAN_ERROR_INVALID_ARGUMENT;
-    }
-    if (tiling_policy != VULKAN_EXPORT_TILING_AUTO &&
-        tiling_policy != VULKAN_EXPORT_TILING_DRM_MODIFIER &&
-        tiling_policy != VULKAN_EXPORT_TILING_LINEAR &&
-        tiling_policy != VULKAN_EXPORT_TILING_OPTIMAL) {
-        return VULKAN_ERROR_INVALID_ARGUMENT;
-    }
-
-    VkFormatFeatureFlags required_features = 0;
-    if (!usage_to_required_features(usage, &required_features)) {
-        return VULKAN_ERROR_INVALID_ARGUMENT;
-    }
-
-    *out_image = (VulkanExportableImage){.dmabuf_fd = -1};
-
-    VkFormatProperties format_props;
-    vkGetPhysicalDeviceFormatProperties(ctx->physical_device, format, &format_props);
-
-    const bool want_modifier = tiling_policy == VULKAN_EXPORT_TILING_AUTO ||
-                               tiling_policy == VULKAN_EXPORT_TILING_DRM_MODIFIER;
-    const bool want_linear = tiling_policy == VULKAN_EXPORT_TILING_AUTO ||
-                             tiling_policy == VULKAN_EXPORT_TILING_LINEAR;
-    const bool want_optimal = tiling_policy == VULKAN_EXPORT_TILING_AUTO ||
-                              tiling_policy == VULKAN_EXPORT_TILING_OPTIMAL;
-
-    bool tried_modifier = false;
-    bool tried_linear = false;
-    bool tried_optimal = false;
-
-    if (want_modifier && ctx->device_info.supports_drm_format_modifiers &&
-        ctx->dispatch.vkGetImageDrmFormatModifierPropertiesEXT != nullptr) {
-        uint64_t *modifiers = nullptr;
-        uint32_t modifier_count = 0;
-        VulkanResult collected = collect_export_modifiers_filtered(
-            ctx, format, required_features, usage, nullptr, 0, &modifiers, &modifier_count);
-        if (collected != VULKAN_SUCCESS) {
-            return collected;
-        }
-        if (modifier_count > 0) {
-            tried_modifier = true;
-            VulkanResult created = create_bound_export_image(
-                ctx, width, height, format, usage, VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
-                modifiers, modifier_count, out_image);
-            free(modifiers);
-            if (created == VULKAN_SUCCESS || result_is_memory_error(created) ||
-                created == VULKAN_ERROR_FUNCTION_POINTER_MISSING) {
-                return created;
-            }
-            fprintf(stderr,
-                    "[Vulkan Warn] DRM-modifier DMA-BUF export failed (%s). %s\n",
-                    vulkan_result_to_str(created),
-                    want_linear || want_optimal ? "Trying another tiling." : "No fallback tiling was requested.");
-        } else {
-            free(modifiers);
-        }
-    }
-
-    if (out_image->image == VK_NULL_HANDLE && want_linear) {
-        VulkanResult created = try_fixed_tiling(
-            ctx, width, height, format, usage, format_props.linearTilingFeatures,
-            required_features, VK_IMAGE_TILING_LINEAR, out_image, &tried_linear);
-        if (created == VULKAN_SUCCESS || result_is_memory_error(created) ||
-            created == VULKAN_ERROR_FUNCTION_POINTER_MISSING) {
-            return created;
-        }
-    }
-
-    if (out_image->image == VK_NULL_HANDLE && want_optimal) {
-        VulkanResult created = try_fixed_tiling(
-            ctx, width, height, format, usage, format_props.optimalTilingFeatures,
-            required_features, VK_IMAGE_TILING_OPTIMAL, out_image, &tried_optimal);
-        if (created == VULKAN_SUCCESS || result_is_memory_error(created) ||
-            created == VULKAN_ERROR_FUNCTION_POINTER_MISSING) {
-            return created;
-        }
-    }
-
-    fprintf(stderr,
-            "[Vulkan Error] No DMA-BUF tiling supports format %d usage 0x%x "
-            "(drm-modifier %s, linear %s, optimal %s)\n",
-            (int)format,
-            usage,
-            tried_modifier ? "tried" : "unavailable",
-            tried_linear ? "tried" : "unavailable",
-            tried_optimal ? "tried" : "unavailable");
-    return VULKAN_ERROR_FORMAT_NOT_SUPPORTED;
-}
-
 void vulkan_destroy_exportable_image(
     VulkanContext         *ctx,
     VulkanExportableImage *image
@@ -688,7 +645,6 @@ void vulkan_destroy_exportable_image(
     if (ctx == nullptr || image == nullptr) {
         return;
     }
-
     if (image->dmabuf_fd >= 0) {
         close(image->dmabuf_fd);
         image->dmabuf_fd = -1;
@@ -721,7 +677,6 @@ VulkanResult vulkan_command_pool_create(VulkanContext *ctx) {
     if (ctx == nullptr || ctx->device == VK_NULL_HANDLE) {
         return VULKAN_ERROR_INVALID_ARGUMENT;
     }
-
     VkCommandPoolCreateInfo pool_info = {
         .sType            = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
         .pNext            = nullptr,
@@ -744,7 +699,6 @@ void vulkan_command_pool_destroy(VulkanContext *ctx) {
     if (ctx == nullptr || ctx->device == VK_NULL_HANDLE || ctx->cmd_pool == VK_NULL_HANDLE) {
         return;
     }
-
     vkDestroyCommandPool(ctx->device, ctx->cmd_pool, nullptr);
     ctx->cmd_pool = VK_NULL_HANDLE;
 }

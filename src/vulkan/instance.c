@@ -12,7 +12,6 @@ static void prefer_one_validation_manifest(void) {
     if (getenv("VK_LAYER_PATH") != nullptr) {
         return;
     }
-
     const char *local_dir = "/usr/local/share/vulkan/explicit_layer.d";
     const char *local_json = "/usr/local/share/vulkan/explicit_layer.d/VkLayer_khronos_validation.json";
     const char *distro_json = "/usr/share/vulkan/explicit_layer.d/VkLayer_khronos_validation.json";
@@ -57,17 +56,11 @@ static void prefer_one_validation_manifest(void) {
         setenv("VK_LAYER_PATH", path, 0);
     }
 }
-#endif
 
-#if defined(ENGINE_DEBUG)
-/**
- * @brief Checks if a specific Vulkan instance layer is installed on the host.
- */
 static bool is_layer_supported(const char *layer_name) {
     if (layer_name == nullptr) {
         return false;
     }
-
     uint32_t layer_count = 0;
     if (vkEnumerateInstanceLayerProperties(&layer_count, nullptr) != VK_SUCCESS || layer_count == 0) {
         return false;
@@ -96,14 +89,10 @@ static bool is_layer_supported(const char *layer_name) {
     return found;
 }
 
-/**
- * @brief Checks if a specific Vulkan instance extension is supported by the host loader.
- */
 static bool is_extension_supported(const char *extension_name) {
     if (extension_name == nullptr) {
         return false;
     }
-
     uint32_t extension_count = 0;
     if (vkEnumerateInstanceExtensionProperties(nullptr, &extension_count, nullptr) != VK_SUCCESS || extension_count == 0) {
         return false;
@@ -132,31 +121,27 @@ static bool is_extension_supported(const char *extension_name) {
     return found;
 }
 
-/**
- * @brief Colorized terminal callback for Vulkan validation layer diagnostics.
- */
 static VKAPI_ATTR VkBool32 VKAPI_CALL vulkan_debug_messenger_callback(
     VkDebugUtilsMessageSeverityFlagBitsEXT           message_severity,
     VkDebugUtilsMessageTypeFlagsEXT                  message_type,
-    const VkDebugUtilsMessengerCallbackDataEXT*     callback_data,
+    const VkDebugUtilsMessengerCallbackDataEXT*      callback_data,
     void*                                            user_data
 ) {
     (void)user_data;
-
     const char *prefix_color = "\033[0m";
     const char *prefix_str   = "[Vulkan]";
 
     if (message_severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) {
-        prefix_color = "\033[1;31m"; // Bold Red
+        prefix_color = "\033[1;31m";
         prefix_str   = "[Vulkan Error]";
     } else if (message_severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT) {
-        prefix_color = "\033[1;33m"; // Bold Yellow
+        prefix_color = "\033[1;33m";
         prefix_str   = "[Vulkan Warn]";
     } else if (message_type & VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT) {
-        prefix_color = "\033[1;35m"; // Bold Magenta
+        prefix_color = "\033[1;35m";
         prefix_str   = "[Vulkan Perf]";
     } else if (message_severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT) {
-        prefix_color = "\033[0;36m"; // Cyan
+        prefix_color = "\033[0;36m";
         prefix_str   = "[Vulkan Info]";
     }
 
@@ -168,14 +153,9 @@ static VKAPI_ATTR VkBool32 VKAPI_CALL vulkan_debug_messenger_callback(
                               : "(No message)";
 
     fprintf(stderr, "%s%s\033[0m (%s): %s\n", prefix_color, prefix_str, id_name, msg);
-
-    // Vulkan specification states applications must return VK_FALSE
     return VK_FALSE;
 }
 
-/**
- * @brief Configures standard debug utils messenger parameters.
- */
 static void setup_debug_messenger_create_info(VkDebugUtilsMessengerCreateInfoEXT *info) {
     *info = (VkDebugUtilsMessengerCreateInfoEXT){
         .sType           = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,
@@ -196,7 +176,6 @@ VulkanResult vulkan_instance_create(VulkanContext *ctx) {
     if (ctx == nullptr) {
         return VULKAN_ERROR_INVALID_ARGUMENT;
     }
-
 #if defined(ENGINE_DEBUG)
     prefer_one_validation_manifest();
 #endif
@@ -233,7 +212,6 @@ VulkanResult vulkan_instance_create(VulkanContext *ctx) {
     const char *enabled_layers[4] = {0};
     uint32_t    enabled_layer_count = 0;
     bool        enable_validation   = false;
-
 #if defined(ENGINE_DEBUG)
     const char *validation_layer = "VK_LAYER_KHRONOS_validation";
     if (is_layer_supported(validation_layer)) {
@@ -249,7 +227,6 @@ VulkanResult vulkan_instance_create(VulkanContext *ctx) {
     // 4. Configure extension selection with safe probing (strictly ZERO WSI extensions)
     const char *enabled_extensions[4] = {0};
     uint32_t    enabled_extension_count = 0;
-
 #if defined(ENGINE_DEBUG)
     bool enable_debug_utils = false;
     const char *debug_utils_ext = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
@@ -270,7 +247,6 @@ VulkanResult vulkan_instance_create(VulkanContext *ctx) {
         .enabledExtensionCount   = enabled_extension_count,
         .ppEnabledExtensionNames = enabled_extensions,
     };
-
 #if defined(ENGINE_DEBUG)
     VkDebugUtilsMessengerCreateInfoEXT debug_create_info = {0};
     if (enable_debug_utils) {
@@ -305,7 +281,6 @@ VulkanResult vulkan_instance_create(VulkanContext *ctx) {
         ctx->dispatch.vkDestroyDebugUtilsMessengerEXT =
             (PFN_vkDestroyDebugUtilsMessengerEXT)vkGetInstanceProcAddr(
                 ctx->instance, "vkDestroyDebugUtilsMessengerEXT");
-
         if (ctx->dispatch.vkCreateDebugUtilsMessengerEXT != nullptr) {
             VkResult msg_res = ctx->dispatch.vkCreateDebugUtilsMessengerEXT(
                 ctx->instance, &debug_create_info, nullptr, &ctx->debug_messenger);
@@ -318,7 +293,6 @@ VulkanResult vulkan_instance_create(VulkanContext *ctx) {
         }
     }
 #endif
-
     return VULKAN_SUCCESS;
 }
 
@@ -326,9 +300,6 @@ void vulkan_instance_destroy(VulkanContext *ctx) {
     if (ctx == nullptr || ctx->instance == VK_NULL_HANDLE) {
         return;
     }
-
-    // Symmetric LIFO destruction:
-    // 1. Destroy debug messenger before the instance
     if (ctx->debug_messenger != VK_NULL_HANDLE) {
         if (ctx->dispatch.vkDestroyDebugUtilsMessengerEXT != nullptr) {
             ctx->dispatch.vkDestroyDebugUtilsMessengerEXT(ctx->instance, ctx->debug_messenger, nullptr);
@@ -336,11 +307,9 @@ void vulkan_instance_destroy(VulkanContext *ctx) {
         ctx->debug_messenger = VK_NULL_HANDLE;
     }
 
-    // 2. Destroy the instance
     vkDestroyInstance(ctx->instance, nullptr);
     ctx->instance = VK_NULL_HANDLE;
 
-    // Reset dispatch entry points
     ctx->dispatch.vkCreateDebugUtilsMessengerEXT  = nullptr;
     ctx->dispatch.vkDestroyDebugUtilsMessengerEXT = nullptr;
     ctx->validation_enabled                       = false;

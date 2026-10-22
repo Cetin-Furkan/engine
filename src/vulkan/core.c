@@ -19,7 +19,6 @@ VulkanResult vulkan_context_init(VulkanContext *ctx) {
     if (ctx == nullptr) {
         return VULKAN_ERROR_INVALID_ARGUMENT;
     }
-
     if (ctx->is_initialized) {
         vulkan_context_shutdown(ctx);
     }
@@ -83,19 +82,25 @@ VulkanResult vulkan_context_init(VulkanContext *ctx) {
                 "[Vulkan Warn] Two roles share one VkQueue. Concurrent submits on those roles must be externally synchronized.\n");
     }
 
-    printf("[Vulkan] Capabilities: DMA-BUF=%s, DRM-Modifiers=%s, Syncobj=%s, BDA=%s, ScalarLayout=%s, Anisotropy=%s, DynRender=%s, Sync2=%s, Timeline=%s, Maint5=%s, Maint6=%s, PushDesc=%s\n",
+    printf("[Vulkan] Capabilities: DMA-BUF=%s, DRM-Modifiers=%s, ForeignQueue=%s, Syncobj=%s, BDA=%s, ScalarLayout=%s, Anisotropy=%s, DynRender=%s, LocalRead=%s, Sync2=%s, Timeline=%s, Maint5=%s, Maint6=%s, PushDesc=%s, HostImageCopy=%s, Int16=%s, Int64=%s, Storage16=%s\n",
            ctx->device_info.supports_dma_buf ? "yes" : "no",
            ctx->device_info.supports_drm_format_modifiers ? "yes" : "no",
+           ctx->device_info.supports_queue_family_foreign ? "yes" : "no",
            ctx->device_info.supports_external_syncobj ? "yes" : "no",
            ctx->device_info.supports_buffer_device_address ? "yes" : "no",
            ctx->device_info.supports_scalar_block_layout ? "yes" : "no",
            ctx->device_info.supports_sampler_anisotropy ? "yes" : "no",
            ctx->device_info.supports_dynamic_rendering ? "yes" : "no",
+           ctx->device_info.supports_dynamic_rendering_local_read ? "yes" : "no",
            ctx->device_info.supports_synchronization2 ? "yes" : "no",
            ctx->device_info.supports_timeline_semaphore ? "yes" : "no",
            ctx->device_info.supports_maintenance5 ? "yes" : "no",
            ctx->device_info.supports_maintenance6 ? "yes" : "no",
-           ctx->device_info.supports_push_descriptors ? "yes" : "no");
+           ctx->device_info.supports_push_descriptors ? "yes" : "no",
+           ctx->device_info.supports_host_image_copy ? "yes" : "no",
+           ctx->device_info.supports_shader_int16 ? "yes" : "no",
+           ctx->device_info.supports_shader_int64 ? "yes" : "no",
+           ctx->device_info.supports_storage_buffer_16bit ? "yes" : "no");
 
     if (ctx->device_info.has_drm_render_node || ctx->device_info.has_drm_primary_node) {
         printf("[Vulkan] DRM Device Nodes: Primary=%s (%lld:%lld), Render=%s (%lld:%lld)\n",
@@ -124,7 +129,6 @@ void vulkan_context_shutdown(VulkanContext *ctx) {
                         vulkan_vkresult_to_str(wait), (int)wait);
             }
         }
-
         vulkan_command_pool_destroy(ctx);
         vulkan_device_destroy(ctx);
         vulkan_instance_destroy(ctx);

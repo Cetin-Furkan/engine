@@ -18,6 +18,10 @@ layout(buffer_reference, scalar, buffer_reference_align = 4) buffer Mesh {
 layout(location = 0) centroid out vec3 v_nrm;
 layout(location = 1) centroid out vec3 v_albedo;
 
+layout(buffer_reference, scalar, buffer_reference_align = 4) buffer Heat {
+    float t[];
+};
+
 layout(push_constant, scalar) uniform Screen {
     uint64_t verts;
     uint width;
@@ -26,6 +30,8 @@ layout(push_constant, scalar) uniform Screen {
     float origin_x;
     float origin_y;
     float depth_bias;
+    uint64_t heat;
+    float phase;
 } screen;
 
 const float k_edge_px = 240.0;
@@ -55,5 +61,14 @@ void main() {
                        0.5 - p.z / 4096.0 - screen.depth_bias,
                        1.0);
     v_nrm = pose * in_nrm;
-    v_albedo = in_albedo;
+    // One hue turn per revolution. The position term is a gradient across
+    // the fillet, so the same phase paints the same colors. Heat still wins.
+    vec3 axis = vec3(0.57735026919);
+    float ang = 6.28318530718 * (screen.phase + dot(in_pos, vec3(0.10, 0.14, 0.08)));
+    float c = cos(ang);
+    float s = sin(ang);
+    vec3 spun = in_albedo * c + cross(axis, in_albedo) * s + axis * dot(axis, in_albedo) * (1.0 - c);
+    vec3 graded = clamp(spun, 0.0, 1.0);
+    float temp = clamp(Heat(screen.heat).t[uint(gl_VertexIndex)], 0.0, 1.0);
+    v_albedo = mix(graded, vec3(1.0, 0.42, 0.12), temp);
 }

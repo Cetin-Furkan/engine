@@ -1,0 +1,98 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_GOOGLE_include_directive : require
+
+// One invocation updates one fillet vertex. Positions stay in the bake.
+// Temperature is a scalar. The step blends it toward the neighbor mean.
+// dt_ms is the wl_surface.frame interval. A seed write fills the upper half.
+// A poke raises temperatures near one click. Nothing here reads the framebuffer.
+
+layout(local_size_x = 64) in;
+
+const uint k_verts = 888u;
+// Per second. A 16 ms callback moves 0.048 of the way toward the neighbors.
+const float k_rate = 3.0;
+
+layout(buffer_reference, scalar, buffer_reference_align = 4) buffer Field {
+    float t[];
+};
+
+layout(buffer_reference, scalar, buffer_reference_align = 4) buffer Mesh {
+    float f[];
+};
+
+layout(push_constant, scalar) uniform Push {
+    uint64_t src;
+    uint64_t dst;
+    uint64_t verts;
+    uint dt_ms;
+    uint seed;
+    uint poke;
+    float poke_x;
+    float poke_y;
+    float yaw_deg;
+} pc;
+
+#include "heat_nbr.inc"
+
+// Same pose as cube.vert. The face interiors have no samples, so a click
+// in the middle of a face is about 100 px from the nearest edge. The spot
+// stays fully hot through that gap and fades before the far side of the cube.
+const float k_edge_px = 240.0;
+const float k_spot_inner = 72.0;
+const float k_spot_outer = 168.0;
+
+bool upper_half(uint id) {
+    return (k_hot_bits[id >> 5u] & (1u << (id & 31u))) != 0u;
+}
+
+vec2 placed(vec3 in_pos, float yaw_deg) {
+    const float ax = radians(28.0);
+    float ay = radians(yaw_deg);
+    mat3 rx = mat3(vec3(1.0, 0.0, 0.0),
+                   vec3(0.0, cos(ax), sin(ax)),
+                   vec3(0.0, -sin(ax), cos(ax)));
+    mat3 ry = mat3(vec3(cos(ay), 0.0, -sin(ay)),
+                   vec3(0.0, 1.0, 0.0),
+                   vec3(sin(ay), 0.0, cos(ay)));
+    vec3 p = ((ry * rx) * in_pos) * (k_edge_px * 0.5);
+    return p.xy;
+}
+
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    if (id >= k_verts) {
+        return;
+    }
+    Field out_field = Field(pc.dst);
+    if (pc.seed != 0u) {
+        out_field.t[id] = upper_half(id) ? 1.0 : 0.0;
+        return;
+    }
+    Field in_field = Field(pc.src);
+    uint begin = k_off[id];
+    uint end = k_off[id + 1u];
+    uint n = end - begin;
+    float cur = in_field.t[id];
+    float next = cur;
+    if (n > 0u) {
+        float sum = 0.0;
+        for (uint i = begin; i < end; ++i) {
+            sum += in_field.t[k_nbr[i]];
+        }
+        float avg = sum / float(n);
+        float blend = clamp(float(pc.dt_ms) * (k_rate / 1000.0), 0.0, 1.0);
+        next = (1.0 - blend) * cur + blend * avg;
+    }
+    if (pc.poke != 0u) {
+        Mesh mesh = Mesh(pc.verts);
+        uint o = id * 9u;
+        vec2 p = placed(vec3(mesh.f[o], mesh.f[o + 1u], mesh.f[o + 2u]), pc.yaw_deg);
+        float d = distance(p, vec2(pc.poke_x, pc.poke_y));
+        float spot = 1.0 - smoothstep(k_spot_inner, k_spot_outer, d);
+        next = max(next, spot);
+    }
+    out_field.t[id] = next;
+}

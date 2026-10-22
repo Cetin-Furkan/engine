@@ -2,6 +2,7 @@
 #include "frame/cube.h"
 #include "frame/hud.h"
 #include "frame/shape.h"
+#include "frame/solid.h"
 #include "frame/world.h"
 #include "chrome/gpu.h"
 #include "chrome/layer.h"
@@ -13,6 +14,7 @@
 #include "vulkan/memory.h"
 #include <drm/drm.h>
 #include <errno.h>
+#include <linux/input-event-codes.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
@@ -197,8 +199,9 @@ static int ensure_frame_targets(VulkanContext *vk, FrameSlot *frame) {
     return 0;
 }
 
+// heat_dt is the callback interval. Zero draws the field as it stands.
 static int record_and_submit_clear(VulkanContext *vk, FrameSlot *frame, VkSemaphore acquire,
-                                   uint64_t signal_point, bool draw_live) {
+                                   uint64_t signal_point, bool draw_live, uint32_t heat_dt) {
     frame->acquire_point = signal_point;
     if (ensure_frame_targets(vk, frame) != 0) {
         return -1;
@@ -242,6 +245,9 @@ static int record_and_submit_clear(VulkanContext *vk, FrameSlot *frame, VkSemaph
         fprintf(stderr, "[Engine Error] vkBeginCommandBuffer failed: %s (%d)\n",
                 vulkan_vkresult_to_str(res), (int)res);
         return -1;
+    }
+    if (heat_dt > 0u || cube_heat_poke_pending()) {
+        cube_heat_record(frame->cmd_buf, heat_dt, world_cube_yaw_deg(draw_live));
     }
 
     VkImageMemoryBarrier2 to_attachment = {
@@ -420,6 +426,7 @@ static int record_and_submit_clear(VulkanContext *vk, FrameSlot *frame, VkSemaph
 
     res = vkEndCommandBuffer(frame->cmd_buf);
     if (res != VK_SUCCESS) {
+        cube_heat_record_abort();
         fprintf(stderr, "[Engine Error] vkEndCommandBuffer failed: %s (%d)\n",
                 vulkan_vkresult_to_str(res), (int)res);
         return -1;
@@ -430,6 +437,22 @@ static int record_and_submit_clear(VulkanContext *vk, FrameSlot *frame, VkSemaph
         .pNext         = nullptr,
         .commandBuffer = frame->cmd_buf,
         .deviceMask    = 0,
+    };
+    // The field the shaders read was written by an earlier submit. That
+    // submit signaled this acquire value at ALL_COMMANDS. Waiting it here
+    // is what makes the write visible. The signal stage is the whole
+    // command buffer, so a step waits at compute and a later draw waits
+    // at vertex. The bake's seed stays at 0 because that queue was idled.
+    uint64_t heat_point = cube_heat_published();
+    bool wait_heat = heat_point != 0 && heat_point < signal_point;
+    VkSemaphoreSubmitInfo wait_info = {
+        .sType       = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+        .pNext       = nullptr,
+        .semaphore   = acquire,
+        .value       = heat_point,
+        .stageMask   = cube_heat_step_open() ? VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT
+                                             : VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT,
+        .deviceIndex = 0,
     };
     VkSemaphoreSubmitInfo signal_info = {
         .sType       = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
@@ -443,8 +466,8 @@ static int record_and_submit_clear(VulkanContext *vk, FrameSlot *frame, VkSemaph
         .sType                    = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
         .pNext                    = nullptr,
         .flags                    = 0,
-        .waitSemaphoreInfoCount   = 0,
-        .pWaitSemaphoreInfos      = nullptr,
+        .waitSemaphoreInfoCount   = wait_heat ? 1u : 0u,
+        .pWaitSemaphoreInfos      = wait_heat ? &wait_info : nullptr,
         .commandBufferInfoCount   = 1,
         .pCommandBufferInfos      = &cmd_submit,
         .signalSemaphoreInfoCount = 1,
@@ -453,10 +476,12 @@ static int record_and_submit_clear(VulkanContext *vk, FrameSlot *frame, VkSemaph
 
     res = vkQueueSubmit2(vk->queues.graphics_queue, 1, &submit_info, VK_NULL_HANDLE);
     if (res != VK_SUCCESS) {
+        cube_heat_record_abort();
         fprintf(stderr, "[Engine Error] vkQueueSubmit2 failed: %s (%d)\n",
                 vulkan_vkresult_to_str(res), (int)res);
         return -1;
     }
+    cube_heat_record_ok(signal_point);
     return 0;
 }
 
@@ -1276,9 +1301,19 @@ static int turn_step(WaylandContext *wl, VulkanContext *vk, bool *queued) {
     if (!wl->frame_stamp_valid) {
         return 0;
     }
-    bool changed = world_advance(wl->frame_time_ms);
-    if (!changed) {
-        if (!world_busy()) {
+    uint32_t stamp = wl->frame_time_ms;
+    bool pulse_ended = false;
+    bool pulse = cube_heat_wants_frame(stamp, &pulse_ended);
+    if (pulse_ended) {
+        cube_heat_hold();
+    }
+    uint32_t heat_dt = cube_heat_interval(stamp);
+    bool changed = world_advance(stamp);
+    // The pose can stay still. An open pulse still presents, because the
+    // spot and the diffusion change the picture. The cube's yaw does not move.
+    bool paint = changed || (pulse && (heat_dt > 0u || cube_heat_poke_pending()));
+    if (!paint) {
+        if (!world_busy() && !pulse) {
             wl->frame_stamp_valid = false;
             s_turn_phase = k_turn_done;
             retire_spare(wl, vk);
@@ -1290,6 +1325,7 @@ static int turn_step(WaylandContext *wl, VulkanContext *vk, bool *queued) {
                 printf("[Engine] Turn idle. Pose repeated. Frame callback dropped.\n");
                 printf("[Engine] %u frames, %u missed.\n", frames, missed);
                 fflush(stdout);
+                cube_heat_hold();
             }
             return 0;
         }
@@ -1320,9 +1356,12 @@ static int turn_step(WaylandContext *wl, VulkanContext *vk, bool *queued) {
         rel += 1u;
     }
     uint64_t next = s_sync_point + 1u;
-    if (record_and_submit_clear(vk, spare(), s_acquire, next, true) != 0) {
+    if (record_and_submit_clear(vk, spare(), s_acquire, next, true, heat_dt) != 0) {
         spare()->acquire_point = 0;
         return -1;
+    }
+    if (heat_dt > 0u) {
+        cube_heat_commit_stamp(stamp);
     }
     s_sync_point = next;
     int q = wayland_queue_turn_commit(
@@ -1462,7 +1501,7 @@ static int queue_resize_frame(WaylandContext *wl, VulkanContext *vk) {
     }
 
     uint64_t next_point = s_sync_point + 1u;
-    if (record_and_submit_clear(vk, &fresh, s_acquire, next_point, false) != 0) {
+    if (record_and_submit_clear(vk, &fresh, s_acquire, next_point, false, 0u) != 0) {
         fresh.acquire_point = 0;
         reap_frame_resources(wl, vk, &fresh);
         return -1;
@@ -1635,11 +1674,12 @@ int engine_subsystem_init(void) {
         (void)engine_subsystem_shutdown();
         return 1;
     }
-    if (cube_init(vk) != 0 || shape_init(vk) != 0 || chrome_gpu_init(vk) != 0 || hud_init(vk) != 0) {
+    if (cube_init(vk) != 0 || solid_init(vk) != 0 || shape_init(vk) != 0 ||
+        chrome_gpu_init(vk) != 0 || hud_init(vk) != 0) {
         (void)engine_subsystem_shutdown();
         return 1;
     }
-    if (record_and_submit_clear(vk, shown(), s_acquire, 1u, false) < 0) {
+    if (record_and_submit_clear(vk, shown(), s_acquire, 1u, false, 0u) < 0) {
         (void)engine_subsystem_shutdown();
         return 1;
     }
@@ -1802,7 +1842,7 @@ int engine_subsystem_run(void) {
         return 1;
     }
 
-    printf("[Engine] Window %ux%u is up. One turn, then io_uring idle. Four clicks on empty space close a rectangle.\n",
+    printf("[Engine] Window %ux%u is up. One turn, then io_uring idle. Four clicks on empty space close a rectangle. A click on the cube plants heat for five seconds. Its colors sweep on that clock, then hold. Keys 1-6 raise a tetrahedron, octahedron, icosahedron, cylinder, cone, and torus. R spins until R again. S smooths edges. Esc clears, Backspace removes, F5 turns the selection again.\n",
            shown()->image.width, shown()->image.height);
     fflush(stdout);
 
@@ -1874,7 +1914,39 @@ int engine_subsystem_run(void) {
             while (pointer_take_spawn(&sx, &sy)) {
                 float ox = (float)sx - (float)shown()->image.width * 0.5f;
                 float oy = (float)shown()->image.height * 0.5f - (float)sy;
-                if (world_spawn(ox, oy) && s_turn_phase == k_turn_done) {
+                if (world_hits_cube(ox, oy)) {
+                    if (cube_heat_poke(ox, oy) && s_turn_phase == k_turn_done) {
+                        s_turn_phase = k_turn_arm;
+                    }
+                } else if (world_hits_solid(ox, oy)) {
+                    if (world_select_solid_at(ox, oy) && s_turn_phase == k_turn_done) {
+                        s_turn_phase = k_turn_arm;
+                    }
+                } else if (world_select_at(ox, oy)) {
+                    if (s_turn_phase == k_turn_done) {
+                        s_turn_phase = k_turn_arm;
+                    }
+                } else if (world_spawn(ox, oy) && s_turn_phase == k_turn_done) {
+                    s_turn_phase = k_turn_arm;
+                }
+            }
+            uint32_t key = 0;
+            while (pointer_take_key(&key)) {
+                bool changed = false;
+                if (key == KEY_ESC) {
+                    changed = world_cancel();
+                } else if (key == KEY_BACKSPACE) {
+                    changed = world_delete();
+                } else if (key == KEY_F5) {
+                    changed = world_respin_selected();
+                } else if (key == KEY_R) {
+                    changed = world_toggle_spin();
+                } else if (key == KEY_S) {
+                    changed = world_toggle_smooth();
+                } else if (key >= KEY_1 && key <= KEY_6) {
+                    changed = world_raise_solid(key - KEY_1);
+                }
+                if (changed && s_turn_phase == k_turn_done) {
                     s_turn_phase = k_turn_arm;
                 }
             }
@@ -2164,6 +2236,7 @@ int engine_subsystem_shutdown(void) {
         chrome_gpu_shutdown(vk);
         hud_shutdown(vk);
         shape_shutdown(vk);
+        solid_shutdown(vk);
         cube_shutdown(vk);
     }
 

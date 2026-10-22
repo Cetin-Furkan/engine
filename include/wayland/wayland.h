@@ -76,6 +76,7 @@ typedef struct WaylandContext {
     uint32_t viewporter_id;
     uint32_t viewport_id;
     uint32_t pointer_id;
+    uint32_t keyboard_id;
     uint32_t cursor_shape_device_id;
     uint32_t seat_capabilities;
     bool     shm_argb8888;
@@ -186,6 +187,9 @@ typedef struct WaylandContext {
 void wayland_shutdown(void);
 [[nodiscard]] WaylandContext *wayland_get_context(void);
 [[nodiscard]] uint32_t wayland_alloc_id(WaylandContext *w);
+
+// The next SCM_RIGHTS fd, in arrival order. The caller closes it.
+[[nodiscard]] bool wayland_take_parked_fd(WaylandContext *w, int *out_fd);
 void wayland_on_cqe(WaylandContext *w, const struct io_uring_cqe *cqe);
 [[nodiscard]] int wayland_ensure_recv(WaylandContext *w);
 

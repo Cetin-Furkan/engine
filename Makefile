@@ -65,6 +65,10 @@ $(GEN_DIR)/bevel.comp.spv: shaders/bevel.comp
 	@mkdir -p $(GEN_DIR)
 	glslangValidator -V --target-env vulkan1.3 -o $@ $<
 
+$(GEN_DIR)/heat.comp.spv: shaders/heat.comp shaders/heat_nbr.inc
+	@mkdir -p $(GEN_DIR)
+	glslangValidator -V --target-env vulkan1.3 -o $@ $<
+
 $(GEN_DIR)/chrome.vert.spv: shaders/chrome.vert
 	@mkdir -p $(GEN_DIR)
 	glslangValidator -V --target-env vulkan1.3 -o $@ $<
@@ -89,7 +93,20 @@ $(GEN_DIR)/hud.frag.spv: shaders/hud.frag
 	@mkdir -p $(GEN_DIR)
 	glslangValidator -V --target-env vulkan1.3 -o $@ $<
 
-$(OBJ_DIR)/src/frame/cube.o: $(GEN_DIR)/cube.vert.spv $(GEN_DIR)/cube.frag.spv $(GEN_DIR)/bevel.comp.spv
+$(GEN_DIR)/solid.vert.spv: shaders/solid.vert
+	@mkdir -p $(GEN_DIR)
+	glslangValidator -V --target-env vulkan1.3 -o $@ $<
+
+$(GEN_DIR)/solid.frag.spv: shaders/solid.frag
+	@mkdir -p $(GEN_DIR)
+	glslangValidator -V --target-env vulkan1.3 -o $@ $<
+
+$(GEN_DIR)/solid.comp.spv: shaders/solid.comp
+	@mkdir -p $(GEN_DIR)
+	glslangValidator -V --target-env vulkan1.3 -o $@ $<
+
+$(OBJ_DIR)/src/frame/cube.o: $(GEN_DIR)/cube.vert.spv $(GEN_DIR)/cube.frag.spv $(GEN_DIR)/bevel.comp.spv $(GEN_DIR)/heat.comp.spv
+$(OBJ_DIR)/src/frame/solid.o: $(GEN_DIR)/solid.vert.spv $(GEN_DIR)/solid.frag.spv $(GEN_DIR)/solid.comp.spv
 $(OBJ_DIR)/src/frame/shape.o: $(GEN_DIR)/shape.vert.spv $(GEN_DIR)/shape.frag.spv
 $(OBJ_DIR)/src/frame/hud.o: $(GEN_DIR)/hud.vert.spv $(GEN_DIR)/hud.frag.spv
 $(OBJ_DIR)/src/chrome/gpu.o: $(GEN_DIR)/chrome.vert.spv $(GEN_DIR)/chrome.frag.spv

@@ -86,8 +86,8 @@ static void free_id(WaylandContext *w, uint32_t id) {
     w->free_id[w->nfree++] = id;
 }
 
-static bool take_parked_fd(WaylandContext *w, int *out_fd) {
-    if (w->nparked == 0) {
+bool wayland_take_parked_fd(WaylandContext *w, int *out_fd) {
+    if (w == nullptr || out_fd == nullptr || w->nparked == 0) {
         return false;
     }
     *out_fd = w->parked_fds[0];
@@ -488,7 +488,7 @@ static void parse_stream(WaylandContext *w) {
                 // format_table is an fd plus a uint byte length. The fd is not in the body.
                 uint32_t table_size = 0;
                 int fd = -1;
-                if (size < 12u || !take_u32(&p, end, &table_size) || !take_parked_fd(w, &fd)) {
+                if (size < 12u || !take_u32(&p, end, &table_size) || !wayland_take_parked_fd(w, &fd)) {
                     wl_fail(w, "zwp_linux_dmabuf_feedback_v1.format_table missing size or fd");
                     break;
                 }

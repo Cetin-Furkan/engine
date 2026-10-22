@@ -51,4 +51,9 @@ void pointer_shutdown(WaylandContext *w);
  */
 bool pointer_take_spawn(int32_t *x, int32_t *y);
 
+// One key press while this surface has keyboard focus. The code is an
+// evdev keycode. Release and repeat are not reported. Returns false when
+// none are waiting.
+bool pointer_take_key(uint32_t *key);
+
 #endif /* ENGINE_INPUT_POINTER_H */

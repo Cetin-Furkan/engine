@@ -12,6 +12,9 @@ alignas(uint32_t) static const unsigned char k_frag_spv[] = {
 alignas(uint32_t) static const unsigned char k_bevel_spv[] = {
 #embed "bevel.comp.spv"
 };
+alignas(uint32_t) static const unsigned char k_heat_spv[] = {
+#embed "heat.comp.spv"
+};
 
 // Matches shaders/bevel.comp. 6 face quads, 12 edges of 8, 8 corners of 8x8.
 // Vertices are the quad corners. Indices repeat a corner for each triangle.
@@ -28,6 +31,7 @@ static_assert(k_indices == 3684u, "fillet index count");
 static_assert(sizeof k_vert_spv % 4u == 0u, "vert spirv");
 static_assert(sizeof k_frag_spv % 4u == 0u, "frag spirv");
 static_assert(sizeof k_bevel_spv % 4u == 0u, "bevel spirv");
+static_assert(sizeof k_heat_spv % 4u == 0u, "heat spirv");
 
 typedef struct DrawPush {
     uint64_t verts;
@@ -37,21 +41,53 @@ typedef struct DrawPush {
     float    origin_x;
     float    origin_y;
     float    depth_bias;
+    uint64_t heat;
+    float    phase;
+    uint32_t pad;
 } DrawPush;
 
-enum { k_draw_push_bytes = 32 };
+enum { k_draw_push_bytes = 48 };
+
+// Three copies so a frame still reading one buffer is not overwritten by the
+// next step. Two slots can be in flight. The third is the one being written.
+// The spare wait retires the image from two presents back. It does not make
+// this step's write visible to the next submit. That submit waits
+// s_heat_published.
+enum { k_heat_copies = 3 };
 
 typedef struct MeshPush {
     uint64_t verts;
     uint64_t indices;
 } MeshPush;
 
+typedef struct HeatPush {
+    uint64_t src;
+    uint64_t dst;
+    uint64_t verts;
+    uint32_t dt_ms;
+    uint32_t seed;
+    uint32_t poke;
+    float    poke_x;
+    float    poke_y;
+    float    yaw_deg;
+} HeatPush;
+
 static_assert(offsetof(DrawPush, yaw_deg) == 16u, "yaw offset");
 static_assert(offsetof(DrawPush, origin_x) == 20u, "origin x");
 static_assert(offsetof(DrawPush, origin_y) == 24u, "origin y");
 static_assert(offsetof(DrawPush, depth_bias) == 28u, "depth bias");
+static_assert(offsetof(DrawPush, heat) == 32u, "heat address");
+static_assert(offsetof(DrawPush, phase) == 40u, "hue phase");
 static_assert(sizeof(DrawPush) == k_draw_push_bytes, "draw push");
 static_assert(sizeof(MeshPush) == 16u, "mesh push");
+static_assert(offsetof(HeatPush, verts) == 16u, "heat verts");
+static_assert(offsetof(HeatPush, dt_ms) == 24u, "heat dt");
+static_assert(offsetof(HeatPush, seed) == 28u, "heat seed");
+static_assert(offsetof(HeatPush, poke) == 32u, "heat poke");
+static_assert(offsetof(HeatPush, poke_x) == 36u, "heat poke x");
+static_assert(offsetof(HeatPush, poke_y) == 40u, "heat poke y");
+static_assert(offsetof(HeatPush, yaw_deg) == 44u, "heat yaw");
+static_assert(sizeof(HeatPush) == 48u, "heat push");
 
 static VkPipelineLayout s_layout = VK_NULL_HANDLE;
 static VkPipeline       s_pipeline = VK_NULL_HANDLE;
@@ -63,6 +99,25 @@ static VkBuffer         s_index = VK_NULL_HANDLE;
 static VkDeviceMemory   s_index_memory = VK_NULL_HANDLE;
 static VkDeviceAddress  s_mesh_addr = 0;
 static VkDeviceAddress  s_index_addr = 0;
+static VkPipelineLayout s_heat_layout = VK_NULL_HANDLE;
+static VkPipeline       s_heat_pipe = VK_NULL_HANDLE;
+static VkBuffer         s_heat_buf[k_heat_copies] = {0};
+static VkDeviceMemory   s_heat_mem[k_heat_copies] = {0};
+static VkDeviceAddress  s_heat_addr[k_heat_copies] = {0};
+static int              s_heat_read = 0;
+static int              s_heat_draw = -1;
+static bool             s_heat_have_stamp = false;
+static uint32_t         s_heat_stamp_ms = 0;
+static bool             s_heat_started = false;
+static bool             s_heat_held = false;
+static uint64_t         s_heat_published = 0;
+static float            s_poke_x = 0.0f;
+static float            s_poke_y = 0.0f;
+static bool             s_poke_pending = false;
+static bool             s_poke_armed_cb = false;
+static bool             s_pulse = false;
+static bool             s_pulse_have_t0 = false;
+static uint32_t         s_pulse_t0 = 0;
 static VkFormat             s_depth_format = VK_FORMAT_UNDEFINED;
 static VkSampleCountFlagBits s_samples = VK_SAMPLE_COUNT_1_BIT;
 static bool             s_push2 = false;
@@ -201,7 +256,59 @@ static VkShaderModule make_module(VulkanContext *vk, const uint32_t *code, uint3
     return module;
 }
 
-// One submit, then the queue is idle. Later draws do not wait on this dispatch.
+// This command buffer only. The vertex read of the buffer just written is
+// in the draw that follows. The next submit's compute read is ordered by
+// waiting s_heat_published, not by widening this barrier.
+static void barrier_heat_to_vertex(VkCommandBuffer cmd) {
+    VkMemoryBarrier2 barrier = {
+        .sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+        .srcStageMask  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        .srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+        .dstStageMask  = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT,
+        .dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
+    };
+    VkDependencyInfo dep = {
+        .sType              = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+        .memoryBarrierCount = 1,
+        .pMemoryBarriers    = &barrier,
+    };
+    vkCmdPipelineBarrier2(cmd, &dep);
+}
+
+static void dispatch_heat(VkCommandBuffer cmd, uint32_t dt_ms, uint32_t seed,
+                          int src_slot, int dst_slot, uint32_t poke, float yaw_deg) {
+    HeatPush heat_push = {
+        .src     = src_slot >= 0 ? s_heat_addr[src_slot] : 0,
+        .dst     = s_heat_addr[dst_slot],
+        .verts   = s_mesh_addr,
+        .dt_ms   = dt_ms,
+        .seed    = seed,
+        .poke    = poke,
+        .poke_x  = poke != 0u ? s_poke_x : 0.0f,
+        .poke_y  = poke != 0u ? s_poke_y : 0.0f,
+        .yaw_deg = yaw_deg,
+    };
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_heat_pipe);
+    if (s_push2) {
+        VkPushConstantsInfo push = {
+            .sType      = VK_STRUCTURE_TYPE_PUSH_CONSTANTS_INFO,
+            .layout     = s_heat_layout,
+            .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+            .offset     = 0,
+            .size       = sizeof heat_push,
+            .pValues    = &heat_push,
+        };
+        vkCmdPushConstants2(cmd, &push);
+    } else {
+        vkCmdPushConstants(cmd, s_heat_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                           sizeof heat_push, &heat_push);
+    }
+    vkCmdDispatch(cmd, (k_verts + k_local - 1u) / k_local, 1u, 1u);
+    barrier_heat_to_vertex(cmd);
+}
+
+// One submit, then the queue is idle. The seed is visible without an acquire
+// wait. A live step publishes the acquire value of its own submit.
 static int bake_mesh(VulkanContext *vk) {
     if (vk->cmd_pool == VK_NULL_HANDLE || vk->queues.graphics_queue == VK_NULL_HANDLE ||
         s_compute == VK_NULL_HANDLE) {
@@ -263,6 +370,14 @@ static int bake_mesh(VulkanContext *vk) {
         .pMemoryBarriers    = &mesh,
     };
     vkCmdPipelineBarrier2(cmd, &dep);
+    if (s_heat_pipe == VK_NULL_HANDLE || s_heat_addr[0] == 0) {
+        fprintf(stderr, "[Cube Error] Heat seed needs its pipeline and buffer\n");
+        vkFreeCommandBuffers(vk->device, vk->cmd_pool, 1, &cmd);
+        return -1;
+    }
+    dispatch_heat(cmd, 0, 1u, -1, 0, 0u, 0.0f);
+    s_heat_read = 0;
+    s_heat_draw = -1;
     res = vkEndCommandBuffer(cmd);
     if (res != VK_SUCCESS) {
         cube_fail("vkEndCommandBuffer bake", res);
@@ -326,6 +441,28 @@ int cube_init(VulkanContext *vk) {
                          &s_index, &s_index_memory, &s_index_addr) != 0) {
         cube_shutdown(vk);
         return -1;
+    }
+    s_heat_read = 0;
+    s_heat_draw = -1;
+    s_heat_have_stamp = false;
+    s_heat_stamp_ms = 0;
+    s_heat_started = false;
+    s_heat_held = false;
+    s_heat_published = 0;
+    s_poke_x = 0.0f;
+    s_poke_y = 0.0f;
+    s_poke_pending = false;
+    s_poke_armed_cb = false;
+    s_pulse = false;
+    s_pulse_have_t0 = false;
+    s_pulse_t0 = 0;
+    for (int i = 0; i < k_heat_copies; ++i) {
+        if (create_da_buffer(vk, (VkDeviceSize)k_verts * sizeof(float),
+                             VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                             &s_heat_buf[i], &s_heat_mem[i], &s_heat_addr[i]) != 0) {
+            cube_shutdown(vk);
+            return -1;
+        }
     }
 
     VkResult res = VK_SUCCESS;
@@ -487,6 +624,45 @@ int cube_init(VulkanContext *vk) {
         cube_shutdown(vk);
         return -1;
     }
+    VkPushConstantRange heat_range = {
+        .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+        .offset     = 0,
+        .size       = sizeof(HeatPush),
+    };
+    VkPipelineLayoutCreateInfo heat_layout_info = {
+        .sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .pushConstantRangeCount = 1,
+        .pPushConstantRanges    = &heat_range,
+    };
+    res = vkCreatePipelineLayout(vk->device, &heat_layout_info, nullptr, &s_heat_layout);
+    if (res != VK_SUCCESS) {
+        cube_fail("vkCreatePipelineLayout heat", res);
+        cube_shutdown(vk);
+        return -1;
+    }
+    VkShaderModule heat = make_module(vk, (const uint32_t *)k_heat_spv, (uint32_t)sizeof k_heat_spv);
+    if (heat == VK_NULL_HANDLE) {
+        cube_shutdown(vk);
+        return -1;
+    }
+    VkPipelineShaderStageCreateInfo heat_stage = {
+        .sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+        .stage  = VK_SHADER_STAGE_COMPUTE_BIT,
+        .module = heat,
+        .pName  = "main",
+    };
+    VkComputePipelineCreateInfo heat_pipe = {
+        .sType  = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+        .stage  = heat_stage,
+        .layout = s_heat_layout,
+    };
+    res = vkCreateComputePipelines(vk->device, VK_NULL_HANDLE, 1, &heat_pipe, nullptr, &s_heat_pipe);
+    vkDestroyShaderModule(vk->device, heat, nullptr);
+    if (res != VK_SUCCESS) {
+        cube_fail("vkCreateComputePipelines heat", res);
+        cube_shutdown(vk);
+        return -1;
+    }
     if (bake_mesh(vk) != 0) {
         cube_shutdown(vk);
         return -1;
@@ -495,6 +671,36 @@ int cube_init(VulkanContext *vk) {
            sample_count_n(s_samples));
     fflush(stdout);
     return 0;
+}
+
+static void release_heat_copies(VulkanContext *vk, bool destroy) {
+    for (int i = 0; i < k_heat_copies; ++i) {
+        if (destroy && vk != nullptr && vk->device != VK_NULL_HANDLE) {
+            if (s_heat_buf[i] != VK_NULL_HANDLE) {
+                vkDestroyBuffer(vk->device, s_heat_buf[i], nullptr);
+            }
+            if (s_heat_mem[i] != VK_NULL_HANDLE) {
+                vkFreeMemory(vk->device, s_heat_mem[i], nullptr);
+            }
+        }
+        s_heat_buf[i] = VK_NULL_HANDLE;
+        s_heat_mem[i] = VK_NULL_HANDLE;
+        s_heat_addr[i] = 0;
+    }
+    s_heat_read = 0;
+    s_heat_draw = -1;
+    s_heat_have_stamp = false;
+    s_heat_stamp_ms = 0;
+    s_heat_started = false;
+    s_heat_held = false;
+    s_heat_published = 0;
+    s_poke_x = 0.0f;
+    s_poke_y = 0.0f;
+    s_poke_pending = false;
+    s_poke_armed_cb = false;
+    s_pulse = false;
+    s_pulse_have_t0 = false;
+    s_pulse_t0 = 0;
 }
 
 void cube_shutdown(VulkanContext *vk) {
@@ -507,10 +713,13 @@ void cube_shutdown(VulkanContext *vk) {
         s_layout = VK_NULL_HANDLE;
         s_compute = VK_NULL_HANDLE;
         s_compute_layout = VK_NULL_HANDLE;
+        s_heat_pipe = VK_NULL_HANDLE;
+        s_heat_layout = VK_NULL_HANDLE;
         s_buffer = VK_NULL_HANDLE;
         s_memory = VK_NULL_HANDLE;
         s_index = VK_NULL_HANDLE;
         s_index_memory = VK_NULL_HANDLE;
+        release_heat_copies(vk, false);
         return;
     }
     if (s_pipeline != VK_NULL_HANDLE) {
@@ -529,6 +738,15 @@ void cube_shutdown(VulkanContext *vk) {
         vkDestroyPipelineLayout(vk->device, s_compute_layout, nullptr);
         s_compute_layout = VK_NULL_HANDLE;
     }
+    if (s_heat_pipe != VK_NULL_HANDLE) {
+        vkDestroyPipeline(vk->device, s_heat_pipe, nullptr);
+        s_heat_pipe = VK_NULL_HANDLE;
+    }
+    if (s_heat_layout != VK_NULL_HANDLE) {
+        vkDestroyPipelineLayout(vk->device, s_heat_layout, nullptr);
+        s_heat_layout = VK_NULL_HANDLE;
+    }
+    release_heat_copies(vk, true);
     if (s_buffer != VK_NULL_HANDLE) {
         vkDestroyBuffer(vk->device, s_buffer, nullptr);
         s_buffer = VK_NULL_HANDLE;
@@ -770,7 +988,7 @@ void cube_prepare_draw(VkCommandBuffer cmd, VkImage depth) {
 }
 
 void cube_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height, float yaw_deg,
-               float origin_x, float origin_y, float depth_bias) {
+               float origin_x, float origin_y, float depth_bias, float phase) {
     if (cmd == VK_NULL_HANDLE || s_pipeline == VK_NULL_HANDLE || width == 0 || height == 0) {
         return;
     }
@@ -785,6 +1003,7 @@ void cube_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height, float yaw_d
     VkRect2D scissor = {
         .extent = { .width = width, .height = height },
     };
+    int heat_slot = s_heat_draw >= 0 ? s_heat_draw : s_heat_read;
     DrawPush draw_push = {
         .verts      = s_mesh_addr,
         .width      = width,
@@ -793,6 +1012,9 @@ void cube_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height, float yaw_d
         .origin_x   = origin_x,
         .origin_y   = origin_y,
         .depth_bias = depth_bias,
+        .heat       = s_heat_addr[heat_slot],
+        .phase      = phase,
+        .pad        = 0,
     };
     vkCmdSetViewport(cmd, 0, 1, &viewport);
     vkCmdSetScissor(cmd, 0, 1, &scissor);
@@ -812,4 +1034,140 @@ VkSampleCountFlagBits cube_raster_samples(void) {
 
 uint32_t cube_vertex_count(void) {
     return k_verts;
+}
+
+uint32_t cube_heat_interval(uint32_t time_ms) {
+    if (s_heat_held) {
+        return 0;
+    }
+    if (!s_heat_have_stamp) {
+        s_heat_have_stamp = true;
+        s_heat_stamp_ms = time_ms;
+        return 0;
+    }
+    uint32_t delta = time_ms - s_heat_stamp_ms;
+    // A gap between revolutions is not a heat step.
+    if (delta == 0u || delta > 1000u) {
+        s_heat_stamp_ms = time_ms;
+        return 0;
+    }
+    return delta;
+}
+
+void cube_heat_commit_stamp(uint32_t time_ms) {
+    if (s_heat_held) {
+        return;
+    }
+    s_heat_have_stamp = true;
+    s_heat_stamp_ms = time_ms;
+}
+
+void cube_heat_record(VkCommandBuffer cmd, uint32_t dt_ms, float yaw_deg) {
+    bool poke = s_poke_pending;
+    if (cmd == VK_NULL_HANDLE || (dt_ms == 0u && !poke) || s_heat_held || s_heat_draw >= 0 ||
+        s_heat_pipe == VK_NULL_HANDLE) {
+        return;
+    }
+    int dst = (s_heat_read + 1) % k_heat_copies;
+    if (s_heat_addr[s_heat_read] == 0 || s_heat_addr[dst] == 0 || s_mesh_addr == 0) {
+        return;
+    }
+    dispatch_heat(cmd, dt_ms, 0u, s_heat_read, dst, poke ? 1u : 0u, yaw_deg);
+    s_heat_draw = dst;
+    if (poke) {
+        s_poke_pending = false;
+        s_poke_armed_cb = true;
+    }
+}
+
+void cube_heat_record_ok(uint64_t signal_point) {
+    if (s_heat_draw < 0) {
+        return;
+    }
+    s_heat_read = s_heat_draw;
+    s_heat_draw = -1;
+    s_poke_armed_cb = false;
+    if (signal_point != 0) {
+        s_heat_published = signal_point;
+    }
+    if (s_heat_started) {
+        return;
+    }
+    s_heat_started = true;
+    printf("[Cube] Fillet heat started. Upper half, callback step, then it holds.\n");
+    fflush(stdout);
+}
+
+void cube_heat_record_abort(void) {
+    s_heat_draw = -1;
+    if (s_poke_armed_cb) {
+        s_poke_pending = true;
+        s_poke_armed_cb = false;
+    }
+}
+
+bool cube_heat_poke(float origin_x, float origin_y) {
+    if (s_heat_pipe == VK_NULL_HANDLE) {
+        return false;
+    }
+    s_poke_x = origin_x;
+    s_poke_y = origin_y;
+    s_poke_pending = true;
+    s_heat_held = false;
+    s_pulse = true;
+    s_pulse_have_t0 = false;
+    printf("[Cube] Fillet heat poked at %+.0f,%+.0f.\n", (double)origin_x, (double)origin_y);
+    fflush(stdout);
+    return true;
+}
+
+bool cube_heat_poke_pending(void) {
+    return s_poke_pending;
+}
+
+bool cube_heat_wants_frame(uint32_t time_ms, bool *ended) {
+    if (ended != nullptr) {
+        *ended = false;
+    }
+    if (!s_pulse) {
+        return false;
+    }
+    if (!s_pulse_have_t0) {
+        s_pulse_t0 = time_ms;
+        s_pulse_have_t0 = true;
+        return true;
+    }
+    if (time_ms - s_pulse_t0 >= 5000u) {
+        s_pulse = false;
+        s_pulse_have_t0 = false;
+        if (ended != nullptr) {
+            *ended = true;
+        }
+        return false;
+    }
+    return true;
+}
+
+uint64_t cube_heat_published(void) {
+    return s_heat_published;
+}
+
+bool cube_heat_step_open(void) {
+    return s_heat_draw >= 0;
+}
+
+void cube_heat_hold(void) {
+    if (s_heat_held) {
+        return;
+    }
+    s_heat_held = true;
+    s_pulse = false;
+    s_pulse_have_t0 = false;
+    s_poke_pending = false;
+    s_poke_armed_cb = false;
+    if (!s_heat_started) {
+        return;
+    }
+    printf("[Cube] Fillet heat holds.\n");
+    fflush(stdout);
 }

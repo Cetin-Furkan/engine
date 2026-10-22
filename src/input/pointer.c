@@ -53,6 +53,13 @@ static struct {
 } s_spawn[k_spawn_cap];
 static uint32_t s_spawn_n = 0;
 
+// Presses only. The compositor sends one press and one release. Repeat would
+// need a timer, and these actions are a single press.
+enum { k_key_cap = 16u };
+static uint32_t s_key_q[k_key_cap];
+static uint32_t s_key_n = 0;
+static bool     s_key_focus = false;
+
 static int32_t fixed_to_int(int32_t v) {
     return v >> 8;
 }
@@ -285,6 +292,58 @@ static bool on_pointer(WaylandContext *w, uint16_t opcode,
     return true;
 }
 
+static bool on_keyboard(WaylandContext *w, uint16_t opcode,
+                        const unsigned char *payload, uint16_t len) {
+    const unsigned char *p = payload;
+    const unsigned char *end = payload + len;
+    if (opcode == 0u) {
+        // wl_keyboard.keymap carries an fd. It shares parked_fds with the
+        // DMA-BUF format table, so this fd has to be taken and closed here.
+        int fd = -1;
+        if (!wayland_take_parked_fd(w, &fd)) {
+            wayland_fail(w, "wl_keyboard.keymap missing fd");
+            return true;
+        }
+        close(fd);
+        return true;
+    }
+    if (opcode == 1u) {
+        uint32_t serial = 0;
+        uint32_t surface = 0;
+        if (!take_u32(&p, end, &serial) || !take_u32(&p, end, &surface)) {
+            wayland_fail(w, "truncated wl_keyboard.enter");
+            return true;
+        }
+        (void)serial;
+        s_key_focus = surface != 0 && surface == w->surface_id;
+        return true;
+    }
+    if (opcode == 2u) {
+        s_key_focus = false;
+        return true;
+    }
+    if (opcode == 3u) {
+        uint32_t serial = 0;
+        uint32_t time_ms = 0;
+        uint32_t key = 0;
+        uint32_t state = 0;
+        if (!take_u32(&p, end, &serial) || !take_u32(&p, end, &time_ms) ||
+            !take_u32(&p, end, &key) || !take_u32(&p, end, &state)) {
+            wayland_fail(w, "truncated wl_keyboard.key");
+            return true;
+        }
+        (void)serial;
+        (void)time_ms;
+        if (state == 1u && s_key_focus && s_key_n < k_key_cap &&
+            (key == KEY_ESC || key == KEY_BACKSPACE || key == KEY_F5 ||
+             key == KEY_R || key == KEY_S || (key >= KEY_1 && key <= KEY_6))) {
+            s_key_q[s_key_n++] = key;
+        }
+        return true;
+    }
+    return true;
+}
+
 bool pointer_dispatch(
     WaylandContext      *w,
     uint32_t             object,
@@ -314,6 +373,9 @@ bool pointer_dispatch(
     if (w->pointer_id != 0 && object == w->pointer_id) {
         return on_pointer(w, opcode, payload, len);
     }
+    if (w->keyboard_id != 0 && object == w->keyboard_id) {
+        return on_keyboard(w, opcode, payload, len);
+    }
     return false;
 }
 
@@ -334,6 +396,16 @@ int pointer_open_devices(WaylandContext *w) {
     if (w->pointer_id == 0 || !wayland_put_raw(w, w->seat_id, 0u, &w->pointer_id, sizeof w->pointer_id)) {
         return -1;
     }
+    if ((w->seat_capabilities & 2u) != 0u) {
+        w->keyboard_id = wayland_alloc_id(w);
+        // wl_seat.get_keyboard is request 1.
+        if (w->keyboard_id == 0 ||
+            !wayland_put_raw(w, w->seat_id, 1u, &w->keyboard_id, sizeof w->keyboard_id)) {
+            return -1;
+        }
+    } else {
+        fprintf(stderr, "[Keyboard] wl_seat has no keyboard capability\n");
+    }
     if (w->cursor_shape_manager_id != 0) {
         w->cursor_shape_device_id = wayland_alloc_id(w);
         uint32_t payload[2] = { w->cursor_shape_device_id, w->pointer_id };
@@ -350,9 +422,10 @@ int pointer_open_devices(WaylandContext *w) {
     if (w->cursor_shape_device_id == 0 && make_fallback_cursor(w) != 0) {
         return -1;
     }
-    printf("[Pointer] seat=%u pointer=%u cursor-shape=%u shm_argb=%s\n",
+    printf("[Pointer] seat=%u pointer=%u keyboard=%u cursor-shape=%u shm_argb=%s\n",
            w->seat_id,
            w->pointer_id,
+           w->keyboard_id,
            w->cursor_shape_device_id,
            w->shm_argb8888 ? "yes" : "no");
     return 0;
@@ -465,6 +538,18 @@ bool pointer_take_spawn(int32_t *x, int32_t *y) {
     return true;
 }
 
+bool pointer_take_key(uint32_t *key) {
+    if (s_key_n == 0 || key == nullptr) {
+        return false;
+    }
+    *key = s_key_q[0];
+    for (uint32_t i = 1; i < s_key_n; ++i) {
+        s_key_q[i - 1] = s_key_q[i];
+    }
+    s_key_n--;
+    return true;
+}
+
 int pointer_flush(WaylandContext *w) {
     int enc = pointer_encode(w);
     if (enc <= 0) {
@@ -503,6 +588,11 @@ void pointer_shutdown(WaylandContext *w) {
             (void)wayland_put_raw(w, w->pointer_id, 1u, nullptr, 0u);
             w->pointer_id = 0;
         }
+        if (w->keyboard_id != 0 && w->seat_bound_version >= 3u) {
+            // wl_keyboard.release is request 0.
+            (void)wayland_put_raw(w, w->keyboard_id, 0u, nullptr, 0u);
+            w->keyboard_id = 0;
+        }
         if (w->send_len > 0 && !w->failed) {
             (void)wayland_send_batch(w);
         }
@@ -519,4 +609,6 @@ void pointer_shutdown(WaylandContext *w) {
     s_ptr.have_enter = false;
     s_ptr.focus = 0;
     s_spawn_n = 0;
+    s_key_n = 0;
+    s_key_focus = false;
 }

@@ -2,7 +2,6 @@
 #define ENGINE_FRAME_HUD_H
 
 #include "vulkan/types.h"
-#include <stdbool.h>
 #include <stdint.h>
 
 // 8x8 readout drawn into frames that are already being recorded.

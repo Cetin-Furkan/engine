@@ -2,6 +2,10 @@
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_scalar_block_layout : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_GOOGLE_include_directive : require
+
+#include "camera.inc"
+#include "material.inc"
 
 // The cube is posed here. The mesh is read by address from gl_VertexIndex.
 // Nothing on the CPU names a front face. The rasterizer keeps a face only
@@ -17,9 +21,14 @@ layout(buffer_reference, scalar, buffer_reference_align = 4) buffer Mesh {
 
 layout(location = 0) centroid out vec3 v_nrm;
 layout(location = 1) centroid out vec3 v_albedo;
+layout(location = 2) centroid out vec3 v_emit;
 
 layout(buffer_reference, scalar, buffer_reference_align = 4) buffer Heat {
     float t[];
+};
+
+layout(buffer_reference, scalar, buffer_reference_align = 4) buffer Field {
+    float v[];
 };
 
 layout(push_constant, scalar) uniform Screen {
@@ -32,6 +41,19 @@ layout(push_constant, scalar) uniform Screen {
     float depth_bias;
     uint64_t heat;
     float phase;
+    float selected;
+    uint64_t grid;
+    layout(offset = 56) uint64_t materials;
+    layout(offset = 64) uint mat_index;
+    layout(offset = 68) uint mat_pad;
+    layout(offset = 72) float qx;
+    layout(offset = 76) float qy;
+    layout(offset = 80) float qz;
+    layout(offset = 84) float qw;
+    layout(offset = 88) float cam_x;
+    layout(offset = 92) float cam_y;
+    layout(offset = 96) float cam_z;
+    layout(offset = 100) float zoom;
 } screen;
 
 const float k_edge_px = 240.0;
@@ -54,13 +76,11 @@ void main() {
     vec3 p = (pose * in_pos) * (k_edge_px * 0.5);
     p.x += screen.origin_x;
     p.y += screen.origin_y;
-    float w = max(float(screen.width), 1.0);
-    float h = max(float(screen.height), 1.0);
-    gl_Position = vec4(p.x / (w * 0.5),
-                       -p.y / (h * 0.5),
-                       0.5 - p.z / 4096.0 - screen.depth_bias,
-                       1.0);
-    v_nrm = pose * in_nrm;
+    vec4 q = vec4(screen.qx, screen.qy, screen.qz, screen.qw);
+    vec3 cam = vec3(screen.cam_x, screen.cam_y, screen.cam_z);
+    vec3 view = view_of(p, q, cam);
+    gl_Position = view_ndc(view, screen.zoom, screen.width, screen.height, screen.depth_bias);
+    v_nrm = view_rotate(q, pose * in_nrm);
     // One hue turn per revolution. The position term is a gradient across
     // the fillet, so the same phase paints the same colors. Heat still wins.
     vec3 axis = vec3(0.57735026919);
@@ -69,6 +89,13 @@ void main() {
     float s = sin(ang);
     vec3 spun = in_albedo * c + cross(axis, in_albedo) * s + axis * dot(axis, in_albedo) * (1.0 - c);
     vec3 graded = clamp(spun, 0.0, 1.0);
+    vec3 cool = graded;
+    if (screen.grid != 0ul) {
+        float cell = clamp(Field(screen.grid).v[uint(gl_VertexIndex)], 0.0, 1.0);
+        cool = mix(graded, vec3(0.45, 0.72, 1.0), cell);
+    }
     float temp = clamp(Heat(screen.heat).t[uint(gl_VertexIndex)], 0.0, 1.0);
-    v_albedo = mix(graded, vec3(1.0, 0.42, 0.12), temp);
+    v_albedo = mix(cool, vec3(1.0, 0.42, 0.12), temp);
+    v_albedo = mix(v_albedo, vec3(1.0), clamp(screen.selected, 0.0, 1.0) * 0.42);
+    v_emit = material_emit(screen.materials, screen.mat_index);
 }

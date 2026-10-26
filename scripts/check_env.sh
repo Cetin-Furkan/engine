@@ -122,20 +122,47 @@ else
     echo -e "  [${YELLOW}WARN${NC}] wayland-protocols not found. The Makefile does not use it."
 fi
 
-# 5. slangc is not used. Shaders are compiled with glslangValidator.
+# 5. slangc compiles chrome and the cube/solid fragment shaders.
+#    glslangValidator --target-env vulkan1.4 compiles everything else.
 SLANG_BIN=""
 SLANG_VER=""
+GLSLANG=""
 
 if command -v slangc >/dev/null 2>&1; then
     SLANG_BIN=$(command -v slangc)
     SLANG_VER=$($SLANG_BIN -v 2>&1 | head -n1 || echo "installed")
-    echo -e "  [${GREEN}OK${NC}] Slang Compiler: $SLANG_BIN ($SLANG_VER, not used by the Makefile)"
-elif command -v slang >/dev/null 2>&1; then
-    SLANG_BIN=$(command -v slang)
-    SLANG_VER="installed"
-    echo -e "  [${GREEN}OK${NC}] Slang Compiler: $SLANG_BIN (not used by the Makefile)"
 else
-    echo -e "  [${YELLOW}WARN${NC}] slangc not found. The Makefile uses glslangValidator."
+    echo -e "  [${RED}FAIL${NC}] slangc not found"
+    FAILURES=$((FAILURES + 1))
+fi
+
+if command -v glslangValidator >/dev/null 2>&1; then
+    GLSLANG=$(command -v glslangValidator)
+else
+    echo -e "  [${RED}FAIL${NC}] glslangValidator not found"
+    FAILURES=$((FAILURES + 1))
+fi
+
+if [[ -n "$SLANG_BIN" && -n "$GLSLANG" ]]; then
+    PROBE=$(mktemp -d)
+    cat > "$PROBE/probe.frag" << 'PROBE_EOF'
+#version 450
+layout(location = 0) out vec4 color;
+void main() { color = vec4(1.0); }
+PROBE_EOF
+    if "$SLANG_BIN" -lang glsl -target spirv -profile spirv_1_6 -stage fragment -entry main -fvk-use-entrypoint-name -o "$PROBE/slang.spv" "$PROBE/probe.frag"; then
+        echo -e "  [${GREEN}OK${NC}] Slang Compiler: $SLANG_BIN ($SLANG_VER)"
+    else
+        echo -e "  [${RED}FAIL${NC}] slangc could not compile a fragment shader"
+        FAILURES=$((FAILURES + 1))
+    fi
+    if "$GLSLANG" -V --target-env vulkan1.4 --depfile "$PROBE/probe.d" -o "$PROBE/glslang.spv" "$PROBE/probe.frag" >/dev/null; then
+        echo -e "  [${GREEN}OK${NC}] glslangValidator: $GLSLANG (vulkan1.4, depfile)"
+    else
+        echo -e "  [${RED}FAIL${NC}] glslangValidator rejected --target-env vulkan1.4 or --depfile"
+        FAILURES=$((FAILURES + 1))
+    fi
+    rm -rf "$PROBE"
 fi
 
 echo -e "${BLUE}=======================================================${NC}"
@@ -160,6 +187,7 @@ VULKAN_INCLUDE_DIR := $(dirname "$(dirname "$VULKAN_HEADER")")
 WAYLAND_PROTOCOLS_VERSION := $WP_VER
 WAYLAND_PROTOCOLS_DIR := $WAYLAND_PROTOCOLS_DIR
 SLANG_BIN := $SLANG_BIN
+GLSLANG := $GLSLANG
 CONFIG_ENV_OK := 1
 CONF_EOF
 
@@ -174,7 +202,8 @@ Status: PASSED
   - Library Location: $VULKAN_LIB
 - Wayland Protocols: ${WP_VER:-unused} (Makefile does not read this)
   - Protocol Directory: ${WAYLAND_PROTOCOLS_DIR:-unused}
-- Slang Shader Compiler: ${SLANG_BIN:-unused} (${SLANG_VER:-unused}; Makefile uses glslangValidator)
+- Slang Shader Compiler: ${SLANG_BIN:-missing} (${SLANG_VER:-missing})
+- GLSL Validator: ${GLSLANG:-missing} (vulkan1.4, depfile)
 INFO_EOF
 
 touch "$STAMP"

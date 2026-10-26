@@ -25,8 +25,9 @@ layout(push_constant, scalar) uniform Push {
     layout(offset = 68) float a;
 } pc;
 
+layout(location = 0) flat in vec3 v_emit;
 layout(location = 0) out vec4 out_color;
 
 void main() {
-    out_color = vec4(pc.r, pc.g, pc.b, pc.a);
+    out_color = vec4(min(vec3(pc.r, pc.g, pc.b) + v_emit, vec3(1.0)), pc.a);
 }

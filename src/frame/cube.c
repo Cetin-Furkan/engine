@@ -1,4 +1,7 @@
 #include "frame/cube.h"
+#include "frame/camera.h"
+#include "frame/grid.h"
+#include "frame/material.h"
 #include "vulkan/memory.h"
 #include <stddef.h>
 #include <stdio.h>
@@ -16,18 +19,27 @@ alignas(uint32_t) static const unsigned char k_heat_spv[] = {
 #embed "heat.comp.spv"
 };
 
-// Matches shaders/bevel.comp. 6 face quads, 12 edges of 8, 8 corners of 8x8.
-// Vertices are the quad corners. Indices repeat a corner for each triangle.
+// Matches shaders/bevel.comp and shaders/face_grid.inc. k_grid is 16.
+// The 888 fillet vertices stay. Each face adds a 16 by 16 grid whose
+// corners are those fillet vertices. Indices are still one quad's two triangles.
 enum {
-    k_arc      = 8,
-    k_verts    = 6 * 4 + 12 * (k_arc + 1) * 2 + 8 * (k_arc + 1) * (k_arc + 1),
-    k_quads    = 6 + 12 * k_arc + 8 * k_arc * k_arc,
-    k_indices  = k_quads * 6,
-    k_local    = 64,
+    k_arc          = 8,
+    k_grid         = 16,
+    k_fillet_verts = 6 * 4 + 12 * (k_arc + 1) * 2 + 8 * (k_arc + 1) * (k_arc + 1),
+    k_face_samples = (k_grid + 1) * (k_grid + 1) - 4,
+    k_verts        = k_fillet_verts + 6 * k_face_samples,
+    k_face_quads   = 6 * k_grid * k_grid,
+    k_quads        = k_face_quads + 12 * k_arc + 8 * k_arc * k_arc,
+    k_indices      = k_quads * 6,
+    k_local        = 64,
 };
 
-static_assert(k_verts == 888u, "fillet vertex count");
-static_assert(k_indices == 3684u, "fillet index count");
+static_assert(k_fillet_verts == 888u, "fillet vertex count");
+static_assert(k_face_samples == 285u, "face sample count");
+static_assert(k_verts == 2598u, "cube vertex count");
+static_assert(k_quads == 2144u, "cube quad count");
+static_assert(k_indices == 12864u, "cube index count");
+static_assert(k_verts < 65536u, "uint16 index");
 static_assert(sizeof k_vert_spv % 4u == 0u, "vert spirv");
 static_assert(sizeof k_frag_spv % 4u == 0u, "frag spirv");
 static_assert(sizeof k_bevel_spv % 4u == 0u, "bevel spirv");
@@ -43,10 +55,12 @@ typedef struct DrawPush {
     float    depth_bias;
     uint64_t heat;
     float    phase;
-    uint32_t pad;
+    float    selected;
+    uint64_t grid;
+    ViewPush view;
 } DrawPush;
 
-enum { k_draw_push_bytes = 48 };
+enum { k_draw_push_bytes = 104 };
 
 // Three copies so a frame still reading one buffer is not overwritten by the
 // next step. Two slots can be in flight. The third is the one being written.
@@ -78,6 +92,11 @@ static_assert(offsetof(DrawPush, origin_y) == 24u, "origin y");
 static_assert(offsetof(DrawPush, depth_bias) == 28u, "depth bias");
 static_assert(offsetof(DrawPush, heat) == 32u, "heat address");
 static_assert(offsetof(DrawPush, phase) == 40u, "hue phase");
+static_assert(offsetof(DrawPush, selected) == 44u, "cube selected");
+static_assert(offsetof(DrawPush, grid) == 48u, "grid address");
+static_assert(offsetof(DrawPush, view) == 56u, "cube view");
+static_assert(offsetof(ViewPush, qx) == 16u, "view quat");
+static_assert(sizeof(ViewPush) == 48u, "view push");
 static_assert(sizeof(DrawPush) == k_draw_push_bytes, "draw push");
 static_assert(sizeof(MeshPush) == 16u, "mesh push");
 static_assert(offsetof(HeatPush, verts) == 16u, "heat verts");
@@ -667,8 +686,8 @@ int cube_init(VulkanContext *vk) {
         cube_shutdown(vk);
         return -1;
     }
-    printf("[Cube] 240px centered, 888 indexed verts, 12px GPU fillet, %ux edge samples, directional sun\n",
-           sample_count_n(s_samples));
+    printf("[Cube] 240px centered, %u verts, 12px GPU fillet, %u by %u face grid, %ux edge samples, directional sun\n",
+           k_verts, k_grid, k_grid, sample_count_n(s_samples));
     fflush(stdout);
     return 0;
 }
@@ -988,7 +1007,7 @@ void cube_prepare_draw(VkCommandBuffer cmd, VkImage depth) {
 }
 
 void cube_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height, float yaw_deg,
-               float origin_x, float origin_y, float depth_bias, float phase) {
+               float origin_x, float origin_y, float depth_bias, float phase, bool selected) {
     if (cmd == VK_NULL_HANDLE || s_pipeline == VK_NULL_HANDLE || width == 0 || height == 0) {
         return;
     }
@@ -1014,8 +1033,10 @@ void cube_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height, float yaw_d
         .depth_bias = depth_bias,
         .heat       = s_heat_addr[heat_slot],
         .phase      = phase,
-        .pad        = 0,
+        .selected   = selected ? 1.0f : 0.0f,
+        .grid       = grid_tint_addr(),
     };
+    view_push_fill(&draw_push.view, k_mat_cube);
     vkCmdSetViewport(cmd, 0, 1, &viewport);
     vkCmdSetScissor(cmd, 0, 1, &scissor);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_pipeline);
@@ -1034,6 +1055,10 @@ VkSampleCountFlagBits cube_raster_samples(void) {
 
 uint32_t cube_vertex_count(void) {
     return k_verts;
+}
+
+uint64_t cube_mesh_addr(void) {
+    return s_mesh_addr;
 }
 
 uint32_t cube_heat_interval(uint32_t time_ms) {

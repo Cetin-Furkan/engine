@@ -1,5 +1,7 @@
 #include "frame/solid.h"
+#include "frame/camera.h"
 #include "frame/cube.h"
+#include "frame/material.h"
 #include "vulkan/memory.h"
 #include <stddef.h>
 #include <stdio.h>
@@ -31,6 +33,9 @@ typedef struct SolidPush {
     float    depth_bias;
     float    selected;
     uint32_t pad;
+    uint32_t tail0;
+    uint32_t tail1;
+    ViewPush view;
 } SolidPush;
 
 typedef struct BakePush {
@@ -42,7 +47,8 @@ static_assert(offsetof(SolidPush, origin_x) == 20u, "solid origin x");
 static_assert(offsetof(SolidPush, origin_y) == 24u, "solid origin y");
 static_assert(offsetof(SolidPush, depth_bias) == 28u, "solid depth");
 static_assert(offsetof(SolidPush, selected) == 32u, "solid selected");
-static_assert(sizeof(SolidPush) == 40u, "solid push");
+static_assert(offsetof(SolidPush, view) == 48u, "solid view");
+static_assert(sizeof(SolidPush) == 96u, "solid push");
 static_assert(sizeof(BakePush) == 8u, "solid bake push");
 
 // [kind][0 faceted, 1 rounded]
@@ -507,6 +513,7 @@ void solid_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height,
         .selected   = selected ? 1.0f : 0.0f,
         .pad        = 0,
     };
+    view_push_fill(&draw_push.view, k_mat_solid0 + kind);
     vkCmdSetViewport(cmd, 0, 1, &viewport);
     vkCmdSetScissor(cmd, 0, 1, &scissor);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_pipeline);

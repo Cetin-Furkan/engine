@@ -13,7 +13,9 @@
 #
 # Layers are drawn by a fragment shader into the Vulkan dma-buf, bottom to top. There is no wl_shm bar.
 # thickness is the layer's cross size in buffer pixels. span = full means the window width.
+# A later top layer sits under the one before it. A later bottom layer sits above the one before it.
 # A control's span is its width along the bar. Its height is the layer thickness.
+# align = start packs from the left. align = end packs from the right. They do not share one x.
 # Omit a layer or a control and it is not painted.
 
 window.title = Antigravity

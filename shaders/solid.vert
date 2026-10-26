@@ -2,6 +2,10 @@
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_scalar_block_layout : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_GOOGLE_include_directive : require
+
+#include "camera.inc"
+#include "material.inc"
 
 // One baked solid. The mesh is 9 floats per vertex, read by gl_VertexIndex.
 // Pitch matches the cube. The solid is 168 pixels across, so it sits beside
@@ -13,6 +17,7 @@ layout(buffer_reference, scalar, buffer_reference_align = 4) buffer Mesh {
 
 layout(location = 0) centroid out vec3 v_nrm;
 layout(location = 1) centroid out vec3 v_albedo;
+layout(location = 2) centroid out vec3 v_emit;
 
 layout(push_constant, scalar) uniform Screen {
     uint64_t verts;
@@ -24,6 +29,19 @@ layout(push_constant, scalar) uniform Screen {
     float depth_bias;
     float selected;
     uint pad;
+    layout(offset = 40) uint tail0;
+    layout(offset = 44) uint tail1;
+    layout(offset = 48) uint64_t materials;
+    layout(offset = 56) uint mat_index;
+    layout(offset = 60) uint mat_pad;
+    layout(offset = 64) float qx;
+    layout(offset = 68) float qy;
+    layout(offset = 72) float qz;
+    layout(offset = 76) float qw;
+    layout(offset = 80) float cam_x;
+    layout(offset = 84) float cam_y;
+    layout(offset = 88) float cam_z;
+    layout(offset = 92) float zoom;
 } screen;
 
 const float k_edge_px = 168.0;
@@ -46,12 +64,11 @@ void main() {
     vec3 p = (pose * in_pos) * (k_edge_px * 0.5);
     p.x += screen.origin_x;
     p.y += screen.origin_y;
-    float w = max(float(screen.width), 1.0);
-    float h = max(float(screen.height), 1.0);
-    gl_Position = vec4(p.x / (w * 0.5),
-                       -p.y / (h * 0.5),
-                       0.5 - p.z / 4096.0 - screen.depth_bias,
-                       1.0);
-    v_nrm = pose * in_nrm;
+    vec4 q = vec4(screen.qx, screen.qy, screen.qz, screen.qw);
+    vec3 cam = vec3(screen.cam_x, screen.cam_y, screen.cam_z);
+    vec3 view = view_of(p, q, cam);
+    gl_Position = view_ndc(view, screen.zoom, screen.width, screen.height, screen.depth_bias);
+    v_nrm = view_rotate(q, pose * in_nrm);
     v_albedo = mix(in_albedo, vec3(1.0), clamp(screen.selected, 0.0, 1.0) * 0.42);
+    v_emit = material_emit(screen.materials, screen.mat_index);
 }

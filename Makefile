@@ -53,62 +53,51 @@ ifneq ($(VULKAN_INCLUDE_DIR),)
     INCLUDES += -I$(VULKAN_INCLUDE_DIR)
 endif
 
-$(GEN_DIR)/cube.vert.spv: shaders/cube.vert
-	@mkdir -p $(GEN_DIR)
-	glslangValidator -V --target-env vulkan1.3 -o $@ $<
+SLANGC ?= $(or $(SLANG_BIN),slangc)
+ifeq ($(GLSLANG),)
+GLSLANG := glslangValidator
+endif
 
-$(GEN_DIR)/cube.frag.spv: shaders/cube.frag
-	@mkdir -p $(GEN_DIR)
-	glslangValidator -V --target-env vulkan1.3 -o $@ $<
+# slangc compiles the shaders it accepts. glslangValidator keeps buffer_reference,
+# explicit offsets, and compute. The branch is per source, not a parse-time ifeq.
+SLANG_SRCS := shaders/chrome.vert shaders/chrome.frag shaders/cube.frag shaders/solid.frag
 
-$(GEN_DIR)/bevel.comp.spv: shaders/bevel.comp
-	@mkdir -p $(GEN_DIR)
-	glslangValidator -V --target-env vulkan1.3 -o $@ $<
+$(GEN_DIR)/%.spv: shaders/%
+	@mkdir -p $(dir $@)
+	@set -e; \
+	if printf '%s\n' $(SLANG_SRCS) | grep -Fxq "$<"; then \
+		case "$<" in \
+			*.vert) stage=vertex ;; \
+			*.frag) stage=fragment ;; \
+			*.comp) stage=compute ;; \
+			*) echo "unknown shader stage: $<" >&2; exit 1 ;; \
+		esac; \
+		$(SLANGC) -lang glsl -target spirv -profile spirv_1_6 -stage "$$stage" -entry main -fvk-use-entrypoint-name -o "$@" "$<"; \
+	else \
+		$(GLSLANG) -V --target-env vulkan1.4 -Ishaders --depfile "$(GEN_DIR)/$*.d" -o "$@" "$<"; \
+	fi
 
-$(GEN_DIR)/heat.comp.spv: shaders/heat.comp shaders/heat_nbr.inc
-	@mkdir -p $(GEN_DIR)
-	glslangValidator -V --target-env vulkan1.3 -o $@ $<
+$(GEN_DIR)/bevel.comp.spv: shaders/face_grid.inc
+$(GEN_DIR)/heat.comp.spv: shaders/heat_nbr.inc shaders/face_grid.inc
+$(GEN_DIR)/cube.vert.spv: shaders/camera.inc shaders/material.inc
+$(GEN_DIR)/solid.vert.spv: shaders/camera.inc shaders/material.inc
+$(GEN_DIR)/shape.vert.spv: shaders/camera.inc shaders/material.inc
+$(GEN_DIR)/plane.vert.spv: shaders/camera.inc
+$(GEN_DIR)/plot.vert.spv: shaders/camera.inc
+$(GEN_DIR)/gimbal.vert.spv: shaders/camera.inc
+$(GEN_DIR)/mesh.vert.spv: shaders/camera.inc shaders/material.inc
 
-$(GEN_DIR)/chrome.vert.spv: shaders/chrome.vert
-	@mkdir -p $(GEN_DIR)
-	glslangValidator -V --target-env vulkan1.3 -o $@ $<
-
-$(GEN_DIR)/chrome.frag.spv: shaders/chrome.frag
-	@mkdir -p $(GEN_DIR)
-	glslangValidator -V --target-env vulkan1.3 -o $@ $<
-
-$(GEN_DIR)/shape.vert.spv: shaders/shape.vert
-	@mkdir -p $(GEN_DIR)
-	glslangValidator -V --target-env vulkan1.3 -o $@ $<
-
-$(GEN_DIR)/shape.frag.spv: shaders/shape.frag
-	@mkdir -p $(GEN_DIR)
-	glslangValidator -V --target-env vulkan1.3 -o $@ $<
-
-$(GEN_DIR)/hud.vert.spv: shaders/hud.vert
-	@mkdir -p $(GEN_DIR)
-	glslangValidator -V --target-env vulkan1.3 -o $@ $<
-
-$(GEN_DIR)/hud.frag.spv: shaders/hud.frag
-	@mkdir -p $(GEN_DIR)
-	glslangValidator -V --target-env vulkan1.3 -o $@ $<
-
-$(GEN_DIR)/solid.vert.spv: shaders/solid.vert
-	@mkdir -p $(GEN_DIR)
-	glslangValidator -V --target-env vulkan1.3 -o $@ $<
-
-$(GEN_DIR)/solid.frag.spv: shaders/solid.frag
-	@mkdir -p $(GEN_DIR)
-	glslangValidator -V --target-env vulkan1.3 -o $@ $<
-
-$(GEN_DIR)/solid.comp.spv: shaders/solid.comp
-	@mkdir -p $(GEN_DIR)
-	glslangValidator -V --target-env vulkan1.3 -o $@ $<
+-include $(wildcard $(GEN_DIR)/*.d)
 
 $(OBJ_DIR)/src/frame/cube.o: $(GEN_DIR)/cube.vert.spv $(GEN_DIR)/cube.frag.spv $(GEN_DIR)/bevel.comp.spv $(GEN_DIR)/heat.comp.spv
 $(OBJ_DIR)/src/frame/solid.o: $(GEN_DIR)/solid.vert.spv $(GEN_DIR)/solid.frag.spv $(GEN_DIR)/solid.comp.spv
 $(OBJ_DIR)/src/frame/shape.o: $(GEN_DIR)/shape.vert.spv $(GEN_DIR)/shape.frag.spv
+$(OBJ_DIR)/src/frame/plane.o: $(GEN_DIR)/plane.vert.spv $(GEN_DIR)/plane.frag.spv
+$(OBJ_DIR)/src/frame/plot.o: $(GEN_DIR)/plot.vert.spv $(GEN_DIR)/plot.frag.spv $(GEN_DIR)/plot.comp.spv
+$(OBJ_DIR)/src/frame/gimbal.o: $(GEN_DIR)/gimbal.vert.spv $(GEN_DIR)/gimbal.frag.spv
+$(OBJ_DIR)/src/frame/mesh.o: $(GEN_DIR)/mesh.vert.spv $(GEN_DIR)/mesh.frag.spv
 $(OBJ_DIR)/src/frame/hud.o: $(GEN_DIR)/hud.vert.spv $(GEN_DIR)/hud.frag.spv
+$(OBJ_DIR)/src/frame/grid.o: $(GEN_DIR)/grid.comp.spv
 $(OBJ_DIR)/src/chrome/gpu.o: $(GEN_DIR)/chrome.vert.spv $(GEN_DIR)/chrome.frag.spv
 
 # Compiler & Preprocessor Flags
@@ -184,7 +173,8 @@ info: $(CONFIG_MK)
 	@echo "  Vulkan Header:     $(VULKAN_HEADER) (v$(VULKAN_VERSION))"
 	@echo "  Vulkan Library:    $(VULKAN_LIB)"
 	@echo "  Wayland Protocols: $(WAYLAND_PROTOCOLS_VERSION) ($(WAYLAND_PROTOCOLS_DIR))"
-	@echo "  Slang Compiler:    $(SLANG_BIN)"
+	@echo "  Slang Compiler:    $(SLANGC)"
+	@echo "  GLSL Compiler:     $(GLSLANG)"
 	@echo -e "\033[0;34m==================================\033[0m"
 
 help:

@@ -1,4 +1,6 @@
 #include "chrome/spec.h"
+#include "ring/ring.h"
+#include "wayland/wayland.h"
 #include <ctype.h>
 #include <errno.h>
 #include <limits.h>
@@ -14,6 +16,7 @@ enum : uint32_t {
 static ChromeSpec s_spec;
 static bool       s_loaded;
 static char       s_err[320];
+static int        s_read_rc;
 
 typedef struct CursorShapeName {
     const char *name;
@@ -117,35 +120,25 @@ static bool parse_color(const char *text, ChromeColor *out) {
     return true;
 }
 
-static bool read_file(const char *path, char *buf, uint32_t cap, uint32_t *out_len) {
-    FILE *f = fopen(path, "r");
-    if (f == nullptr) {
-        snprintf(s_err, sizeof s_err, "%s", strerror(errno));
-        return false;
+static void forward_wayland(const struct io_uring_cqe *cqe, void *user) {
+    if (user != nullptr) {
+        wayland_on_cqe(user, cqe);
     }
-    if (fseek(f, 0, SEEK_END) != 0) {
-        snprintf(s_err, sizeof s_err, "%s", strerror(errno));
-        fclose(f);
-        return false;
-    }
-    long sz = ftell(f);
-    if (sz < 0 || (unsigned long)sz > cap - 1u) {
-        fclose(f);
+}
+
+static bool read_file(const char *path, char *buf, uint32_t cap, uint32_t *out_len,
+                      ChromeCqeFn on_cqe, void *on_user) {
+    RingContext *ring = ring_get_context();
+    size_t n = 0;
+    s_read_rc = ring_read_file_all(ring, path, buf, cap, &n, on_cqe, on_user);
+    if (s_read_rc == -EFBIG) {
         snprintf(s_err, sizeof s_err, "%s is missing or larger than %u bytes", path, cap - 1u);
         return false;
     }
-    if (fseek(f, 0, SEEK_SET) != 0) {
-        snprintf(s_err, sizeof s_err, "%s", strerror(errno));
-        fclose(f);
+    if (s_read_rc < 0) {
+        snprintf(s_err, sizeof s_err, "%s", strerror(-s_read_rc));
         return false;
     }
-    size_t n = fread(buf, 1, (size_t)sz, f);
-    fclose(f);
-    if (n != (size_t)sz) {
-        snprintf(s_err, sizeof s_err, "short read on %s", path);
-        return false;
-    }
-    buf[n] = '\0';
     *out_len = (uint32_t)n;
     return true;
 }
@@ -495,6 +488,12 @@ static int parse_spec(char *text, ChromeSpec *spec) {
         }
     }
     for (uint32_t i = 0; i < spec->ncontrols; ++i) {
+        for (uint32_t k = i + 1u; k < spec->ncontrols; ++k) {
+            if (strcmp(spec->controls[i].name, spec->controls[k].name) == 0) {
+                snprintf(s_err, sizeof s_err, "duplicate control name '%s'", spec->controls[i].name);
+                return -1;
+            }
+        }
         bool found = false;
         for (uint32_t j = 0; j < spec->nlayers; ++j) {
             if (strcmp(spec->controls[i].layer, spec->layers[j].name) == 0) {
@@ -511,9 +510,29 @@ static int parse_spec(char *text, ChromeSpec *spec) {
     return 0;
 }
 
+static void log_spec(const char *verb) {
+    printf("[Chrome] %s %s | layers=%u controls=%u resize=%s band=%u cursor=%u\n",
+           verb,
+           s_spec.path,
+           s_spec.nlayers,
+           s_spec.ncontrols,
+           s_spec.resize ? "on" : "off",
+           s_spec.resize_band,
+           s_spec.cursor_shape);
+}
+
+static int commit_text(const char *path, char *text) {
+    ChromeSpec parsed = {0};
+    if (parse_spec(text, &parsed) != 0) {
+        return -1;
+    }
+    memcpy(parsed.path, path, strlen(path) + 1u);
+    s_spec = parsed;
+    s_loaded = true;
+    return 0;
+}
+
 int chrome_load(void) {
-    s_loaded = false;
-    s_spec = (ChromeSpec){0};
     s_err[0] = '\0';
     char path[256];
     if (!resolve_path(path, sizeof path)) {
@@ -522,23 +541,46 @@ int chrome_load(void) {
     }
     char text[k_spec_max_bytes];
     uint32_t len = 0;
-    if (!read_file(path, text, sizeof text, &len)) {
+    WaylandContext *wl = wayland_get_context();
+    if (!read_file(path, text, sizeof text, &len, forward_wayland, wl)) {
         fprintf(stderr, "[Chrome Error] Cannot read '%s'%s%s\n",
                 path, s_err[0] != '\0' ? ": " : "", s_err);
         return -1;
     }
-    if (parse_spec(text, &s_spec) != 0) {
+    if (commit_text(path, text) != 0) {
         fprintf(stderr, "[Chrome Error] %s (%s)\n", s_err, path);
         return -1;
     }
-    memcpy(s_spec.path, path, strlen(path) + 1u);
-    s_loaded = true;
-    printf("[Chrome] Spec %s | layers=%u controls=%u resize=%s band=%u cursor=%u\n",
-           s_spec.path,
-           s_spec.nlayers,
-           s_spec.ncontrols,
-           s_spec.resize ? "on" : "off",
-           s_spec.resize_band,
-           s_spec.cursor_shape);
+    log_spec("Spec");
+    return 0;
+}
+
+int chrome_reload(ChromeCqeFn on_cqe, void *user) {
+    if (!s_loaded || s_spec.path[0] == '\0') {
+        snprintf(s_err, sizeof s_err, "no chrome spec is loaded");
+        fprintf(stderr, "[Chrome] Reload kept the previous spec: %s\n", s_err);
+        return -EINVAL;
+    }
+    char path[256];
+    memcpy(path, s_spec.path, sizeof path);
+    path[sizeof path - 1u] = '\0';
+    if (on_cqe == nullptr) {
+        on_cqe = forward_wayland;
+        user = wayland_get_context();
+    }
+    char text[k_spec_max_bytes];
+    uint32_t len = 0;
+    s_err[0] = '\0';
+    if (!read_file(path, text, sizeof text, &len, on_cqe, user)) {
+        fprintf(stderr, "[Chrome] Reload kept the previous spec: %s\n",
+                s_err[0] != '\0' ? s_err : "read failed");
+        return s_read_rc < 0 ? s_read_rc : -EIO;
+    }
+    if (commit_text(path, text) != 0) {
+        fprintf(stderr, "[Chrome] Reload kept the previous spec: %s\n",
+                s_err[0] != '\0' ? s_err : "parse failed");
+        return -EINVAL;
+    }
+    log_spec("Reloaded");
     return 0;
 }

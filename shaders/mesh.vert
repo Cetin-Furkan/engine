@@ -1,0 +1,65 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_GOOGLE_include_directive : require
+
+#include "camera.inc"
+#include "material.inc"
+
+// OBJ corners are already world pixels. Yaw is about Y through the fitted
+// center. There is no extra pitch and no 168 px scale.
+
+layout(buffer_reference, scalar, buffer_reference_align = 4) buffer Mesh {
+    float f[];
+};
+
+layout(location = 0) centroid out vec3 v_nrm;
+layout(location = 1) centroid out vec3 v_albedo;
+layout(location = 2) centroid out vec3 v_emit;
+
+layout(push_constant, scalar) uniform Screen {
+    uint64_t verts;
+    uint width;
+    uint height;
+    float yaw_deg;
+    float origin_x;
+    float origin_y;
+    float depth_bias;
+    float selected;
+    uint pad;
+    layout(offset = 40) uint tail0;
+    layout(offset = 44) uint tail1;
+    layout(offset = 48) uint64_t materials;
+    layout(offset = 56) uint mat_index;
+    layout(offset = 60) uint mat_pad;
+    layout(offset = 64) float qx;
+    layout(offset = 68) float qy;
+    layout(offset = 72) float qz;
+    layout(offset = 76) float qw;
+    layout(offset = 80) float cam_x;
+    layout(offset = 84) float cam_y;
+    layout(offset = 88) float cam_z;
+    layout(offset = 92) float zoom;
+} screen;
+
+void main() {
+    Mesh mesh = Mesh(screen.verts);
+    uint o = uint(gl_VertexIndex) * 9u;
+    vec3 in_pos = vec3(mesh.f[o + 0u], mesh.f[o + 1u], mesh.f[o + 2u]);
+    vec3 in_nrm = vec3(mesh.f[o + 3u], mesh.f[o + 4u], mesh.f[o + 5u]);
+    vec3 in_albedo = vec3(mesh.f[o + 6u], mesh.f[o + 7u], mesh.f[o + 8u]);
+    float ay = radians(screen.yaw_deg);
+    mat3 ry = mat3(vec3(cos(ay), 0.0, -sin(ay)),
+                   vec3(0.0, 1.0, 0.0),
+                   vec3(sin(ay), 0.0, cos(ay)));
+    vec3 center = vec3(screen.origin_x, screen.origin_y, 0.0);
+    vec3 p = ry * (in_pos - center) + center;
+    vec4 q = vec4(screen.qx, screen.qy, screen.qz, screen.qw);
+    vec3 cam = vec3(screen.cam_x, screen.cam_y, screen.cam_z);
+    vec3 view = view_of(p, q, cam);
+    gl_Position = view_ndc(view, screen.zoom, screen.width, screen.height, screen.depth_bias);
+    v_nrm = view_rotate(q, ry * in_nrm);
+    v_albedo = mix(in_albedo, vec3(1.0), clamp(screen.selected, 0.0, 1.0) * 0.42);
+    v_emit = material_emit(screen.materials, screen.mat_index);
+}

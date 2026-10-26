@@ -1,0 +1,86 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+// One invocation writes one sample of the math curve, or one axis end.
+// The curve is not walked on the CPU. Mode 1 is sin, 2 is sinc, 3 is a
+// gaussian. The box sits in the gap left of the cube so the front view
+// shows it beside the fillet.
+
+layout(local_size_x = 64) in;
+
+struct PlotPoint {
+    float x;
+    float y;
+    float z;
+    float brk;
+};
+
+layout(buffer_reference, scalar, buffer_reference_align = 16) buffer PlotBuf {
+    PlotPoint p[];
+};
+
+layout(push_constant, scalar) uniform Bake {
+    layout(offset = 0) uint64_t addr;
+    layout(offset = 8) uint mode;
+    layout(offset = 12) uint count;
+} pc;
+
+void write_point(PlotBuf buf, uint i, vec3 p, float brk) {
+    buf.p[i].x = p.x;
+    buf.p[i].y = p.y;
+    buf.p[i].z = p.z;
+    buf.p[i].brk = brk;
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    uint total = 6u + pc.count;
+    if (i >= total || pc.count < 2u) {
+        return;
+    }
+    PlotBuf buf = PlotBuf(pc.addr);
+    const vec2 c = vec2(-300.0, -15.0);
+    const vec2 h = vec2(100.0, 55.0);
+    if (i == 0u) {
+        write_point(buf, i, vec3(c.x - h.x, c.y, 0.0), 1.0);
+        return;
+    }
+    if (i == 1u) {
+        write_point(buf, i, vec3(c.x + h.x, c.y, 0.0), 0.0);
+        return;
+    }
+    if (i == 2u) {
+        write_point(buf, i, vec3(c.x, c.y - h.y, 0.0), 1.0);
+        return;
+    }
+    if (i == 3u) {
+        write_point(buf, i, vec3(c.x, c.y + h.y, 0.0), 0.0);
+        return;
+    }
+    if (i == 4u) {
+        write_point(buf, i, vec3(c, -40.0), 1.0);
+        return;
+    }
+    if (i == 5u) {
+        write_point(buf, i, vec3(c, 40.0), 0.0);
+        return;
+    }
+    uint s = i - 6u;
+    float t = float(s) / float(pc.count - 1u);
+    float u = t * 2.0 - 1.0;
+    float x = 0.0;
+    float y = 0.0;
+    if (pc.mode == 2u) {
+        x = u * 12.0;
+        y = abs(x) < 1.0e-4 ? 1.0 : sin(x) / x;
+    } else if (pc.mode == 3u) {
+        x = u * 3.0;
+        y = exp(-0.5 * x * x);
+    } else {
+        x = u * 6.28318530718;
+        y = sin(x);
+    }
+    write_point(buf, i, vec3(c.x + u * h.x, c.y + y * h.y, 0.0), s == 0u ? 1.0 : 0.0);
+}

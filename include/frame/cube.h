@@ -13,6 +13,8 @@
 // That dispatch does not read the color attachment.
 // A second dispatch steps one scalar temperature per vertex on a live frame.
 // The draw mixes that temperature into the baked color.
+// Each face is a 16 by 16 grid so a click lands on a sample. The fillet
+// edges and corners stay on the original 888 vertices.
 
 typedef struct CubeDepth {
     VkImage        image;
@@ -46,8 +48,9 @@ void cube_prepare_draw(VkCommandBuffer cmd, VkImage depth);
 // origin_x is pixels right of center. origin_y is pixels up from center.
 // depth_bias pulls a later object closer. Object 0 passes 0.
 // phase is turns of hue, one full turn per 5000 ms of frame-clock time.
+// selected lightens the cube the same way a selected solid is lightened.
 void cube_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height, float yaw_deg,
-               float origin_x, float origin_y, float depth_bias, float phase);
+               float origin_x, float origin_y, float depth_bias, float phase, bool selected);
 
 // Fold one wl_surface.frame stamp. The returned interval is the heat step
 // for a frame that actually submits. Zero is a baseline, a repeated stamp,
@@ -85,9 +88,10 @@ bool cube_heat_wants_frame(uint32_t time_ms, bool *ended);
 // Later presents keep the last temperatures until the next poke.
 void cube_heat_hold(void);
 
-// The filled-quad pipeline is drawn in the same pass, so it uses these.
+// The face fill is drawn in the same pass, so it uses these.
 VkFormat cube_depth_format(void);
 VkSampleCountFlagBits cube_raster_samples(void);
 uint32_t cube_vertex_count(void);
+[[nodiscard]] uint64_t cube_mesh_addr(void);
 
 #endif /* ENGINE_FRAME_CUBE_H */

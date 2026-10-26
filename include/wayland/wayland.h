@@ -82,6 +82,7 @@ typedef struct WaylandContext {
     bool     shm_argb8888;
     bool     configure_resizing;
     bool     noted_signal;
+    int      noted_signal_res;
     bool     send_tracks_ack;
     bool     lock_toplevel_size;
     int32_t  lock_width;
@@ -223,7 +224,7 @@ void wayland_on_cqe(WaylandContext *w, const struct io_uring_cqe *cqe);
 
 /**
  * @brief Imports a DMA-BUF fd into a wl_buffer via zwp_linux_buffer_params_v1.add + create_immed.
- * Duplicates dmabuf_fd for the kernel sendmsg so the caller retains ownership of dmabuf_fd.
+ * The fd is placed in SCM_RIGHTS and must stay open until this call returns.
  */
 [[nodiscard]] int wayland_import_dmabuf_immed(
     WaylandContext *w,
@@ -239,7 +240,7 @@ void wayland_on_cqe(WaylandContext *w, const struct io_uring_cqe *cqe);
 
 /**
  * @brief Imports one DRM syncobj fd as a wp_linux_drm_syncobj_timeline_v1.
- * The fd is duplicated for sendmsg. The caller keeps the original.
+ * The fd is placed in SCM_RIGHTS and must stay open until this call returns.
  */
 [[nodiscard]] int wayland_import_syncobj_timeline(
     WaylandContext *w,

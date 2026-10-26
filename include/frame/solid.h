@@ -2,7 +2,6 @@
 #define ENGINE_FRAME_SOLID_H
 
 #include "vulkan/types.h"
-#include <stdbool.h>
 #include <stdint.h>
 
 // Six meshes baked once on the GPU. Each has a faceted cage and a rounded

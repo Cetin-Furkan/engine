@@ -3,6 +3,10 @@
 
 #include <stdint.h>
 
+struct io_uring_cqe;
+
+typedef void (*ChromeCqeFn)(const struct io_uring_cqe *cqe, void *user);
+
 enum : uint32_t {
     ENG_CHROME_LAYERS   = 4,
     ENG_CHROME_CONTROLS = 8,
@@ -55,6 +59,13 @@ typedef struct ChromeSpec {
  *        unknown cursor names fail. Nothing in the spec is invented here.
  */
 [[nodiscard]] int chrome_load(void);
+
+/**
+ * @brief Re-reads the path already loaded. A failed read or parse leaves the
+ *        previous spec in place. on_cqe receives completions that are not part
+ *        of the file read. A null callback forwards those to Wayland.
+ */
+[[nodiscard]] int chrome_reload(ChromeCqeFn on_cqe, void *user);
 
 [[nodiscard]] const ChromeSpec *chrome_spec(void);
 

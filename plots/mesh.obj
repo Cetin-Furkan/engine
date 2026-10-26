@@ -1,0 +1,10 @@
+# Plot mesh. A .blend is Blender's database; export OBJ into this file.
+v -1.0 0.0 0.0
+v 0.0 1.0 0.15
+v 1.0 0.0 0.0
+v 0.0 -1.0 -0.15
+l 1 2 3 4 1
+v -0.35 0.15 0.85
+v 0.35 0.15 0.85
+v 0.0 -0.25 0.85
+f 5 7 6

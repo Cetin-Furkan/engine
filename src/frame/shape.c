@@ -1,4 +1,5 @@
 #include "frame/shape.h"
+#include "frame/camera.h"
 #include "frame/cube.h"
 #include <stddef.h>
 #include <stdio.h>
@@ -23,6 +24,7 @@ typedef struct ShapePush {
     uint32_t width;
     uint32_t height;
     float    r, g, b, a;
+    ViewPush view;
 } ShapePush;
 
 static_assert(offsetof(ShapePush, center_x) == 32u, "shape center");
@@ -30,7 +32,8 @@ static_assert(offsetof(ShapePush, angle_rad) == 40u, "shape angle");
 static_assert(offsetof(ShapePush, depth) == 44u, "shape depth");
 static_assert(offsetof(ShapePush, width) == 48u, "shape width");
 static_assert(offsetof(ShapePush, r) == 56u, "shape color");
-static_assert(sizeof(ShapePush) == 72u, "shape push");
+static_assert(offsetof(ShapePush, view) == 72u, "shape view");
+static_assert(sizeof(ShapePush) == 120u, "shape push");
 
 static VkPipelineLayout s_layout = VK_NULL_HANDLE;
 static VkPipeline       s_pipeline = VK_NULL_HANDLE;
@@ -87,7 +90,7 @@ int shape_init(VulkanContext *vk) {
     VkPhysicalDeviceProperties props = {0};
     vkGetPhysicalDeviceProperties(vk->physical_device, &props);
     if (props.limits.maxPushConstantsSize < sizeof(ShapePush)) {
-        fprintf(stderr, "[Shape Error] Push constants are %u bytes, the quad needs %zu\n",
+        fprintf(stderr, "[Shape Error] Push constants are %u bytes, the fill needs %zu\n",
                 props.limits.maxPushConstantsSize, sizeof(ShapePush));
         return -1;
     }
@@ -212,7 +215,7 @@ int shape_init(VulkanContext *vk) {
         shape_shutdown(vk);
         return -1;
     }
-    printf("[Shape] Filled quad in the cube pass\n");
+    printf("[Shape] Four-corner fill in the cube pass\n");
     fflush(stdout);
     return 0;
 }
@@ -220,7 +223,7 @@ int shape_init(VulkanContext *vk) {
 void shape_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height,
                 const float x[4], const float y[4],
                 float center_x, float center_y, float angle_rad, float depth,
-                float r, float g, float b, float a) {
+                float r, float g, float b, float a, uint32_t mat_index) {
     if (cmd == VK_NULL_HANDLE || s_pipeline == VK_NULL_HANDLE || s_layout == VK_NULL_HANDLE ||
         x == nullptr || y == nullptr || width == 0 || height == 0) {
         return;
@@ -249,6 +252,7 @@ void shape_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height,
         .height    = height,
         .r = r, .g = g, .b = b, .a = a,
     };
+    view_push_fill(&push.view, mat_index);
     vkCmdSetViewport(cmd, 0, 1, &viewport);
     vkCmdSetScissor(cmd, 0, 1, &scissor);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_pipeline);

@@ -348,11 +348,11 @@ static void note_key_global(WaylandContext *w, uint32_t name, const char *iface,
     }
 }
 
-static void parse_stream(WaylandContext *w) {
+static uint32_t parse_span(WaylandContext *w, const unsigned char *data, uint32_t len) {
     uint32_t offset = 0;
-    const unsigned char *stream_end = w->stream + w->stream_len;
-    while (w->stream_len - offset >= 8u && !w->failed) {
-        const unsigned char *msg_start = w->stream + offset;
+    const unsigned char *stream_end = data + len;
+    while (len - offset >= 8u && !w->failed) {
+        const unsigned char *msg_start = data + offset;
         const unsigned char *p         = msg_start;
         uint32_t object = 0;
         uint16_t opcode = 0;
@@ -367,7 +367,7 @@ static void parse_stream(WaylandContext *w) {
             wl_fail(w, "invalid wayland wire message size");
             break;
         }
-        if (w->stream_len - offset < size) {
+        if (len - offset < size) {
             break;
         }
 
@@ -570,14 +570,22 @@ static void parse_stream(WaylandContext *w) {
 
         offset += size;
     }
+    return offset;
+}
 
-    if (offset > 0) {
-        uint32_t remaining = w->stream_len - offset;
-        if (remaining > 0) {
-            memmove(w->stream, w->stream + offset, remaining);
-        }
-        w->stream_len = remaining;
+static void parse_stream(WaylandContext *w) {
+    if (w->stream_len == 0 || w->failed) {
+        return;
     }
+    uint32_t consumed = parse_span(w, w->stream, w->stream_len);
+    if (consumed == 0) {
+        return;
+    }
+    uint32_t remaining = w->stream_len - consumed;
+    if (remaining > 0) {
+        memmove(w->stream, w->stream + consumed, remaining);
+    }
+    w->stream_len = remaining;
 }
 
 static void arm_recv(WaylandContext *w) {
@@ -608,6 +616,7 @@ int wayland_ensure_recv(WaylandContext *w) {
 void wayland_on_cqe(WaylandContext *w, const struct io_uring_cqe *cqe) {
     if (cqe->user_data == ENG_UD_SIGNAL) {
         w->noted_signal = true;
+        w->noted_signal_res = cqe->res;
         return;
     }
     if (cqe->user_data == ENG_UD_WL_PONG) {
@@ -641,6 +650,19 @@ void wayland_on_cqe(WaylandContext *w, const struct io_uring_cqe *cqe) {
 
     if (cqe->res < 0) {
         w->recv_armed = false;
+        // recvmsg cannot split its header across an incremental tail. This kernel
+        // returns EFAULT instead of selecting the next buffer. The bytes stay in
+        // the socket. Drop incremental mode and arm a fresh multishot.
+        bool inc_reject = w->ring->pbuf_inc &&
+                          ((cqe->res == -EINVAL && w->recv_cqes == 1) || cqe->res == -EFAULT);
+        if (inc_reject) {
+            fprintf(stderr, "[Wayland] Incremental buffers rejected recvmsg (%s). Falling back.\n",
+                    strerror(-cqe->res));
+            if (ring_pbuf_drop_inc(w->ring) == 0) {
+                arm_recv(w);
+                return;
+            }
+        }
         if (cqe->res == -ENOBUFS) {
             (void)wayland_ensure_recv(w);
             return;
@@ -654,8 +676,10 @@ void wayland_on_cqe(WaylandContext *w, const struct io_uring_cqe *cqe) {
     }
 
     uint16_t bid = (uint16_t)(cqe->flags >> IORING_CQE_BUFFER_SHIFT);
-    uint8_t *buf = ring_buf(w->ring, bid);
+    bool more = w->ring->pbuf_inc && (cqe->flags & IORING_CQE_F_BUF_MORE) != 0;
+    uint8_t *buf = ring_pbuf_chunk(w->ring, bid, (uint32_t)cqe->res);
     if (buf == nullptr) {
+        ring_pbuf_finish(w->ring, bid, (uint32_t)cqe->res, more);
         wl_fail(w, "recvmsg buffer ID out of range");
         return;
     }
@@ -663,7 +687,7 @@ void wayland_on_cqe(WaylandContext *w, const struct io_uring_cqe *cqe) {
     const struct io_uring_recvmsg_out *out = (const struct io_uring_recvmsg_out *)buf;
     uint32_t hdr = (uint32_t)sizeof(*out) + w->control_reserve;
     if ((uint32_t)cqe->res < hdr || (out->flags & (MSG_CTRUNC | MSG_TRUNC)) != 0) {
-        ring_pbuf_recycle(w->ring, bid);
+        ring_pbuf_finish(w->ring, bid, (uint32_t)cqe->res, more);
         wl_fail(w, "recvmsg truncated");
         return;
     }
@@ -672,15 +696,29 @@ void wayland_on_cqe(WaylandContext *w, const struct io_uring_cqe *cqe) {
     if (out->controllen > 0) {
         park_fds(w, buf + sizeof(*out), out->controllen);
     }
-    if (!w->failed && w->stream_len + copied <= sizeof(w->stream)) {
+    if (w->failed) {
+        ring_pbuf_finish(w->ring, bid, (uint32_t)cqe->res, more);
+        return;
+    }
+    if (w->stream_len == 0) {
+        uint32_t consumed = parse_span(w, buf + hdr, copied);
+        uint32_t tail = copied - consumed;
+        if (!w->failed && tail > 0) {
+            if (tail > sizeof w->stream) {
+                wl_fail(w, "wayland stream buffer overflow");
+            } else {
+                memcpy(w->stream, buf + hdr + consumed, tail);
+                w->stream_len = tail;
+            }
+        }
+    } else if (w->stream_len + copied <= sizeof w->stream) {
         memcpy(w->stream + w->stream_len, buf + hdr, copied);
         w->stream_len += copied;
-        ring_pbuf_recycle(w->ring, bid);
         parse_stream(w);
     } else {
-        ring_pbuf_recycle(w->ring, bid);
         wl_fail(w, "wayland stream buffer overflow");
     }
+    ring_pbuf_finish(w->ring, bid, (uint32_t)cqe->res, more);
 
     if (!w->failed) {
         (void)wayland_ensure_recv(w);
@@ -767,27 +805,21 @@ static int send_wire_batch_with_fd(WaylandContext *w, int fd_to_send) {
     if (w->failed) {
         return -EIO;
     }
-    int dup_fd = -1;
-    if (fd_to_send >= 0) {
-        dup_fd = dup(fd_to_send);
-        if (dup_fd < 0) {
-            wl_fail_err(w, "dup SCM_RIGHTS fd", errno);
-            return -errno;
-        }
-    }
 
     for (;;) {
         uint32_t remaining = w->send_len - w->send_off;
         struct io_uring_sqe *sqe = ring_sqe(w->ring);
         if (sqe == nullptr) {
-            if (dup_fd >= 0) {
-                close(dup_fd);
-            }
+            w->send_msg.msg_control    = nullptr;
+            w->send_msg.msg_controllen = 0u;
             wl_fail(w, "SQ full while sending wire batch");
             return -ENOSPC;
         }
 
-        if (dup_fd >= 0) {
+        // SCM_RIGHTS rides the first accepted byte. A retry after that byte
+        // is a plain send. A retry before any byte still carries the caller's fd.
+        bool with_cmsg = fd_to_send >= 0 && w->send_off == 0;
+        if (with_cmsg) {
             w->send_iov.iov_base   = w->send_bytes + w->send_off;
             w->send_iov.iov_len    = remaining;
             w->send_msg.msg_iov    = &w->send_iov;
@@ -801,7 +833,7 @@ static int send_wire_batch_with_fd(WaylandContext *w, int fd_to_send) {
             cmsg->cmsg_level = SOL_SOCKET;
             cmsg->cmsg_type  = SCM_RIGHTS;
             cmsg->cmsg_len   = CMSG_LEN(sizeof(int));
-            memcpy(CMSG_DATA(cmsg), &dup_fd, sizeof(int));
+            memcpy(CMSG_DATA(cmsg), &fd_to_send, sizeof(int));
 
             sqe->opcode    = IORING_OP_SENDMSG;
             sqe->flags     = IOSQE_FIXED_FILE;
@@ -827,22 +859,12 @@ static int send_wire_batch_with_fd(WaylandContext *w, int fd_to_send) {
         struct io_uring_cqe cqe = {0};
         int rc = submit_and_wait_tag(w, ENG_UD_WL_SEND, &cqe);
         if (rc < 0) {
-            if (dup_fd >= 0) {
-                close(dup_fd);
-            }
             w->send_msg.msg_control    = nullptr;
             w->send_msg.msg_controllen = 0u;
             return rc;
         }
-        if (cqe.res > 0 && dup_fd >= 0) {
-            close(dup_fd);
-            dup_fd = -1;
-        }
         int progress = note_send_progress(w, cqe.res);
         if (progress < 0) {
-            if (dup_fd >= 0) {
-                close(dup_fd);
-            }
             w->send_msg.msg_control    = nullptr;
             w->send_msg.msg_controllen = 0u;
             return progress;
@@ -852,9 +874,6 @@ static int send_wire_batch_with_fd(WaylandContext *w, int fd_to_send) {
         }
     }
 
-    if (dup_fd >= 0) {
-        close(dup_fd);
-    }
     w->send_msg.msg_control    = nullptr;
     w->send_msg.msg_controllen = 0u;
     return 0;
@@ -1070,14 +1089,11 @@ int wayland_import_dmabuf_immed(
     if (flush_if_pending(w) < 0) {
         return -EIO;
     }
+    uint32_t mark = w->send_len;
     w->buffer_params_id = wayland_alloc_id(w);
     w->buffer_id        = wayland_alloc_id(w);
     w->buffer_released  = false;
 
-    // 1. zwp_linux_dmabuf_v1.create_params (request 1)
-    (void)wayland_put_raw(w, w->linux_dmabuf_id, 1u, &w->buffer_params_id, sizeof(w->buffer_params_id));
-
-    // 2. zwp_linux_buffer_params_v1.add (request 1, carries 1 SCM_RIGHTS fd)
     uint32_t add_payload[5] = {
         0u,                                 // plane_idx = 0
         offset,                             // offset = 0
@@ -1085,9 +1101,6 @@ int wayland_import_dmabuf_immed(
         (uint32_t)(modifier >> 32u),        // modifier_hi
         (uint32_t)(modifier & 0xffffffffu), // modifier_lo
     };
-    (void)wayland_put_raw(w, w->buffer_params_id, 1u, add_payload, sizeof(add_payload));
-
-    // 3. zwp_linux_buffer_params_v1.create_immed (request 3)
     uint32_t immed_payload[5] = {
         w->buffer_id,
         width,
@@ -1095,10 +1108,14 @@ int wayland_import_dmabuf_immed(
         drm_fourcc,
         0u, // flags = 0
     };
-    (void)wayland_put_raw(w, w->buffer_params_id, 3u, immed_payload, sizeof(immed_payload));
-
-    // 4. zwp_linux_buffer_params_v1.destroy (request 0)
-    (void)wayland_put_raw(w, w->buffer_params_id, 0u, nullptr, 0u);
+    if (!wayland_put_raw(w, w->linux_dmabuf_id, 1u, &w->buffer_params_id, sizeof(w->buffer_params_id)) ||
+        !wayland_put_raw(w, w->buffer_params_id, 1u, add_payload, sizeof(add_payload)) ||
+        !wayland_put_raw(w, w->buffer_params_id, 3u, immed_payload, sizeof(immed_payload)) ||
+        !wayland_put_raw(w, w->buffer_params_id, 0u, nullptr, 0u)) {
+        wayland_rewind_send(w, mark);
+        fprintf(stderr, "[Wayland Error] DMA-BUF create_immed encode failed: %s\n", w->err);
+        return -EIO;
+    }
 
     if (send_wire_batch_with_fd(w, dmabuf_fd) < 0) {
         fprintf(stderr, "[Wayland Error] DMA-BUF create_immed batch failed: %s\n", w->err);
@@ -1592,6 +1609,83 @@ void wayland_destroy_frame_objects(WaylandContext *w) {
     close_feedback_table(w);
 }
 
+static int queue_registry_send(WaylandContext *w) {
+    struct io_uring_sqe *sqe = ring_sqe(w->ring);
+    if (sqe == nullptr) {
+        wl_fail(w, "SQ full while sending the registry");
+        return -ENOSPC;
+    }
+    sqe->opcode    = IORING_OP_SEND;
+    sqe->flags     = IOSQE_FIXED_FILE;
+    sqe->ioprio    = IORING_RECVSEND_POLL_FIRST;
+    sqe->fd        = ENG_WL_SOCK_SLOT;
+    sqe->addr      = (uint64_t)(uintptr_t)(w->send_bytes + w->send_off);
+    sqe->len       = w->send_len - w->send_off;
+    sqe->msg_flags = MSG_NOSIGNAL;
+    sqe->user_data = ENG_UD_WL_SEND;
+    return 0;
+}
+
+static int finish_linked_handshake(WaylandContext *w) {
+    uint64_t deadline = ring_mono_ns() + 3000000000ull;
+    bool send_done = false;
+    for (;;) {
+        struct io_uring_cqe cqe;
+        while (ring_peek(w->ring, &cqe)) {
+            if (cqe.user_data == ENG_UD_WL_SOCKET) {
+                if (cqe.res != 0) {
+                    fprintf(stderr, "[Wayland Error] IORING_OP_SOCKET fixed slot 0 failed: %d\n", cqe.res);
+                    return -EIO;
+                }
+                continue;
+            }
+            if (cqe.user_data == ENG_UD_WL_CONNECT) {
+                if (cqe.res < 0) {
+                    fprintf(stderr, "[Wayland Error] IORING_OP_CONNECT failed: %s (%d)\n",
+                            strerror(-cqe.res), cqe.res);
+                    return -EIO;
+                }
+                continue;
+            }
+            if (cqe.user_data == ENG_UD_WL_SEND) {
+                if (cqe.res == -ECANCELED) {
+                    fprintf(stderr, "[Wayland Error] Handshake link canceled before the registry send\n");
+                    return -EIO;
+                }
+                int progress = note_send_progress(w, cqe.res);
+                if (progress < 0) {
+                    return progress;
+                }
+                if (progress == 0) {
+                    send_done = true;
+                    continue;
+                }
+                if (queue_registry_send(w) != 0) {
+                    return -EIO;
+                }
+                continue;
+            }
+            wayland_on_cqe(w, &cqe);
+            if (w->failed) {
+                return -EIO;
+            }
+        }
+        if (send_done && w->ring->sq_pending == 0) {
+            return 0;
+        }
+        if (ring_mono_ns() > deadline) {
+            wl_fail(w, "wayland handshake timed out");
+            return -ETIMEDOUT;
+        }
+        unsigned n = ring_submit(w->ring);
+        int rc = ring_enter(w->ring, n, 1, 200);
+        if (rc < 0 && rc != -ETIME) {
+            wl_fail_err(w, "io_uring_enter", rc);
+            return rc;
+        }
+    }
+}
+
 int wayland_init(void) {
     RingContext *r = ring_get_context();
     if (r == nullptr || !r->is_initialized) {
@@ -1610,13 +1704,22 @@ int wayland_init(void) {
 
     const char *dir  = getenv("XDG_RUNTIME_DIR");
     const char *disp = getenv("WAYLAND_DISPLAY");
-    if (dir == nullptr || dir[0] == '\0' || disp == nullptr || disp[0] == '\0') {
-        fprintf(stderr, "[Wayland Error] XDG_RUNTIME_DIR or WAYLAND_DISPLAY is not set\n");
+    if (disp == nullptr || disp[0] == '\0') {
+        fprintf(stderr, "[Wayland Error] WAYLAND_DISPLAY is not set\n");
         return 1;
     }
 
-    int path_n = snprintf(w->path, sizeof w->path, "%s/%s", dir, disp);
-    if (path_n < 0 || (size_t)path_n >= sizeof w->path) {
+    int path_n;
+    if (disp[0] == '/') {
+        path_n = snprintf(w->path, sizeof w->path, "%s", disp);
+    } else if (dir == nullptr || dir[0] == '\0') {
+        fprintf(stderr, "[Wayland Error] XDG_RUNTIME_DIR or WAYLAND_DISPLAY is not set\n");
+        return 1;
+    } else {
+        path_n = snprintf(w->path, sizeof w->path, "%s/%s", dir, disp);
+    }
+    if (path_n < 0 || (size_t)path_n >= sizeof w->path ||
+        (size_t)path_n >= sizeof w->addr.sun_path) {
         fprintf(stderr, "[Wayland Error] Wayland socket path exceeds sockaddr_un limit\n");
         return 1;
     }
@@ -1629,36 +1732,10 @@ int wayland_init(void) {
     memcpy(w->addr.sun_path, w->path, (size_t)path_n + 1u);
     w->addr_len = (unsigned)(offsetof(struct sockaddr_un, sun_path) + (size_t)path_n + 1u);
 
-    // 1. Direct socket creation into io_uring fixed file slot 0 (1-based file_index = 1)
-    struct io_uring_sqe *sqe = ring_sqe(r);
-    struct io_uring_cqe cqe  = {0};
-    sqe->opcode     = IORING_OP_SOCKET;
-    sqe->fd         = AF_UNIX;
-    sqe->off        = SOCK_STREAM | SOCK_NONBLOCK;
-    sqe->file_index = ENG_WL_SOCK_SLOT + 1u;
-    sqe->user_data  = ENG_UD_WL_SOCKET;
-    if (submit_and_wait_tag(w, ENG_UD_WL_SOCKET, &cqe) < 0 || cqe.res != 0) {
-        fprintf(stderr, "[Wayland Error] IORING_OP_SOCKET fixed slot 0 failed\n");
-        return 1;
-    }
-    w->fixed_socket_installed = true;
-
-    // 2. Connect fixed file 0 to the Wayland compositor
-    sqe = ring_sqe(r);
-    sqe->opcode    = IORING_OP_CONNECT;
-    sqe->flags     = IOSQE_FIXED_FILE;
-    sqe->fd        = ENG_WL_SOCK_SLOT;
-    sqe->addr      = (uint64_t)(uintptr_t)&w->addr;
-    sqe->addr2     = w->addr_len;
-    sqe->user_data = ENG_UD_WL_CONNECT;
-    if (submit_and_wait_tag(w, ENG_UD_WL_CONNECT, &cqe) < 0 || cqe.res < 0) {
-        fprintf(stderr, "[Wayland Error] IORING_OP_CONNECT failed: %s (%d)\n",
-                strerror(-cqe.res), cqe.res);
-        return 1;
-    }
-
-    // 3. Send wl_display.get_registry (opcode 1) + wl_display.sync (opcode 0)
+    // Socket, connect, and the registry send share one enter. The send CQE stays
+    // visible so a short write can be retried. Recv is armed after that send.
     w->send_len = 0;
+    w->send_off = 0;
     (void)wayland_put_raw(w, w->display_id, 1u, &w->registry_id, sizeof(w->registry_id));
     (void)append_display_sync(w, w->sync_id);
 
@@ -1670,12 +1747,46 @@ int wayland_init(void) {
     w->recv_msg.msg_control    = w->recv_control;
     w->recv_msg.msg_controllen = w->control_reserve;
 
-    if (send_wire_batch(w) < 0) {
-        fprintf(stderr, "[Wayland Error] Registry handshake send failed: %s\n", w->err);
+    uint32_t held = r->sq_pending;
+    struct io_uring_sqe *sock = ring_sqe(r);
+    struct io_uring_sqe *conn = ring_sqe(r);
+    struct io_uring_sqe *send = ring_sqe(r);
+    if (sock == nullptr || conn == nullptr || send == nullptr || w->send_len == 0) {
+        r->sq_pending = held;
+        fprintf(stderr, "[Wayland Error] Registry handshake was not queued\n");
         return 1;
     }
+    sock->opcode     = IORING_OP_SOCKET;
+    sock->flags      = IOSQE_IO_LINK | IOSQE_CQE_SKIP_SUCCESS;
+    sock->fd         = AF_UNIX;
+    sock->off        = SOCK_STREAM | SOCK_NONBLOCK;
+    sock->file_index = ENG_WL_SOCK_SLOT + 1u;
+    sock->user_data  = ENG_UD_WL_SOCKET;
 
-    // 4. Arm multishot RECVMSG and drain until first wl_callback.done
+    conn->opcode    = IORING_OP_CONNECT;
+    conn->flags     = IOSQE_FIXED_FILE | IOSQE_IO_LINK | IOSQE_CQE_SKIP_SUCCESS;
+    conn->fd        = ENG_WL_SOCK_SLOT;
+    conn->addr      = (uint64_t)(uintptr_t)&w->addr;
+    conn->addr2     = w->addr_len;
+    conn->user_data = ENG_UD_WL_CONNECT;
+
+    send->opcode    = IORING_OP_SEND;
+    send->flags     = IOSQE_FIXED_FILE;
+    send->ioprio    = IORING_RECVSEND_POLL_FIRST;
+    send->fd        = ENG_WL_SOCK_SLOT;
+    send->addr      = (uint64_t)(uintptr_t)w->send_bytes;
+    send->len       = w->send_len;
+    send->msg_flags = MSG_NOSIGNAL;
+    send->user_data = ENG_UD_WL_SEND;
+
+    if (finish_linked_handshake(w) != 0) {
+        fprintf(stderr, "[Wayland Error] Registry handshake send failed: %s\n",
+                w->err[0] != '\0' ? w->err : "socket, connect, or registry send");
+        return 1;
+    }
+    w->fixed_socket_installed = true;
+
+    struct io_uring_cqe cqe = {0};
     arm_recv(w);
     while (!w->synced && !w->failed) {
         if (submit_and_wait_tag(w, ENG_UD_WL_RECV, &cqe) < 0) {

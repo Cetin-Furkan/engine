@@ -55,10 +55,56 @@ static uint32_t s_spawn_n = 0;
 
 // Presses only. The compositor sends one press and one release. Repeat would
 // need a timer, and these actions are a single press.
-enum { k_key_cap = 16u };
+enum { k_key_cap = 16u, k_held_cap = 16u };
 static uint32_t s_key_q[k_key_cap];
 static uint32_t s_key_n = 0;
+static uint32_t s_held[k_held_cap];
+static uint32_t s_held_n = 0;
 static bool     s_key_focus = false;
+
+static bool shift_key(uint32_t key) {
+    return key == KEY_LEFTSHIFT || key == KEY_RIGHTSHIFT;
+}
+
+static bool shift_held(void) {
+    for (uint32_t i = 0; i < s_held_n; ++i) {
+        if (shift_key(s_held[i])) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// KEY_4 is the cylinder tap unless shift is already down. On a Turkish Q
+// keyboard that chord is plus. Numpad plus and minus are their own keys.
+static bool motion_key(uint32_t key) {
+    return key == KEY_LEFT || key == KEY_RIGHT || key == KEY_UP || key == KEY_DOWN ||
+           key == KEY_Q || key == KEY_E || key == KEY_C || key == KEY_V ||
+           key == KEY_MINUS || key == KEY_EQUAL || key == KEY_KPMINUS || key == KEY_KPPLUS;
+}
+
+static bool tap_key(uint32_t key) {
+    return key == KEY_ESC || key == KEY_BACKSPACE || key == KEY_F5 ||
+           key == KEY_R || key == KEY_S || key == KEY_G ||
+           key == KEY_F || key == KEY_M || key == KEY_L ||
+           key == KEY_HOME || key == KEY_KP1 ||
+           (key >= KEY_1 && key <= KEY_6);
+}
+
+static void held_add(uint32_t key) {
+    for (uint32_t i = 0; i < s_held_n; ++i) {
+        if (s_held[i] == key) {
+            return;
+        }
+    }
+    if (s_held_n < k_held_cap) {
+        s_held[s_held_n++] = key;
+    }
+}
+
+static void held_clear(void) {
+    s_held_n = 0;
+}
 
 static int32_t fixed_to_int(int32_t v) {
     return v >> 8;
@@ -316,10 +362,12 @@ static bool on_keyboard(WaylandContext *w, uint16_t opcode,
         }
         (void)serial;
         s_key_focus = surface != 0 && surface == w->surface_id;
+        held_clear();
         return true;
     }
     if (opcode == 2u) {
         s_key_focus = false;
+        held_clear();
         return true;
     }
     if (opcode == 3u) {
@@ -334,9 +382,28 @@ static bool on_keyboard(WaylandContext *w, uint16_t opcode,
         }
         (void)serial;
         (void)time_ms;
-        if (state == 1u && s_key_focus && s_key_n < k_key_cap &&
-            (key == KEY_ESC || key == KEY_BACKSPACE || key == KEY_F5 ||
-             key == KEY_R || key == KEY_S || (key >= KEY_1 && key <= KEY_6))) {
+        if (!s_key_focus) {
+            return true;
+        }
+        if (state == 0u) {
+            for (uint32_t i = 0; i < s_held_n; ++i) {
+                if (s_held[i] == key) {
+                    s_held[i] = s_held[s_held_n - 1u];
+                    s_held_n--;
+                    break;
+                }
+            }
+            return true;
+        }
+        if (state == 1u && (shift_key(key) || motion_key(key))) {
+            held_add(key);
+            return true;
+        }
+        if (state == 1u && key == KEY_4 && shift_held()) {
+            held_add(key);
+            return true;
+        }
+        if (state == 1u && s_key_n < k_key_cap && tap_key(key)) {
             s_key_q[s_key_n++] = key;
         }
         return true;
@@ -536,6 +603,18 @@ bool pointer_take_spawn(int32_t *x, int32_t *y) {
     }
     s_spawn_n--;
     return true;
+}
+
+bool pointer_key_down(uint32_t key) {
+    if (!s_key_focus) {
+        return false;
+    }
+    for (uint32_t i = 0; i < s_held_n; ++i) {
+        if (s_held[i] == key) {
+            return true;
+        }
+    }
+    return false;
 }
 
 bool pointer_take_key(uint32_t *key) {

@@ -3,21 +3,23 @@
 #extension GL_EXT_scalar_block_layout : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_GOOGLE_include_directive : require
 
-// One invocation writes one vertex. The first 614 invocations also write
-// one quad's six indices. Face interiors stay flat. Edges are a
-// constant-radius fillet and corners are the matching sphere octant.
+// One invocation writes one vertex. Invocations below the quad count also
+// write one quad. Each face is a 16 by 16 grid on the flat inset. Edges
+// stay a constant-radius fillet and corners stay the sphere octant.
 // Nothing here reads the framebuffer.
+
+#include "face_grid.inc"
 
 layout(local_size_x = 64) in;
 
-const float k_radius = 0.10;
 const uint k_arc = 8u;
 const float k_half_pi = 1.5707963;
 const uint k_face_verts = 24u;
 const uint k_edge_verts = 216u;
-const uint k_verts = 888u;
-const uint k_quads = 614u;
+const uint k_face_quads = 6u * k_grid * k_grid;
+const uint k_quads = k_face_quads + 12u * k_arc + 8u * k_arc * k_arc;
 
 layout(buffer_reference, scalar, buffer_reference_align = 4) buffer Mesh {
     float f[];
@@ -66,15 +68,6 @@ vec3 color_of(vec3 n) {
     return vec3(0.35, 0.38, 0.62);
 }
 
-void face_basis(uint face, out vec3 n, out vec3 t, out vec3 b) {
-    if (face == 0u)      { n = vec3( 1, 0, 0); t = vec3(0, 0,-1); b = vec3(0, 1, 0); }
-    else if (face == 1u) { n = vec3(-1, 0, 0); t = vec3(0, 0, 1); b = vec3(0, 1, 0); }
-    else if (face == 2u) { n = vec3(0,  1, 0); t = vec3(1, 0, 0); b = vec3(0, 0,-1); }
-    else if (face == 3u) { n = vec3(0, -1, 0); t = vec3(1, 0, 0); b = vec3(0, 0, 1); }
-    else if (face == 4u) { n = vec3(0, 0,  1); t = vec3(1, 0, 0); b = vec3(0, 1, 0); }
-    else                 { n = vec3(0, 0, -1); t = vec3(-1, 0, 0); b = vec3(0, 1, 0); }
-}
-
 void edge_basis(uint e, out vec3 n0, out vec3 n1, out vec3 d) {
     uint pair = e / 4u;
     uint bits = e % 4u;
@@ -112,6 +105,18 @@ vec3 corner_color(vec3 dir, vec3 n0, vec3 n1, vec3 n2, vec3 c0, vec3 c1, vec3 c2
 }
 
 void write_vert(uint id) {
+    if (id >= k_fillet_verts) {
+        uint face;
+        uint i;
+        uint j;
+        grid_decode(id, face, i, j);
+        vec3 n;
+        vec3 t;
+        vec3 b;
+        face_basis(face, n, t, b);
+        store_vert(id, face_point(face, i, j), n, color_of(n));
+        return;
+    }
     float m = 1.0 - k_radius;
     if (id < k_face_verts) {
         uint face = id / 4u;
@@ -160,13 +165,22 @@ void write_vert(uint id) {
 }
 
 void write_quad(uint q) {
-    if (q < 6u) {
-        uint base = q * 4u;
-        store_quad(q, base, base + 1u, base + 2u, base + 3u);
+    if (q < k_face_quads) {
+        uint cell = k_grid * k_grid;
+        uint face = q / cell;
+        uint rem = q - face * cell;
+        uint j = rem / k_grid;
+        uint i = rem - j * k_grid;
+        store_quad(q,
+                   grid_vertex(face, i, j),
+                   grid_vertex(face, i + 1u, j),
+                   grid_vertex(face, i + 1u, j + 1u),
+                   grid_vertex(face, i, j + 1u));
         return;
     }
-    if (q < 102u) {
-        uint local = q - 6u;
+    uint edge_quads = 12u * k_arc;
+    if (q < k_face_quads + edge_quads) {
+        uint local = q - k_face_quads;
         uint e = local / k_arc;
         uint i = local % k_arc;
         uint base = k_face_verts + e * 18u;
@@ -177,7 +191,7 @@ void write_quad(uint q) {
         store_quad(q, p00, p10, p11, p01);
         return;
     }
-    uint local = q - 102u;
+    uint local = q - (k_face_quads + edge_quads);
     uint c = local / 64u;
     uint rem = local % 64u;
     uint iv = rem / k_arc;
@@ -192,7 +206,7 @@ void write_quad(uint q) {
 
 void main() {
     uint id = gl_GlobalInvocationID.x;
-    if (id < k_verts) {
+    if (id < k_grid_verts) {
         write_vert(id);
     }
     if (id < k_quads) {

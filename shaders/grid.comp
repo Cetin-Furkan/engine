@@ -1,0 +1,90 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+// 128^3 scalar field. mode 0 diffuses src into dst. A seed writes a ball and
+// ignores src. mode 1 samples dst at each mesh vertex into tint.
+// One invocation per cell, then one per vertex. The draw reads tint.
+
+layout(local_size_x = 64) in;
+
+layout(buffer_reference, scalar, buffer_reference_align = 4) buffer Field {
+    float v[];
+};
+
+layout(buffer_reference, scalar, buffer_reference_align = 4) buffer Mesh {
+    float f[];
+};
+
+layout(push_constant, scalar) uniform Push {
+    uint64_t src;
+    uint64_t dst;
+    uint64_t tint;
+    uint64_t verts;
+    uint dt_ms;
+    uint seed;
+    uint mode;
+    uint nverts;
+} pc;
+
+const uint N = 128u;
+
+uint at(uint x, uint y, uint z) {
+    return x + y * N + z * N * N;
+}
+
+void diffuse(uint id) {
+    uint cell = N * N * N;
+    if (id >= cell || pc.dst == 0ul) {
+        return;
+    }
+    uint x = id % N;
+    uint y = (id / N) % N;
+    uint z = id / (N * N);
+    if (pc.seed != 0u) {
+        float dx = float(x) - 63.5;
+        float dy = float(y) - 63.5;
+        float dz = float(z) - 63.5;
+        Field(pc.dst).v[id] = (dx * dx + dy * dy + dz * dz) < 100.0 ? 1.0 : 0.0;
+        return;
+    }
+    if (pc.src == 0ul) {
+        return;
+    }
+    float c = Field(pc.src).v[id];
+    float sum = 0.0;
+    uint count = 0u;
+    if (x > 0u) { sum += Field(pc.src).v[at(x - 1u, y, z)]; count++; }
+    if (x + 1u < N) { sum += Field(pc.src).v[at(x + 1u, y, z)]; count++; }
+    if (y > 0u) { sum += Field(pc.src).v[at(x, y - 1u, z)]; count++; }
+    if (y + 1u < N) { sum += Field(pc.src).v[at(x, y + 1u, z)]; count++; }
+    if (z > 0u) { sum += Field(pc.src).v[at(x, y, z - 1u)]; count++; }
+    if (z + 1u < N) { sum += Field(pc.src).v[at(x, y, z + 1u)]; count++; }
+    float avg = count > 0u ? sum / float(count) : c;
+    float alpha = min(float(pc.dt_ms) * 0.02, 1.0);
+    Field(pc.dst).v[id] = clamp(mix(c, avg, alpha), 0.0, 1.0);
+}
+
+void sample_vert(uint id) {
+    if (id >= pc.nverts || pc.dst == 0ul || pc.tint == 0ul || pc.verts == 0ul) {
+        return;
+    }
+    uint o = id * 9u;
+    float px = Mesh(pc.verts).f[o + 0u];
+    float py = Mesh(pc.verts).f[o + 1u];
+    float pz = Mesh(pc.verts).f[o + 2u];
+    uint ix = uint(clamp(px * 0.5 + 0.5, 0.0, 1.0) * 127.0);
+    uint iy = uint(clamp(py * 0.5 + 0.5, 0.0, 1.0) * 127.0);
+    uint iz = uint(clamp(pz * 0.5 + 0.5, 0.0, 1.0) * 127.0);
+    Field(pc.tint).v[id] = Field(pc.dst).v[at(ix, iy, iz)];
+}
+
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    if (pc.mode == 0u) {
+        diffuse(id);
+    } else {
+        sample_vert(id);
+    }
+}

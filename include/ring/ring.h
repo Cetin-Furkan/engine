@@ -6,15 +6,17 @@
 #include <stdint.h>
 
 enum : uint32_t {
-    ENG_SQ_ENTRIES      = 64,
-    ENG_CQ_ENTRIES      = 256,
-    ENG_PBUF_ENTRIES    = 32,
-    ENG_PBUF_LEN        = 8192,
-    ENG_PBUF_BGID       = 1,
-    ENG_FIXED_FILES     = 16,
-    ENG_WL_SOCK_SLOT    = 0,
-    ENG_RELEASE_FD_SLOT = 1,
-    ENG_SIGNAL_FD_SLOT  = 2,
+    ENG_SQ_ENTRIES       = 64,
+    ENG_CQ_ENTRIES       = 256,
+    ENG_PBUF_ENTRIES     = 32,
+    ENG_PBUF_LEN         = 8192,
+    ENG_PBUF_BGID        = 1,
+    ENG_FIXED_FILES      = 16,
+    ENG_WL_SOCK_SLOT     = 0,
+    ENG_RELEASE_FD_SLOT  = 1,
+    ENG_SIGNAL_FD_SLOT   = 2,
+    ENG_SCRATCH_FD_SLOT  = 3,
+    ENG_INOTIFY_FD_SLOT  = 4,
 };
 
 enum : uint64_t {
@@ -25,6 +27,12 @@ enum : uint64_t {
     ENG_UD_WL_PONG     = 7,
     ENG_UD_GPU_RELEASE = 8,
     ENG_UD_SIGNAL      = 9,
+    ENG_UD_FILE_OPEN   = 10,
+    ENG_UD_FILE_READ   = 11,
+    ENG_UD_FILE_CLOSE  = 12,
+    ENG_UD_INOTIFY     = 13,
+    ENG_UD_FILE_FENCE  = 14,
+    ENG_UD_FILE_CANCEL = 15,
 };
 
 typedef struct RingContext {
@@ -66,9 +74,15 @@ typedef struct RingContext {
     uint16_t                  pbuf_tail;
     uint16_t                  pbuf_mask;
     bool                      pbuf_on;
+    bool                      pbuf_inc;
+    bool                      ring_registered;
+    int                       enter_fd;
+    uint32_t                  pbuf_used[ENG_PBUF_ENTRIES];
     bool                      wait_reg_on;
     bool                      is_initialized;
 } RingContext;
+
+typedef void (*RingCqeFn)(const struct io_uring_cqe *cqe, void *user);
 
 [[nodiscard]] uint64_t ring_mono_ns(void);
 [[nodiscard]] int ring_context_init(RingContext *r, const char *name, bool with_pbuf);
@@ -81,7 +95,13 @@ unsigned ring_submit(RingContext *r);
 [[nodiscard]] int ring_enter(RingContext *r, unsigned submit, unsigned min_complete, int timeout_ms);
 [[nodiscard]] bool ring_peek(RingContext *r, struct io_uring_cqe *out);
 [[nodiscard]] uint8_t *ring_buf(const RingContext *r, uint16_t bid);
+[[nodiscard]] uint8_t *ring_pbuf_chunk(const RingContext *r, uint16_t bid, uint32_t nbytes);
+void ring_pbuf_finish(RingContext *r, uint16_t bid, uint32_t nbytes, bool more);
+[[nodiscard]] int ring_pbuf_drop_inc(RingContext *r);
 void ring_pbuf_recycle(RingContext *r, uint16_t bid);
+void ring_sqe_unget(RingContext *r, uint32_t n);
+[[nodiscard]] int ring_read_file_all(RingContext *r, const char *path, void *buf, size_t cap,
+                                     size_t *out_len, RingCqeFn on_cqe, void *on_user);
 [[nodiscard]] int ring_init(void);
 void ring_shutdown(void);
 [[nodiscard]] RingContext *ring_get_context(void);

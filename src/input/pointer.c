@@ -1,5 +1,6 @@
 #include "input/pointer.h"
 #include "chrome/layer.h"
+#include "engine/app.h"
 #include <errno.h>
 #include <linux/input-event-codes.h>
 #include <stdio.h>
@@ -55,7 +56,9 @@ static uint32_t s_spawn_n = 0;
 
 // Presses only. The compositor sends one press and one release. Repeat would
 // need a timer, and these actions are a single press.
-enum { k_key_cap = 16u, k_held_cap = 16u };
+// Held slots cover a full workspace bind table plus both shift keys.
+// A press past this cap is dropped; 32 is the whole evdev set we poll.
+enum { k_key_cap = 16u, k_held_cap = 32u };
 static uint32_t s_key_q[k_key_cap];
 static uint32_t s_key_n = 0;
 static uint32_t s_held[k_held_cap];
@@ -395,15 +398,27 @@ static bool on_keyboard(WaylandContext *w, uint16_t opcode,
             }
             return true;
         }
-        if (state == 1u && (shift_key(key) || motion_key(key))) {
+        if (state != 1u) {
+            return true;
+        }
+        if (shift_key(key)) {
             held_add(key);
             return true;
         }
-        if (state == 1u && key == KEY_4 && shift_held()) {
+        const EngineApp *app = engine_app();
+        uint8_t route = ENGINE_KEY_IGNORE;
+        if (app != nullptr && app->route_key != nullptr) {
+            route = app->route_key(key);
+        } else if (motion_key(key) || (key == KEY_4 && shift_held())) {
+            route = ENGINE_KEY_HOLD;
+        } else if (tap_key(key)) {
+            route = ENGINE_KEY_TAP;
+        }
+        if (route == ENGINE_KEY_HOLD) {
             held_add(key);
             return true;
         }
-        if (state == 1u && s_key_n < k_key_cap && tap_key(key)) {
+        if (route == ENGINE_KEY_TAP && s_key_n < k_key_cap) {
             s_key_q[s_key_n++] = key;
         }
         return true;

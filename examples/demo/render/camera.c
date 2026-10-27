@@ -1,13 +1,17 @@
 #include "frame/camera.h"
 #include "frame/material.h"
+#include "frame/policy.h"
 #include "input/pointer.h"
 #include <linux/input-event-codes.h>
 #include <math.h>
 #include <stdio.h>
 
-// Body-frame increment, then project back onto yaw and pitch so the
-// plane's up does not roll. Pitch stops before the look axis lies in
-// the plane, where the unproject ray would run along z = 0.
+// Yaw and pitch are the pose. The quaternion is Ry(yaw) * Rx(-pitch).
+// Positive pitch raises the look direction. The view quaternion rotates
+// world into camera, and a positive X rotation points camera -Z downward,
+// so the stored X half-angle is the negation of the pitch angle. Pitch
+// stops before the look axis lies in the plane, where the unproject ray
+// would run along z = 0.
 
 enum : uint32_t {
     k_gap_ms = 1000u,
@@ -50,6 +54,7 @@ static bool     s_bind_live = false;
 static uint32_t s_t0 = 0;
 static bool     s_have_t0 = false;
 static float    s_held_yaw = 0.0f;
+static float    s_held_pitch = 0.0f;
 static bool     s_logged = false;
 
 static float clampf(float v, float lo, float hi) {
@@ -147,26 +152,23 @@ static Vec3 unit_or(Vec3 v, Vec3 fallback) {
     return (Vec3){ v.x * s, v.y * s, v.z * s };
 }
 
-static float pose_pitch(Quat q) {
-    Vec3 fwd = look_dir(q);
-    return asinf(clampf(fwd.y, -1.0f, 1.0f));
-}
-
-static void strip_roll(Pose *p) {
-    Quat q = quat_of(p);
-    Vec3 fwd = look_dir(q);
-    float pitch = asinf(clampf(fwd.y, -1.0f, 1.0f));
-    float horiz = sqrtf(fwd.x * fwd.x + fwd.z * fwd.z);
-    float yaw = s_held_yaw;
-    if (horiz > 1.0e-4f) {
-        yaw = atan2f(fwd.x, -fwd.z);
-        s_held_yaw = yaw;
-    }
+// q rotates world into camera. Rx(+pitch) sends the look direction down,
+// so the stored X rotation is the opposite of the pitch angle.
+static void store_yaw_pitch(Pose *p, float yaw, float pitch) {
     float hy = yaw * 0.5f;
-    float hp = pitch * 0.5f;
+    float hp = -pitch * 0.5f;
     Quat qy = { 0.0f, sinf(hy), 0.0f, cosf(hy) };
     Quat qp = { sinf(hp), 0.0f, 0.0f, cosf(hp) };
     quat_store(p, normalize_q(mul_q(qy, qp)));
+}
+
+static float wrap_pi(float a) {
+    const float pi = 3.14159265f;
+    const float turn = 6.28318531f;
+    if (a > pi || a < -pi) {
+        a = remainderf(a, turn);
+    }
+    return a;
 }
 
 static bool pose_same(const Pose *a, const Pose *b) {
@@ -178,25 +180,49 @@ static const Pose *bound_pose(void) {
     return s_bind_live ? &s_live : &s_shown;
 }
 
-static int axis_of(uint32_t positive, uint32_t negative) {
-    int p = pointer_key_down(positive) ? 1 : 0;
-    int n = pointer_key_down(negative) ? 1 : 0;
-    return p - n;
-}
-
 static bool shift_down(void) {
     return pointer_key_down(KEY_LEFTSHIFT) || pointer_key_down(KEY_RIGHTSHIFT);
 }
 
-// Equals is plus on a US keyboard. Numpad plus is the key the Turkish
-// layout prints as plus. Shift+4 is plus on the Turkish Q number row.
-static int zoom_axis(void) {
-    int inn = (pointer_key_down(KEY_EQUAL) || pointer_key_down(KEY_KPPLUS) ||
-               (shift_down() && pointer_key_down(KEY_4)))
-                  ? 1
-                  : 0;
-    int out = (pointer_key_down(KEY_MINUS) || pointer_key_down(KEY_KPMINUS)) ? 1 : 0;
-    return inn - out;
+static bool cam_key_down(uint16_t key, void *user) {
+    (void)user;
+    return pointer_key_down(key);
+}
+
+typedef struct CamAxes {
+    int pan_x;
+    int pan_y;
+    int yaw;
+    int pitch;
+    int zoom;
+} CamAxes;
+
+// lock_2d_quat forces the yaw and pitch axes to zero even when a key
+// is still bound. The permission mask and the pose lock are separate:
+// granting yaw on a flat profile does not tilt the plane.
+static CamAxes cam_axes(void) {
+    const WorkspacePolicy *p = policy_active();
+    bool shift = shift_down();
+    bool flat = p->lock_2d_quat;
+    CamAxes axes = {0};
+    if (!flat) {
+        axes.yaw = policy_held_axis(p, ACT_YAW_CW, ACT_YAW_CCW, shift, cam_key_down, nullptr);
+        axes.pitch = policy_held_axis(p, ACT_PITCH_UP, ACT_PITCH_DOWN, shift, cam_key_down, nullptr);
+    }
+    axes.pan_x = policy_held_axis(p, ACT_PAN_RIGHT, ACT_PAN_LEFT, shift, cam_key_down, nullptr);
+    axes.pan_y = policy_held_axis(p, ACT_PAN_UP, ACT_PAN_DOWN, shift, cam_key_down, nullptr);
+    axes.zoom = policy_held_axis(p, ACT_ZOOM_IN, ACT_ZOOM_OUT, shift, cam_key_down, nullptr);
+    return axes;
+}
+
+static void hold_flat(void) {
+    s_live.qx = 0.0f;
+    s_live.qy = 0.0f;
+    s_live.qz = 0.0f;
+    s_live.qw = 1.0f;
+    s_live.z = 0.0f;
+    s_held_yaw = 0.0f;
+    s_held_pitch = 0.0f;
 }
 
 static void translate_view(float dt, int move_x, int move_y) {
@@ -217,39 +243,23 @@ static void translate_view(float dt, int move_x, int move_y) {
 }
 
 static void integrate(float dt) {
-    int yaw_axis = axis_of(KEY_E, KEY_Q);
-    int pitch_axis = axis_of(KEY_C, KEY_V);
-    float pitch = pose_pitch(quat_of(&s_live));
-    if (pitch >= k_pitch_limit && pitch_axis > 0) {
-        pitch_axis = 0;
+    if (policy_active()->lock_2d_quat) {
+        hold_flat();
     }
-    if (pitch <= -k_pitch_limit && pitch_axis < 0) {
-        pitch_axis = 0;
-    }
-    if (yaw_axis != 0 || pitch_axis != 0) {
-        float ox = (float)pitch_axis * k_pitch_rate * dt;
-        float oy = (float)yaw_axis * k_yaw_rate * dt;
-        float theta2 = ox * ox + oy * oy;
-        Quat dq = { 0.0f, 0.0f, 0.0f, 1.0f };
-        if (theta2 > 1.0e-12f) {
-            float theta = sqrtf(theta2);
-            float s = sinf(theta * 0.5f) / theta;
-            dq.x = ox * s;
-            dq.y = oy * s;
-            dq.z = 0.0f;
-            dq.w = cosf(theta * 0.5f);
-        }
-        quat_store(&s_live, normalize_q(mul_q(dq, quat_of(&s_live))));
-        strip_roll(&s_live);
+    CamAxes axes = cam_axes();
+    if (axes.yaw != 0 || axes.pitch != 0) {
+        s_held_yaw = wrap_pi(s_held_yaw + (float)axes.yaw * k_yaw_rate * dt);
+        s_held_pitch = clampf(s_held_pitch + (float)axes.pitch * k_pitch_rate * dt,
+                              -k_pitch_limit, k_pitch_limit);
+        store_yaw_pitch(&s_live, s_held_yaw, s_held_pitch);
     }
 
-    int zoom = zoom_axis();
-    if (zoom != 0) {
-        s_live.zoom *= expf((float)zoom * k_zoom_rate * dt);
+    if (axes.zoom != 0) {
+        s_live.zoom *= expf((float)axes.zoom * k_zoom_rate * dt);
         s_live.zoom = clampf(s_live.zoom, k_camera_zoom_min, k_camera_zoom_max);
     }
 
-    translate_view(dt, axis_of(KEY_RIGHT, KEY_LEFT), axis_of(KEY_UP, KEY_DOWN));
+    translate_view(dt, axes.pan_x, axes.pan_y);
 }
 
 static void check_identity(void) {
@@ -267,9 +277,19 @@ static void check_identity(void) {
                  fabsf(up.y - 1.0f) < 1.0e-4f && fabsf(up.z) < 1.0e-4f &&
                  fabsf(look.x) < 1.0e-4f && fabsf(look.y) < 1.0e-4f &&
                  fabsf(look.z + 1.0f) < 1.0e-4f;
-    bool ok = basis && fabsf(r.x - 3.0f) < 1.0e-4f && fabsf(r.y + 2.0f) < 1.0e-4f &&
-              fabsf(r.z - 7.0f) < 1.0e-4f && fabsf(x.x) < 1.0e-4f &&
-              fabsf(x.y) < 1.0e-4f && fabsf(x.z + 1.0f) < 1.0e-4f;
+    Pose pitched = { .qw = 1.0f, .zoom = 1.0f };
+    store_yaw_pitch(&pitched, 0.0f, 0.40f);
+    Vec3 look_up = look_dir(quat_of(&pitched));
+    store_yaw_pitch(&pitched, 0.0f, -0.40f);
+    Vec3 look_down = look_dir(quat_of(&pitched));
+    store_yaw_pitch(&pitched, 0.70f, 0.40f);
+    Vec3 look_both = look_dir(quat_of(&pitched));
+    bool pitched_ok = look_up.y > 0.30f && look_down.y < -0.30f &&
+                      look_both.y > 0.25f && look_both.x > 0.50f;
+    bool ok = basis && pitched_ok && fabsf(r.x - 3.0f) < 1.0e-4f &&
+              fabsf(r.y + 2.0f) < 1.0e-4f && fabsf(r.z - 7.0f) < 1.0e-4f &&
+              fabsf(x.x) < 1.0e-4f && fabsf(x.y) < 1.0e-4f &&
+              fabsf(x.z + 1.0f) < 1.0e-4f;
     float wx = 0.0f;
     float wy = 0.0f;
     camera_unproject(12.0f, -4.0f, 1280u, 720u, &wx, &wy);
@@ -289,9 +309,10 @@ void camera_reset(void) {
     s_t0 = 0;
     s_have_t0 = false;
     s_held_yaw = 0.0f;
+    s_held_pitch = 0.0f;
     check_identity();
     if (!s_logged) {
-        printf("[Camera] Quaternion exponential map, exponential zoom, view-plane move.\n");
+        printf("[Camera] Yaw and pitch on the view, exponential zoom, view-plane move.\n");
         fflush(stdout);
         s_logged = true;
     }
@@ -365,6 +386,7 @@ bool camera_snap_front(void) {
     s_live.qw = 1.0f;
     s_live.z = 0.0f;
     s_held_yaw = 0.0f;
+    s_held_pitch = 0.0f;
     if (!changed) {
         return false;
     }
@@ -374,11 +396,9 @@ bool camera_snap_front(void) {
 }
 
 bool camera_motion_down(void) {
-    return pointer_key_down(KEY_LEFT) || pointer_key_down(KEY_RIGHT) ||
-           pointer_key_down(KEY_UP) || pointer_key_down(KEY_DOWN) ||
-           pointer_key_down(KEY_Q) || pointer_key_down(KEY_E) ||
-           pointer_key_down(KEY_C) || pointer_key_down(KEY_V) ||
-           zoom_axis() != 0;
+    CamAxes axes = cam_axes();
+    return axes.pan_x != 0 || axes.pan_y != 0 || axes.yaw != 0 ||
+           axes.pitch != 0 || axes.zoom != 0;
 }
 
 float camera_zoom_shown(void) {

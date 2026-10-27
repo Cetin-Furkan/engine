@@ -12,9 +12,9 @@ static const float k_camera_zoom_max = 10000.0f;
 // The view of the plane. Identity pan, zoom 1, and a unit quaternion
 // reproduce the picture the window had before the camera existed:
 // one world pixel is one screen pixel, +X right, +Y up.
-// A step is an exponential map on the quaternion, then the roll is
-// removed so the plane keeps a stable up. Zoom multiplies by an
-// exponential of the key axis. Move follows the camera's right and up,
+// A step adds yaw and pitch, then stores Ry(yaw) * Rx(-pitch), so the
+// plane keeps a stable up and a positive pitch looks up. Zoom multiplies
+// by an exponential of the key axis. Move follows the camera's right and up,
 // depth included, so an arrow stays on the screen axis. The step is
 // scaled by 1/zoom. The clock is the wl_surface.frame stamp. Nothing
 // here starts the cube's revolution.

@@ -20,7 +20,8 @@ typedef struct MatSlot {
 static_assert(sizeof(MatSlot) == 32u, "material slot");
 static_assert(k_mat_solid0 + 6u <= k_mat_face0, "solid slots");
 static_assert(k_mat_face0 + k_mat_faces <= k_mat_mesh, "face slots");
-static_assert(k_mat_mesh < k_mat_none, "mesh slot");
+static_assert(k_mat_mesh < k_mat_cube_more, "mesh slot");
+static_assert(k_mat_cube_more < k_mat_none, "further cube looks");
 
 static VkBuffer        s_buffer = VK_NULL_HANDLE;
 static VkDeviceMemory  s_memory = VK_NULL_HANDLE;

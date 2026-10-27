@@ -6,7 +6,8 @@
 
 // 128^3 diffusion in one device-address arena. A live frame steps it, then
 // the field holds and the frame callback can drop. The cube vertex shader
-// reads one sample per vertex. Heat still wins where the fillet is hot.
+// reads one sample per vertex. That sample is in mesh space, so every fillet
+// shares it. Each fillet's own heat still wins where that fillet is hot.
 
 [[nodiscard]] int grid_init(VulkanContext *vk);
 void grid_shutdown(VulkanContext *vk);

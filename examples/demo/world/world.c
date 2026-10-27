@@ -1,5 +1,6 @@
 #include "world/world_int.h"
 #include "frame/camera.h"
+#include "frame/policy.h"
 #include <stdio.h>
 
 // Starts the world and calls the layers under src/world. Object kinds live
@@ -70,6 +71,10 @@ bool world_click(float screen_x, float screen_y) {
     Coord hit = {0};
     int index = table_pick(&ray, &hit, nullptr);
     if (index >= 0) {
+        // A rejected select must not fall through into a face spawn.
+        if (!policy_allows(PERM_OBJ_SELECT)) {
+            return false;
+        }
         bool changed = table_select(index);
         WorldObj *o = table_at(index);
         if (o != nullptr && o->ops != nullptr && o->ops->on_click != nullptr &&
@@ -80,6 +85,11 @@ bool world_click(float screen_x, float screen_y) {
     }
     Coord ground = {0};
     if (!coord_ground_hit(&ray, &ground, nullptr)) {
+        return false;
+    }
+    if (!policy_allows(PERM_OBJ_SPAWN)) {
+        printf("[Policy] Grid %+.2f, %+.2f.\n", ground.x, ground.y);
+        fflush(stdout);
         return false;
     }
     return face_spawn(ground);
@@ -114,7 +124,17 @@ bool world_delete(void) {
         table_clear_selection();
         return true;
     }
-    return face_pop_corner();
+    if (face_pop_corner()) {
+        return true;
+    }
+    // Nothing selected and no open corner: the first placed cube is the
+    // fallback, the same object R and G reach when the selection is empty.
+    o = table_fallback();
+    if (o != nullptr && o->ops != nullptr && o->ops->remove != nullptr && o->ops->remove(o)) {
+        table_clear_selection();
+        return true;
+    }
+    return false;
 }
 
 bool world_respin_selected(void) {

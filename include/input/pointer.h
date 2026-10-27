@@ -52,9 +52,11 @@ void pointer_shutdown(WaylandContext *w);
 bool pointer_take_spawn(int32_t *x, int32_t *y);
 
 // One key press while this surface has keyboard focus. The code is an
-// evdev keycode. Camera keys, shift, and shift+4 are not queued here.
-// F, M, L, Home, and numpad 1 are taps. Release and repeat are not
-// reported. Returns false when none are waiting.
+// evdev keycode. route_key on the hosted program says whether the press
+// is ignored, held for polling, or queued as one tap. Shift is always
+// held and never queued. Release and repeat are not reported. When
+// route_key is null, the built-in camera set is held and the built-in
+// tap set is queued. Returns false when none are waiting.
 bool pointer_take_key(uint32_t *key);
 
 // True while this surface has focus and the key is down. Used for held

@@ -1,7 +1,6 @@
 #include "frame/cube.h"
 #include "frame/camera.h"
 #include "frame/grid.h"
-#include "frame/material.h"
 #include "frame/pass.h"
 #include "vulkan/memory.h"
 #include <stddef.h>
@@ -64,11 +63,18 @@ typedef struct DrawPush {
 enum { k_draw_push_bytes = 104 };
 
 // Three copies so a frame still reading one buffer is not overwritten by the
-// next step. Two slots can be in flight. The third is the one being written.
+// next step. Two copies can be in flight. The third is the one being written.
 // The spare wait retires the image from two presents back. It does not make
 // this step's write visible to the next submit. That submit waits
 // s_heat_published.
-enum { k_heat_copies = 3 };
+// Each copy holds k_cube_heat_slots slices. A fillet reads only its slice.
+enum : uint32_t {
+    k_heat_copies = 3u,
+    k_heat_slots  = k_cube_heat_slots,
+    k_heat_stride = ((k_verts * (uint32_t)sizeof(float)) + 15u) & ~15u,
+};
+static_assert(k_heat_stride % 16u == 0u, "heat slice align");
+static_assert(k_heat_stride >= k_verts * (uint32_t)sizeof(float), "heat slice fits");
 
 typedef struct MeshPush {
     uint64_t verts;
@@ -124,20 +130,29 @@ static VkPipeline       s_heat_pipe = VK_NULL_HANDLE;
 static VkBuffer         s_heat_buf[k_heat_copies] = {0};
 static VkDeviceMemory   s_heat_mem[k_heat_copies] = {0};
 static VkDeviceAddress  s_heat_addr[k_heat_copies] = {0};
-static int              s_heat_read = 0;
-static int              s_heat_draw = -1;
-static bool             s_heat_have_stamp = false;
-static uint32_t         s_heat_stamp_ms = 0;
-static bool             s_heat_started = false;
-static bool             s_heat_held = false;
-static uint64_t         s_heat_published = 0;
-static float            s_poke_x = 0.0f;
-static float            s_poke_y = 0.0f;
-static bool             s_poke_pending = false;
-static bool             s_poke_armed_cb = false;
-static bool             s_pulse = false;
-static bool             s_pulse_have_t0 = false;
-static uint32_t         s_pulse_t0 = 0;
+
+typedef struct HeatLive {
+    int      read;
+    int      draw;
+    bool     have_stamp;
+    uint32_t stamp_ms;
+    uint32_t step_dt;
+    bool     started;
+    bool     held;
+    bool     dirty;
+    bool     need_seed;
+    float    poke_x;
+    float    poke_y;
+    bool     poke_pending;
+    bool     poke_armed;
+    bool     pulse;
+    bool     pulse_have_t0;
+    uint32_t pulse_t0;
+} HeatLive;
+
+static HeatLive s_live[k_heat_slots];
+static bool     s_heat_announced = false;
+static uint64_t s_heat_published = 0;
 static void cube_fail(const char *what, VkResult res) {
     fprintf(stderr, "[Cube Error] %s: %s (%d)\n", what, vulkan_vkresult_to_str(res), (int)res);
 }
@@ -260,17 +275,38 @@ static void barrier_heat_to_vertex(VkCommandBuffer cmd) {
     vkCmdPipelineBarrier2(cmd, &dep);
 }
 
+static bool heat_slot_ok(uint32_t slot) {
+    return slot < k_heat_slots;
+}
+
+static void heat_live_clear(void) {
+    for (uint32_t i = 0; i < k_heat_slots; ++i) {
+        s_live[i] = (HeatLive){0};
+        s_live[i].draw = -1;
+    }
+    s_heat_announced = false;
+    s_heat_published = 0;
+}
+
+static VkDeviceAddress heat_at(int copy, uint32_t slot) {
+    if (copy < 0 || (uint32_t)copy >= k_heat_copies || slot >= k_heat_slots) {
+        return 0;
+    }
+    return s_heat_addr[copy] + (VkDeviceAddress)slot * (VkDeviceAddress)k_heat_stride;
+}
+
 static void dispatch_heat(VkCommandBuffer cmd, uint32_t dt_ms, uint32_t seed,
-                          int src_slot, int dst_slot, uint32_t poke, float yaw_deg) {
+                          int src_copy, int dst_copy, uint32_t slot, uint32_t poke, float yaw_deg) {
+    const HeatLive *live = &s_live[slot];
     HeatPush heat_push = {
-        .src     = src_slot >= 0 ? s_heat_addr[src_slot] : 0,
-        .dst     = s_heat_addr[dst_slot],
+        .src     = heat_at(src_copy, slot),
+        .dst     = heat_at(dst_copy, slot),
         .verts   = s_mesh_addr,
         .dt_ms   = dt_ms,
         .seed    = seed,
         .poke    = poke,
-        .poke_x  = poke != 0u ? s_poke_x : 0.0f,
-        .poke_y  = poke != 0u ? s_poke_y : 0.0f,
+        .poke_x  = poke != 0u ? live->poke_x : 0.0f,
+        .poke_y  = poke != 0u ? live->poke_y : 0.0f,
         .yaw_deg = yaw_deg,
     };
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_heat_pipe);
@@ -334,9 +370,9 @@ static int bake_mesh(VulkanContext *vk) {
         vkFreeCommandBuffers(vk->device, vk->cmd_pool, 1, &cmd);
         return -1;
     }
-    dispatch_heat(cmd, 0, 1u, -1, 0, 0u, 0.0f);
-    s_heat_read = 0;
-    s_heat_draw = -1;
+    for (uint32_t slot = 0; slot < k_heat_slots; ++slot) {
+        dispatch_heat(cmd, 0, 1u, -1, 0, slot, 0u, 0.0f);
+    }
     res = vkEndCommandBuffer(cmd);
     if (res != VK_SUCCESS) {
         cube_fail("vkEndCommandBuffer bake", res);
@@ -390,22 +426,9 @@ int cube_init(VulkanContext *vk) {
         cube_shutdown(vk);
         return -1;
     }
-    s_heat_read = 0;
-    s_heat_draw = -1;
-    s_heat_have_stamp = false;
-    s_heat_stamp_ms = 0;
-    s_heat_started = false;
-    s_heat_held = false;
-    s_heat_published = 0;
-    s_poke_x = 0.0f;
-    s_poke_y = 0.0f;
-    s_poke_pending = false;
-    s_poke_armed_cb = false;
-    s_pulse = false;
-    s_pulse_have_t0 = false;
-    s_pulse_t0 = 0;
-    for (int i = 0; i < k_heat_copies; ++i) {
-        if (create_da_buffer(vk, (VkDeviceSize)k_verts * sizeof(float),
+    heat_live_clear();
+    for (uint32_t i = 0; i < k_heat_copies; ++i) {
+        if (create_da_buffer(vk, (VkDeviceSize)k_heat_slots * (VkDeviceSize)k_heat_stride,
                              VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
                              &s_heat_buf[i], &s_heat_mem[i], &s_heat_addr[i]) != 0) {
             cube_shutdown(vk);
@@ -622,7 +645,7 @@ int cube_init(VulkanContext *vk) {
 }
 
 static void release_heat_copies(VulkanContext *vk, bool destroy) {
-    for (int i = 0; i < k_heat_copies; ++i) {
+    for (uint32_t i = 0; i < k_heat_copies; ++i) {
         if (destroy && vk != nullptr && vk->device != VK_NULL_HANDLE) {
             if (s_heat_buf[i] != VK_NULL_HANDLE) {
                 vkDestroyBuffer(vk->device, s_heat_buf[i], nullptr);
@@ -635,20 +658,7 @@ static void release_heat_copies(VulkanContext *vk, bool destroy) {
         s_heat_mem[i] = VK_NULL_HANDLE;
         s_heat_addr[i] = 0;
     }
-    s_heat_read = 0;
-    s_heat_draw = -1;
-    s_heat_have_stamp = false;
-    s_heat_stamp_ms = 0;
-    s_heat_started = false;
-    s_heat_held = false;
-    s_heat_published = 0;
-    s_poke_x = 0.0f;
-    s_poke_y = 0.0f;
-    s_poke_pending = false;
-    s_poke_armed_cb = false;
-    s_pulse = false;
-    s_pulse_have_t0 = false;
-    s_pulse_t0 = 0;
+    heat_live_clear();
 }
 
 void cube_shutdown(VulkanContext *vk) {
@@ -712,8 +722,10 @@ void cube_shutdown(VulkanContext *vk) {
 }
 
 void cube_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height, float yaw_deg,
-               float origin_x, float origin_y, float depth_bias, float phase, bool selected) {
-    if (cmd == VK_NULL_HANDLE || s_pipeline == VK_NULL_HANDLE || width == 0 || height == 0) {
+               float origin_x, float origin_y, float depth_bias, float phase, bool selected,
+               uint32_t mat, uint32_t heat_slot) {
+    if (cmd == VK_NULL_HANDLE || s_pipeline == VK_NULL_HANDLE || width == 0 || height == 0 ||
+        !heat_slot_ok(heat_slot)) {
         return;
     }
     VkViewport viewport = {
@@ -727,7 +739,8 @@ void cube_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height, float yaw_d
     VkRect2D scissor = {
         .extent = { .width = width, .height = height },
     };
-    int heat_slot = s_heat_draw >= 0 ? s_heat_draw : s_heat_read;
+    const HeatLive *live = &s_live[heat_slot];
+    int heat_copy = live->draw >= 0 ? live->draw : live->read;
     DrawPush draw_push = {
         .verts      = s_mesh_addr,
         .width      = width,
@@ -736,12 +749,12 @@ void cube_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height, float yaw_d
         .origin_x   = origin_x,
         .origin_y   = origin_y,
         .depth_bias = depth_bias,
-        .heat       = s_heat_addr[heat_slot],
+        .heat       = heat_at(heat_copy, heat_slot),
         .phase      = phase,
         .selected   = selected ? 1.0f : 0.0f,
         .grid       = grid_tint_addr(),
     };
-    view_push_fill(&draw_push.view, k_mat_cube);
+    view_push_fill(&draw_push.view, mat);
     vkCmdSetViewport(cmd, 0, 1, &viewport);
     vkCmdSetScissor(cmd, 0, 1, &scissor);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_pipeline);
@@ -758,110 +771,174 @@ uint64_t cube_mesh_addr(void) {
     return s_mesh_addr;
 }
 
-uint32_t cube_heat_interval(uint32_t time_ms) {
-    if (s_heat_held) {
+static bool heat_still_running(void) {
+    for (uint32_t i = 0; i < k_heat_slots; ++i) {
+        if (s_live[i].started && !s_live[i].held) {
+            return true;
+        }
+    }
+    return false;
+}
+
+uint32_t cube_heat_interval(uint32_t slot, uint32_t time_ms) {
+    if (!heat_slot_ok(slot)) {
         return 0;
     }
-    if (!s_heat_have_stamp) {
-        s_heat_have_stamp = true;
-        s_heat_stamp_ms = time_ms;
+    HeatLive *h = &s_live[slot];
+    if (h->held) {
+        h->step_dt = 0;
         return 0;
     }
-    uint32_t delta = time_ms - s_heat_stamp_ms;
+    if (!h->have_stamp) {
+        h->have_stamp = true;
+        h->stamp_ms = time_ms;
+        h->step_dt = 0;
+        return 0;
+    }
+    uint32_t delta = time_ms - h->stamp_ms;
     // A gap between revolutions is not a heat step.
     if (delta == 0u || delta > 1000u) {
-        s_heat_stamp_ms = time_ms;
+        h->stamp_ms = time_ms;
+        h->step_dt = 0;
         return 0;
     }
+    h->step_dt = delta;
     return delta;
 }
 
-void cube_heat_commit_stamp(uint32_t time_ms) {
-    if (s_heat_held) {
-        return;
+uint32_t cube_heat_step_dt(uint32_t slot) {
+    if (!heat_slot_ok(slot)) {
+        return 0;
     }
-    s_heat_have_stamp = true;
-    s_heat_stamp_ms = time_ms;
+    return s_live[slot].step_dt;
 }
 
-void cube_heat_record(VkCommandBuffer cmd, uint32_t dt_ms, float yaw_deg) {
-    bool poke = s_poke_pending;
-    if (cmd == VK_NULL_HANDLE || (dt_ms == 0u && !poke) || s_heat_held || s_heat_draw >= 0 ||
-        s_heat_pipe == VK_NULL_HANDLE) {
+void cube_heat_commit_stamp(uint32_t slot, uint32_t time_ms) {
+    if (!heat_slot_ok(slot)) {
         return;
     }
-    int dst = (s_heat_read + 1) % k_heat_copies;
-    if (s_heat_addr[s_heat_read] == 0 || s_heat_addr[dst] == 0 || s_mesh_addr == 0) {
+    HeatLive *h = &s_live[slot];
+    if (h->held || h->step_dt == 0u) {
         return;
     }
-    dispatch_heat(cmd, dt_ms, 0u, s_heat_read, dst, poke ? 1u : 0u, yaw_deg);
-    s_heat_draw = dst;
+    h->have_stamp = true;
+    h->stamp_ms = time_ms;
+}
+
+bool cube_heat_record(VkCommandBuffer cmd, uint32_t slot, float yaw_deg) {
+    if (!heat_slot_ok(slot) || cmd == VK_NULL_HANDLE || s_heat_pipe == VK_NULL_HANDLE) {
+        return false;
+    }
+    HeatLive *h = &s_live[slot];
+    if (h->draw >= 0 || s_mesh_addr == 0) {
+        return false;
+    }
+    int dst = (h->read + 1) % (int)k_heat_copies;
+    if (heat_at(dst, slot) == 0) {
+        return false;
+    }
+    if (h->need_seed) {
+        dispatch_heat(cmd, 0, 1u, -1, dst, slot, 0u, yaw_deg);
+        h->draw = dst;
+        h->need_seed = false;
+        return true;
+    }
+    bool poke = h->poke_pending;
+    if ((h->step_dt == 0u && !poke) || h->held || heat_at(h->read, slot) == 0) {
+        return false;
+    }
+    dispatch_heat(cmd, h->step_dt, 0u, h->read, dst, slot, poke ? 1u : 0u, yaw_deg);
+    h->draw = dst;
     if (poke) {
-        s_poke_pending = false;
-        s_poke_armed_cb = true;
+        h->poke_pending = false;
+        h->poke_armed = true;
     }
+    return true;
 }
 
-void cube_heat_record_ok(uint64_t signal_point) {
-    if (s_heat_draw < 0) {
+void cube_heat_record_ok(uint32_t slot, uint64_t signal_point) {
+    if (!heat_slot_ok(slot)) {
         return;
     }
-    s_heat_read = s_heat_draw;
-    s_heat_draw = -1;
-    s_poke_armed_cb = false;
+    HeatLive *h = &s_live[slot];
+    if (h->draw < 0) {
+        return;
+    }
+    h->read = h->draw;
+    h->draw = -1;
+    h->poke_armed = false;
     if (signal_point != 0) {
         s_heat_published = signal_point;
     }
-    if (s_heat_started) {
+    h->started = true;
+    if (s_heat_announced) {
         return;
     }
-    s_heat_started = true;
-    printf("[Cube] Fillet heat started. Upper half, callback step, then it holds.\n");
+    s_heat_announced = true;
+    printf("[Cube] Fillet heat started. Each cube keeps its own field. Upper half, callback step, then it holds.\n");
     fflush(stdout);
 }
 
-void cube_heat_record_abort(void) {
-    s_heat_draw = -1;
-    if (s_poke_armed_cb) {
-        s_poke_pending = true;
-        s_poke_armed_cb = false;
+void cube_heat_record_abort(uint32_t slot) {
+    if (!heat_slot_ok(slot)) {
+        return;
+    }
+    HeatLive *h = &s_live[slot];
+    h->draw = -1;
+    if (h->poke_armed) {
+        h->poke_pending = true;
+        h->poke_armed = false;
     }
 }
 
-bool cube_heat_poke(float origin_x, float origin_y) {
-    if (s_heat_pipe == VK_NULL_HANDLE) {
+bool cube_heat_poke(uint32_t slot, float origin_x, float origin_y) {
+    if (!heat_slot_ok(slot) || s_heat_pipe == VK_NULL_HANDLE) {
         return false;
     }
-    s_poke_x = origin_x;
-    s_poke_y = origin_y;
-    s_poke_pending = true;
-    s_heat_held = false;
-    s_pulse = true;
-    s_pulse_have_t0 = false;
+    HeatLive *h = &s_live[slot];
+    h->poke_x = origin_x;
+    h->poke_y = origin_y;
+    h->poke_pending = true;
+    h->held = false;
+    h->pulse = true;
+    h->pulse_have_t0 = false;
     printf("[Cube] Fillet heat poked at %+.0f,%+.0f.\n", (double)origin_x, (double)origin_y);
     fflush(stdout);
     return true;
 }
 
 bool cube_heat_poke_pending(void) {
-    return s_poke_pending;
+    for (uint32_t i = 0; i < k_heat_slots; ++i) {
+        if (s_live[i].poke_pending) {
+            return true;
+        }
+    }
+    return false;
 }
 
-bool cube_heat_wants_frame(uint32_t time_ms, bool *ended) {
+bool cube_heat_slot_pending(uint32_t slot) {
+    return heat_slot_ok(slot) && s_live[slot].poke_pending;
+}
+
+bool cube_heat_wants_frame(uint32_t slot, uint32_t time_ms, bool *ended) {
     if (ended != nullptr) {
         *ended = false;
     }
-    if (!s_pulse) {
+    if (!heat_slot_ok(slot)) {
         return false;
     }
-    if (!s_pulse_have_t0) {
-        s_pulse_t0 = time_ms;
-        s_pulse_have_t0 = true;
+    HeatLive *h = &s_live[slot];
+    if (!h->pulse) {
+        return false;
+    }
+    if (!h->pulse_have_t0) {
+        h->pulse_t0 = time_ms;
+        h->pulse_have_t0 = true;
         return true;
     }
-    if (time_ms - s_pulse_t0 >= 5000u) {
-        s_pulse = false;
-        s_pulse_have_t0 = false;
+    if (time_ms - h->pulse_t0 >= 5000u) {
+        h->pulse = false;
+        h->pulse_have_t0 = false;
         if (ended != nullptr) {
             *ended = true;
         }
@@ -875,21 +952,59 @@ uint64_t cube_heat_published(void) {
 }
 
 bool cube_heat_step_open(void) {
-    return s_heat_draw >= 0;
+    for (uint32_t i = 0; i < k_heat_slots; ++i) {
+        if (s_live[i].draw >= 0) {
+            return true;
+        }
+    }
+    return false;
 }
 
-void cube_heat_hold(void) {
-    if (s_heat_held) {
+bool cube_heat_slot_open(uint32_t slot) {
+    return heat_slot_ok(slot) && s_live[slot].draw >= 0;
+}
+
+void cube_heat_hold(uint32_t slot) {
+    if (!heat_slot_ok(slot)) {
         return;
     }
-    s_heat_held = true;
-    s_pulse = false;
-    s_pulse_have_t0 = false;
-    s_poke_pending = false;
-    s_poke_armed_cb = false;
-    if (!s_heat_started) {
+    HeatLive *h = &s_live[slot];
+    if (h->held) {
+        return;
+    }
+    bool was_started = h->started;
+    h->held = true;
+    h->pulse = false;
+    h->pulse_have_t0 = false;
+    h->poke_pending = false;
+    h->poke_armed = false;
+    h->step_dt = 0;
+    if (!was_started || heat_still_running()) {
         return;
     }
     printf("[Cube] Fillet heat holds.\n");
     fflush(stdout);
+}
+
+bool cube_heat_held(uint32_t slot) {
+    return !heat_slot_ok(slot) || s_live[slot].held;
+}
+
+void cube_heat_claim(uint32_t slot) {
+    if (!heat_slot_ok(slot)) {
+        return;
+    }
+    HeatLive *h = &s_live[slot];
+    bool reseed = h->started || h->read != 0 || h->dirty || h->need_seed;
+    *h = (HeatLive){0};
+    h->draw = -1;
+    h->need_seed = reseed;
+}
+
+void cube_heat_retire(uint32_t slot) {
+    if (!heat_slot_ok(slot)) {
+        return;
+    }
+    cube_heat_hold(slot);
+    s_live[slot].dirty = true;
 }

@@ -225,5 +225,7 @@ test: $(CONFIG_MK)
 	./build/test_clock
 	$(CC) $(CFLAGS) -o build/test_world tests/test_world.c examples/demo/world/table.c examples/demo/world/spin.c -lm
 	./build/test_world
+	$(CC) $(CFLAGS) -o build/test_policy tests/test_policy.c examples/demo/world/policy.c
+	./build/test_policy
 
 .PHONY: all debug release run run-release release-patch release-minor release-major info help clean clear recheck distclean test

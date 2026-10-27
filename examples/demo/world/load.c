@@ -4,7 +4,7 @@
 
 // world/opening.world. One record a line. A # starts a comment.
 // ground z          the calculated clipmap, on z = 0
-// cube x y z        one fillet. z is stored. The draw sits on the ground, so z is 0.
+// cube x y z        one fillet on the ground. z is 0. Each line is its own cube.
 // mesh              the OBJ pipeline, at the coordinate that pipeline fitted
 
 // Demo data lives with the demo. The legacy path is still tried so a

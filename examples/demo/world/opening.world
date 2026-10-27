@@ -1,7 +1,10 @@
 # Placement list. Coordinates are world pixels.
 # +X right, +Y up, +Z out of the ground. The ground is the z = 0 plane.
 # The metric grid on that plane is on from boot. It is not a record.
-# This file starts empty. A line places one object:
-#   ground z
-#   cube x y z
-#   mesh
+# Each cube line places one fillet. This one sits 100 world pixels
+# to the right of the origin. Another cube line places another fillet.
+
+ground z
+cube 100 0 0
+cube 1000 0 0
+cube -1000 0 0

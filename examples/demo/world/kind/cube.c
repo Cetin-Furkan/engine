@@ -10,7 +10,16 @@ enum : int32_t { k_yaw_start_milli = 38000 };
 static const float k_cube_half = 120.0f;
 static const float k_deg       = 0.01745329251f;
 
+// One fillet mesh, many placements. Each opening.world cube line takes a
+// slot, its own spin, its own hue phase, and its own temperature field.
+// Slot 0 uses material 0. Slots 1..23 use materials 40..62. A click plants
+// heat on that fillet only. The 128^3 tint stays one mesh-local sample.
+enum : uint32_t { k_cube_cap = k_cube_heat_slots };
+
 typedef struct CubeData {
+    bool     used;
+    uint32_t mat;
+    uint32_t heat;
     Spin     spin;
     float    phase;
     float    phase_shown;
@@ -18,15 +27,16 @@ typedef struct CubeData {
     bool     phase_have;
 } CubeData;
 
-static CubeData s_cube;
-static bool     s_up = false;
+static_assert(k_mat_cube_more + k_cube_cap - 2u < k_mat_none, "cube looks fit the table");
+
+static CubeData s_pool[k_cube_cap];
 static bool     s_pick_logged = false;
 static const WorldOps s_ops;
 
 static void cube_kind_reset(void);
 static void cube_kind_self_check(void);
-static float cube_kind_yaw(bool live);
-static bool cube_kind_poke(Coord world_hit);
+static uint32_t mat_of(uint32_t index);
+static bool any_heat_running(void);
 static void cube_record_compute(WorldObj *o, VkCommandBuffer cmd, uint32_t heat_dt, bool live);
 static void cube_record_ok(WorldObj *o, uint64_t signal_point);
 static void cube_record_abort(WorldObj *o);
@@ -116,54 +126,87 @@ static bool slab_hit(const CameraRay *ray, Coord center, float yaw_rad, float ha
     return true;
 }
 
+static uint32_t mat_of(uint32_t index) {
+    if (index == 0u) {
+        return k_mat_cube;
+    }
+    return k_mat_cube_more + (index - 1u);
+}
+
+static bool any_heat_running(void) {
+    for (uint32_t i = 0; i < k_cube_cap; ++i) {
+        if (s_pool[i].used && !cube_heat_held(s_pool[i].heat)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool cube_hit(const WorldObj *o, const CameraRay *ray, float *t, Coord *at) {
-    float yaw = rad_of(s_cube.spin.shown_milli);
+    const CubeData *c = o->data;
+    if (c == nullptr) {
+        return false;
+    }
+    float yaw = rad_of(c->spin.shown_milli);
     return slab_hit(ray, o->at, yaw, k_cube_half, t, at);
 }
 
-static void advance_phase(uint32_t time_ms) {
-    if (!s_cube.phase_have) {
-        s_cube.phase_t0 = time_ms;
-        s_cube.phase_have = true;
+static void advance_phase(CubeData *c, uint32_t time_ms) {
+    if (!c->phase_have) {
+        c->phase_t0 = time_ms;
+        c->phase_have = true;
         return;
     }
-    uint32_t step = time_ms - s_cube.phase_t0;
+    uint32_t step = time_ms - c->phase_t0;
     if (step == 0u) {
         return;
     }
     if (step > 1000u) {
-        s_cube.phase_t0 = time_ms;
+        c->phase_t0 = time_ms;
         return;
     }
-    s_cube.phase_t0 = time_ms;
-    s_cube.phase += (float)step / 5000.0f;
-    if (s_cube.phase >= 1.0f) {
-        s_cube.phase -= floorf(s_cube.phase);
+    c->phase_t0 = time_ms;
+    c->phase += (float)step / 5000.0f;
+    if (c->phase >= 1.0f) {
+        c->phase -= floorf(c->phase);
     }
 }
 
 static bool cube_advance(WorldObj *o, uint32_t time_ms) {
-    (void)o;
-    advance_phase(time_ms);
-    return spin_advance(&s_cube.spin, time_ms, true);
+    CubeData *c = o->data;
+    if (c == nullptr) {
+        return false;
+    }
+    advance_phase(c, time_ms);
+    return spin_advance(&c->spin, time_ms, true);
 }
 
 static void cube_commit(WorldObj *o) {
-    (void)o;
-    s_cube.phase_shown = s_cube.phase;
+    CubeData *c = o->data;
+    if (c == nullptr) {
+        return;
+    }
+    c->phase_shown = c->phase;
 }
 
 static void cube_draw_obj(const WorldObj *o, VkCommandBuffer cmd, uint32_t width, uint32_t height, bool live) {
-    bool glow = live ? s_cube.spin.glow : s_cube.spin.shown_glow;
-    material_set(k_mat_cube, glow);
-    float phase = live ? s_cube.phase : s_cube.phase_shown;
-    cube_draw(cmd, width, height, spin_deg(&s_cube.spin, live), o->at.x, o->at.y, 0.0f,
-              phase, table_highlight(o, live));
+    const CubeData *c = o->data;
+    if (c == nullptr) {
+        return;
+    }
+    bool glow = live ? c->spin.glow : c->spin.shown_glow;
+    material_set(c->mat, glow);
+    float phase = live ? c->phase : c->phase_shown;
+    cube_draw(cmd, width, height, spin_deg(&c->spin, live), o->at.x, o->at.y, 0.0f,
+              phase, table_highlight(o, live), c->mat, c->heat);
 }
 
 static bool cube_toggle_spin(WorldObj *o) {
-    (void)o;
-    if (spin_toggle(&s_cube.spin)) {
+    CubeData *c = o->data;
+    if (c == nullptr) {
+        return false;
+    }
+    if (spin_toggle(&c->spin)) {
         printf("[Engine] Cube spins.\n");
     } else {
         printf("[Engine] Cube holds.\n");
@@ -173,9 +216,30 @@ static bool cube_toggle_spin(WorldObj *o) {
 }
 
 static bool cube_toggle_glow(WorldObj *o) {
-    (void)o;
-    s_cube.spin.glow = !s_cube.spin.glow;
-    printf("[Material] Cube glow %s.\n", s_cube.spin.glow ? "on" : "off");
+    CubeData *c = o->data;
+    if (c == nullptr) {
+        return false;
+    }
+    c->spin.glow = !c->spin.glow;
+    printf("[Material] Cube glow %s.\n", c->spin.glow ? "on" : "off");
+    fflush(stdout);
+    return true;
+}
+
+static bool cube_remove(WorldObj *o) {
+    CubeData *c = o->data;
+    o->alive = false;
+    if (c != nullptr) {
+        c->used = false;
+        c->spin.spinning = false;
+        c->spin.infinite = false;
+        material_set(c->mat, false);
+        cube_heat_retire(c->heat);
+    }
+    if (!any_heat_running()) {
+        grid_hold();
+    }
+    printf("[Engine] Cube removed.\n");
     fflush(stdout);
     return true;
 }
@@ -186,8 +250,11 @@ static const char *cube_name(const WorldObj *o) {
 }
 
 static bool cube_on_click(WorldObj *o, Coord hit) {
-    (void)o;
-    return cube_kind_poke(hit);
+    CubeData *c = o->data;
+    if (c == nullptr) {
+        return false;
+    }
+    return cube_heat_poke(c->heat, hit.x - o->at.x, hit.y - o->at.y);
 }
 
 static uint32_t cube_vertices(const WorldObj *o) {
@@ -204,6 +271,7 @@ static const WorldOps s_ops = {
     .commit               = cube_commit,
     .toggle_spin          = cube_toggle_spin,
     .toggle_glow          = cube_toggle_glow,
+    .remove               = cube_remove,
     .name                 = cube_name,
     .record_compute       = cube_record_compute,
     .record_ok            = cube_record_ok,
@@ -222,25 +290,39 @@ const WorldOps *cube_ops(void) {
 }
 
 static void cube_kind_reset(void) {
-    s_cube = (CubeData){0};
-    s_up = false;
+    for (uint32_t i = 0; i < k_cube_cap; ++i) {
+        material_set(mat_of(i), false);
+        s_pool[i] = (CubeData){0};
+    }
     s_pick_logged = false;
-    material_set(k_mat_cube, false);
 }
 
 bool cube_kind_spawn(Coord at) {
-    if (s_up) {
-        fprintf(stderr, "[World] The file names a second cube. One fillet is placed.\n");
+    int slot = -1;
+    for (uint32_t i = 0; i < k_cube_cap; ++i) {
+        if (!s_pool[i].used) {
+            slot = (int)i;
+            break;
+        }
+    }
+    if (slot < 0) {
+        fprintf(stderr, "[World] The cube list is full.\n");
         return false;
     }
-    s_cube = (CubeData){0};
-    s_cube.spin = spin_start(k_yaw_start_milli);
-    int index = table_add(&s_ops, &s_cube, at, &s_cube.spin);
+    CubeData *c = &s_pool[slot];
+    *c = (CubeData){0};
+    c->used = true;
+    c->mat = mat_of((uint32_t)slot);
+    c->heat = (uint32_t)slot;
+    cube_heat_claim(c->heat);
+    c->spin = spin_start(k_yaw_start_milli);
+    int index = table_add(&s_ops, c, at, &c->spin);
     if (index < 0) {
+        cube_heat_retire(c->heat);
+        c->used = false;
         fprintf(stderr, "[World] No room for the cube.\n");
         return false;
     }
-    s_up = true;
     table_mark_spun();
     return true;
 }
@@ -266,42 +348,33 @@ static void cube_kind_self_check(void) {
     }
 }
 
-static float cube_kind_yaw(bool live) {
-    if (!s_up) {
-        return (float)k_yaw_start_milli / 1000.0f;
-    }
-    return spin_deg(&s_cube.spin, live);
-}
-
-static bool cube_kind_poke(Coord world_hit) {
-    float x = world_hit.x;
-    float y = world_hit.y;
-    WorldObj *o = table_find(&s_ops);
-    if (o != nullptr) {
-        x -= o->at.x;
-        y -= o->at.y;
-    }
-    return cube_heat_poke(x, y);
-}
-
 static void cube_record_compute(WorldObj *o, VkCommandBuffer cmd, uint32_t heat_dt, bool live) {
-    (void)o;
-    if (heat_dt == 0u && !cube_heat_poke_pending()) {
+    (void)heat_dt;
+    const CubeData *c = o->data;
+    if (c == nullptr) {
         return;
     }
-    cube_heat_record(cmd, heat_dt, cube_kind_yaw(live));
-    grid_record(cmd, heat_dt);
+    if (!cube_heat_record(cmd, c->heat, spin_deg(&c->spin, live))) {
+        return;
+    }
+    grid_record(cmd, cube_heat_step_dt(c->heat));
 }
 
 static void cube_record_ok(WorldObj *o, uint64_t signal_point) {
-    (void)o;
-    cube_heat_record_ok(signal_point);
+    const CubeData *c = o->data;
+    if (c == nullptr) {
+        return;
+    }
+    cube_heat_record_ok(c->heat, signal_point);
     grid_record_ok();
 }
 
 static void cube_record_abort(WorldObj *o) {
-    (void)o;
-    cube_heat_record_abort();
+    const CubeData *c = o->data;
+    if (c == nullptr) {
+        return;
+    }
+    cube_heat_record_abort(c->heat);
     grid_record_abort();
 }
 
@@ -311,42 +384,62 @@ static uint64_t cube_record_published(const WorldObj *o) {
 }
 
 static bool cube_record_step_open(const WorldObj *o) {
-    (void)o;
-    return cube_heat_step_open();
+    const CubeData *c = o->data;
+    if (c == nullptr) {
+        return false;
+    }
+    return cube_heat_slot_open(c->heat);
 }
 
 static bool cube_record_poke_pending(const WorldObj *o) {
-    (void)o;
-    return cube_heat_poke_pending();
+    const CubeData *c = o->data;
+    if (c == nullptr) {
+        return false;
+    }
+    return cube_heat_slot_pending(c->heat);
 }
 
 static bool cube_simulate(WorldObj *o, uint32_t time_ms, uint32_t *heat_dt) {
-    (void)o;
+    CubeData *c = o->data;
+    if (c == nullptr) {
+        if (heat_dt != nullptr) {
+            *heat_dt = 0;
+        }
+        return false;
+    }
     bool ended = false;
-    bool pulse = cube_heat_wants_frame(time_ms, &ended);
+    bool pulse = cube_heat_wants_frame(c->heat, time_ms, &ended);
     if (ended) {
-        cube_heat_hold();
-        grid_hold();
+        cube_heat_hold(c->heat);
+        if (!any_heat_running()) {
+            grid_hold();
+        }
     } else if (pulse) {
         grid_wake();
     }
+    uint32_t one = cube_heat_interval(c->heat, time_ms);
     if (heat_dt != nullptr) {
-        *heat_dt = cube_heat_interval(time_ms);
+        *heat_dt = one;
     }
     return pulse;
 }
 
 static void cube_simulate_hold(WorldObj *o) {
-    (void)o;
-    cube_heat_hold();
+    CubeData *c = o->data;
+    if (c == nullptr) {
+        return;
+    }
+    cube_heat_hold(c->heat);
     grid_hold();
 }
 
 static void cube_simulate_commit(WorldObj *o, uint32_t stamp, uint32_t heat_dt) {
-    (void)o;
-    if (heat_dt > 0u) {
-        cube_heat_commit_stamp(stamp);
+    (void)heat_dt;
+    CubeData *c = o->data;
+    if (c == nullptr) {
+        return;
     }
+    cube_heat_commit_stamp(c->heat, stamp);
 }
 
 // The kind opts itself in. An empty boot and world.c do not name it.

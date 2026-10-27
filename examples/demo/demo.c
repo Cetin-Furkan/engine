@@ -8,20 +8,23 @@
 #include "frame/mesh.h"
 #include "frame/pass.h"
 #include "frame/plane.h"
+#include "frame/policy.h"
 #include "frame/plot.h"
 #include "frame/shape.h"
 #include "frame/solid.h"
 #include "frame/world.h"
+#include "input/pointer.h"
 #include "world/world_int.h"
 #include <linux/input-event-codes.h>
 #include <stdio.h>
 #include <string.h>
 
 // The hosted program. Boot draws the metric grid and no objects.
-// opening.world may place a cube or a mesh. Clicks build faces.
+// opening.world places each cube line on z = 0. Clicks build faces.
 // Keys 1-6 raise solids. M cycles the math plot. L reloads the CSV
-// chart and the OBJ. The engine knows none of these names; it only
-// calls the EngineApp hooks below on its io_uring thread.
+// chart and the OBJ. Tab swaps the flat plot workspace and the 3D
+// workspace. The engine knows none of these names; it only calls
+// the EngineApp hooks below on its io_uring thread.
 
 // ---------------------------------------------------------------- targets
 
@@ -111,6 +114,7 @@ static void demo_destroy_targets(VulkanContext *vk, EngineTargets *targets) {
 // ------------------------------------------------------------------- hooks
 
 static int demo_init(VulkanContext *vk, RingCqeFn forward_cqe, void *forward_user) {
+    policy_boot();
     if (pass_init(vk) != 0 || cube_init(vk) != 0 || solid_init(vk) != 0 || shape_init(vk) != 0 ||
         plane_init(vk) != 0 || material_init(vk) != 0 ||
         plot_init(vk, forward_cqe, forward_user) != 0 ||
@@ -173,32 +177,44 @@ static bool demo_click(float origin_x, float origin_y) {
     return world_click(origin_x, origin_y);
 }
 
+static bool demo_shift_down(void) {
+    return pointer_key_down(KEY_LEFTSHIFT) || pointer_key_down(KEY_RIGHTSHIFT);
+}
+
+static uint8_t demo_route_key(uint32_t key) {
+    KeyRoute route = policy_route(policy_active(), (uint16_t)key, demo_shift_down());
+    if (route == KEY_ROUTE_HOLD) {
+        return ENGINE_KEY_HOLD;
+    }
+    if (route == KEY_ROUTE_TAP) {
+        return ENGINE_KEY_TAP;
+    }
+    return ENGINE_KEY_IGNORE;
+}
+
 static bool demo_key(uint32_t key, EngineKeyContext *ctx) {
-    if (key == KEY_ESC) {
+    EngineAction act = policy_lookup(policy_active(), (uint16_t)key, demo_shift_down());
+    if (!policy_can(policy_active(), act)) {
+        return false;
+    }
+    switch (act) {
+    case ACT_CANCEL:
         return world_cancel();
-    }
-    if (key == KEY_BACKSPACE) {
+    case ACT_DELETE:
         return world_delete();
-    }
-    if (key == KEY_F) {
+    case ACT_CLOSE_FACE:
         return world_close_face();
-    }
-    if (key == KEY_F5) {
+    case ACT_RESPIN:
         return world_respin_selected();
-    }
-    if (key == KEY_R) {
+    case ACT_TOGGLE_SPIN:
         return world_toggle_spin();
-    }
-    if (key == KEY_S) {
+    case ACT_TOGGLE_SMOOTH:
         return world_toggle_smooth();
-    }
-    if (key == KEY_G) {
+    case ACT_TOGGLE_GLOW:
         return world_toggle_glow();
-    }
-    if (key == KEY_M) {
+    case ACT_PLOT_CYCLE:
         return plot_cycle();
-    }
-    if (key == KEY_L) {
+    case ACT_DATA_RELOAD: {
         EngineRelay relay;
         engine_relay_begin(&relay, ctx->signal_armed, ctx->got_signal,
                            ctx->signo, ctx->inotify_armed);
@@ -215,13 +231,26 @@ static bool demo_key(uint32_t key, EngineKeyContext *ctx) {
         }
         return changed;
     }
-    if (key == KEY_HOME || key == KEY_KP1) {
+    case ACT_SNAP_FRONT:
         return camera_snap_front();
+    case ACT_SPAWN_SOLID_1:
+    case ACT_SPAWN_SOLID_2:
+    case ACT_SPAWN_SOLID_3:
+    case ACT_SPAWN_SOLID_4:
+    case ACT_SPAWN_SOLID_5:
+    case ACT_SPAWN_SOLID_6:
+        return world_raise_solid((uint32_t)(act - ACT_SPAWN_SOLID_1));
+    case ACT_SWITCH_MODE:
+        if (!policy_switch()) {
+            return false;
+        }
+        if (policy_active()->lock_2d_quat) {
+            (void)camera_snap_front();
+        }
+        return true;
+    default:
+        return false;
     }
-    if (key >= KEY_1 && key <= KEY_6) {
-        return world_raise_solid(key - KEY_1);
-    }
-    return false;
 }
 
 static bool demo_camera_active(void) {
@@ -231,16 +260,17 @@ static bool demo_camera_active(void) {
 static const EngineApp s_app = {
     .help = "One turn, then io_uring idle. Clicks on empty space place points. "
             "F closes those points into a face. A click on a mesh selects it. "
-            "The cube click also plants heat for five seconds, and it can be "
+            "A cube click also plants heat for five seconds, and it can be "
             "selected while other meshes are up. Its colors sweep on that "
             "clock, then hold. Keys 1-6 raise a tetrahedron, octahedron, "
             "icosahedron, cylinder, cone, and torus. R spins until R again. "
             "S smooths edges. G opens or closes glow. Esc clears, Backspace "
-            "removes, F5 turns the selection again. M cycles the math plot. "
+            "or Delete removes, F5 turns the selection again. M cycles the math plot. "
             "L reloads the CSV chart and the OBJ mesh. Home or numpad 1 "
             "snaps the front view. Arrows move on the screen axes. Q and E "
             "yaw, C and V pitch. Minus zooms out. Plus is numpad plus, "
-            "shift+4, or equals.",
+            "shift+4, or equals. X removes the selection. Tab switches "
+            "the flat plot workspace and the 3D workspace.",
     .init              = demo_init,
     .shutdown          = demo_shutdown,
     .load              = world_load,
@@ -270,6 +300,7 @@ static const EngineApp s_app = {
     .click             = demo_click,
     .key               = demo_key,
     .camera_active     = demo_camera_active,
+    .route_key         = demo_route_key,
 };
 
 const EngineApp *engine_app(void) {

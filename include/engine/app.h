@@ -126,7 +126,19 @@ typedef struct EngineApp {
     bool (*click)(float origin_x, float origin_y);
     bool (*key)(uint32_t key, EngineKeyContext *ctx);
     bool (*camera_active)(void);
+
+    // How a press is classified. The engine does not name the action.
+    // Shift stays inside the pointer. IGNORE drops the press, HOLD keeps
+    // it for polling, TAP queues one press. Null keeps the pointer's
+    // built-in camera set and tap set.
+    uint8_t (*route_key)(uint32_t evdev_key);
 } EngineApp;
+
+enum : uint8_t {
+    ENGINE_KEY_IGNORE = 0,
+    ENGINE_KEY_HOLD   = 1,
+    ENGINE_KEY_TAP    = 2,
+};
 
 // Implemented by the hosted program (exactly one per binary).
 const EngineApp *engine_app(void);

@@ -12,13 +12,14 @@
 // once in its plane. Keys 1-6 raise a tetrahedron, octahedron, icosahedron,
 // cylinder, cone, and torus. The OBJ is placed when the file names mesh.
 // It turns once, and L reads it again. R keeps the selection spinning until
-// R again. With nothing selected, R spins a placed cube. S smooths or facets
-// the six solids. G opens or closes glow on the selection, or on that cube.
-// Esc clears a partial build and the selection. Backspace removes the
-// selection, or the last loose corner. F5 runs the selected object through
-// one more revolution. A click on the cube also plants heat.
+// R again. With nothing selected, R spins the first placed cube. S smooths
+// or facets the six solids. G opens or closes glow on the selection, or on
+// that cube. Esc clears a partial build and the selection. Backspace or
+// Delete removes the selection, or the last loose corner, or the first
+// placed cube when neither is present. F5 runs the selected object through
+// one more revolution. A click on a cube also plants heat.
 // The window idles when nothing is turning and no heat pulse is open.
-// The cube's colors crawl one hue turn per revolution on those same stamps,
+// Each cube's colors crawl one hue turn per revolution on those same stamps,
 // then hold. The sweep does not arm a frame by itself.
 
 void world_reset(void);
@@ -45,7 +46,7 @@ void world_adopt_mesh(void);
 bool world_apply_mesh(bool has, bool bytes);
 
 // R. The selected OBJ mesh, else the selected solid, else the selected face,
-// else the cube. Starts an endless spin, or holds the current angle.
+// else the first placed cube. Starts an endless spin, or holds the current angle.
 bool world_toggle_spin(void);
 
 // S. Faceted cages and rounded cages, for every raised solid.
@@ -53,15 +54,14 @@ bool world_toggle_spin(void);
 bool world_toggle_smooth(void);
 
 // G. The selected OBJ mesh, else the selected solid, else the selected face,
-// else the cube. Opens or closes that object's glow record.
+// else the first placed cube. Opens or closes that object's glow record.
 bool world_toggle_glow(void);
 
 // Drop loose corners and clear the selection. True when the picture changed.
 bool world_cancel(void);
 
-// Remove the selected OBJ mesh, else the selected solid, else the selected
-// face. With no selection, remove the last loose corner.
-// True when the picture changed.
+// Remove the selected object. With no selection, remove the last loose
+// corner. With neither, remove the first placed cube. True when the picture changed.
 bool world_delete(void);
 
 // One more five-second revolution for the selected OBJ mesh, solid, or face.

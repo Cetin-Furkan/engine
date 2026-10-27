@@ -132,8 +132,9 @@ int frame_boot(void) {
         (void)frame_stop();
         return 1;
     }
-    if (engine_app()->init(vk, forward_init_cqe, wl) != 0 ||
-        chrome_gpu_init(vk) != 0) {
+    // The layout has to exist before the app binds the scene sample count.
+    if (chrome_gpu_init(vk) != 0 ||
+        engine_app()->init(vk, forward_init_cqe, wl) != 0) {
         (void)frame_stop();
         return 1;
     }

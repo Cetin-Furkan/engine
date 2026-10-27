@@ -2,7 +2,8 @@
 #include "frame/plot_file.h"
 #include "frame/camera.h"
 #include "frame/pass.h"
-#include "vulkan/memory.h"
+#include "vulkan/bda.h"
+#include "vulkan/pipe.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -73,25 +74,54 @@ static_assert(sizeof(PlotPush) == 72u, "plot push");
 static_assert(offsetof(PlotBake, mode) == 8u, "plot bake mode");
 static_assert(sizeof(PlotBake) == 16u, "plot bake");
 
+// Twelve slices cover both frame slots and the orphan ring. The draw slice
+// stays until a newer one is published, so a failed submit still has the
+// previous samples. Math is copied only from a slice whose timeline point
+// has retired. The GPU write is the one compute dispatch in plot_prepare.
+enum : uint32_t { k_slice_count = 12u };
+
+static_assert((k_plot_points * sizeof(PlotSample)) % 16u == 0u, "plot slice");
+
+typedef struct PlotSlice {
+    uint64_t point;
+    uint32_t mode;
+    bool     math_ready;
+} PlotSlice;
+
 static VkPipelineLayout s_layout = VK_NULL_HANDLE;
 static VkPipeline       s_pipeline = VK_NULL_HANDLE;
 static VkPipelineLayout s_bake_layout = VK_NULL_HANDLE;
 static VkPipeline       s_bake = VK_NULL_HANDLE;
-static VkBuffer         s_buffer = VK_NULL_HANDLE;
-static VkDeviceMemory   s_memory = VK_NULL_HANDLE;
-static VkDeviceAddress  s_addr = 0;
+static DaBuffer         s_geom;
+static VkDevice         s_device = VK_NULL_HANDLE;
+static VkDeviceAddress  s_base = 0;
 static VkQueue          s_queue = VK_NULL_HANDLE;
 static PlotSample      *s_map = nullptr;
 // Off until M. The pipeline stays. A cycle is sin, sinc, gaussian, off.
 static uint32_t         s_mode = k_mode_off;
 static bool             s_math_dirty = false;
+static bool             s_file_dirty = false;
 static uint32_t         s_file_n = 0;
 static uint32_t         s_gen = 0;
 static uint32_t         s_shown_gen = 0;
 static bool             s_logged = false;
-static bool             s_drawn = false;
+static bool             s_busy_warned = false;
+static PlotSlice        s_slice[k_slice_count];
+static int              s_draw_slice = -1;
+static VkDeviceAddress  s_draw_addr = 0;
+static uint32_t         s_draw_file_n = 0;
+static int              s_armed = -1;
+static uint64_t         s_armed_point = 0;
+static bool             s_armed_published = false;
+static bool             s_saved_math = false;
+static bool             s_saved_file = false;
+static int              s_prev_draw = -1;
+static VkDeviceAddress  s_prev_addr = 0;
+static uint32_t         s_prev_file_n = 0;
 
 static PlotSample      s_built[k_file_samples];
+static PlotSample      s_file_cpu[k_file_points];
+static PlotSample      s_math_stage[k_math_points];
 
 static const float k_file_cx = 300.0f;
 static const float k_file_cy = -15.0f;
@@ -116,19 +146,12 @@ static const char *mode_name(uint32_t mode) {
     return "off";
 }
 
-static VkShaderModule make_module(VulkanContext *vk, const uint32_t *code, uint32_t bytes) {
-    VkShaderModuleCreateInfo info = {
-        .sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-        .codeSize = bytes,
-        .pCode    = code,
-    };
-    VkShaderModule module = VK_NULL_HANDLE;
-    VkResult res = vkCreateShaderModule(vk->device, &info, nullptr, &module);
-    if (res != VK_SUCCESS) {
-        plot_fail("vkCreateShaderModule", res);
-        return VK_NULL_HANDLE;
-    }
-    return module;
+static VkDeviceAddress slice_addr(uint32_t index) {
+    return s_base + (VkDeviceAddress)index * (VkDeviceAddress)k_plot_points * sizeof(PlotSample);
+}
+
+static PlotSample *slice_cpu(uint32_t index) {
+    return s_map + (size_t)index * k_plot_points;
 }
 
 static void push_bytes(VkCommandBuffer cmd, VkPipelineLayout layout, VkShaderStageFlags stage,
@@ -140,112 +163,53 @@ void plot_shutdown(VulkanContext *vk) {
     if (vk != nullptr && vk->device != VK_NULL_HANDLE && s_queue != VK_NULL_HANDLE) {
         (void)vkQueueWaitIdle(s_queue);
     }
-    if (vk != nullptr && vk->device != VK_NULL_HANDLE &&
-        s_memory != VK_NULL_HANDLE && s_map != nullptr) {
-        vkUnmapMemory(vk->device, s_memory);
-    }
     s_map = nullptr;
-    s_addr = 0;
+    s_base = 0;
+    s_device = VK_NULL_HANDLE;
     s_queue = VK_NULL_HANDLE;
-    if (vk == nullptr || vk->device == VK_NULL_HANDLE) {
-        s_bake = VK_NULL_HANDLE;
-        s_bake_layout = VK_NULL_HANDLE;
-        s_pipeline = VK_NULL_HANDLE;
-        s_layout = VK_NULL_HANDLE;
-        s_buffer = VK_NULL_HANDLE;
-        s_memory = VK_NULL_HANDLE;
-        return;
-    }
-    if (s_bake != VK_NULL_HANDLE) {
-        vkDestroyPipeline(vk->device, s_bake, nullptr);
-    }
-    if (s_bake_layout != VK_NULL_HANDLE) {
-        vkDestroyPipelineLayout(vk->device, s_bake_layout, nullptr);
-    }
-    if (s_pipeline != VK_NULL_HANDLE) {
-        vkDestroyPipeline(vk->device, s_pipeline, nullptr);
-    }
-    if (s_layout != VK_NULL_HANDLE) {
-        vkDestroyPipelineLayout(vk->device, s_layout, nullptr);
-    }
-    if (s_buffer != VK_NULL_HANDLE) {
-        vkDestroyBuffer(vk->device, s_buffer, nullptr);
-    }
-    if (s_memory != VK_NULL_HANDLE) {
-        vkFreeMemory(vk->device, s_memory, nullptr);
+    s_draw_slice = -1;
+    s_draw_addr = 0;
+    s_draw_file_n = 0;
+    s_armed = -1;
+    s_armed_point = 0;
+    s_armed_published = false;
+    s_math_dirty = false;
+    s_file_dirty = false;
+    memset(s_slice, 0, sizeof s_slice);
+    if (vk != nullptr && vk->device != VK_NULL_HANDLE) {
+        if (s_bake != VK_NULL_HANDLE) {
+            vkDestroyPipeline(vk->device, s_bake, nullptr);
+        }
+        if (s_bake_layout != VK_NULL_HANDLE) {
+            vkDestroyPipelineLayout(vk->device, s_bake_layout, nullptr);
+        }
+        if (s_pipeline != VK_NULL_HANDLE) {
+            vkDestroyPipeline(vk->device, s_pipeline, nullptr);
+        }
+        if (s_layout != VK_NULL_HANDLE) {
+            vkDestroyPipelineLayout(vk->device, s_layout, nullptr);
+        }
     }
     s_bake = VK_NULL_HANDLE;
     s_bake_layout = VK_NULL_HANDLE;
     s_pipeline = VK_NULL_HANDLE;
     s_layout = VK_NULL_HANDLE;
-    s_buffer = VK_NULL_HANDLE;
-    s_memory = VK_NULL_HANDLE;
+    da_buffer_destroy(vk, &s_geom);
 }
 
 static int create_buffer(VulkanContext *vk) {
-    VkDeviceSize bytes = (VkDeviceSize)k_plot_points * sizeof(PlotSample);
-    VkBufferCreateInfo buffer_info = {
-        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-        .size  = bytes,
-        .usage = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-    };
-    VkResult res = vkCreateBuffer(vk->device, &buffer_info, nullptr, &s_buffer);
-    if (res != VK_SUCCESS) {
-        s_buffer = VK_NULL_HANDLE;
-        plot_fail("vkCreateBuffer", res);
+    VkDeviceSize bytes = (VkDeviceSize)k_slice_count * k_plot_points * sizeof(PlotSample);
+    if (da_buffer_create(vk, bytes, VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, true, &s_geom) != 0) {
         return -1;
     }
-    VkMemoryRequirements reqs = {0};
-    vkGetBufferMemoryRequirements(vk->device, s_buffer, &reqs);
-    uint32_t type_index = 0;
-    VkMemoryPropertyFlags host = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-    VulkanResult mem = vulkan_find_memory_type(
-        vk, reqs.memoryTypeBits, host | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &type_index);
-    if (mem != VULKAN_SUCCESS) {
-        mem = vulkan_find_memory_type(vk, reqs.memoryTypeBits, host, &type_index);
-    }
-    if (mem != VULKAN_SUCCESS) {
-        fprintf(stderr, "[Plot Error] No host-visible memory for the plot\n");
-        return -1;
-    }
-    VkMemoryAllocateFlagsInfo alloc_flags = {
-        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO,
-        .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT,
-    };
-    VkMemoryAllocateInfo alloc = {
-        .sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-        .pNext           = &alloc_flags,
-        .allocationSize  = reqs.size,
-        .memoryTypeIndex = type_index,
-    };
-    res = vkAllocateMemory(vk->device, &alloc, nullptr, &s_memory);
-    if (res != VK_SUCCESS) {
-        s_memory = VK_NULL_HANDLE;
-        plot_fail("vkAllocateMemory", res);
-        return -1;
-    }
-    res = vkBindBufferMemory(vk->device, s_buffer, s_memory, 0);
-    if (res != VK_SUCCESS) {
-        plot_fail("vkBindBufferMemory", res);
-        return -1;
-    }
-    void *mapped = nullptr;
-    res = vkMapMemory(vk->device, s_memory, 0, reqs.size, 0, &mapped);
-    if (res != VK_SUCCESS || mapped == nullptr) {
-        plot_fail("vkMapMemory", res);
-        return -1;
-    }
-    s_map = mapped;
-    memset(s_map, 0, (size_t)bytes);
-    VkBufferDeviceAddressInfo address_info = {
-        .sType  = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO,
-        .buffer = s_buffer,
-    };
-    s_addr = vkGetBufferDeviceAddress(vk->device, &address_info);
-    if (s_addr == 0) {
+    if (s_geom.map == nullptr || s_geom.address == 0 || (s_geom.address & 15u) != 0u) {
         fprintf(stderr, "[Plot Error] Plot device address is null\n");
         return -1;
     }
+    s_map = s_geom.map;
+    s_base = s_geom.address;
+    s_device = vk->device;
+    memset(s_map, 0, (size_t)bytes);
     return 0;
 }
 
@@ -277,7 +241,7 @@ static int bake_math(VulkanContext *vk) {
     }
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_bake);
     PlotBake bake = {
-        .addr  = s_addr,
+        .addr  = slice_addr(0),
         .mode  = s_mode,
         .count = k_math_samples,
     };
@@ -323,8 +287,146 @@ static int bake_math(VulkanContext *vk) {
         plot_fail("vkQueueWaitIdle bake", res);
         return -1;
     }
+    s_slice[0].point = 0;
+    s_slice[0].mode = s_mode;
+    s_slice[0].math_ready = true;
+    s_draw_slice = 0;
+    s_draw_addr = slice_addr(0);
+    s_draw_file_n = s_file_n;
     s_math_dirty = false;
     return 0;
+}
+
+static int claim_slice(VkSemaphore acquire, uint64_t signal_point) {
+    for (uint32_t i = 0; i < k_slice_count; ++i) {
+        if (s_slice[i].point == signal_point) {
+            return (int)i;
+        }
+    }
+    uint64_t counter = 0;
+    bool have = false;
+    if (s_device != VK_NULL_HANDLE && acquire != VK_NULL_HANDLE &&
+        vkGetSemaphoreCounterValue(s_device, acquire, &counter) == VK_SUCCESS) {
+        have = true;
+    }
+    for (uint32_t i = 0; i < k_slice_count; ++i) {
+        if ((int)i == s_draw_slice) {
+            continue;
+        }
+        if (s_slice[i].point == 0u || (have && counter >= s_slice[i].point)) {
+            s_slice[i].point = signal_point;
+            s_slice[i].math_ready = false;
+            s_slice[i].mode = 0;
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+static int retired_math(VkSemaphore acquire) {
+    uint64_t counter = 0;
+    bool have = false;
+    if (s_device != VK_NULL_HANDLE && acquire != VK_NULL_HANDLE &&
+        vkGetSemaphoreCounterValue(s_device, acquire, &counter) == VK_SUCCESS) {
+        have = true;
+    }
+    for (uint32_t i = 0; i < k_slice_count; ++i) {
+        if (!s_slice[i].math_ready || s_slice[i].mode != s_mode) {
+            continue;
+        }
+        if (s_slice[i].point == 0u || (have && counter >= s_slice[i].point)) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+static void copy_file_into(PlotSample *dst) {
+    PlotSample *file = dst + k_math_points;
+    if (s_file_n > 0u) {
+        memcpy(file, s_file_cpu, (size_t)s_file_n * sizeof(PlotSample));
+    }
+    if (s_file_n < k_file_points) {
+        memset(file + s_file_n, 0, (size_t)(k_file_points - s_file_n) * sizeof(PlotSample));
+    }
+}
+
+static void publish_draw(int slot) {
+    s_prev_draw = s_draw_slice;
+    s_prev_addr = s_draw_addr;
+    s_prev_file_n = s_draw_file_n;
+    s_draw_slice = slot;
+    s_draw_addr = slice_addr((uint32_t)slot);
+    s_draw_file_n = s_file_n;
+    s_saved_math = s_math_dirty;
+    s_saved_file = s_file_dirty;
+    s_math_dirty = false;
+    s_file_dirty = false;
+    s_armed_published = true;
+}
+
+void plot_begin(VkSemaphore acquire, uint64_t signal_point) {
+    s_armed = -1;
+    s_armed_point = 0;
+    s_armed_published = false;
+    s_saved_math = false;
+    s_saved_file = false;
+    if (s_map == nullptr || signal_point == 0u || (!s_math_dirty && !s_file_dirty)) {
+        return;
+    }
+    bool need_math = !s_math_dirty && s_mode != k_mode_off;
+    if (need_math) {
+        int src = retired_math(acquire);
+        if (src < 0) {
+            return;
+        }
+        memcpy(s_math_stage, slice_cpu((uint32_t)src), sizeof s_math_stage);
+    }
+    int slot = claim_slice(acquire, signal_point);
+    if (slot < 0) {
+        if (!s_busy_warned) {
+            fprintf(stderr, "[Plot Error] Plot samples are still on the GPU\n");
+            s_busy_warned = true;
+        }
+        return;
+    }
+    PlotSample *dst = slice_cpu((uint32_t)slot);
+    if (need_math) {
+        memcpy(dst, s_math_stage, sizeof s_math_stage);
+        s_slice[slot].math_ready = true;
+        s_slice[slot].mode = s_mode;
+    }
+    copy_file_into(dst);
+    s_armed = slot;
+    s_armed_point = signal_point;
+    if (!s_math_dirty) {
+        publish_draw(slot);
+    }
+}
+
+void plot_release(uint64_t signal_point) {
+    if (signal_point == 0u) {
+        return;
+    }
+    if (s_armed_published && s_armed_point == signal_point) {
+        s_math_dirty = s_saved_math;
+        s_file_dirty = s_saved_file;
+        s_draw_slice = s_prev_draw;
+        s_draw_addr = s_prev_addr;
+        s_draw_file_n = s_prev_file_n;
+        s_armed_published = false;
+    }
+    for (uint32_t i = 0; i < k_slice_count; ++i) {
+        if (s_slice[i].point == signal_point) {
+            s_slice[i].point = 0;
+            s_slice[i].math_ready = false;
+            s_slice[i].mode = 0;
+        }
+    }
+    if (s_armed >= 0 && s_armed_point == signal_point) {
+        s_armed = -1;
+        s_armed_point = 0;
+    }
 }
 
 void plot_prepare(VkCommandBuffer cmd) {
@@ -334,12 +436,12 @@ void plot_prepare(VkCommandBuffer cmd) {
         }
         return;
     }
-    if (s_drawn && s_queue != VK_NULL_HANDLE && vkQueueWaitIdle(s_queue) != VK_SUCCESS) {
+    if (s_armed < 0) {
         return;
     }
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_bake);
     PlotBake bake = {
-        .addr  = s_addr,
+        .addr  = slice_addr((uint32_t)s_armed),
         .mode  = s_mode,
         .count = k_math_samples,
     };
@@ -358,31 +460,25 @@ void plot_prepare(VkCommandBuffer cmd) {
         .pMemoryBarriers    = &done,
     };
     vkCmdPipelineBarrier2(cmd, &dep);
-    s_math_dirty = false;
+    s_slice[s_armed].math_ready = true;
+    s_slice[s_armed].mode = s_mode;
+    publish_draw(s_armed);
 }
 
 static void draw_range(VkCommandBuffer cmd, uint32_t width, uint32_t height,
                        uint32_t base, uint32_t count, uint32_t kind,
                        float r, float g, float b) {
-    if (s_pipeline == VK_NULL_HANDLE || s_addr == 0 || count == 0) {
+    if (s_draw_addr == 0 || count == 0) {
         return;
     }
     if (kind == 0u && count < 2u) {
         return;
     }
     uint32_t verts = kind == 0u ? (count - 1u) * 6u : count * 6u;
-    VkViewport viewport = {
-        .width    = (float)width,
-        .height   = (float)height,
-        .maxDepth = 1.0f,
-    };
-    VkRect2D scissor = {
-        .extent = { .width = width, .height = height },
-    };
     ViewPush view;
     view_push_fill(&view, 0);
     PlotPush push = {
-        .addr   = s_addr,
+        .addr   = s_draw_addr,
         .width  = width,
         .height = height,
         .base   = base,
@@ -393,28 +489,28 @@ static void draw_range(VkCommandBuffer cmd, uint32_t width, uint32_t height,
         .cam_x = view.cam_x, .cam_y = view.cam_y, .cam_z = view.cam_z,
         .zoom = view.zoom,
     };
-    vkCmdSetViewport(cmd, 0, 1, &viewport);
-    vkCmdSetScissor(cmd, 0, 1, &scissor);
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_pipeline);
     push_bytes(cmd, s_layout, VK_SHADER_STAGE_VERTEX_BIT, &push, sizeof push);
     vkCmdDraw(cmd, verts, 1, 0, 0);
 }
 
 void plot_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height) {
-    if (cmd == VK_NULL_HANDLE || width == 0 || height == 0 || s_pipeline == VK_NULL_HANDLE) {
+    if (cmd == VK_NULL_HANDLE || width == 0 || height == 0 || s_pipeline == VK_NULL_HANDLE ||
+        s_draw_addr == 0) {
         return;
     }
-    if (s_mode != k_mode_off) {
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_pipeline);
+    bool math_ok = s_mode != k_mode_off && s_draw_slice >= 0 &&
+                   s_slice[s_draw_slice].math_ready && s_slice[s_draw_slice].mode == s_mode;
+    if (math_ok) {
         draw_range(cmd, width, height, 0u, k_math_axes, 0u, 0.82f, 0.84f, 0.88f);
         draw_range(cmd, width, height, k_math_axes, k_math_samples, 0u, 0.95f, 0.72f, 0.28f);
     }
-    if (s_file_n > k_math_axes) {
-        uint32_t data = s_file_n - k_math_axes;
+    if (s_draw_file_n > k_math_axes) {
+        uint32_t data = s_draw_file_n - k_math_axes;
         draw_range(cmd, width, height, k_math_points, k_math_axes, 0u, 0.82f, 0.84f, 0.88f);
         draw_range(cmd, width, height, k_math_points + k_math_axes, data, 0u, 0.40f, 0.86f, 0.95f);
         draw_range(cmd, width, height, k_math_points + k_math_axes, data, 1u, 0.93f, 0.95f, 0.90f);
     }
-    s_drawn = true;
 }
 
 bool plot_cycle(void) {
@@ -435,7 +531,7 @@ bool plot_cycle(void) {
 }
 
 bool plot_wants_frame(void) {
-    return s_gen != s_shown_gen || s_math_dirty;
+    return s_gen != s_shown_gen || s_math_dirty || s_file_dirty;
 }
 
 void plot_commit(void) {
@@ -497,50 +593,44 @@ static void write_axes(PlotSample *dst) {
 }
 
 static bool store_file(uint32_t n) {
-    if (s_map == nullptr) {
+    if (s_base == 0) {
         return false;
     }
     if (n > k_file_samples) {
         n = k_file_samples;
     }
-    PlotSample *dst = s_map + k_math_points;
     bool changed = false;
     if (n == 0u) {
         changed = s_file_n != 0u;
     } else {
         fit_built(n);
         changed = s_file_n != k_math_axes + n ||
-                  memcmp(dst + k_math_axes, s_built, (size_t)n * sizeof(PlotSample)) != 0;
+                  memcmp(s_file_cpu + k_math_axes, s_built, (size_t)n * sizeof(PlotSample)) != 0;
     }
     if (!changed) {
         return false;
     }
-    if (s_drawn && s_queue != VK_NULL_HANDLE) {
-        VkResult waited = vkQueueWaitIdle(s_queue);
-        if (waited != VK_SUCCESS) {
-            plot_fail("vkQueueWaitIdle reload", waited);
-            return false;
-        }
-    }
     if (n == 0u) {
-        memset(dst, 0, (size_t)s_file_n * sizeof(PlotSample));
+        memset(s_file_cpu, 0, (size_t)s_file_n * sizeof(PlotSample));
         s_file_n = 0;
+        s_file_dirty = true;
         return true;
     }
     uint32_t total = k_math_axes + n;
-    write_axes(dst);
-    memcpy(dst + k_math_axes, s_built, (size_t)n * sizeof(PlotSample));
+    write_axes(s_file_cpu);
+    memcpy(s_file_cpu + k_math_axes, s_built, (size_t)n * sizeof(PlotSample));
     if (total < s_file_n) {
-        memset(dst + total, 0, (size_t)(s_file_n - total) * sizeof(PlotSample));
+        memset(s_file_cpu + total, 0, (size_t)(s_file_n - total) * sizeof(PlotSample));
     }
     s_file_n = total;
+    s_file_dirty = true;
     return true;
 }
 
 bool plot_reload(RingCqeFn on_cqe, void *on_user) {
     bool found = false;
     uint32_t n = plot_file_load(s_built, k_file_samples, &found, nullptr, on_cqe, on_user);
-    if (s_map == nullptr) {
+    if (s_base == 0) {
         return false;
     }
     bool changed = store_file(found ? n : 0u);
@@ -607,123 +697,27 @@ int plot_init(VulkanContext *vk, RingCqeFn on_cqe, void *on_user) {
         return -1;
     }
 
-    VkShaderModule vert = make_module(vk, (const uint32_t *)k_vert_spv, (uint32_t)sizeof k_vert_spv);
-    VkShaderModule frag = make_module(vk, (const uint32_t *)k_frag_spv, (uint32_t)sizeof k_frag_spv);
-    VkShaderModule comp = make_module(vk, (const uint32_t *)k_bake_spv, (uint32_t)sizeof k_bake_spv);
-    if (vert == VK_NULL_HANDLE || frag == VK_NULL_HANDLE || comp == VK_NULL_HANDLE) {
-        if (vert != VK_NULL_HANDLE) vkDestroyShaderModule(vk->device, vert, nullptr);
-        if (frag != VK_NULL_HANDLE) vkDestroyShaderModule(vk->device, frag, nullptr);
-        if (comp != VK_NULL_HANDLE) vkDestroyShaderModule(vk->device, comp, nullptr);
+    s_bake = vulkan_compute_pipeline(vk, k_bake_spv, sizeof k_bake_spv, s_bake_layout);
+    if (s_bake == VK_NULL_HANDLE) {
         plot_shutdown(vk);
         return -1;
     }
-    VkPipelineShaderStageCreateInfo comp_stage = {
-        .sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-        .stage  = VK_SHADER_STAGE_COMPUTE_BIT,
-        .module = comp,
-        .pName  = "main",
-    };
-    VkComputePipelineCreateInfo bake_pipe = {
-        .sType  = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
-        .stage  = comp_stage,
-        .layout = s_bake_layout,
-    };
-    res = vkCreateComputePipelines(vk->device, VK_NULL_HANDLE, 1, &bake_pipe, nullptr, &s_bake);
-    vkDestroyShaderModule(vk->device, comp, nullptr);
-    if (res != VK_SUCCESS) {
-        plot_fail("vkCreateComputePipelines", res);
-        if (vert != VK_NULL_HANDLE) vkDestroyShaderModule(vk->device, vert, nullptr);
-        if (frag != VK_NULL_HANDLE) vkDestroyShaderModule(vk->device, frag, nullptr);
-        plot_shutdown(vk);
-        return -1;
-    }
-
-    VkPipelineShaderStageCreateInfo stages[2] = {
-        {
-            .sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-            .stage  = VK_SHADER_STAGE_VERTEX_BIT,
-            .module = vert,
-            .pName  = "main",
-        },
-        {
-            .sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-            .stage  = VK_SHADER_STAGE_FRAGMENT_BIT,
-            .module = frag,
-            .pName  = "main",
-        },
-    };
-    VkPipelineVertexInputStateCreateInfo vertex = {
-        .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
-    };
-    VkPipelineInputAssemblyStateCreateInfo assembly = {
-        .sType    = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
-        .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
-    };
-    VkPipelineViewportStateCreateInfo viewport = {
-        .sType         = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
-        .viewportCount = 1,
-        .scissorCount  = 1,
-    };
-    VkPipelineRasterizationStateCreateInfo raster = {
-        .sType       = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
-        .polygonMode = VK_POLYGON_MODE_FILL,
-        .cullMode    = VK_CULL_MODE_NONE,
-        .frontFace   = VK_FRONT_FACE_COUNTER_CLOCKWISE,
-        .lineWidth   = 1.0f,
-    };
-    VkPipelineMultisampleStateCreateInfo sample_state = {
-        .sType                = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
-        .rasterizationSamples = samples,
-    };
-    VkPipelineDepthStencilStateCreateInfo depth = {
-        .sType            = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
-        .depthTestEnable  = VK_TRUE,
-        .depthWriteEnable = VK_TRUE,
-        .depthCompareOp   = VK_COMPARE_OP_LESS,
-    };
-    VkPipelineColorBlendAttachmentState blend_att = {
-        .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
-                          VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT,
-    };
-    VkPipelineColorBlendStateCreateInfo blend = {
-        .sType           = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
-        .attachmentCount = 1,
-        .pAttachments    = &blend_att,
-    };
-    VkDynamicState dynamics[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
-    VkPipelineDynamicStateCreateInfo dynamic = {
-        .sType             = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
-        .dynamicStateCount = 2,
-        .pDynamicStates    = dynamics,
-    };
     VkFormat color_format = VK_FORMAT_B8G8R8A8_SRGB;
-    VkPipelineRenderingCreateInfo rendering = {
-        .sType                   = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
-        .colorAttachmentCount    = 1,
-        .pColorAttachmentFormats = &color_format,
-        .depthAttachmentFormat   = depth_format,
+    VulkanGfxPipe gfx = {
+        .vert          = k_vert_spv,
+        .vert_bytes    = sizeof k_vert_spv,
+        .frag          = k_frag_spv,
+        .frag_bytes    = sizeof k_frag_spv,
+        .layout        = s_layout,
+        .depth_format  = depth_format,
+        .samples       = samples,
+        .cull          = VK_CULL_MODE_NONE,
+        .depth_test    = VK_TRUE,
+        .depth_write   = VK_TRUE,
+        .depth_compare = VK_COMPARE_OP_LESS,
+        .blend         = VK_FALSE,
     };
-    VkGraphicsPipelineCreateInfo pipe = {
-        .sType               = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
-        .pNext               = &rendering,
-        .stageCount          = 2,
-        .pStages             = stages,
-        .pVertexInputState   = &vertex,
-        .pInputAssemblyState = &assembly,
-        .pViewportState      = &viewport,
-        .pRasterizationState = &raster,
-        .pMultisampleState   = &sample_state,
-        .pDepthStencilState  = &depth,
-        .pColorBlendState    = &blend,
-        .pDynamicState       = &dynamic,
-        .layout              = s_layout,
-    };
-    res = vkCreateGraphicsPipelines(vk->device, VK_NULL_HANDLE, 1, &pipe, nullptr, &s_pipeline);
-    vkDestroyShaderModule(vk->device, vert, nullptr);
-    vkDestroyShaderModule(vk->device, frag, nullptr);
-    if (res != VK_SUCCESS) {
-        s_pipeline = VK_NULL_HANDLE;
-        plot_fail("vkCreateGraphicsPipelines", res);
+    if (vulkan_gfx_pipelines(vk, &gfx, &color_format, nullptr, 1, &s_pipeline) != 0) {
         plot_shutdown(vk);
         return -1;
     }

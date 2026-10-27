@@ -25,10 +25,14 @@
 // A null depth_image means "no 3D pass this slot" (the engine then
 // presents chrome over a clear, exactly as before for 2D-only slots).
 typedef struct EngineTargets {
-    VkImage     depth_image;
-    VkImageView depth_view;
-    VkImage     coverage_image;
-    VkImageView coverage_view;
+    VkImage               depth_image;
+    VkImageView           depth_view;
+    VkImage               coverage_image;
+    VkImageView           coverage_view;
+    // The pass the color image is cleared in. Zero means a 1-sample pass
+    // with no depth attachment. Overlay pipelines must match this pair.
+    VkFormat              depth_format;
+    VkSampleCountFlagBits samples;
 } EngineTargets;
 
 // File-reload relay state. Reloading a file on the io_uring thread can
@@ -92,15 +96,19 @@ typedef struct EngineApp {
                                         uint32_t width, uint32_t height);
     void (*destroy_targets)(VulkanContext *vk, EngineTargets *targets);
 
-    // Recording, in command-buffer order: compute first, then the 3D pass
-    // bracketed by prepare_draw/claim_frame, then the 2D overlay.
+    // Recording, in command-buffer order: compute, then claim_frame (slice
+    // ownership for this signal point), then prepare_draw, then one
+    // rendering pass. The world and the overlay share that pass when depth
+    // exists. depth_format and samples are the pass pair, or zero for the
+    // flat pass.
     void (*record_compute)(VkCommandBuffer cmd, uint32_t heat_dt, bool live);
     void (*prepare_draw)(VkCommandBuffer cmd, VkImage depth_image);
     void (*claim_frame)(VkSemaphore acquire, uint64_t signal_point);
     void (*draw)(VkCommandBuffer cmd, uint32_t width, uint32_t height, bool live);
     void (*draw_overlay)(VkCommandBuffer cmd, uint32_t width, uint32_t height,
-                         VkFormat format, uint32_t frame_ms, bool have_stamp,
-                         uint64_t modifier);
+                         VkFormat format, VkFormat depth_format,
+                         VkSampleCountFlagBits samples, uint32_t frame_ms,
+                         bool have_stamp, uint64_t modifier);
     // Recording outcome, mirroring the submit that carries the frame.
     void (*record_abort)(void);
     void (*record_ok)(uint64_t signal_point);

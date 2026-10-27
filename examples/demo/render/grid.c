@@ -1,5 +1,6 @@
 #include "frame/grid.h"
 #include "vulkan/bda.h"
+#include "vulkan/pipe.h"
 #include "vulkan/memory.h"
 #include <stddef.h>
 #include <stdio.h>
@@ -162,33 +163,8 @@ int grid_init(VulkanContext *vk) {
         grid_shutdown(vk);
         return -1;
     }
-    VkShaderModuleCreateInfo module_info = {
-        .sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-        .codeSize = sizeof k_grid_spv,
-        .pCode    = (const uint32_t *)k_grid_spv,
-    };
-    VkShaderModule module = VK_NULL_HANDLE;
-    res = vkCreateShaderModule(vk->device, &module_info, nullptr, &module);
-    if (res != VK_SUCCESS) {
-        grid_fail("vkCreateShaderModule", res);
-        grid_shutdown(vk);
-        return -1;
-    }
-    VkPipelineShaderStageCreateInfo stage = {
-        .sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-        .stage  = VK_SHADER_STAGE_COMPUTE_BIT,
-        .module = module,
-        .pName  = "main",
-    };
-    VkComputePipelineCreateInfo pipe = {
-        .sType  = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
-        .stage  = stage,
-        .layout = s_layout,
-    };
-    res = vkCreateComputePipelines(vk->device, VK_NULL_HANDLE, 1, &pipe, nullptr, &s_pipe);
-    vkDestroyShaderModule(vk->device, module, nullptr);
-    if (res != VK_SUCCESS) {
-        grid_fail("vkCreateComputePipelines", res);
+    s_pipe = vulkan_compute_pipeline(vk, k_grid_spv, sizeof k_grid_spv, s_layout);
+    if (s_pipe == VK_NULL_HANDLE) {
         grid_shutdown(vk);
         return -1;
     }

@@ -1,4 +1,5 @@
 #include "vulkan/device.h"
+#include "vulkan/pipe.h"
 #include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -1043,6 +1044,7 @@ VulkanResult vulkan_device_create(VulkanContext *ctx) {
         return VULKAN_ERROR_FUNCTION_POINTER_MISSING;
     }
 
+    vulkan_pipe_cache_open(ctx);
     return VULKAN_SUCCESS;
 }
 
@@ -1051,6 +1053,7 @@ void vulkan_device_destroy(VulkanContext *ctx) {
         return;
     }
     vkDeviceWaitIdle(ctx->device);
+    vulkan_pipe_cache_close(ctx);
     vkDestroyDevice(ctx->device, nullptr);
     ctx->device = VK_NULL_HANDLE;
     ctx->queues.graphics_queue = VK_NULL_HANDLE;

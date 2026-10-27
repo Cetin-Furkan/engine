@@ -13,13 +13,12 @@ layout(buffer_reference, scalar, buffer_reference_align = 4) buffer Atlas {
 };
 
 layout(push_constant, scalar) uniform Push {
-    layout(offset = 0) uint64_t atlas;
-    layout(offset = 8) uint fb_w;
-    layout(offset = 12) uint fb_h;
-    layout(offset = 16) uint dim;
-    layout(offset = 20) uint spread;
-    layout(offset = 24) uint pad0;
-    layout(offset = 28) uint pad1;
+    layout(offset = 0) uint64_t quads;
+    layout(offset = 8) uint64_t atlas;
+    layout(offset = 16) uint fb_w;
+    layout(offset = 20) uint fb_h;
+    layout(offset = 24) uint dim;
+    layout(offset = 28) uint spread;
 } pc;
 
 layout(location = 0) in vec2 v_uv;

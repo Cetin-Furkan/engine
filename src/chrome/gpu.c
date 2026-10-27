@@ -1,5 +1,6 @@
 #include "chrome/gpu.h"
 #include "chrome/layer.h"
+#include "vulkan/pipe.h"
 #include <stddef.h>
 #include <stdio.h>
 
@@ -42,11 +43,15 @@ static_assert(sizeof(ChromeGpuControl) == 24u, "chrome control push");
 static_assert(offsetof(ChromeGpuPush, ctl) == 40u, "chrome control offset");
 static_assert(sizeof(ChromeGpuPush) == 232u, "chrome push size");
 
-static VkPipelineLayout s_layout = VK_NULL_HANDLE;
-static VkPipeline       s_srgb = VK_NULL_HANDLE;
-static VkPipeline       s_unorm = VK_NULL_HANDLE;
-static uint32_t         s_logged_w = 0;
-static uint32_t         s_logged_h = 0;
+static VkPipelineLayout     s_layout = VK_NULL_HANDLE;
+static VkPipeline           s_srgb = VK_NULL_HANDLE;
+static VkPipeline           s_unorm = VK_NULL_HANDLE;
+static VkPipeline           s_scene_srgb = VK_NULL_HANDLE;
+static VkPipeline           s_scene_unorm = VK_NULL_HANDLE;
+static VkFormat             s_scene_depth = VK_FORMAT_UNDEFINED;
+static VkSampleCountFlagBits s_scene_samples = VK_SAMPLE_COUNT_1_BIT;
+static uint32_t             s_logged_w = 0;
+static uint32_t             s_logged_h = 0;
 
 static void chrome_fail(const char *what, VkResult res) {
     fprintf(stderr, "[Chrome Error] %s failed: %d\n", what, (int)res);
@@ -56,106 +61,46 @@ static uint32_t pack_rgb(uint8_t r, uint8_t g, uint8_t b, uint32_t flag) {
     return (uint32_t)r | ((uint32_t)g << 8) | ((uint32_t)b << 16) | (flag << 24);
 }
 
-static VkShaderModule make_module(VulkanContext *vk, const uint32_t *code, uint32_t bytes) {
-    VkShaderModuleCreateInfo info = {
-        .sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-        .codeSize = bytes,
-        .pCode    = code,
+static int make_pair(VulkanContext *vk, VkSampleCountFlagBits samples, VkFormat depth,
+                     VkPipeline *srgb, VkPipeline *unorm) {
+    VkFormat formats[2] = { VK_FORMAT_B8G8R8A8_SRGB, VK_FORMAT_B8G8R8A8_UNORM };
+    VulkanGfxPipe info = {
+        .vert          = k_vert_spv,
+        .vert_bytes    = sizeof k_vert_spv,
+        .frag          = k_frag_spv,
+        .frag_bytes    = sizeof k_frag_spv,
+        .layout        = s_layout,
+        .depth_format  = depth,
+        .samples       = samples,
+        .cull          = VK_CULL_MODE_NONE,
+        .depth_test    = VK_FALSE,
+        .depth_write   = VK_FALSE,
+        .depth_compare = VK_COMPARE_OP_LESS,
+        .blend         = VK_FALSE,
     };
-    VkShaderModule module = VK_NULL_HANDLE;
-    VkResult res = vkCreateShaderModule(vk->device, &info, nullptr, &module);
-    if (res != VK_SUCCESS) {
-        chrome_fail("vkCreateShaderModule", res);
-        return VK_NULL_HANDLE;
+    VkPipeline out[2] = {0};
+    if (vulkan_gfx_pipelines(vk, &info, formats, nullptr, 2, out) != 0) {
+        return -1;
     }
-    return module;
+    *srgb = out[0];
+    *unorm = out[1];
+    return 0;
 }
 
-static VkPipeline make_pipeline(VulkanContext *vk, VkFormat format,
-                                VkShaderModule vert, VkShaderModule frag) {
-    VkPipelineShaderStageCreateInfo stages[2] = {
-        {
-            .sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-            .stage  = VK_SHADER_STAGE_VERTEX_BIT,
-            .module = vert,
-            .pName  = "main",
-        },
-        {
-            .sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-            .stage  = VK_SHADER_STAGE_FRAGMENT_BIT,
-            .module = frag,
-            .pName  = "main",
-        },
-    };
-    VkPipelineVertexInputStateCreateInfo vertex = {
-        .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
-    };
-    VkPipelineInputAssemblyStateCreateInfo assembly = {
-        .sType    = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
-        .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
-    };
-    VkPipelineViewportStateCreateInfo viewport = {
-        .sType         = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
-        .viewportCount = 1,
-        .scissorCount  = 1,
-    };
-    VkPipelineRasterizationStateCreateInfo raster = {
-        .sType       = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
-        .polygonMode = VK_POLYGON_MODE_FILL,
-        .cullMode    = VK_CULL_MODE_NONE,
-        .frontFace   = VK_FRONT_FACE_COUNTER_CLOCKWISE,
-        .lineWidth   = 1.0f,
-    };
-    VkPipelineMultisampleStateCreateInfo samples = {
-        .sType                = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
-        .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT,
-    };
-    VkPipelineDepthStencilStateCreateInfo depth = {
-        .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
-    };
-    VkPipelineColorBlendAttachmentState blend_att = {
-        .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
-                          VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT,
-    };
-    VkPipelineColorBlendStateCreateInfo blend = {
-        .sType           = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
-        .attachmentCount = 1,
-        .pAttachments    = &blend_att,
-    };
-    VkDynamicState dynamics[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
-    VkPipelineDynamicStateCreateInfo dynamic = {
-        .sType             = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
-        .dynamicStateCount = 2,
-        .pDynamicStates    = dynamics,
-    };
-    VkPipelineRenderingCreateInfo rendering = {
-        .sType                   = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
-        .colorAttachmentCount    = 1,
-        .pColorAttachmentFormats = &format,
-        .depthAttachmentFormat   = VK_FORMAT_UNDEFINED,
-    };
-    VkGraphicsPipelineCreateInfo pipe = {
-        .sType               = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
-        .pNext               = &rendering,
-        .stageCount          = 2,
-        .pStages             = stages,
-        .pVertexInputState   = &vertex,
-        .pInputAssemblyState = &assembly,
-        .pViewportState      = &viewport,
-        .pRasterizationState = &raster,
-        .pMultisampleState   = &samples,
-        .pDepthStencilState  = &depth,
-        .pColorBlendState    = &blend,
-        .pDynamicState       = &dynamic,
-        .layout              = s_layout,
-    };
-    VkPipeline pipeline = VK_NULL_HANDLE;
-    VkResult res = vkCreateGraphicsPipelines(vk->device, VK_NULL_HANDLE, 1, &pipe, nullptr, &pipeline);
-    if (res != VK_SUCCESS) {
-        chrome_fail("vkCreateGraphicsPipelines", res);
-        return VK_NULL_HANDLE;
+static void destroy_scene(VkDevice device) {
+    if (device == VK_NULL_HANDLE) {
+        s_scene_srgb = VK_NULL_HANDLE;
+        s_scene_unorm = VK_NULL_HANDLE;
+        return;
     }
-    return pipeline;
+    if (s_scene_srgb != VK_NULL_HANDLE) {
+        vkDestroyPipeline(device, s_scene_srgb, nullptr);
+        s_scene_srgb = VK_NULL_HANDLE;
+    }
+    if (s_scene_unorm != VK_NULL_HANDLE) {
+        vkDestroyPipeline(device, s_scene_unorm, nullptr);
+        s_scene_unorm = VK_NULL_HANDLE;
+    }
 }
 
 int chrome_gpu_init(VulkanContext *vk) {
@@ -191,24 +136,7 @@ int chrome_gpu_init(VulkanContext *vk) {
         return -1;
     }
 
-    VkShaderModule vert = make_module(vk, (const uint32_t *)k_vert_spv, (uint32_t)sizeof k_vert_spv);
-    VkShaderModule frag = make_module(vk, (const uint32_t *)k_frag_spv, (uint32_t)sizeof k_frag_spv);
-    if (vert == VK_NULL_HANDLE || frag == VK_NULL_HANDLE) {
-        if (vert != VK_NULL_HANDLE) {
-            vkDestroyShaderModule(vk->device, vert, nullptr);
-        }
-        if (frag != VK_NULL_HANDLE) {
-            vkDestroyShaderModule(vk->device, frag, nullptr);
-        }
-        chrome_gpu_shutdown(vk);
-        return -1;
-    }
-
-    s_srgb = make_pipeline(vk, VK_FORMAT_B8G8R8A8_SRGB, vert, frag);
-    s_unorm = make_pipeline(vk, VK_FORMAT_B8G8R8A8_UNORM, vert, frag);
-    vkDestroyShaderModule(vk->device, vert, nullptr);
-    vkDestroyShaderModule(vk->device, frag, nullptr);
-    if (s_srgb == VK_NULL_HANDLE || s_unorm == VK_NULL_HANDLE) {
+    if (make_pair(vk, VK_SAMPLE_COUNT_1_BIT, VK_FORMAT_UNDEFINED, &s_srgb, &s_unorm) != 0) {
         chrome_gpu_shutdown(vk);
         return -1;
     }
@@ -218,12 +146,17 @@ int chrome_gpu_init(VulkanContext *vk) {
 }
 
 void chrome_gpu_shutdown(VulkanContext *vk) {
+    s_scene_depth = VK_FORMAT_UNDEFINED;
+    s_scene_samples = VK_SAMPLE_COUNT_1_BIT;
     if (vk == nullptr || vk->device == VK_NULL_HANDLE) {
         s_layout = VK_NULL_HANDLE;
         s_srgb = VK_NULL_HANDLE;
         s_unorm = VK_NULL_HANDLE;
+        s_scene_srgb = VK_NULL_HANDLE;
+        s_scene_unorm = VK_NULL_HANDLE;
         return;
     }
+    destroy_scene(vk->device);
     if (s_srgb != VK_NULL_HANDLE) {
         vkDestroyPipeline(vk->device, s_srgb, nullptr);
         s_srgb = VK_NULL_HANDLE;
@@ -238,31 +171,53 @@ void chrome_gpu_shutdown(VulkanContext *vk) {
     }
 }
 
+int chrome_gpu_bind_pass(VulkanContext *vk, VkFormat depth_format,
+                         VkSampleCountFlagBits samples) {
+    if (vk == nullptr || vk->device == VK_NULL_HANDLE || s_layout == VK_NULL_HANDLE ||
+        depth_format == VK_FORMAT_UNDEFINED || samples == 0) {
+        fprintf(stderr, "[Chrome Error] Scene pipelines need the layout and a depth pass\n");
+        return -1;
+    }
+    if (s_scene_srgb != VK_NULL_HANDLE && s_scene_unorm != VK_NULL_HANDLE &&
+        s_scene_depth == depth_format && s_scene_samples == samples) {
+        return 0;
+    }
+    destroy_scene(vk->device);
+    if (make_pair(vk, samples, depth_format, &s_scene_srgb, &s_scene_unorm) != 0) {
+        s_scene_depth = VK_FORMAT_UNDEFINED;
+        return -1;
+    }
+    s_scene_depth = depth_format;
+    s_scene_samples = samples;
+    return 0;
+}
+
+static VkPipeline pick_pipeline(VkFormat format, VkFormat depth_format,
+                                VkSampleCountFlagBits samples) {
+    bool scene = depth_format != VK_FORMAT_UNDEFINED;
+    if (scene && (depth_format != s_scene_depth || samples != s_scene_samples)) {
+        return VK_NULL_HANDLE;
+    }
+    if (format == VK_FORMAT_B8G8R8A8_SRGB) {
+        return scene ? s_scene_srgb : s_srgb;
+    }
+    if (format == VK_FORMAT_B8G8R8A8_UNORM) {
+        return scene ? s_scene_unorm : s_unorm;
+    }
+    return VK_NULL_HANDLE;
+}
+
 void chrome_gpu_draw(VulkanContext *vk, VkCommandBuffer cmd,
-                     uint32_t width, uint32_t height, VkFormat format) {
+                     uint32_t width, uint32_t height, VkFormat format,
+                     VkFormat depth_format, VkSampleCountFlagBits samples) {
     if (vk == nullptr || cmd == VK_NULL_HANDLE || width == 0 || height == 0) {
         return;
     }
-    VkPipeline pipeline = (format == VK_FORMAT_B8G8R8A8_SRGB) ? s_srgb : s_unorm;
-    if (format != VK_FORMAT_B8G8R8A8_SRGB && format != VK_FORMAT_B8G8R8A8_UNORM) {
-        return;
-    }
+    VkPipeline pipeline = pick_pipeline(format, depth_format, samples);
     if (pipeline == VK_NULL_HANDLE || s_layout == VK_NULL_HANDLE) {
         return;
     }
-
-    VkViewport viewport = {
-        .width    = (float)width,
-        .height   = (float)height,
-        .minDepth = 0.0f,
-        .maxDepth = 1.0f,
-    };
-    VkRect2D scissor = {
-        .extent = { .width = width, .height = height },
-    };
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-    vkCmdSetViewport(cmd, 0, 1, &viewport);
-    vkCmdSetScissor(cmd, 0, 1, &scissor);
 
     uint32_t drawn = 0;
     for (uint32_t i = 0; i < ENG_CHROME_LAYERS; ++i) {

@@ -34,10 +34,6 @@ void pass_depth_destroy(VulkanContext *vk, PassDepth *depth);
                                        uint32_t width, uint32_t height);
 void pass_coverage_destroy(VulkanContext *vk, PassCoverage *coverage);
 
-// Depth starts undefined. The barrier makes it a depth attachment before
-// the render clears it.
-void pass_prepare_draw(VkCommandBuffer cmd, VkImage depth);
-
 VkFormat pass_depth_format(void);
 VkSampleCountFlagBits pass_raster_samples(void);
 

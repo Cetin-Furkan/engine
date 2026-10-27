@@ -3,7 +3,8 @@
 #include "frame/camera.h"
 #include "frame/pass.h"
 #include "frame/material.h"
-#include "vulkan/memory.h"
+#include "vulkan/bda.h"
+#include "vulkan/pipe.h"
 #include <math.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -50,105 +51,68 @@ static_assert(offsetof(MeshPush, selected) == 32u, "mesh selected");
 static_assert(offsetof(MeshPush, view) == 48u, "mesh view");
 static_assert(sizeof(MeshPush) == 96u, "mesh push");
 
+// One slice per submit still on the GPU. The draw slice stays put until a
+// newer copy is published, so a failed submit can point back at it.
+enum : uint32_t {
+    k_slice_count   = 12u,
+    k_slice_corners = k_obj_tri_cap * 3u,
+};
+
+static_assert((k_slice_corners * sizeof(ObjCorner)) % 16u == 0u, "mesh slice");
+
+typedef struct MeshSlice {
+    uint64_t point;
+} MeshSlice;
+
 static VkPipelineLayout s_layout = VK_NULL_HANDLE;
 static VkPipeline       s_pipeline = VK_NULL_HANDLE;
-static VkBuffer         s_buffer = VK_NULL_HANDLE;
-static VkDeviceMemory   s_memory = VK_NULL_HANDLE;
-static VkDeviceAddress  s_addr = 0;
+static DaBuffer         s_geom;
+static VkDevice         s_device = VK_NULL_HANDLE;
+static VkDeviceAddress  s_base = 0;
 static VkQueue          s_queue = VK_NULL_HANDLE;
 static ObjCorner       *s_map = nullptr;
-static bool             s_drawn = false;
 static bool             s_logged = false;
 static uint32_t         s_count = 0;
+static uint32_t         s_gpu_count = 0;
 static uint32_t         s_gen = 0;
 static uint32_t         s_shown_gen = 0;
 static float            s_radius = 0.0f;
+static bool             s_dirty = false;
+static bool             s_busy_warned = false;
+static MeshSlice        s_slice[k_slice_count];
+static int              s_draw_slice = -1;
+static VkDeviceAddress  s_draw_addr = 0;
+static int              s_armed = -1;
+static uint64_t         s_armed_point = 0;
+static bool             s_armed_published = false;
+static int              s_prev_draw = -1;
+static VkDeviceAddress  s_prev_addr = 0;
+static uint32_t         s_prev_count = 0;
 
-static ObjCorner s_cpu[k_obj_tri_cap * 3u];
+static ObjCorner s_cpu[k_slice_corners];
+static ObjCorner s_held[k_slice_corners];
 
 static void mesh_fail(const char *what, VkResult res) {
     fprintf(stderr, "[Mesh Error] %s: %s (%d)\n", what, vulkan_vkresult_to_str(res), (int)res);
 }
 
-static VkShaderModule make_module(VulkanContext *vk, const uint32_t *code, uint32_t bytes) {
-    VkShaderModuleCreateInfo info = {
-        .sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-        .codeSize = bytes,
-        .pCode    = code,
-    };
-    VkShaderModule module = VK_NULL_HANDLE;
-    VkResult res = vkCreateShaderModule(vk->device, &info, nullptr, &module);
-    if (res != VK_SUCCESS) {
-        mesh_fail("vkCreateShaderModule", res);
-        return VK_NULL_HANDLE;
-    }
-    return module;
+static VkDeviceAddress mesh_slice_addr(uint32_t index) {
+    return s_base + (VkDeviceAddress)index * (VkDeviceAddress)k_slice_corners * sizeof(ObjCorner);
 }
 
 static int create_buffer(VulkanContext *vk) {
-    VkDeviceSize bytes = (VkDeviceSize)(k_obj_tri_cap * 3u) * sizeof(ObjCorner);
-    VkBufferCreateInfo buffer_info = {
-        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-        .size  = bytes,
-        .usage = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-    };
-    VkResult res = vkCreateBuffer(vk->device, &buffer_info, nullptr, &s_buffer);
-    if (res != VK_SUCCESS) {
-        s_buffer = VK_NULL_HANDLE;
-        mesh_fail("vkCreateBuffer", res);
+    VkDeviceSize bytes = (VkDeviceSize)k_slice_count * k_slice_corners * sizeof(ObjCorner);
+    if (da_buffer_create(vk, bytes, VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, true, &s_geom) != 0) {
         return -1;
     }
-    VkMemoryRequirements reqs = {0};
-    vkGetBufferMemoryRequirements(vk->device, s_buffer, &reqs);
-    uint32_t type_index = 0;
-    VkMemoryPropertyFlags host = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-    VulkanResult mem = vulkan_find_memory_type(
-        vk, reqs.memoryTypeBits, host | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &type_index);
-    if (mem != VULKAN_SUCCESS) {
-        mem = vulkan_find_memory_type(vk, reqs.memoryTypeBits, host, &type_index);
-    }
-    if (mem != VULKAN_SUCCESS) {
-        fprintf(stderr, "[Mesh Error] No host-visible memory for the mesh\n");
-        return -1;
-    }
-    VkMemoryAllocateFlagsInfo alloc_flags = {
-        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO,
-        .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT,
-    };
-    VkMemoryAllocateInfo alloc = {
-        .sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-        .pNext           = &alloc_flags,
-        .allocationSize  = reqs.size,
-        .memoryTypeIndex = type_index,
-    };
-    res = vkAllocateMemory(vk->device, &alloc, nullptr, &s_memory);
-    if (res != VK_SUCCESS) {
-        s_memory = VK_NULL_HANDLE;
-        mesh_fail("vkAllocateMemory", res);
-        return -1;
-    }
-    res = vkBindBufferMemory(vk->device, s_buffer, s_memory, 0);
-    if (res != VK_SUCCESS) {
-        mesh_fail("vkBindBufferMemory", res);
-        return -1;
-    }
-    void *mapped = nullptr;
-    res = vkMapMemory(vk->device, s_memory, 0, reqs.size, 0, &mapped);
-    if (res != VK_SUCCESS || mapped == nullptr) {
-        mesh_fail("vkMapMemory", res);
-        return -1;
-    }
-    s_map = mapped;
-    memset(s_map, 0, (size_t)bytes);
-    VkBufferDeviceAddressInfo address_info = {
-        .sType  = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO,
-        .buffer = s_buffer,
-    };
-    s_addr = vkGetBufferDeviceAddress(vk->device, &address_info);
-    if (s_addr == 0) {
+    if (s_geom.map == nullptr || s_geom.address == 0) {
         fprintf(stderr, "[Mesh Error] Mesh device address is null\n");
         return -1;
     }
+    s_map = s_geom.map;
+    s_base = s_geom.address;
+    s_device = vk->device;
+    memset(s_map, 0, (size_t)bytes);
     return 0;
 }
 
@@ -211,31 +175,25 @@ static void fit_corners(ObjCorner *dst, uint32_t corners) {
 }
 
 static bool store_corners(const ObjCorner *src, uint32_t corners) {
-    if (s_map == nullptr) {
+    if (s_base == 0) {
         return false;
     }
-    if (corners > k_obj_tri_cap * 3u) {
-        corners = k_obj_tri_cap * 3u;
+    if (corners > k_slice_corners) {
+        corners = k_slice_corners;
     }
     bool same = corners == s_count &&
-                (corners == 0u || memcmp(s_map, src, (size_t)corners * sizeof(ObjCorner)) == 0);
+                (corners == 0u || memcmp(s_held, src, (size_t)corners * sizeof(ObjCorner)) == 0);
     if (same) {
         return false;
     }
-    if (s_drawn && s_queue != VK_NULL_HANDLE) {
-        VkResult waited = vkQueueWaitIdle(s_queue);
-        if (waited != VK_SUCCESS) {
-            mesh_fail("vkQueueWaitIdle reload", waited);
-            return false;
-        }
-    }
     if (corners > 0u && src != nullptr) {
-        memcpy(s_map, src, (size_t)corners * sizeof(ObjCorner));
+        memcpy(s_held, src, (size_t)corners * sizeof(ObjCorner));
     }
     if (corners < s_count) {
-        memset(s_map + corners, 0, (size_t)(s_count - corners) * sizeof(ObjCorner));
+        memset(s_held + corners, 0, (size_t)(s_count - corners) * sizeof(ObjCorner));
     }
     s_count = corners;
+    s_dirty = true;
     s_gen++;
     return true;
 }
@@ -267,7 +225,7 @@ static bool load_file(RingCqeFn on_cqe, void *on_user, bool *has) {
     bool found = false;
     bool capped = false;
     bool crossed = false;
-    int corners = plot_file_load_mesh(s_cpu, k_obj_tri_cap * 3u, &found, &capped, &crossed,
+    int corners = plot_file_load_mesh(s_cpu, k_slice_corners, &found, &capped, &crossed,
                                       on_cqe, on_user);
     if (corners < 0) {
         if (has != nullptr) {
@@ -299,38 +257,31 @@ void mesh_shutdown(VulkanContext *vk) {
     if (vk != nullptr && vk->device != VK_NULL_HANDLE && s_queue != VK_NULL_HANDLE) {
         (void)vkQueueWaitIdle(s_queue);
     }
-    if (vk != nullptr && vk->device != VK_NULL_HANDLE &&
-        s_memory != VK_NULL_HANDLE && s_map != nullptr) {
-        vkUnmapMemory(vk->device, s_memory);
-    }
     s_map = nullptr;
-    s_addr = 0;
+    s_base = 0;
+    s_device = VK_NULL_HANDLE;
     s_queue = VK_NULL_HANDLE;
     s_count = 0;
+    s_gpu_count = 0;
     s_radius = 0.0f;
-    if (vk == nullptr || vk->device == VK_NULL_HANDLE) {
-        s_pipeline = VK_NULL_HANDLE;
-        s_layout = VK_NULL_HANDLE;
-        s_buffer = VK_NULL_HANDLE;
-        s_memory = VK_NULL_HANDLE;
-        return;
-    }
-    if (s_pipeline != VK_NULL_HANDLE) {
-        vkDestroyPipeline(vk->device, s_pipeline, nullptr);
-    }
-    if (s_layout != VK_NULL_HANDLE) {
-        vkDestroyPipelineLayout(vk->device, s_layout, nullptr);
-    }
-    if (s_buffer != VK_NULL_HANDLE) {
-        vkDestroyBuffer(vk->device, s_buffer, nullptr);
-    }
-    if (s_memory != VK_NULL_HANDLE) {
-        vkFreeMemory(vk->device, s_memory, nullptr);
+    s_dirty = false;
+    s_draw_slice = -1;
+    s_draw_addr = 0;
+    s_armed = -1;
+    s_armed_point = 0;
+    s_armed_published = false;
+    memset(s_slice, 0, sizeof s_slice);
+    if (vk != nullptr && vk->device != VK_NULL_HANDLE) {
+        if (s_pipeline != VK_NULL_HANDLE) {
+            vkDestroyPipeline(vk->device, s_pipeline, nullptr);
+        }
+        if (s_layout != VK_NULL_HANDLE) {
+            vkDestroyPipelineLayout(vk->device, s_layout, nullptr);
+        }
     }
     s_pipeline = VK_NULL_HANDLE;
     s_layout = VK_NULL_HANDLE;
-    s_buffer = VK_NULL_HANDLE;
-    s_memory = VK_NULL_HANDLE;
+    da_buffer_destroy(vk, &s_geom);
 }
 
 int mesh_init(VulkanContext *vk, RingCqeFn on_cqe, void *on_user) {
@@ -377,104 +328,22 @@ int mesh_init(VulkanContext *vk, RingCqeFn on_cqe, void *on_user) {
         mesh_shutdown(vk);
         return -1;
     }
-    VkShaderModule vert = make_module(vk, (const uint32_t *)k_vert_spv, (uint32_t)sizeof k_vert_spv);
-    VkShaderModule frag = make_module(vk, (const uint32_t *)k_frag_spv, (uint32_t)sizeof k_frag_spv);
-    if (vert == VK_NULL_HANDLE || frag == VK_NULL_HANDLE) {
-        if (vert != VK_NULL_HANDLE) {
-            vkDestroyShaderModule(vk->device, vert, nullptr);
-        }
-        if (frag != VK_NULL_HANDLE) {
-            vkDestroyShaderModule(vk->device, frag, nullptr);
-        }
-        mesh_shutdown(vk);
-        return -1;
-    }
-    VkPipelineShaderStageCreateInfo stages[2] = {
-        {
-            .sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-            .stage  = VK_SHADER_STAGE_VERTEX_BIT,
-            .module = vert,
-            .pName  = "main",
-        },
-        {
-            .sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-            .stage  = VK_SHADER_STAGE_FRAGMENT_BIT,
-            .module = frag,
-            .pName  = "main",
-        },
-    };
-    VkPipelineVertexInputStateCreateInfo vertex = {
-        .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
-    };
-    VkPipelineInputAssemblyStateCreateInfo assembly = {
-        .sType    = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
-        .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
-    };
-    VkPipelineViewportStateCreateInfo viewport = {
-        .sType         = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
-        .viewportCount = 1,
-        .scissorCount  = 1,
-    };
-    VkPipelineRasterizationStateCreateInfo raster = {
-        .sType       = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
-        .polygonMode = VK_POLYGON_MODE_FILL,
-        .cullMode    = VK_CULL_MODE_BACK_BIT,
-        .frontFace   = VK_FRONT_FACE_COUNTER_CLOCKWISE,
-        .lineWidth   = 1.0f,
-    };
-    VkPipelineMultisampleStateCreateInfo sample_state = {
-        .sType                = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
-        .rasterizationSamples = samples,
-    };
-    VkPipelineDepthStencilStateCreateInfo depth = {
-        .sType            = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
-        .depthTestEnable  = VK_TRUE,
-        .depthWriteEnable = VK_TRUE,
-        .depthCompareOp   = VK_COMPARE_OP_LESS,
-    };
-    VkPipelineColorBlendAttachmentState blend_att = {
-        .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
-                          VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT,
-    };
-    VkPipelineColorBlendStateCreateInfo blend = {
-        .sType           = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
-        .attachmentCount = 1,
-        .pAttachments    = &blend_att,
-    };
-    VkDynamicState dynamics[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
-    VkPipelineDynamicStateCreateInfo dynamic = {
-        .sType             = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
-        .dynamicStateCount = 2,
-        .pDynamicStates    = dynamics,
-    };
     VkFormat color_format = VK_FORMAT_B8G8R8A8_SRGB;
-    VkPipelineRenderingCreateInfo rendering = {
-        .sType                   = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
-        .colorAttachmentCount    = 1,
-        .pColorAttachmentFormats = &color_format,
-        .depthAttachmentFormat   = depth_format,
+    VulkanGfxPipe gfx = {
+        .vert          = k_vert_spv,
+        .vert_bytes    = sizeof k_vert_spv,
+        .frag          = k_frag_spv,
+        .frag_bytes    = sizeof k_frag_spv,
+        .layout        = s_layout,
+        .depth_format  = depth_format,
+        .samples       = samples,
+        .cull          = VK_CULL_MODE_BACK_BIT,
+        .depth_test    = VK_TRUE,
+        .depth_write   = VK_TRUE,
+        .depth_compare = VK_COMPARE_OP_LESS,
+        .blend         = VK_FALSE,
     };
-    VkGraphicsPipelineCreateInfo pipe = {
-        .sType               = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
-        .pNext               = &rendering,
-        .stageCount          = 2,
-        .pStages             = stages,
-        .pVertexInputState   = &vertex,
-        .pInputAssemblyState = &assembly,
-        .pViewportState      = &viewport,
-        .pRasterizationState = &raster,
-        .pMultisampleState   = &sample_state,
-        .pDepthStencilState  = &depth,
-        .pColorBlendState    = &blend,
-        .pDynamicState       = &dynamic,
-        .layout              = s_layout,
-    };
-    res = vkCreateGraphicsPipelines(vk->device, VK_NULL_HANDLE, 1, &pipe, nullptr, &s_pipeline);
-    vkDestroyShaderModule(vk->device, vert, nullptr);
-    vkDestroyShaderModule(vk->device, frag, nullptr);
-    if (res != VK_SUCCESS) {
-        s_pipeline = VK_NULL_HANDLE;
-        mesh_fail("vkCreateGraphicsPipelines", res);
+    if (vulkan_gfx_pipelines(vk, &gfx, &color_format, nullptr, 1, &s_pipeline) != 0) {
         mesh_shutdown(vk);
         return -1;
     }
@@ -490,7 +359,7 @@ int mesh_init(VulkanContext *vk, RingCqeFn on_cqe, void *on_user) {
 }
 
 bool mesh_reload(RingCqeFn on_cqe, void *on_user, bool *has) {
-    if (s_map == nullptr) {
+    if (s_base == 0) {
         if (has != nullptr) {
             *has = false;
         }
@@ -524,32 +393,101 @@ bool mesh_sphere(float *cx, float *cy, float *radius) {
 }
 
 bool mesh_wants_frame(void) {
-    return s_gen != s_shown_gen;
+    return s_gen != s_shown_gen || s_dirty;
 }
 
 void mesh_commit(void) {
     s_shown_gen = s_gen;
 }
 
-void mesh_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height,
-               float yaw_deg, bool selected) {
-    if (cmd == VK_NULL_HANDLE || s_pipeline == VK_NULL_HANDLE || s_count < 3u ||
-        width == 0u || height == 0u) {
+static int claim_slice(VkSemaphore acquire, uint64_t signal_point) {
+    for (uint32_t i = 0; i < k_slice_count; ++i) {
+        if (s_slice[i].point == signal_point) {
+            return (int)i;
+        }
+    }
+    uint64_t counter = 0;
+    bool have = false;
+    if (s_device != VK_NULL_HANDLE && acquire != VK_NULL_HANDLE &&
+        vkGetSemaphoreCounterValue(s_device, acquire, &counter) == VK_SUCCESS) {
+        have = true;
+    }
+    for (uint32_t i = 0; i < k_slice_count; ++i) {
+        if ((int)i == s_draw_slice) {
+            continue;
+        }
+        if (s_slice[i].point == 0u || (have && counter >= s_slice[i].point)) {
+            s_slice[i].point = signal_point;
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+void mesh_begin(VkSemaphore acquire, uint64_t signal_point) {
+    s_armed = -1;
+    s_armed_point = 0;
+    s_armed_published = false;
+    if (!s_dirty || s_map == nullptr || signal_point == 0u) {
         return;
     }
-    VkViewport viewport = {
-        .x        = 0.0f,
-        .y        = 0.0f,
-        .width    = (float)width,
-        .height   = (float)height,
-        .minDepth = 0.0f,
-        .maxDepth = 1.0f,
-    };
-    VkRect2D scissor = {
-        .extent = { .width = width, .height = height },
-    };
+    int slot = claim_slice(acquire, signal_point);
+    if (slot < 0) {
+        if (!s_busy_warned) {
+            fprintf(stderr, "[Mesh Error] Mesh corners are still on the GPU\n");
+            s_busy_warned = true;
+        }
+        return;
+    }
+    ObjCorner *dst = s_map + (size_t)slot * k_slice_corners;
+    if (s_count > 0u) {
+        memcpy(dst, s_held, (size_t)s_count * sizeof(ObjCorner));
+    }
+    if (s_count < k_slice_corners) {
+        memset(dst + s_count, 0, (size_t)(k_slice_corners - s_count) * sizeof(ObjCorner));
+    }
+    s_prev_draw = s_draw_slice;
+    s_prev_addr = s_draw_addr;
+    s_prev_count = s_gpu_count;
+    s_draw_slice = slot;
+    s_draw_addr = mesh_slice_addr((uint32_t)slot);
+    s_gpu_count = s_count;
+    s_dirty = false;
+    s_armed = slot;
+    s_armed_point = signal_point;
+    s_armed_published = true;
+}
+
+void mesh_release(uint64_t signal_point) {
+    if (signal_point == 0u) {
+        return;
+    }
+    if (s_armed_published && s_armed_point == signal_point) {
+        s_dirty = true;
+        s_draw_slice = s_prev_draw;
+        s_draw_addr = s_prev_addr;
+        s_gpu_count = s_prev_count;
+        s_armed_published = false;
+    }
+    for (uint32_t i = 0; i < k_slice_count; ++i) {
+        if (s_slice[i].point == signal_point) {
+            s_slice[i].point = 0;
+        }
+    }
+    if (s_armed >= 0 && s_armed_point == signal_point) {
+        s_armed = -1;
+        s_armed_point = 0;
+    }
+}
+
+void mesh_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height,
+               float yaw_deg, bool selected) {
+    if (cmd == VK_NULL_HANDLE || s_pipeline == VK_NULL_HANDLE || s_gpu_count < 3u ||
+        s_draw_addr == 0 || width == 0u || height == 0u) {
+        return;
+    }
     MeshPush draw_push = {
-        .verts      = s_addr,
+        .verts      = s_draw_addr,
         .width      = width,
         .height     = height,
         .yaw_deg    = yaw_deg,
@@ -560,10 +498,7 @@ void mesh_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height,
         .pad        = 0,
     };
     view_push_fill(&draw_push.view, k_mat_mesh);
-    vkCmdSetViewport(cmd, 0, 1, &viewport);
-    vkCmdSetScissor(cmd, 0, 1, &scissor);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_pipeline);
     vulkan_cmd_push(cmd, s_layout, VK_SHADER_STAGE_VERTEX_BIT, sizeof draw_push, &draw_push);
-    vkCmdDraw(cmd, s_count, 1, 0, 0);
-    s_drawn = true;
+    vkCmdDraw(cmd, s_gpu_count, 1, 0, 0);
 }

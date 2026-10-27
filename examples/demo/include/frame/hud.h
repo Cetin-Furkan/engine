@@ -25,6 +25,7 @@ void hud_prepare(uint32_t frame_ms, bool have_stamp, uint64_t modifier);
 // longer than one learned refresh counts as a miss. Clears the counters.
 void hud_turn_report(uint32_t *frames, uint32_t *missed);
 
-void hud_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height, VkFormat format);
+void hud_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height, VkFormat format,
+              VkFormat depth_format, VkSampleCountFlagBits samples);
 
 #endif /* ENGINE_FRAME_HUD_H */

@@ -159,6 +159,7 @@ typedef struct VulkanContext {
     VulkanQueueInfo          queues;
     VulkanDeviceInfo         device_info;
     VulkanDispatchTable      dispatch;
+    VkPipelineCache          pipe_cache;
     bool                     validation_enabled;
     bool                     is_initialized;
 } VulkanContext;

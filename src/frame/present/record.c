@@ -50,13 +50,17 @@ int record_and_submit_clear(VulkanContext *vk, FrameSlot *frame, VkSemaphore acq
         return -1;
     }
     engine_app()->record_compute(frame->cmd_buf, heat_dt, draw_live);
+    engine_app()->claim_frame(acquire, signal_point);
 
-    uint32_t foreign_family = vk->device_info.supports_queue_family_foreign
-        ? VK_QUEUE_FAMILY_FOREIGN_EXT
-        : VK_QUEUE_FAMILY_EXTERNAL;
-    VkImageMemoryBarrier2 to_attachment = {
+    // The image is cleared. oldLayout UNDEFINED discards the previous
+    // contents, so this is not a queue-family acquire. The release at the
+    // end of the buffer is the ownership handoff to the compositor, and
+    // the release syncobj is what lets this record start.
+    const bool depth_pass = srgb_view && frame->targets.depth_image != VK_NULL_HANDLE;
+    VkImageMemoryBarrier2 barriers[3] = {0};
+    uint32_t nbar = 0;
+    barriers[nbar++] = (VkImageMemoryBarrier2){
         .sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
-        .pNext               = nullptr,
         .srcStageMask        = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
         .srcAccessMask       = VK_ACCESS_2_NONE,
         .dstStageMask        = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
@@ -74,35 +78,39 @@ int record_and_submit_clear(VulkanContext *vk, FrameSlot *frame, VkSemaphore acq
             .layerCount     = 1,
         },
     };
-    if (frame->foreign_owned) {
-        to_attachment.srcStageMask        = VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT;
-        to_attachment.srcAccessMask       = VK_ACCESS_2_NONE;
-        to_attachment.srcQueueFamilyIndex = foreign_family;
-        to_attachment.dstQueueFamilyIndex = vk->queues.graphics_family_index;
+    if (frame->targets.coverage_image != VK_NULL_HANDLE) {
+        barriers[nbar] = barriers[0];
+        barriers[nbar].image = frame->targets.coverage_image;
+        nbar++;
+    }
+    if (depth_pass) {
+        barriers[nbar++] = (VkImageMemoryBarrier2){
+            .sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+            .srcStageMask        = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
+            .srcAccessMask       = VK_ACCESS_2_NONE,
+            .dstStageMask        = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT,
+            .dstAccessMask       = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+            .oldLayout           = VK_IMAGE_LAYOUT_UNDEFINED,
+            .newLayout           = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image               = frame->targets.depth_image,
+            .subresourceRange    = {
+                .aspectMask     = VK_IMAGE_ASPECT_DEPTH_BIT,
+                .baseMipLevel   = 0,
+                .levelCount     = 1,
+                .baseArrayLayer = 0,
+                .layerCount     = 1,
+            },
+        };
     }
     VkDependencyInfo dep_to_attachment = {
         .sType                   = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
-        .pNext                   = nullptr,
-        .dependencyFlags         = 0,
-        .imageMemoryBarrierCount = 1,
-        .pImageMemoryBarriers    = &to_attachment,
+        .imageMemoryBarrierCount = nbar,
+        .pImageMemoryBarriers    = barriers,
     };
     vkCmdPipelineBarrier2(frame->cmd_buf, &dep_to_attachment);
-    if (frame->targets.coverage_image != VK_NULL_HANDLE) {
-        VkImageMemoryBarrier2 to_coverage = to_attachment;
-        to_coverage.image = frame->targets.coverage_image;
-        to_coverage.srcStageMask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
-        to_coverage.srcAccessMask = VK_ACCESS_2_NONE;
-        to_coverage.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        to_coverage.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        VkDependencyInfo dep_coverage = {
-            .sType                   = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
-            .imageMemoryBarrierCount = 1,
-            .pImageMemoryBarriers    = &to_coverage,
-        };
-        vkCmdPipelineBarrier2(frame->cmd_buf, &dep_coverage);
-    }
-    if (srgb_view && frame->targets.depth_image != VK_NULL_HANDLE) {
+    if (depth_pass) {
         engine_app()->prepare_draw(frame->cmd_buf, frame->targets.depth_image);
     }
 
@@ -141,7 +149,7 @@ int record_and_submit_clear(VulkanContext *vk, FrameSlot *frame, VkSemaphore acq
         .storeOp     = VK_ATTACHMENT_STORE_OP_DONT_CARE,
         .clearValue  = { .depthStencil = { .depth = 1.0f, .stencil = 0 } },
     };
-    if (srgb_view && frame->targets.depth_view != VK_NULL_HANDLE) {
+    if (depth_pass && frame->targets.depth_view != VK_NULL_HANDLE) {
         rendering_info.pDepthAttachment = &depth_attachment;
     }
     if (frame->targets.coverage_view != VK_NULL_HANDLE) {
@@ -153,9 +161,38 @@ int record_and_submit_clear(VulkanContext *vk, FrameSlot *frame, VkSemaphore acq
     }
 
     vkCmdBeginRendering(frame->cmd_buf, &rendering_info);
+    VkViewport viewport = {
+        .width    = (float)frame->image.width,
+        .height   = (float)frame->image.height,
+        .minDepth = 0.0f,
+        .maxDepth = 1.0f,
+    };
+    VkRect2D scissor = {
+        .extent = { .width = frame->image.width, .height = frame->image.height },
+    };
+    vkCmdSetViewport(frame->cmd_buf, 0, 1, &viewport);
+    vkCmdSetScissor(frame->cmd_buf, 0, 1, &scissor);
     if (rendering_info.pDepthAttachment != nullptr) {
-        engine_app()->claim_frame(acquire, signal_point);
         engine_app()->draw(frame->cmd_buf, frame->image.width, frame->image.height, draw_live);
+    }
+    // Chrome, the readout, and text are drawn in this pass. Sample shading
+    // is off, so one fragment covers every sample and the resolve at
+    // vkCmdEndRendering is the only color store.
+    VkFormat overlay_depth = VK_FORMAT_UNDEFINED;
+    VkSampleCountFlagBits overlay_samples = VK_SAMPLE_COUNT_1_BIT;
+    if (rendering_info.pDepthAttachment != nullptr) {
+        overlay_depth = frame->targets.depth_format;
+        overlay_samples = frame->targets.samples;
+    }
+    chrome_gpu_draw(vk, frame->cmd_buf, frame->image.width, frame->image.height,
+                    frame->view_format, overlay_depth, overlay_samples);
+    {
+        WaylandContext *wl_hud = wayland_get_context();
+        bool have_stamp = wl_hud != nullptr && wl_hud->frame_stamp_valid;
+        engine_app()->draw_overlay(frame->cmd_buf, frame->image.width, frame->image.height,
+                                   frame->view_format, overlay_depth, overlay_samples,
+                                   have_stamp ? wl_hud->frame_time_ms : 0u, have_stamp,
+                                   frame->image.drm_format_modifier);
     }
     vkCmdEndRendering(frame->cmd_buf);
 
@@ -166,52 +203,6 @@ int record_and_submit_clear(VulkanContext *vk, FrameSlot *frame, VkSemaphore acq
         .baseArrayLayer = 0,
         .layerCount     = 1,
     };
-
-    VkImageMemoryBarrier2 chrome_vis = {
-        .sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
-        .srcStageMask        = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-        .srcAccessMask       = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
-        .dstStageMask        = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-        .dstAccessMask       = VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
-        .oldLayout           = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-        .newLayout           = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .image               = frame->image.image,
-        .subresourceRange    = color_range,
-    };
-    VkDependencyInfo chrome_dep = {
-        .sType                   = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
-        .imageMemoryBarrierCount = 1,
-        .pImageMemoryBarriers    = &chrome_vis,
-    };
-    vkCmdPipelineBarrier2(frame->cmd_buf, &chrome_dep);
-
-    VkRenderingAttachmentInfo chrome_color = {
-        .sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
-        .imageView   = frame->image_view,
-        .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-        .loadOp      = VK_ATTACHMENT_LOAD_OP_LOAD,
-        .storeOp     = VK_ATTACHMENT_STORE_OP_STORE,
-    };
-    VkRenderingInfo chrome_rendering = {
-        .sType                = VK_STRUCTURE_TYPE_RENDERING_INFO,
-        .renderArea           = rendering_info.renderArea,
-        .layerCount           = 1,
-        .colorAttachmentCount = 1,
-        .pColorAttachments    = &chrome_color,
-    };
-    vkCmdBeginRendering(frame->cmd_buf, &chrome_rendering);
-    chrome_gpu_draw(vk, frame->cmd_buf, frame->image.width, frame->image.height, frame->view_format);
-    {
-        WaylandContext *wl_hud = wayland_get_context();
-        bool have_stamp = wl_hud != nullptr && wl_hud->frame_stamp_valid;
-        engine_app()->draw_overlay(frame->cmd_buf, frame->image.width, frame->image.height,
-                                   frame->view_format,
-                                   have_stamp ? wl_hud->frame_time_ms : 0u, have_stamp,
-                                   frame->image.drm_format_modifier);
-    }
-    vkCmdEndRendering(frame->cmd_buf);
 
     uint32_t dst_queue = vk->device_info.supports_queue_family_foreign
         ? VK_QUEUE_FAMILY_FOREIGN_EXT

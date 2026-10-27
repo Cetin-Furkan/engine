@@ -591,34 +591,29 @@ static void ensure_layout(Run *run, float width, float height) {
     run->cache_ok = true;
 }
 
-static uint32_t push_quad(TextVert *out, uint32_t n, uint32_t cap,
+static uint32_t push_quad(TextQuad *out, uint32_t n, uint32_t cap,
                           float x0, float y0, float x1, float y1,
                           float u0, float v0, float u1, float v1,
                           float r, float g, float b, float a,
                           float bx0, float by0, float bx1, float by1, float mode) {
-    if (n + 6u > cap) {
+    if (n + 1u > cap) {
         if (!s_quad_warned) {
-            fprintf(stderr, "[Text Error] Text vertex buffer is full\n");
+            fprintf(stderr, "[Text Error] Text quad buffer is full\n");
             s_quad_warned = true;
         }
         return n;
     }
-    float xs[6] = { x0, x1, x1, x0, x1, x0 };
-    float ys[6] = { y0, y0, y1, y0, y1, y1 };
-    float us[6] = { u0, u1, u1, u0, u1, u0 };
-    float vs[6] = { v0, v0, v1, v0, v1, v1 };
-    for (uint32_t i = 0; i < 6u; ++i) {
-        out[n + i] = (TextVert){
-            .x = xs[i], .y = ys[i], .u = us[i], .v = vs[i],
-            .r = r, .g = g, .b = b, .a = a,
-            .bx0 = bx0, .by0 = by0, .bx1 = bx1, .by1 = by1,
-            .mode = mode,
-        };
-    }
-    return n + 6u;
+    out[n] = (TextQuad){
+        .x0 = x0, .y0 = y0, .x1 = x1, .y1 = y1,
+        .u0 = u0, .v0 = v0, .u1 = u1, .v1 = v1,
+        .r = r, .g = g, .b = b, .a = a,
+        .bx0 = bx0, .by0 = by0, .bx1 = bx1, .by1 = by1,
+        .mode = mode,
+    };
+    return n + 1u;
 }
 
-static uint32_t push_frame(TextVert *out, uint32_t n, uint32_t cap,
+static uint32_t push_frame(TextQuad *out, uint32_t n, uint32_t cap,
                            float x0, float y0, float x1, float y1,
                            float r, float g, float b, float a) {
     float t = 1.5f;
@@ -640,7 +635,7 @@ static float to_px_y(float click_y, float fb_h) {
     return fb_h * 0.5f - click_y;
 }
 
-static uint32_t emit_run(TextVert *out, uint32_t n, uint32_t cap, Run *run,
+static uint32_t emit_run(TextQuad *out, uint32_t n, uint32_t cap, Run *run,
                          float left, float bottom, float right, float top,
                          uint32_t fb_w, uint32_t fb_h, bool plate) {
     float width = right - left;
@@ -702,10 +697,10 @@ static uint32_t emit_run(TextVert *out, uint32_t n, uint32_t cap, Run *run,
     return n;
 }
 
-uint32_t text_fill(TextVert *out, uint32_t cap, uint32_t fb_w, uint32_t fb_h) {
+uint32_t text_fill(TextQuad *out, uint32_t cap, uint32_t fb_w, uint32_t fb_h) {
     s_fb_w = fb_w;
     s_fb_h = fb_h;
-    if (out == nullptr || cap < 6u || fb_w == 0u || fb_h == 0u) {
+    if (out == nullptr || cap == 0u || fb_w == 0u || fb_h == 0u) {
         return 0;
     }
     uint32_t n = 0;

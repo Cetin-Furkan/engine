@@ -1,6 +1,8 @@
 #include "frame/hud.h"
+#include "frame/pass.h"
 #include "frame/world.h"
 #include "ring/ring.h"
+#include "vulkan/pipe.h"
 #include <stddef.h>
 #include <stdio.h>
 #include <string.h>
@@ -41,9 +43,13 @@ static_assert(sizeof(HudPush) == 40u, "hud push");
 
 enum { k_text_cap = 80 };
 
-static VkPipelineLayout s_layout = VK_NULL_HANDLE;
-static VkPipeline       s_srgb = VK_NULL_HANDLE;
-static VkPipeline       s_unorm = VK_NULL_HANDLE;
+static VkPipelineLayout      s_layout = VK_NULL_HANDLE;
+static VkPipeline            s_srgb = VK_NULL_HANDLE;
+static VkPipeline            s_unorm = VK_NULL_HANDLE;
+static VkPipeline            s_scene_srgb = VK_NULL_HANDLE;
+static VkPipeline            s_scene_unorm = VK_NULL_HANDLE;
+static VkFormat              s_scene_depth = VK_FORMAT_UNDEFINED;
+static VkSampleCountFlagBits s_scene_samples = VK_SAMPLE_COUNT_1_BIT;
 static char             s_text[k_text_cap + 1];
 static uint32_t         s_nchars = 0;
 static uint32_t         s_cqe_count = 0;
@@ -67,127 +73,71 @@ static void hud_fail(const char *what, VkResult res) {
     fprintf(stderr, "[Hud Error] %s: %s (%d)\n", what, vulkan_vkresult_to_str(res), (int)res);
 }
 
-static VkShaderModule make_module(VulkanContext *vk, const uint32_t *code, uint32_t bytes) {
-    VkShaderModuleCreateInfo info = {
-        .sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-        .codeSize = bytes,
-        .pCode    = code,
-    };
-    VkShaderModule module = VK_NULL_HANDLE;
-    VkResult res = vkCreateShaderModule(vk->device, &info, nullptr, &module);
-    if (res != VK_SUCCESS) {
-        hud_fail("vkCreateShaderModule", res);
-        return VK_NULL_HANDLE;
-    }
-    return module;
-}
-
-static VkPipeline make_pipeline(VulkanContext *vk, VkFormat format,
-                                VkShaderModule vert, VkShaderModule frag) {
-    uint32_t srgb = format == VK_FORMAT_B8G8R8A8_SRGB ? 1u : 0u;
-    VkSpecializationMapEntry spec_entry = {
+static int make_pair(VulkanContext *vk, VkSampleCountFlagBits samples, VkFormat depth,
+                     VkPipeline *srgb, VkPipeline *unorm) {
+    uint32_t flag[2] = { 1u, 0u };
+    VkSpecializationMapEntry entry = {
         .constantID = 0,
         .offset     = 0,
-        .size       = sizeof srgb,
+        .size       = sizeof(uint32_t),
     };
-    VkSpecializationInfo spec_info = {
-        .mapEntryCount = 1,
-        .pMapEntries   = &spec_entry,
-        .dataSize      = sizeof srgb,
-        .pData         = &srgb,
-    };
-    VkPipelineShaderStageCreateInfo stages[2] = {
+    VkSpecializationInfo spec[2] = {
         {
-            .sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-            .stage  = VK_SHADER_STAGE_VERTEX_BIT,
-            .module = vert,
-            .pName  = "main",
+            .mapEntryCount = 1,
+            .pMapEntries   = &entry,
+            .dataSize      = sizeof(uint32_t),
+            .pData         = &flag[0],
         },
         {
-            .sType               = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-            .stage               = VK_SHADER_STAGE_FRAGMENT_BIT,
-            .module              = frag,
-            .pName               = "main",
-            .pSpecializationInfo = &spec_info,
+            .mapEntryCount = 1,
+            .pMapEntries   = &entry,
+            .dataSize      = sizeof(uint32_t),
+            .pData         = &flag[1],
         },
     };
-    VkPipelineVertexInputStateCreateInfo vertex = {
-        .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+    const VkSpecializationInfo *specs[2] = { &spec[0], &spec[1] };
+    VkFormat formats[2] = { VK_FORMAT_B8G8R8A8_SRGB, VK_FORMAT_B8G8R8A8_UNORM };
+    VulkanGfxPipe info = {
+        .vert          = k_vert_spv,
+        .vert_bytes    = sizeof k_vert_spv,
+        .frag          = k_frag_spv,
+        .frag_bytes    = sizeof k_frag_spv,
+        .layout        = s_layout,
+        .depth_format  = depth,
+        .samples       = samples,
+        .cull          = VK_CULL_MODE_NONE,
+        .depth_test    = VK_FALSE,
+        .depth_write   = VK_FALSE,
+        .depth_compare = VK_COMPARE_OP_LESS,
+        .blend         = VK_FALSE,
     };
-    VkPipelineInputAssemblyStateCreateInfo assembly = {
-        .sType    = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
-        .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
-    };
-    VkPipelineViewportStateCreateInfo viewport = {
-        .sType         = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
-        .viewportCount = 1,
-        .scissorCount  = 1,
-    };
-    VkPipelineRasterizationStateCreateInfo raster = {
-        .sType       = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
-        .polygonMode = VK_POLYGON_MODE_FILL,
-        .cullMode    = VK_CULL_MODE_NONE,
-        .frontFace   = VK_FRONT_FACE_COUNTER_CLOCKWISE,
-        .lineWidth   = 1.0f,
-    };
-    VkPipelineMultisampleStateCreateInfo samples = {
-        .sType                = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
-        .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT,
-    };
-    VkPipelineDepthStencilStateCreateInfo depth = {
-        .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
-    };
-    VkPipelineColorBlendAttachmentState blend_att = {
-        .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
-                          VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT,
-    };
-    VkPipelineColorBlendStateCreateInfo blend = {
-        .sType           = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
-        .attachmentCount = 1,
-        .pAttachments    = &blend_att,
-    };
-    VkDynamicState dynamics[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
-    VkPipelineDynamicStateCreateInfo dynamic = {
-        .sType             = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
-        .dynamicStateCount = 2,
-        .pDynamicStates    = dynamics,
-    };
-    VkPipelineRenderingCreateInfo rendering = {
-        .sType                   = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
-        .colorAttachmentCount    = 1,
-        .pColorAttachmentFormats = &format,
-        .depthAttachmentFormat   = VK_FORMAT_UNDEFINED,
-    };
-    VkGraphicsPipelineCreateInfo pipe = {
-        .sType               = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
-        .pNext               = &rendering,
-        .stageCount          = 2,
-        .pStages             = stages,
-        .pVertexInputState   = &vertex,
-        .pInputAssemblyState = &assembly,
-        .pViewportState      = &viewport,
-        .pRasterizationState = &raster,
-        .pMultisampleState   = &samples,
-        .pDepthStencilState  = &depth,
-        .pColorBlendState    = &blend,
-        .pDynamicState       = &dynamic,
-        .layout              = s_layout,
-    };
-    VkPipeline pipeline = VK_NULL_HANDLE;
-    VkResult res = vkCreateGraphicsPipelines(vk->device, VK_NULL_HANDLE, 1, &pipe, nullptr, &pipeline);
-    if (res != VK_SUCCESS) {
-        hud_fail("vkCreateGraphicsPipelines", res);
-        return VK_NULL_HANDLE;
+    VkPipeline out[2] = {0};
+    if (vulkan_gfx_pipelines(vk, &info, formats, specs, 2, out) != 0) {
+        return -1;
     }
-    return pipeline;
+    *srgb = out[0];
+    *unorm = out[1];
+    return 0;
 }
 
 void hud_shutdown(VulkanContext *vk) {
+    s_scene_depth = VK_FORMAT_UNDEFINED;
+    s_scene_samples = VK_SAMPLE_COUNT_1_BIT;
     if (vk == nullptr || vk->device == VK_NULL_HANDLE) {
         s_layout = VK_NULL_HANDLE;
         s_srgb = VK_NULL_HANDLE;
         s_unorm = VK_NULL_HANDLE;
+        s_scene_srgb = VK_NULL_HANDLE;
+        s_scene_unorm = VK_NULL_HANDLE;
         return;
+    }
+    if (s_scene_srgb != VK_NULL_HANDLE) {
+        vkDestroyPipeline(vk->device, s_scene_srgb, nullptr);
+        s_scene_srgb = VK_NULL_HANDLE;
+    }
+    if (s_scene_unorm != VK_NULL_HANDLE) {
+        vkDestroyPipeline(vk->device, s_scene_unorm, nullptr);
+        s_scene_unorm = VK_NULL_HANDLE;
     }
     if (s_srgb != VK_NULL_HANDLE) {
         vkDestroyPipeline(vk->device, s_srgb, nullptr);
@@ -234,22 +184,13 @@ int hud_init(VulkanContext *vk) {
         hud_shutdown(vk);
         return -1;
     }
-    VkShaderModule vert = make_module(vk, (const uint32_t *)k_vert_spv, (uint32_t)sizeof k_vert_spv);
-    VkShaderModule frag = make_module(vk, (const uint32_t *)k_frag_spv, (uint32_t)sizeof k_frag_spv);
-    if (vert == VK_NULL_HANDLE || frag == VK_NULL_HANDLE) {
-        if (vert != VK_NULL_HANDLE) {
-            vkDestroyShaderModule(vk->device, vert, nullptr);
-        }
-        if (frag != VK_NULL_HANDLE) {
-            vkDestroyShaderModule(vk->device, frag, nullptr);
-        }
+    if (make_pair(vk, VK_SAMPLE_COUNT_1_BIT, VK_FORMAT_UNDEFINED, &s_srgb, &s_unorm) != 0 ||
+        make_pair(vk, pass_raster_samples(), pass_depth_format(), &s_scene_srgb, &s_scene_unorm) != 0) {
         hud_shutdown(vk);
         return -1;
     }
-    s_srgb = make_pipeline(vk, VK_FORMAT_B8G8R8A8_SRGB, vert, frag);
-    s_unorm = make_pipeline(vk, VK_FORMAT_B8G8R8A8_UNORM, vert, frag);
-    vkDestroyShaderModule(vk->device, vert, nullptr);
-    vkDestroyShaderModule(vk->device, frag, nullptr);
+    s_scene_depth = pass_depth_format();
+    s_scene_samples = pass_raster_samples();
     if (s_srgb == VK_NULL_HANDLE || s_unorm == VK_NULL_HANDLE) {
         hud_shutdown(vk);
         return -1;
@@ -400,17 +341,28 @@ static void draw_quad(VkCommandBuffer cmd, HudPush push) {
     vkCmdDraw(cmd, 6, 1, 0, 0);
 }
 
-void hud_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height, VkFormat format) {
+static VkPipeline pick_pipeline(VkFormat format, VkFormat depth_format,
+                                VkSampleCountFlagBits samples) {
+    bool scene = depth_format != VK_FORMAT_UNDEFINED;
+    if (scene && (depth_format != s_scene_depth || samples != s_scene_samples)) {
+        return VK_NULL_HANDLE;
+    }
+    if (format == VK_FORMAT_B8G8R8A8_SRGB) {
+        return scene ? s_scene_srgb : s_srgb;
+    }
+    if (format == VK_FORMAT_B8G8R8A8_UNORM) {
+        return scene ? s_scene_unorm : s_unorm;
+    }
+    return VK_NULL_HANDLE;
+}
+
+void hud_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height, VkFormat format,
+              VkFormat depth_format, VkSampleCountFlagBits samples) {
     if (cmd == VK_NULL_HANDLE || s_layout == VK_NULL_HANDLE || s_nchars == 0 ||
         width < 80u || height < 48u) {
         return;
     }
-    VkPipeline pipeline = VK_NULL_HANDLE;
-    if (format == VK_FORMAT_B8G8R8A8_SRGB) {
-        pipeline = s_srgb;
-    } else if (format == VK_FORMAT_B8G8R8A8_UNORM) {
-        pipeline = s_unorm;
-    }
+    VkPipeline pipeline = pick_pipeline(format, depth_format, samples);
     if (pipeline == VK_NULL_HANDLE) {
         return;
     }
@@ -427,18 +379,7 @@ void hud_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height, VkFormat for
     uint32_t plate_x = 10u;
     uint32_t plate_y = height - 10u - plate_h;
 
-    VkViewport viewport = {
-        .width    = (float)width,
-        .height   = (float)height,
-        .minDepth = 0.0f,
-        .maxDepth = 1.0f,
-    };
-    VkRect2D scissor = {
-        .extent = { .width = width, .height = height },
-    };
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-    vkCmdSetViewport(cmd, 0, 1, &viewport);
-    vkCmdSetScissor(cmd, 0, 1, &scissor);
 
     HudPush plate = {
         .fb_w  = width,

@@ -23,7 +23,12 @@ bool plot_reload(RingCqeFn on_cqe, void *on_user);
 bool plot_wants_frame(void);
 void plot_commit(void);
 
-// Records the math dispatch before the color pass. The draw reads it.
+// plot_begin claims a retired slice when the math or the file changed.
+// The copy and the dispatch land in that slice. A full ring keeps the
+// previous slice and stays dirty. plot_release returns the slice when
+// the submit does not happen.
+void plot_begin(VkSemaphore acquire, uint64_t signal_point);
+void plot_release(uint64_t signal_point);
 void plot_prepare(VkCommandBuffer cmd);
 void plot_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height);
 

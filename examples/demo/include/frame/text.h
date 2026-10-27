@@ -13,7 +13,15 @@
 
 [[nodiscard]] int text_init(VulkanContext *vk);
 void text_shutdown(VulkanContext *vk);
-void text_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height, VkFormat format);
+
+// text_begin claims one slice for signal_point. The slice stays until the
+// acquire timeline reaches that point. text_release gives it back when the
+// submit does not happen. A full ring skips the draw and keeps the last
+// slice's bytes.
+void text_begin(VkSemaphore acquire, uint64_t signal_point);
+void text_release(uint64_t signal_point);
+void text_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height, VkFormat format,
+               VkFormat depth_format, VkSampleCountFlagBits samples);
 
 // id 0 is invalid. A sealed id is never issued. A freed id fails later.
 [[nodiscard]] uint32_t text_add(float x0, float y0, float x1, float y1, const char *utf8);

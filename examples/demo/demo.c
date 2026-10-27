@@ -1,3 +1,4 @@
+#include "chrome/gpu.h"
 #include "engine/app.h"
 #include "frame/camera.h"
 #include "frame/cube.h"
@@ -93,6 +94,8 @@ static int demo_create_targets(VulkanContext *vk, EngineTargets *targets,
     targets->depth_view      = entry->depth.view;
     targets->coverage_image  = entry->coverage.image;
     targets->coverage_view   = entry->coverage.view;
+    targets->depth_format    = pass_depth_format();
+    targets->samples         = pass_raster_samples();
     return 0;
 }
 
@@ -116,7 +119,9 @@ static void demo_destroy_targets(VulkanContext *vk, EngineTargets *targets) {
 
 static int demo_init(VulkanContext *vk, RingCqeFn forward_cqe, void *forward_user) {
     policy_boot();
-    if (pass_init(vk) != 0 || cube_init(vk) != 0 || solid_init(vk) != 0 || shape_init(vk) != 0 ||
+    if (pass_init(vk) != 0 ||
+        chrome_gpu_bind_pass(vk, pass_depth_format(), pass_raster_samples()) != 0 ||
+        cube_init(vk) != 0 || solid_init(vk) != 0 || shape_init(vk) != 0 ||
         plane_init(vk) != 0 || material_init(vk) != 0 ||
         plot_init(vk, forward_cqe, forward_user) != 0 ||
         mesh_init(vk, forward_cqe, forward_user) != 0 ||
@@ -146,12 +151,22 @@ static void demo_record_compute(VkCommandBuffer cmd, uint32_t heat_dt, bool live
 }
 
 static void demo_prepare_draw(VkCommandBuffer cmd, VkImage depth_image) {
-    pass_prepare_draw(cmd, depth_image);
+    (void)depth_image;
     plot_prepare(cmd);
 }
 
 static void demo_claim_frame(VkSemaphore acquire, uint64_t signal_point) {
     shape_begin(acquire, signal_point);
+    text_begin(acquire, signal_point);
+    plot_begin(acquire, signal_point);
+    mesh_begin(acquire, signal_point);
+}
+
+static void demo_release_frame(uint64_t signal_point) {
+    shape_release(signal_point);
+    text_release(signal_point);
+    plot_release(signal_point);
+    mesh_release(signal_point);
 }
 
 static void demo_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height, bool live) {
@@ -159,11 +174,12 @@ static void demo_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height, bool
 }
 
 static void demo_draw_overlay(VkCommandBuffer cmd, uint32_t width, uint32_t height,
-                              VkFormat format, uint32_t frame_ms, bool have_stamp,
-                              uint64_t modifier) {
+                              VkFormat format, VkFormat depth_format,
+                              VkSampleCountFlagBits samples, uint32_t frame_ms,
+                              bool have_stamp, uint64_t modifier) {
     hud_prepare(frame_ms, have_stamp, modifier);
-    hud_draw(cmd, width, height, format);
-    text_draw(cmd, width, height, format);
+    hud_draw(cmd, width, height, format, depth_format, samples);
+    text_draw(cmd, width, height, format, depth_format, samples);
 }
 
 static bool demo_simulation(uint32_t time_ms, const FrameStep *step, uint32_t *heat_dt) {
@@ -351,7 +367,7 @@ static const EngineApp s_app = {
     .record_published  = world_record_published,
     .record_step_open  = world_record_step_open,
     .record_poke_pending = world_record_poke_pending,
-    .release_frame     = shape_release,
+    .release_frame     = demo_release_frame,
     .simulation        = demo_simulation,
     .simulation_hold   = world_simulation_hold,
     .simulation_commit = world_simulation_commit,

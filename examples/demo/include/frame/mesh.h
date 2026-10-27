@@ -26,6 +26,12 @@ bool mesh_sphere(float *cx, float *cy, float *radius);
 bool mesh_wants_frame(void);
 void mesh_commit(void);
 
+// mesh_begin copies the CPU corners into a retired slice. A full ring
+// keeps the previous slice and stays dirty. mesh_release returns the
+// slice when the submit does not happen.
+void mesh_begin(VkSemaphore acquire, uint64_t signal_point);
+void mesh_release(uint64_t signal_point);
+
 void mesh_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height,
                float yaw_deg, bool selected);
 

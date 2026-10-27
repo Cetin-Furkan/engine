@@ -22,6 +22,20 @@ typedef struct BdaSlice {
     uint32_t        bytes;
 } BdaSlice;
 
+// One device-address allocation. host requires a coherent mapping.
+// The address is set when usage includes SHADER_DEVICE_ADDRESS.
+typedef struct DaBuffer {
+    VkBuffer        buffer;
+    VkDeviceMemory  memory;
+    void           *map;
+    VkDeviceAddress address;
+    VkDeviceSize    bytes;
+} DaBuffer;
+
+[[nodiscard]] int da_buffer_create(VulkanContext *vk, VkDeviceSize size,
+                                   VkBufferUsageFlags usage, bool host, DaBuffer *out);
+void da_buffer_destroy(VulkanContext *vk, DaBuffer *buf);
+
 [[nodiscard]] int bda_arena_init(VulkanContext *vk, BdaArena *arena, uint32_t capacity);
 void bda_arena_destroy(VulkanContext *vk, BdaArena *arena);
 void bda_arena_reset(BdaArena *arena);

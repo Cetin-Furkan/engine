@@ -2,7 +2,8 @@
 #include "frame/camera.h"
 #include "frame/grid.h"
 #include "frame/pass.h"
-#include "vulkan/memory.h"
+#include "vulkan/bda.h"
+#include "vulkan/pipe.h"
 #include <stddef.h>
 #include <stdio.h>
 
@@ -175,88 +176,14 @@ static uint32_t sample_count_n(VkSampleCountFlagBits samples) {
 
 static int create_da_buffer(VulkanContext *vk, VkDeviceSize size, VkBufferUsageFlags usage,
                             VkBuffer *buffer, VkDeviceMemory *memory, VkDeviceAddress *addr) {
-    *buffer = VK_NULL_HANDLE;
-    *memory = VK_NULL_HANDLE;
-    *addr = 0;
-    VkBufferCreateInfo buffer_info = {
-        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-        .size  = size,
-        .usage = usage,
-    };
-    VkResult res = vkCreateBuffer(vk->device, &buffer_info, nullptr, buffer);
-    if (res != VK_SUCCESS) {
-        cube_fail("vkCreateBuffer", res);
+    DaBuffer buf = {0};
+    if (da_buffer_create(vk, size, usage, false, &buf) != 0) {
         return -1;
     }
-    VkMemoryRequirements reqs = {0};
-    vkGetBufferMemoryRequirements(vk->device, *buffer, &reqs);
-    uint32_t type_index = 0;
-    VulkanResult mem = vulkan_find_memory_type(
-        vk, reqs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &type_index);
-    if (mem != VULKAN_SUCCESS) {
-        mem = vulkan_find_memory_type(vk, reqs.memoryTypeBits, 0, &type_index);
-    }
-    if (mem != VULKAN_SUCCESS) {
-        vkDestroyBuffer(vk->device, *buffer, nullptr);
-        *buffer = VK_NULL_HANDLE;
-        fprintf(stderr, "[Cube Error] No device memory for a mesh buffer\n");
-        return -1;
-    }
-    VkMemoryAllocateFlagsInfo alloc_flags = {
-        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO,
-        .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT,
-    };
-    VkMemoryAllocateInfo alloc = {
-        .sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-        .pNext           = &alloc_flags,
-        .allocationSize  = reqs.size,
-        .memoryTypeIndex = type_index,
-    };
-    res = vkAllocateMemory(vk->device, &alloc, nullptr, memory);
-    if (res != VK_SUCCESS) {
-        cube_fail("vkAllocateMemory", res);
-        vkDestroyBuffer(vk->device, *buffer, nullptr);
-        *buffer = VK_NULL_HANDLE;
-        return -1;
-    }
-    res = vkBindBufferMemory(vk->device, *buffer, *memory, 0);
-    if (res != VK_SUCCESS) {
-        cube_fail("vkBindBufferMemory", res);
-        vkFreeMemory(vk->device, *memory, nullptr);
-        vkDestroyBuffer(vk->device, *buffer, nullptr);
-        *memory = VK_NULL_HANDLE;
-        *buffer = VK_NULL_HANDLE;
-        return -1;
-    }
-    VkBufferDeviceAddressInfo address_info = {
-        .sType  = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO,
-        .buffer = *buffer,
-    };
-    *addr = vkGetBufferDeviceAddress(vk->device, &address_info);
-    if (*addr == 0) {
-        fprintf(stderr, "[Cube Error] Mesh device address is null\n");
-        vkFreeMemory(vk->device, *memory, nullptr);
-        vkDestroyBuffer(vk->device, *buffer, nullptr);
-        *memory = VK_NULL_HANDLE;
-        *buffer = VK_NULL_HANDLE;
-        return -1;
-    }
+    *buffer = buf.buffer;
+    *memory = buf.memory;
+    *addr = buf.address;
     return 0;
-}
-
-static VkShaderModule make_module(VulkanContext *vk, const uint32_t *code, uint32_t bytes) {
-    VkShaderModuleCreateInfo info = {
-        .sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-        .codeSize = bytes,
-        .pCode    = code,
-    };
-    VkShaderModule module = VK_NULL_HANDLE;
-    VkResult res = vkCreateShaderModule(vk->device, &info, nullptr, &module);
-    if (res != VK_SUCCESS) {
-        cube_fail("vkCreateShaderModule", res);
-        return VK_NULL_HANDLE;
-    }
-    return module;
 }
 
 // This command buffer only. The vertex read of the buffer just written is
@@ -457,104 +384,22 @@ int cube_init(VulkanContext *vk) {
         return -1;
     }
 
-    VkShaderModule vert = make_module(vk, (const uint32_t *)k_vert_spv, (uint32_t)sizeof k_vert_spv);
-    VkShaderModule frag = make_module(vk, (const uint32_t *)k_frag_spv, (uint32_t)sizeof k_frag_spv);
-    if (vert == VK_NULL_HANDLE || frag == VK_NULL_HANDLE) {
-        if (vert != VK_NULL_HANDLE) {
-            vkDestroyShaderModule(vk->device, vert, nullptr);
-        }
-        if (frag != VK_NULL_HANDLE) {
-            vkDestroyShaderModule(vk->device, frag, nullptr);
-        }
-        cube_shutdown(vk);
-        return -1;
-    }
-
-    VkPipelineShaderStageCreateInfo stages[2] = {
-        {
-            .sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-            .stage  = VK_SHADER_STAGE_VERTEX_BIT,
-            .module = vert,
-            .pName  = "main",
-        },
-        {
-            .sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-            .stage  = VK_SHADER_STAGE_FRAGMENT_BIT,
-            .module = frag,
-            .pName  = "main",
-        },
-    };
-    VkPipelineVertexInputStateCreateInfo vertex = {
-        .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
-    };
-    VkPipelineInputAssemblyStateCreateInfo assembly = {
-        .sType    = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
-        .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
-    };
-    VkPipelineViewportStateCreateInfo viewport = {
-        .sType         = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
-        .viewportCount = 1,
-        .scissorCount  = 1,
-    };
-    VkPipelineRasterizationStateCreateInfo raster = {
-        .sType       = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
-        .polygonMode = VK_POLYGON_MODE_FILL,
-        .cullMode    = VK_CULL_MODE_BACK_BIT,
-        .frontFace   = VK_FRONT_FACE_COUNTER_CLOCKWISE,
-        .lineWidth   = 1.0f,
-    };
-    VkPipelineMultisampleStateCreateInfo samples = {
-        .sType                = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
-        .rasterizationSamples = sample_count,
-    };
-    VkPipelineDepthStencilStateCreateInfo depth = {
-        .sType            = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
-        .depthTestEnable  = VK_TRUE,
-        .depthWriteEnable = VK_TRUE,
-        .depthCompareOp   = VK_COMPARE_OP_LESS,
-    };
-    VkPipelineColorBlendAttachmentState blend_att = {
-        .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
-                          VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT,
-    };
-    VkPipelineColorBlendStateCreateInfo blend = {
-        .sType           = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
-        .attachmentCount = 1,
-        .pAttachments    = &blend_att,
-    };
-    VkDynamicState dynamics[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
-    VkPipelineDynamicStateCreateInfo dynamic = {
-        .sType             = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
-        .dynamicStateCount = 2,
-        .pDynamicStates    = dynamics,
-    };
     VkFormat color_format = VK_FORMAT_B8G8R8A8_SRGB;
-    VkPipelineRenderingCreateInfo rendering = {
-        .sType                   = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
-        .colorAttachmentCount    = 1,
-        .pColorAttachmentFormats = &color_format,
-        .depthAttachmentFormat   = depth_format,
+    VulkanGfxPipe gfx = {
+        .vert          = k_vert_spv,
+        .vert_bytes    = sizeof k_vert_spv,
+        .frag          = k_frag_spv,
+        .frag_bytes    = sizeof k_frag_spv,
+        .layout        = s_layout,
+        .depth_format  = depth_format,
+        .samples       = sample_count,
+        .cull          = VK_CULL_MODE_BACK_BIT,
+        .depth_test    = VK_TRUE,
+        .depth_write   = VK_TRUE,
+        .depth_compare = VK_COMPARE_OP_LESS,
+        .blend         = VK_FALSE,
     };
-    VkGraphicsPipelineCreateInfo pipe = {
-        .sType               = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
-        .pNext               = &rendering,
-        .stageCount          = 2,
-        .pStages             = stages,
-        .pVertexInputState   = &vertex,
-        .pInputAssemblyState = &assembly,
-        .pViewportState      = &viewport,
-        .pRasterizationState = &raster,
-        .pMultisampleState   = &samples,
-        .pDepthStencilState  = &depth,
-        .pColorBlendState    = &blend,
-        .pDynamicState       = &dynamic,
-        .layout              = s_layout,
-    };
-    res = vkCreateGraphicsPipelines(vk->device, VK_NULL_HANDLE, 1, &pipe, nullptr, &s_pipeline);
-    vkDestroyShaderModule(vk->device, vert, nullptr);
-    vkDestroyShaderModule(vk->device, frag, nullptr);
-    if (res != VK_SUCCESS) {
-        cube_fail("vkCreateGraphicsPipelines", res);
+    if (vulkan_gfx_pipelines(vk, &gfx, &color_format, nullptr, 1, &s_pipeline) != 0) {
         cube_shutdown(vk);
         return -1;
     }
@@ -575,26 +420,8 @@ int cube_init(VulkanContext *vk) {
         cube_shutdown(vk);
         return -1;
     }
-    VkShaderModule comp = make_module(vk, (const uint32_t *)k_bevel_spv, (uint32_t)sizeof k_bevel_spv);
-    if (comp == VK_NULL_HANDLE) {
-        cube_shutdown(vk);
-        return -1;
-    }
-    VkPipelineShaderStageCreateInfo compute_stage = {
-        .sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-        .stage  = VK_SHADER_STAGE_COMPUTE_BIT,
-        .module = comp,
-        .pName  = "main",
-    };
-    VkComputePipelineCreateInfo compute_pipe = {
-        .sType  = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
-        .stage  = compute_stage,
-        .layout = s_compute_layout,
-    };
-    res = vkCreateComputePipelines(vk->device, VK_NULL_HANDLE, 1, &compute_pipe, nullptr, &s_compute);
-    vkDestroyShaderModule(vk->device, comp, nullptr);
-    if (res != VK_SUCCESS) {
-        cube_fail("vkCreateComputePipelines", res);
+    s_compute = vulkan_compute_pipeline(vk, k_bevel_spv, sizeof k_bevel_spv, s_compute_layout);
+    if (s_compute == VK_NULL_HANDLE) {
         cube_shutdown(vk);
         return -1;
     }
@@ -614,26 +441,8 @@ int cube_init(VulkanContext *vk) {
         cube_shutdown(vk);
         return -1;
     }
-    VkShaderModule heat = make_module(vk, (const uint32_t *)k_heat_spv, (uint32_t)sizeof k_heat_spv);
-    if (heat == VK_NULL_HANDLE) {
-        cube_shutdown(vk);
-        return -1;
-    }
-    VkPipelineShaderStageCreateInfo heat_stage = {
-        .sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-        .stage  = VK_SHADER_STAGE_COMPUTE_BIT,
-        .module = heat,
-        .pName  = "main",
-    };
-    VkComputePipelineCreateInfo heat_pipe = {
-        .sType  = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
-        .stage  = heat_stage,
-        .layout = s_heat_layout,
-    };
-    res = vkCreateComputePipelines(vk->device, VK_NULL_HANDLE, 1, &heat_pipe, nullptr, &s_heat_pipe);
-    vkDestroyShaderModule(vk->device, heat, nullptr);
-    if (res != VK_SUCCESS) {
-        cube_fail("vkCreateComputePipelines heat", res);
+    s_heat_pipe = vulkan_compute_pipeline(vk, k_heat_spv, sizeof k_heat_spv, s_heat_layout);
+    if (s_heat_pipe == VK_NULL_HANDLE) {
         cube_shutdown(vk);
         return -1;
     }
@@ -731,17 +540,6 @@ void cube_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height, float yaw_d
         !heat_slot_ok(heat_slot)) {
         return;
     }
-    VkViewport viewport = {
-        .x        = 0.0f,
-        .y        = 0.0f,
-        .width    = (float)width,
-        .height   = (float)height,
-        .minDepth = 0.0f,
-        .maxDepth = 1.0f,
-    };
-    VkRect2D scissor = {
-        .extent = { .width = width, .height = height },
-    };
     const HeatLive *live = &s_live[heat_slot];
     int heat_copy = live->draw >= 0 ? live->draw : live->read;
     DrawPush draw_push = {
@@ -759,10 +557,9 @@ void cube_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height, float yaw_d
         .grid_n     = grid_n(),
     };
     view_push_fill(&draw_push.view, mat);
-    vkCmdSetViewport(cmd, 0, 1, &viewport);
-    vkCmdSetScissor(cmd, 0, 1, &scissor);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_pipeline);
-    vkCmdBindIndexBuffer(cmd, s_index, 0, VK_INDEX_TYPE_UINT16);
+    vkCmdBindIndexBuffer2(cmd, s_index, 0, (VkDeviceSize)k_indices * sizeof(uint16_t),
+                          VK_INDEX_TYPE_UINT16);
     vulkan_cmd_push(cmd, s_layout, VK_SHADER_STAGE_VERTEX_BIT, k_draw_push_bytes, &draw_push);
     vkCmdDrawIndexed(cmd, k_indices, 1, 0, 0, 0);
 }

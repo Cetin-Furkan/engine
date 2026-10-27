@@ -1,5 +1,4 @@
 #include "world/world_int.h"
-#include <errno.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -128,10 +127,6 @@ int world_load(void) {
         // an optional placement list, not a boot requirement.
         table_publish();
         return 0;
-    }
-    if (f == nullptr) {
-        fprintf(stderr, "[World] %s was not opened: %s\n", k_path, strerror(errno));
-        return -1;
     }
     char line[256];
     int number = 0;

@@ -1,7 +1,7 @@
 #include "frame/plot.h"
 #include "frame/plot_file.h"
 #include "frame/camera.h"
-#include "frame/cube.h"
+#include "frame/pass.h"
 #include "vulkan/memory.h"
 #include <stdio.h>
 #include <string.h>
@@ -82,7 +82,8 @@ static VkDeviceMemory   s_memory = VK_NULL_HANDLE;
 static VkDeviceAddress  s_addr = 0;
 static VkQueue          s_queue = VK_NULL_HANDLE;
 static PlotSample      *s_map = nullptr;
-static uint32_t         s_mode = k_mode_sin;
+// Off until M. The pipeline stays. A cycle is sin, sinc, gaussian, off.
+static uint32_t         s_mode = k_mode_off;
 static bool             s_math_dirty = false;
 static uint32_t         s_file_n = 0;
 static uint32_t         s_gen = 0;
@@ -556,10 +557,10 @@ int plot_init(VulkanContext *vk, RingCqeFn on_cqe, void *on_user) {
     if (s_pipeline != VK_NULL_HANDLE) {
         return 0;
     }
-    VkFormat depth_format = cube_depth_format();
-    VkSampleCountFlagBits samples = cube_raster_samples();
+    VkFormat depth_format = pass_depth_format();
+    VkSampleCountFlagBits samples = pass_raster_samples();
     if (depth_format == VK_FORMAT_UNDEFINED || samples == 0) {
-        fprintf(stderr, "[Plot Error] The cube pass has no depth format yet\n");
+        fprintf(stderr, "[Plot Error] The render pass has no depth format yet\n");
         return -1;
     }
     VkPhysicalDeviceProperties props = {0};
@@ -739,7 +740,7 @@ int plot_init(VulkanContext *vk, RingCqeFn on_cqe, void *on_user) {
     s_gen = 0;
     s_shown_gen = 0;
     if (!s_logged) {
-        printf("[Plot] Math curve on the GPU. M cycles sin, sinc, gaussian, off. L reloads plots/data.csv and plots/mesh.obj.\n");
+        printf("[Plot] Math curve on the GPU, off until M. M cycles sin, sinc, gaussian, off. L reloads plots/data.csv and plots/mesh.obj.\n");
         fflush(stdout);
         s_logged = true;
     }

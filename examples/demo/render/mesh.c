@@ -1,7 +1,7 @@
 #include "frame/mesh.h"
 #include "frame/plot_file.h"
 #include "frame/camera.h"
-#include "frame/cube.h"
+#include "frame/pass.h"
 #include "frame/material.h"
 #include "vulkan/memory.h"
 #include <math.h>
@@ -343,10 +343,10 @@ int mesh_init(VulkanContext *vk, RingCqeFn on_cqe, void *on_user) {
     if (!plot_file_mesh_check()) {
         fprintf(stderr, "[Mesh Error] Triangulation self-check failed\n");
     }
-    VkFormat depth_format = cube_depth_format();
-    VkSampleCountFlagBits samples = cube_raster_samples();
+    VkFormat depth_format = pass_depth_format();
+    VkSampleCountFlagBits samples = pass_raster_samples();
     if (depth_format == VK_FORMAT_UNDEFINED || samples == 0) {
-        fprintf(stderr, "[Mesh Error] The cube pass has no depth format yet\n");
+        fprintf(stderr, "[Mesh Error] The render pass has no depth format yet\n");
         return -1;
     }
     VkPhysicalDeviceProperties props = {0};

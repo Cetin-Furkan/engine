@@ -6,6 +6,7 @@
 #include "frame/hud.h"
 #include "frame/material.h"
 #include "frame/mesh.h"
+#include "frame/pass.h"
 #include "frame/plane.h"
 #include "frame/plot.h"
 #include "frame/shape.h"
@@ -16,9 +17,10 @@
 #include <stdio.h>
 #include <string.h>
 
-// The hosted program: one bevelled heat cube, click-built faces, six
-// raised solids, a math plot, a CSV chart, and an OBJ mesh, all placed
-// by world/opening.world. The engine knows none of these names; it only
+// The hosted program. Boot draws the metric grid and no objects.
+// opening.world may place a cube or a mesh. Clicks build faces.
+// Keys 1-6 raise solids. M cycles the math plot. L reloads the CSV
+// chart and the OBJ. The engine knows none of these names; it only
 // calls the EngineApp hooks below on its io_uring thread.
 
 // ---------------------------------------------------------------- targets
@@ -31,8 +33,8 @@
 enum : uint32_t { k_target_cap = 16 };
 
 typedef struct TargetEntry {
-    CubeDepth    depth;
-    CubeCoverage coverage;
+    PassDepth    depth;
+    PassCoverage coverage;
     uint32_t     generation;
     bool         used;
 } TargetEntry;
@@ -70,10 +72,10 @@ static int demo_create_targets(VulkanContext *vk, EngineTargets *targets,
         fprintf(stderr, "[Demo] No free render-target slot\n");
         return -1;
     }
-    if (cube_depth_create(vk, &entry->depth, width, height) != 0 ||
-        cube_coverage_create(vk, &entry->coverage, width, height) != 0) {
-        cube_depth_destroy(vk, &entry->depth);
-        cube_coverage_destroy(vk, &entry->coverage);
+    if (pass_depth_create(vk, &entry->depth, width, height) != 0 ||
+        pass_coverage_create(vk, &entry->coverage, width, height) != 0) {
+        pass_depth_destroy(vk, &entry->depth);
+        pass_coverage_destroy(vk, &entry->coverage);
         entry->used = false;
         *targets = (EngineTargets){0};
         return -1;
@@ -96,8 +98,8 @@ static void demo_destroy_targets(VulkanContext *vk, EngineTargets *targets) {
     }
     TargetEntry *entry = target_find(targets);
     if (entry != nullptr) {
-        cube_depth_destroy(vk, &entry->depth);
-        cube_coverage_destroy(vk, &entry->coverage);
+        pass_depth_destroy(vk, &entry->depth);
+        pass_coverage_destroy(vk, &entry->coverage);
         entry->used = false;
         // Poison: a copied EngineTargets still naming these handles must
         // not match a future entry that recycles the same image handle
@@ -109,7 +111,7 @@ static void demo_destroy_targets(VulkanContext *vk, EngineTargets *targets) {
 // ------------------------------------------------------------------- hooks
 
 static int demo_init(VulkanContext *vk, RingCqeFn forward_cqe, void *forward_user) {
-    if (cube_init(vk) != 0 || solid_init(vk) != 0 || shape_init(vk) != 0 ||
+    if (pass_init(vk) != 0 || cube_init(vk) != 0 || solid_init(vk) != 0 || shape_init(vk) != 0 ||
         plane_init(vk) != 0 || material_init(vk) != 0 ||
         plot_init(vk, forward_cqe, forward_user) != 0 ||
         mesh_init(vk, forward_cqe, forward_user) != 0 ||
@@ -130,6 +132,7 @@ static void demo_shutdown(VulkanContext *vk) {
     shape_shutdown(vk);
     solid_shutdown(vk);
     cube_shutdown(vk);
+    pass_shutdown(vk);
 }
 
 static void demo_record_compute(VkCommandBuffer cmd, uint32_t heat_dt, bool live) {
@@ -137,7 +140,7 @@ static void demo_record_compute(VkCommandBuffer cmd, uint32_t heat_dt, bool live
 }
 
 static void demo_prepare_draw(VkCommandBuffer cmd, VkImage depth_image) {
-    cube_prepare_draw(cmd, depth_image);
+    pass_prepare_draw(cmd, depth_image);
     plot_prepare(cmd);
 }
 

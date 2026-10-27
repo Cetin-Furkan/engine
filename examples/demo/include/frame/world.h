@@ -4,15 +4,16 @@
 #include "vulkan/types.h"
 #include <stdint.h>
 
-// world/opening.world names what is placed. Each placed thing is one object
-// with a coordinate and a function table. The closest hit on the click ray
-// wins. Empty ground, the plane named in that file, collects corners.
+// The metric grid is the ground and is on with an empty placement list.
+// examples/demo/world/opening.world names extra objects. Each placed thing
+// is one object with a coordinate and a function table. The closest hit
+// on the click ray wins. Empty ground collects corners.
 // F closes that chain into one face, in click order, and the face turns
 // once in its plane. Keys 1-6 raise a tetrahedron, octahedron, icosahedron,
 // cylinder, cone, and torus. The OBJ is placed when the file names mesh.
 // It turns once, and L reads it again. R keeps the selection spinning until
-// R again. With nothing selected, R spins the cube. S smooths or facets the
-// six solids. G opens or closes glow on the selection, or on the cube.
+// R again. With nothing selected, R spins a placed cube. S smooths or facets
+// the six solids. G opens or closes glow on the selection, or on that cube.
 // Esc clears a partial build and the selection. Backspace removes the
 // selection, or the last loose corner. F5 runs the selected object through
 // one more revolution. A click on the cube also plants heat.
@@ -71,11 +72,8 @@ bool world_respin_selected(void);
 // a crossing outline, or a chain that will not clip leaves the dots.
 bool world_close_face(void);
 
-// Degrees about Y. live is the pose world_advance just computed.
-float world_cube_yaw_deg(bool live);
-
-// The cube's heat step and the diffusion field tied to its vertices.
-// A submit calls world_record. world_record_ok keeps that step's point.
+// Objects that own a GPU step record it here. world_record_ok keeps
+// that step's acquire point. An object with no compute is skipped.
 void world_record(VkCommandBuffer cmd, uint32_t heat_dt, bool live);
 void world_record_ok(uint64_t signal_point);
 void world_record_abort(void);

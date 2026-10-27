@@ -288,3 +288,168 @@ uint32_t table_alive_vertices(void) {
     }
     return total;
 }
+
+void table_record(VkCommandBuffer cmd, uint32_t heat_dt, bool live) {
+    for (int i = 0; i < s_n; ++i) {
+        WorldObj *o = &s_obj[i];
+        if (!o->alive || o->ops == nullptr || o->ops->record_compute == nullptr) {
+            continue;
+        }
+        o->ops->record_compute(o, cmd, heat_dt, live);
+    }
+}
+
+void table_record_ok(uint64_t signal_point) {
+    for (int i = 0; i < s_n; ++i) {
+        WorldObj *o = &s_obj[i];
+        if (!o->alive || o->ops == nullptr || o->ops->record_ok == nullptr) {
+            continue;
+        }
+        o->ops->record_ok(o, signal_point);
+    }
+}
+
+void table_record_abort(void) {
+    for (int i = 0; i < s_n; ++i) {
+        WorldObj *o = &s_obj[i];
+        if (!o->alive || o->ops == nullptr || o->ops->record_abort == nullptr) {
+            continue;
+        }
+        o->ops->record_abort(o);
+    }
+}
+
+uint64_t table_record_published(void) {
+    // One queue. The next submit waits the newest compute signal any
+    // object published. An earlier point is already ordered behind it.
+    uint64_t point = 0;
+    for (int i = 0; i < s_n; ++i) {
+        const WorldObj *o = &s_obj[i];
+        if (!o->alive || o->ops == nullptr || o->ops->record_published == nullptr) {
+            continue;
+        }
+        uint64_t one = o->ops->record_published(o);
+        if (one > point) {
+            point = one;
+        }
+    }
+    return point;
+}
+
+bool table_record_step_open(void) {
+    for (int i = 0; i < s_n; ++i) {
+        const WorldObj *o = &s_obj[i];
+        if (!o->alive || o->ops == nullptr || o->ops->record_step_open == nullptr) {
+            continue;
+        }
+        if (o->ops->record_step_open(o)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool table_record_poke_pending(void) {
+    for (int i = 0; i < s_n; ++i) {
+        const WorldObj *o = &s_obj[i];
+        if (!o->alive || o->ops == nullptr || o->ops->record_poke_pending == nullptr) {
+            continue;
+        }
+        if (o->ops->record_poke_pending(o)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool table_simulate(uint32_t time_ms, uint32_t *heat_dt) {
+    bool pulse = false;
+    uint32_t dt = 0;
+    for (int i = 0; i < s_n; ++i) {
+        WorldObj *o = &s_obj[i];
+        if (!o->alive || o->ops == nullptr || o->ops->simulate == nullptr) {
+            continue;
+        }
+        uint32_t one = 0;
+        if (o->ops->simulate(o, time_ms, &one)) {
+            pulse = true;
+        }
+        if (one > dt) {
+            dt = one;
+        }
+    }
+    if (heat_dt != nullptr) {
+        *heat_dt = dt;
+    }
+    return pulse;
+}
+
+void table_simulate_hold(void) {
+    for (int i = 0; i < s_n; ++i) {
+        WorldObj *o = &s_obj[i];
+        if (!o->alive || o->ops == nullptr || o->ops->simulate_hold == nullptr) {
+            continue;
+        }
+        o->ops->simulate_hold(o);
+    }
+}
+
+void table_simulate_commit(uint32_t stamp, uint32_t heat_dt) {
+    for (int i = 0; i < s_n; ++i) {
+        WorldObj *o = &s_obj[i];
+        if (!o->alive || o->ops == nullptr || o->ops->simulate_commit == nullptr) {
+            continue;
+        }
+        o->ops->simulate_commit(o, stamp, heat_dt);
+    }
+}
+
+WorldObj *table_fallback(void) {
+    for (int i = 0; i < s_n; ++i) {
+        WorldObj *o = &s_obj[i];
+        if (o->alive && o->ops != nullptr && o->ops->fallback) {
+            return o;
+        }
+    }
+    return nullptr;
+}
+
+enum { k_kind_cap = 8 };
+
+typedef struct KindHook {
+    void (*reset)(void);
+    void (*self_check)(void);
+} KindHook;
+
+static KindHook s_kinds[k_kind_cap];
+static int      s_kind_n = 0;
+
+void table_kind_listen(void (*reset)(void), void (*self_check)(void)) {
+    if (reset == nullptr && self_check == nullptr) {
+        return;
+    }
+    if (s_kind_n >= k_kind_cap) {
+        fprintf(stderr, "[World] Kind listen list is full\n");
+        return;
+    }
+    s_kinds[s_kind_n++] = (KindHook){
+        .reset      = reset,
+        .self_check = self_check,
+    };
+}
+
+void table_kinds_reset(void) {
+    for (int i = 0; i < s_kind_n; ++i) {
+        if (s_kinds[i].reset != nullptr) {
+            s_kinds[i].reset();
+        }
+    }
+}
+
+void table_kinds_check(void) {
+    for (int i = 0; i < s_kind_n; ++i) {
+        if (s_kinds[i].self_check != nullptr) {
+            s_kinds[i].self_check();
+        }
+    }
+}

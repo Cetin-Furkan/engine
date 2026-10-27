@@ -180,10 +180,3 @@ bool mesh_kind_apply(bool has, bool bytes) {
     }
     return bytes;
 }
-
-uint32_t mesh_kind_stat_vertices(void) {
-    if (table_find(&s_ops) == nullptr) {
-        return 0u;
-    }
-    return mesh_vertex_count();
-}

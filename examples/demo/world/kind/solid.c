@@ -200,14 +200,3 @@ bool solid_kind_smooth_dirty(void) {
 void solid_kind_commit_smooth(void) {
     s_shown_curved = s_curved;
 }
-
-uint32_t solid_kind_stat_vertices(void) {
-    // Only kinds actually raised count; the baked buffer size does not.
-    uint32_t total = 0;
-    for (int i = 0; i < k_kinds; ++i) {
-        if (find_kind(i) >= 0) {
-            total += solid_vertex_count_for((uint32_t)i, s_shown_curved);
-        }
-    }
-    return total;
-}

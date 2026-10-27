@@ -10,49 +10,49 @@ void world_reset(void) {
     table_reset();
     ground_reset();
     face_reset();
-    cube_kind_reset();
+    table_kinds_reset();
     solid_kind_reset();
     mesh_kind_reset();
     spin_clear();
     camera_reset();
     face_self_check();
-    cube_kind_self_check();
+    table_kinds_check();
 }
 
 void world_record(VkCommandBuffer cmd, uint32_t heat_dt, bool live) {
-    cube_kind_record(cmd, heat_dt, live);
+    table_record(cmd, heat_dt, live);
 }
 
 void world_record_ok(uint64_t signal_point) {
-    cube_kind_record_ok(signal_point);
+    table_record_ok(signal_point);
 }
 
 void world_record_abort(void) {
-    cube_kind_record_abort();
+    table_record_abort();
 }
 
 uint64_t world_record_published(void) {
-    return cube_kind_published();
+    return table_record_published();
 }
 
 bool world_record_step_open(void) {
-    return cube_kind_step_open();
+    return table_record_step_open();
 }
 
 bool world_record_poke_pending(void) {
-    return cube_kind_poke_pending();
+    return table_record_poke_pending();
 }
 
 bool world_simulation(uint32_t time_ms, uint32_t *heat_dt) {
-    return cube_kind_simulation(time_ms, heat_dt);
+    return table_simulate(time_ms, heat_dt);
 }
 
 void world_simulation_hold(void) {
-    cube_kind_hold();
+    table_simulate_hold();
 }
 
 void world_simulation_commit(uint32_t time_ms, uint32_t heat_dt) {
-    cube_kind_commit_stamp(time_ms, heat_dt);
+    table_simulate_commit(time_ms, heat_dt);
 }
 
 void world_adopt_mesh(void) {
@@ -134,7 +134,11 @@ bool world_toggle_spin(void) {
     if (o != nullptr && o->ops != nullptr && o->ops->toggle_spin != nullptr) {
         return o->ops->toggle_spin(o);
     }
-    return cube_kind_toggle_fallback();
+    o = table_fallback();
+    if (o == nullptr || o->ops == nullptr || o->ops->toggle_spin == nullptr) {
+        return false;
+    }
+    return o->ops->toggle_spin(o);
 }
 
 bool world_toggle_glow(void) {
@@ -142,7 +146,11 @@ bool world_toggle_glow(void) {
     if (o != nullptr && o->ops != nullptr && o->ops->toggle_glow != nullptr) {
         return o->ops->toggle_glow(o);
     }
-    return cube_kind_glow_fallback();
+    o = table_fallback();
+    if (o == nullptr || o->ops == nullptr || o->ops->toggle_glow == nullptr) {
+        return false;
+    }
+    return o->ops->toggle_glow(o);
 }
 
 bool world_toggle_smooth(void) {
@@ -178,10 +186,6 @@ bool world_consume_spin(void) {
     }
     table_clear_spun();
     return true;
-}
-
-float world_cube_yaw_deg(bool live) {
-    return cube_kind_yaw(live);
 }
 
 void world_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height, bool live) {

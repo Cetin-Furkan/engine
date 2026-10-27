@@ -27,6 +27,26 @@ typedef struct WorldOps {
     // kind with nothing on screen contributes zero.
     uint32_t (*vertices)(const WorldObj *o);
     const char *(*name)(const WorldObj *o);
+    // GPU compute in the frame command buffer, before the draw. Null
+    // skips the object. record_ok keeps the written field and stores
+    // the acquire signal. record_abort restores the previous field.
+    // published is that signal. step_open is true while this command
+    // buffer holds an unsubmitted write. poke_pending is a click waiting
+    // to be planted.
+    void (*record_compute)(WorldObj *o, VkCommandBuffer cmd, uint32_t heat_dt, bool live);
+    void (*record_ok)(WorldObj *o, uint64_t signal_point);
+    void (*record_abort)(WorldObj *o);
+    uint64_t (*record_published)(const WorldObj *o);
+    bool (*record_step_open)(const WorldObj *o);
+    bool (*record_poke_pending)(const WorldObj *o);
+    // Compositor stamp. True while this object wants another frame.
+    // heat_dt is the interval a submit records. hold freezes the field.
+    // commit moves the stamp baseline after that submit lands.
+    bool (*simulate)(WorldObj *o, uint32_t time_ms, uint32_t *heat_dt);
+    void (*simulate_hold)(WorldObj *o);
+    void (*simulate_commit)(WorldObj *o, uint32_t stamp, uint32_t heat_dt);
+    // R and G reach this object when the selection does not handle them.
+    bool fallback;
 } WorldOps;
 
 // Compile-time placement: an ops table plus its state, no text files.
@@ -75,6 +95,21 @@ bool table_spun_pending(void);
 void table_clear_spun(void);
 uint32_t table_alive_count(void);
 uint32_t table_alive_vertices(void);
+void table_record(VkCommandBuffer cmd, uint32_t heat_dt, bool live);
+void table_record_ok(uint64_t signal_point);
+void table_record_abort(void);
+uint64_t table_record_published(void);
+bool table_record_step_open(void);
+bool table_record_poke_pending(void);
+bool table_simulate(uint32_t time_ms, uint32_t *heat_dt);
+void table_simulate_hold(void);
+void table_simulate_commit(uint32_t stamp, uint32_t heat_dt);
+WorldObj *table_fallback(void);
+// A kind opts in at startup. world_reset runs reset, then self_check
+// after the camera exists. The world file does not name the kind for that.
+void table_kind_listen(void (*reset)(void), void (*self_check)(void));
+void table_kinds_reset(void);
+void table_kinds_check(void);
 
 void ground_reset(void);
 bool ground_set(int axis, float offset);
@@ -93,38 +128,20 @@ void face_draw_chain(VkCommandBuffer cmd, uint32_t width, uint32_t height, bool 
 uint32_t face_chain_count(void);
 const WorldOps *face_ops(void);
 
-void cube_kind_reset(void);
 bool cube_kind_spawn(Coord at);
-void cube_kind_self_check(void);
-float cube_kind_yaw(bool live);
-bool cube_kind_toggle_fallback(void);
-bool cube_kind_glow_fallback(void);
-bool cube_kind_poke(Coord world_hit);
-void cube_kind_record(VkCommandBuffer cmd, uint32_t heat_dt, bool live);
-void cube_kind_record_ok(uint64_t signal_point);
-void cube_kind_record_abort(void);
-uint64_t cube_kind_published(void);
-bool cube_kind_step_open(void);
-bool cube_kind_poke_pending(void);
-bool cube_kind_simulation(uint32_t time_ms, uint32_t *heat_dt);
-void cube_kind_hold(void);
-void cube_kind_commit_stamp(uint32_t stamp, uint32_t heat_dt);
 const WorldOps *cube_ops(void);
-uint32_t cube_kind_stat_vertices(void);
 
 void solid_kind_reset(void);
 bool solid_kind_raise(uint32_t kind);
 bool solid_kind_toggle_smooth(void);
 bool solid_kind_smooth_dirty(void);
 void solid_kind_commit_smooth(void);
-uint32_t solid_kind_stat_vertices(void);
 
 void mesh_kind_reset(void);
 void mesh_kind_set_wanted(bool wanted);
 bool mesh_kind_wanted(void);
 bool mesh_kind_raise(void);
 bool mesh_kind_apply(bool has, bool bytes);
-uint32_t mesh_kind_stat_vertices(void);
 
 void overlay_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height);
 bool overlay_busy(void);

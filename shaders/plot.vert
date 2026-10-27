@@ -56,7 +56,9 @@ void main() {
     PlotBuf buf = PlotBuf(pc.addr);
     vec4 q = vec4(pc.qx, pc.qy, pc.qz, pc.qw);
     vec3 cam = vec3(pc.cam_x, pc.cam_y, pc.cam_z);
-    float zoom = max(pc.zoom, 0.04);
+    // Same floor as k_camera_zoom_min. Below it the ribbon stops tracking
+    // the screen thickness and a zoomed-out plot goes hairline.
+    float zoom = max(pc.zoom, 1.0e-4);
     PlotPoint a = buf.p[pc.base + slot];
     vec3 view_a = view_of(vec3(a.x, a.y, a.z), q, cam);
     vec3 view_b = view_a;

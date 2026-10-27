@@ -1,5 +1,4 @@
 #include "frame/hud.h"
-#include "frame/cube.h"
 #include "frame/world.h"
 #include "ring/ring.h"
 #include <stddef.h>

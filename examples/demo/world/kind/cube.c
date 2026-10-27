@@ -23,6 +23,20 @@ static bool     s_up = false;
 static bool     s_pick_logged = false;
 static const WorldOps s_ops;
 
+static void cube_kind_reset(void);
+static void cube_kind_self_check(void);
+static float cube_kind_yaw(bool live);
+static bool cube_kind_poke(Coord world_hit);
+static void cube_record_compute(WorldObj *o, VkCommandBuffer cmd, uint32_t heat_dt, bool live);
+static void cube_record_ok(WorldObj *o, uint64_t signal_point);
+static void cube_record_abort(WorldObj *o);
+static uint64_t cube_record_published(const WorldObj *o);
+static bool cube_record_step_open(const WorldObj *o);
+static bool cube_record_poke_pending(const WorldObj *o);
+static bool cube_simulate(WorldObj *o, uint32_t time_ms, uint32_t *heat_dt);
+static void cube_simulate_hold(WorldObj *o);
+static void cube_simulate_commit(WorldObj *o, uint32_t stamp, uint32_t heat_dt);
+
 static float rad_of(int32_t milli) {
     return ((float)milli / 1000.0f) * k_deg;
 }
@@ -182,22 +196,32 @@ static uint32_t cube_vertices(const WorldObj *o) {
 }
 
 static const WorldOps s_ops = {
-    .hit         = cube_hit,
-    .on_click    = cube_on_click,
-    .vertices    = cube_vertices,
-    .draw        = cube_draw_obj,
-    .advance     = cube_advance,
-    .commit      = cube_commit,
-    .toggle_spin = cube_toggle_spin,
-    .toggle_glow = cube_toggle_glow,
-    .name        = cube_name,
+    .hit                  = cube_hit,
+    .on_click             = cube_on_click,
+    .vertices             = cube_vertices,
+    .draw                 = cube_draw_obj,
+    .advance              = cube_advance,
+    .commit               = cube_commit,
+    .toggle_spin          = cube_toggle_spin,
+    .toggle_glow          = cube_toggle_glow,
+    .name                 = cube_name,
+    .record_compute       = cube_record_compute,
+    .record_ok            = cube_record_ok,
+    .record_abort         = cube_record_abort,
+    .record_published     = cube_record_published,
+    .record_step_open     = cube_record_step_open,
+    .record_poke_pending  = cube_record_poke_pending,
+    .simulate             = cube_simulate,
+    .simulate_hold        = cube_simulate_hold,
+    .simulate_commit      = cube_simulate_commit,
+    .fallback             = true,
 };
 
 const WorldOps *cube_ops(void) {
     return &s_ops;
 }
 
-void cube_kind_reset(void) {
+static void cube_kind_reset(void) {
     s_cube = (CubeData){0};
     s_up = false;
     s_pick_logged = false;
@@ -221,7 +245,7 @@ bool cube_kind_spawn(Coord at) {
     return true;
 }
 
-void cube_kind_self_check(void) {
+static void cube_kind_self_check(void) {
     if (s_pick_logged) {
         return;
     }
@@ -242,30 +266,14 @@ void cube_kind_self_check(void) {
     }
 }
 
-float cube_kind_yaw(bool live) {
+static float cube_kind_yaw(bool live) {
     if (!s_up) {
         return (float)k_yaw_start_milli / 1000.0f;
     }
     return spin_deg(&s_cube.spin, live);
 }
 
-bool cube_kind_toggle_fallback(void) {
-    WorldObj *o = table_find(&s_ops);
-    if (o == nullptr) {
-        return false;
-    }
-    return cube_toggle_spin(o);
-}
-
-bool cube_kind_glow_fallback(void) {
-    WorldObj *o = table_find(&s_ops);
-    if (o == nullptr) {
-        return false;
-    }
-    return cube_toggle_glow(o);
-}
-
-bool cube_kind_poke(Coord world_hit) {
+static bool cube_kind_poke(Coord world_hit) {
     float x = world_hit.x;
     float y = world_hit.y;
     WorldObj *o = table_find(&s_ops);
@@ -276,7 +284,8 @@ bool cube_kind_poke(Coord world_hit) {
     return cube_heat_poke(x, y);
 }
 
-void cube_kind_record(VkCommandBuffer cmd, uint32_t heat_dt, bool live) {
+static void cube_record_compute(WorldObj *o, VkCommandBuffer cmd, uint32_t heat_dt, bool live) {
+    (void)o;
     if (heat_dt == 0u && !cube_heat_poke_pending()) {
         return;
     }
@@ -284,29 +293,35 @@ void cube_kind_record(VkCommandBuffer cmd, uint32_t heat_dt, bool live) {
     grid_record(cmd, heat_dt);
 }
 
-void cube_kind_record_ok(uint64_t signal_point) {
+static void cube_record_ok(WorldObj *o, uint64_t signal_point) {
+    (void)o;
     cube_heat_record_ok(signal_point);
     grid_record_ok();
 }
 
-void cube_kind_record_abort(void) {
+static void cube_record_abort(WorldObj *o) {
+    (void)o;
     cube_heat_record_abort();
     grid_record_abort();
 }
 
-uint64_t cube_kind_published(void) {
+static uint64_t cube_record_published(const WorldObj *o) {
+    (void)o;
     return cube_heat_published();
 }
 
-bool cube_kind_step_open(void) {
+static bool cube_record_step_open(const WorldObj *o) {
+    (void)o;
     return cube_heat_step_open();
 }
 
-bool cube_kind_poke_pending(void) {
+static bool cube_record_poke_pending(const WorldObj *o) {
+    (void)o;
     return cube_heat_poke_pending();
 }
 
-bool cube_kind_simulation(uint32_t time_ms, uint32_t *heat_dt) {
+static bool cube_simulate(WorldObj *o, uint32_t time_ms, uint32_t *heat_dt) {
+    (void)o;
     bool ended = false;
     bool pulse = cube_heat_wants_frame(time_ms, &ended);
     if (ended) {
@@ -321,20 +336,21 @@ bool cube_kind_simulation(uint32_t time_ms, uint32_t *heat_dt) {
     return pulse;
 }
 
-void cube_kind_hold(void) {
+static void cube_simulate_hold(WorldObj *o) {
+    (void)o;
     cube_heat_hold();
     grid_hold();
 }
 
-void cube_kind_commit_stamp(uint32_t stamp, uint32_t heat_dt) {
+static void cube_simulate_commit(WorldObj *o, uint32_t stamp, uint32_t heat_dt) {
+    (void)o;
     if (heat_dt > 0u) {
         cube_heat_commit_stamp(stamp);
     }
 }
 
-uint32_t cube_kind_stat_vertices(void) {
-    if (!s_up) {
-        return 0u;
-    }
-    return cube_vertex_count();
+// The kind opts itself in. An empty boot and world.c do not name it.
+// Reset still runs, and the pick self-check still runs after the camera.
+[[gnu::constructor]] static void cube_kind_register(void) {
+    table_kind_listen(cube_kind_reset, cube_kind_self_check);
 }

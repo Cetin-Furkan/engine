@@ -15,35 +15,11 @@
 // The draw mixes that temperature into the baked color.
 // Each face is a 16 by 16 grid so a click lands on a sample. The fillet
 // edges and corners stay on the original 888 vertices.
-
-typedef struct CubeDepth {
-    VkImage        image;
-    VkDeviceMemory memory;
-    VkImageView    view;
-} CubeDepth;
-
-// Multisample color target. The cube is drawn here and resolved into the
-// dma-buf. Empty when the device only has one sample.
-typedef struct CubeCoverage {
-    VkImage        image;
-    VkDeviceMemory memory;
-    VkImageView    view;
-} CubeCoverage;
+// Depth and MSAA targets live in frame/pass.h. This file is the fillet.
 
 [[nodiscard]] int cube_init(VulkanContext *vk);
 void cube_shutdown(VulkanContext *vk);
 
-[[nodiscard]] int cube_depth_create(VulkanContext *vk, CubeDepth *depth,
-                                    uint32_t width, uint32_t height);
-void cube_depth_destroy(VulkanContext *vk, CubeDepth *depth);
-
-[[nodiscard]] int cube_coverage_create(VulkanContext *vk, CubeCoverage *coverage,
-                                       uint32_t width, uint32_t height);
-void cube_coverage_destroy(VulkanContext *vk, CubeCoverage *coverage);
-
-// Transitions depth for this draw. Fillet positions were written once in cube_init.
-// The temperature field is separate. A live frame steps it before this draw.
-void cube_prepare_draw(VkCommandBuffer cmd, VkImage depth);
 // yaw_deg is degrees about Y. 38 with a 28 degree pitch is the still pose.
 // origin_x is pixels right of center. origin_y is pixels up from center.
 // depth_bias pulls a later object closer. Object 0 passes 0.
@@ -88,9 +64,6 @@ bool cube_heat_wants_frame(uint32_t time_ms, bool *ended);
 // Later presents keep the last temperatures until the next poke.
 void cube_heat_hold(void);
 
-// The face fill is drawn in the same pass, so it uses these.
-VkFormat cube_depth_format(void);
-VkSampleCountFlagBits cube_raster_samples(void);
 uint32_t cube_vertex_count(void);
 [[nodiscard]] uint64_t cube_mesh_addr(void);
 

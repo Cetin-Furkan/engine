@@ -1,6 +1,6 @@
 #include "frame/shape.h"
 #include "frame/camera.h"
-#include "frame/cube.h"
+#include "frame/pass.h"
 #include "vulkan/memory.h"
 #include <stddef.h>
 #include <stdint.h>
@@ -240,10 +240,10 @@ int shape_init(VulkanContext *vk) {
     if (s_pipeline != VK_NULL_HANDLE) {
         return 0;
     }
-    VkFormat depth_format = cube_depth_format();
-    VkSampleCountFlagBits samples = cube_raster_samples();
+    VkFormat depth_format = pass_depth_format();
+    VkSampleCountFlagBits samples = pass_raster_samples();
     if (depth_format == VK_FORMAT_UNDEFINED || samples == 0) {
-        fprintf(stderr, "[Shape Error] The cube pass has no depth format yet\n");
+        fprintf(stderr, "[Shape Error] The render pass has no depth format yet\n");
         return -1;
     }
 

@@ -18,8 +18,7 @@ static const float k_yaw_rate    = 1.15f;
 static const float k_pitch_rate  = 0.85f;
 static const float k_zoom_rate   = 1.35f;
 static const float k_move_speed  = 720.0f;
-static const float k_zoom_min    = 0.0001f;
-static const float k_zoom_max    = 10000.0f;
+
 
 typedef struct Vec3 {
     float x;
@@ -247,7 +246,7 @@ static void integrate(float dt) {
     int zoom = zoom_axis();
     if (zoom != 0) {
         s_live.zoom *= expf((float)zoom * k_zoom_rate * dt);
-        s_live.zoom = clampf(s_live.zoom, k_zoom_min, k_zoom_max);
+        s_live.zoom = clampf(s_live.zoom, k_camera_zoom_min, k_camera_zoom_max);
     }
 
     translate_view(dt, axis_of(KEY_RIGHT, KEY_LEFT), axis_of(KEY_UP, KEY_DOWN));
@@ -384,8 +383,8 @@ bool camera_motion_down(void) {
 
 float camera_zoom_shown(void) {
     float z = s_shown.zoom;
-    if (z < k_zoom_min) {
-        return k_zoom_min;
+    if (z < k_camera_zoom_min) {
+        return k_camera_zoom_min;
     }
     return z;
 }
@@ -400,8 +399,8 @@ void camera_click_ray(float screen_x, float screen_y, CameraRay *out) {
     }
     const Pose *p = &s_shown;
     float zoom = p->zoom;
-    if (zoom < k_zoom_min) {
-        zoom = k_zoom_min;
+    if (zoom < k_camera_zoom_min) {
+        zoom = k_camera_zoom_min;
     }
     float sx = screen_x / zoom;
     float sy = screen_y / zoom;

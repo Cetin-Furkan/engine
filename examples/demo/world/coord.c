@@ -61,8 +61,8 @@ bool coord_ground_hit(const CameraRay *ray, Coord *out, float *t_hit) {
 
 float coord_near(void) {
     float z = camera_zoom_shown();
-    if (z < 0.04f) {
-        z = 0.04f;
+    if (z < k_camera_zoom_min) {
+        z = k_camera_zoom_min;
     }
     return k_near_px / z;
 }

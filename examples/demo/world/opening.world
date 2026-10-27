@@ -1,7 +1,7 @@
-# What this world places. Coordinates are world pixels.
+# Placement list. Coordinates are world pixels.
 # +X right, +Y up, +Z out of the ground. The ground is the z = 0 plane.
-# The clipmap on that plane is computed from the camera. It is not a mesh.
-
-ground z
-cube 1000 0 0
-mesh
+# The metric grid on that plane is on from boot. It is not a record.
+# This file starts empty. A line places one object:
+#   ground z
+#   cube x y z
+#   mesh

@@ -3,6 +3,12 @@
 
 #include <stdint.h>
 
+// The pose will not zoom past these. Hit tests and the plot ribbons use
+// the same floor, so a grab and a stroke keep their screen size out to
+// the far end of the range.
+static const float k_camera_zoom_min = 0.0001f;
+static const float k_camera_zoom_max = 10000.0f;
+
 // The view of the plane. Identity pan, zoom 1, and a unit quaternion
 // reproduce the picture the window had before the camera existed:
 // one world pixel is one screen pixel, +X right, +Y up.

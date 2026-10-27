@@ -1,7 +1,7 @@
 #include "frame/plane.h"
 #include "frame/camera.h"
 #include "frame/grid_math.h"
-#include "frame/cube.h"
+#include "frame/pass.h"
 #include <math.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -28,8 +28,8 @@ typedef struct PlanePush {
     float    origin_x;
     float    origin_y;
     float    span;
-    float    pad0;
-    float    pad1;
+    float    span_mod;
+    float    span_steps;
     float    pad2;
     uint32_t pad3;
     uint32_t pad4;
@@ -39,6 +39,8 @@ typedef struct PlanePush {
 static_assert(offsetof(PlanePush, cell_med) == 8u, "plane cell_med");
 static_assert(offsetof(PlanePush, origin_x) == 16u, "plane origin");
 static_assert(offsetof(PlanePush, span) == 24u, "plane span");
+static_assert(offsetof(PlanePush, span_mod) == 28u, "plane span mod");
+static_assert(offsetof(PlanePush, span_steps) == 32u, "plane span steps");
 static_assert(offsetof(PlanePush, view) == 48u, "plane view");
 static_assert(sizeof(PlanePush) == 96u, "plane push");
 
@@ -87,10 +89,10 @@ int plane_init(VulkanContext *vk) {
     if (s_pipeline != VK_NULL_HANDLE) {
         return 0;
     }
-    VkFormat depth_format = cube_depth_format();
-    VkSampleCountFlagBits samples = cube_raster_samples();
+    VkFormat depth_format = pass_depth_format();
+    VkSampleCountFlagBits samples = pass_raster_samples();
     if (depth_format == VK_FORMAT_UNDEFINED || samples == 0) {
-        fprintf(stderr, "[Plane Error] The cube pass has no depth format yet\n");
+        fprintf(stderr, "[Plane Error] The render pass has no depth format yet\n");
         return -1;
     }
     VkPhysicalDeviceProperties props = {0};
@@ -256,9 +258,11 @@ void plane_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height) {
         .height     = height,
         .cell_med   = grid.cell_med,
         .level_frac = grid.level_frac,
-        .origin_x   = view.cam_x,
-        .origin_y   = view.cam_y,
+        .origin_x   = plane_grid_wrap(view.cam_x, grid.coarse),
+        .origin_y   = plane_grid_wrap(view.cam_y, grid.coarse),
         .span       = grid.span,
+        .span_mod   = grid.span_mod,
+        .span_steps = grid.span_steps,
         .view       = view,
     };
     vulkan_cmd_push(cmd, s_layout, VK_SHADER_STAGE_VERTEX_BIT, sizeof push, &push);

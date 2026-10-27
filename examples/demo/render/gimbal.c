@@ -1,6 +1,6 @@
 #include "frame/gimbal.h"
 #include "frame/camera.h"
-#include "frame/cube.h"
+#include "frame/pass.h"
 #include <stddef.h>
 #include <stdio.h>
 
@@ -69,10 +69,10 @@ int gimbal_init(VulkanContext *vk) {
     if (s_pipeline != VK_NULL_HANDLE) {
         return 0;
     }
-    VkFormat depth_format = cube_depth_format();
-    VkSampleCountFlagBits samples = cube_raster_samples();
+    VkFormat depth_format = pass_depth_format();
+    VkSampleCountFlagBits samples = pass_raster_samples();
     if (depth_format == VK_FORMAT_UNDEFINED || samples == 0) {
-        fprintf(stderr, "[Gimbal Error] The cube pass has no depth format yet\n");
+        fprintf(stderr, "[Gimbal Error] The render pass has no depth format yet\n");
         return -1;
     }
     VkPushConstantRange push = {

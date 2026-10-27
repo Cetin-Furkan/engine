@@ -64,32 +64,25 @@ bool world_apply_mesh(bool has, bool bytes) {
     return mesh_kind_apply(has, bytes);
 }
 
-WorldClick world_click(float screen_x, float screen_y) {
+bool world_click(float screen_x, float screen_y) {
     CameraRay ray;
     camera_click_ray(screen_x, screen_y, &ray);
-    WorldClick out = {0};
     Coord hit = {0};
     int index = table_pick(&ray, &hit, nullptr);
     if (index >= 0) {
         bool changed = table_select(index);
         WorldObj *o = table_at(index);
-        if (o != nullptr && o->ops == cube_ops()) {
-            out.cube = true;
-            out.heat_x = hit.x;
-            out.heat_y = hit.y;
-            if (cube_kind_poke(hit)) {
-                changed = true;
-            }
+        if (o != nullptr && o->ops != nullptr && o->ops->on_click != nullptr &&
+            o->ops->on_click(o, hit)) {
+            changed = true;
         }
-        out.changed = changed;
-        return out;
+        return changed;
     }
     Coord ground = {0};
     if (!coord_ground_hit(&ray, &ground, nullptr)) {
-        return out;
+        return false;
     }
-    out.changed = face_spawn(ground);
-    return out;
+    return face_spawn(ground);
 }
 
 bool world_close_face(void) {
@@ -204,7 +197,6 @@ void world_stats(uint32_t *objects, uint32_t *vertices) {
         *objects = table_alive_count();
     }
     if (vertices != nullptr) {
-        *vertices = cube_kind_stat_vertices() + solid_kind_stat_vertices() +
-                    mesh_kind_stat_vertices();
+        *vertices = table_alive_vertices();
     }
 }

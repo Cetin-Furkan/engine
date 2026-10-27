@@ -508,3 +508,10 @@ void solid_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height,
 uint32_t solid_vertex_count(void) {
     return k_solid_verts;
 }
+
+uint32_t solid_vertex_count_for(uint32_t kind, bool curved) {
+    if (kind >= 6u) {
+        return 0;
+    }
+    return k_count[kind][curved ? 1u : 0u];
+}

@@ -13,6 +13,8 @@ typedef struct WorldObj WorldObj;
 
 typedef struct WorldOps {
     bool (*hit)(const WorldObj *o, const CameraRay *ray, float *t, Coord *at);
+    // A click that hit this object. True when the picture changed.
+    bool (*on_click)(WorldObj *o, Coord hit);
     void (*draw)(const WorldObj *o, VkCommandBuffer cmd, uint32_t width, uint32_t height, bool live);
     bool (*advance)(WorldObj *o, uint32_t time_ms);
     void (*commit)(WorldObj *o);
@@ -21,8 +23,21 @@ typedef struct WorldOps {
     bool (*toggle_glow)(WorldObj *o);
     bool (*respin)(WorldObj *o);
     bool (*remove)(WorldObj *o);
+    // Vertices this live object draws. Stats query through here, so a
+    // kind with nothing on screen contributes zero.
+    uint32_t (*vertices)(const WorldObj *o);
     const char *(*name)(const WorldObj *o);
 } WorldOps;
+
+// Compile-time placement: an ops table plus its state, no text files.
+// init_fn, when set, spawns through the kind's own entry point instead.
+typedef struct WorldBlueprint {
+    const WorldOps *ops;
+    void           *data;
+    Coord           at;
+    Spin           *spin;
+    bool          (*init_fn)(Coord at, void *data);
+} WorldBlueprint;
 
 struct WorldObj {
     const WorldOps *ops;
@@ -59,6 +74,7 @@ void table_mark_spun(void);
 bool table_spun_pending(void);
 void table_clear_spun(void);
 uint32_t table_alive_count(void);
+uint32_t table_alive_vertices(void);
 
 void ground_reset(void);
 bool ground_set(int axis, float offset);

@@ -70,6 +70,13 @@ uint32_t frame_clock_stall_after_ms(const FrameClock *clock) {
     return after;
 }
 
+bool frame_clock_stalled(const FrameClock *clock, uint64_t stamp_age_ms) {
+    if (clock == nullptr || !clock->have_stamp) {
+        return true;
+    }
+    return stamp_age_ms > 2ull * (uint64_t)frame_clock_stall_after_ms(clock);
+}
+
 void frame_clock_note_stall(FrameClock *clock) {
     if (clock != nullptr) {
         clock->stalls++;

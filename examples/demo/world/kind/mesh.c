@@ -105,8 +105,14 @@ static const char *mesh_name(const WorldObj *o) {
     return "Mesh";
 }
 
+static uint32_t mesh_vertices(const WorldObj *o) {
+    (void)o;
+    return mesh_vertex_count();
+}
+
 static const WorldOps s_ops = {
     .hit         = mesh_hit,
+    .vertices    = mesh_vertices,
     .draw        = mesh_draw_obj,
     .advance     = mesh_advance,
     .commit      = mesh_commit_obj,

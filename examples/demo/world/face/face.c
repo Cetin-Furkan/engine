@@ -212,8 +212,14 @@ static const char *face_name(const WorldObj *o) {
     return face->name;
 }
 
+static uint32_t face_vertices(const WorldObj *o) {
+    const FaceData *face = o->data;
+    return face != nullptr ? face->tri_n * 3u : 0u;
+}
+
 static const WorldOps s_ops = {
     .hit         = face_hit,
+    .vertices    = face_vertices,
     .draw        = face_draw,
     .advance     = face_advance,
     .toggle_spin = face_toggle_spin,

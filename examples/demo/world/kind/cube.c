@@ -171,8 +171,20 @@ static const char *cube_name(const WorldObj *o) {
     return "Cube";
 }
 
+static bool cube_on_click(WorldObj *o, Coord hit) {
+    (void)o;
+    return cube_kind_poke(hit);
+}
+
+static uint32_t cube_vertices(const WorldObj *o) {
+    (void)o;
+    return cube_vertex_count();
+}
+
 static const WorldOps s_ops = {
     .hit         = cube_hit,
+    .on_click    = cube_on_click,
+    .vertices    = cube_vertices,
     .draw        = cube_draw_obj,
     .advance     = cube_advance,
     .commit      = cube_commit,

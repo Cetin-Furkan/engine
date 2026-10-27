@@ -1,5 +1,6 @@
 #include "frame/plane.h"
 #include "frame/camera.h"
+#include "frame/grid_math.h"
 #include "frame/cube.h"
 #include <math.h>
 #include <stddef.h>
@@ -15,38 +16,34 @@ alignas(uint32_t) static const unsigned char k_frag_spv[] = {
 static_assert(sizeof k_vert_spv % 4u == 0u, "plane vert spirv");
 static_assert(sizeof k_frag_spv % 4u == 0u, "plane frag spirv");
 
-// Three nested windows. 32 cells, so the vertex shader's half-extent is 16.
-// Level 0 is behind the meshes. Each coarser level sits a little further
-// back so the overlap at the ring edge does not flicker.
-enum { k_levels = 3u, k_cells = 32u, k_draw = k_cells * k_cells * 6u };
-
-static const float k_step[k_levels] = { 16.0f, 64.0f, 256.0f };
-
+// One 6-vertex quad on the true z = 0 plane, no vertex buffer. The
+// metric decades are analytic in the fragment shader. The old 3-level
+// clipmap sat at z = -170 behind the meshes; this plane is at the
+// world ground and depth-tests (without writing) against real geometry.
 typedef struct PlanePush {
     uint32_t width;
     uint32_t height;
-    float    cell;
-    float    z;
+    float    cell_med;
+    float    level_frac;
     float    origin_x;
     float    origin_y;
-    float    hole_min_x;
-    float    hole_min_y;
-    float    hole_max_x;
-    float    hole_max_y;
-    uint32_t hole;
-    uint32_t cells;
+    float    span;
+    float    pad0;
+    float    pad1;
+    float    pad2;
+    uint32_t pad3;
+    uint32_t pad4;
     ViewPush view;
 } PlanePush;
 
-static_assert(offsetof(PlanePush, cell) == 8u, "plane cell");
+static_assert(offsetof(PlanePush, cell_med) == 8u, "plane cell_med");
 static_assert(offsetof(PlanePush, origin_x) == 16u, "plane origin");
-static_assert(offsetof(PlanePush, hole) == 40u, "plane hole");
+static_assert(offsetof(PlanePush, span) == 24u, "plane span");
 static_assert(offsetof(PlanePush, view) == 48u, "plane view");
 static_assert(sizeof(PlanePush) == 96u, "plane push");
 
 static VkPipelineLayout s_layout = VK_NULL_HANDLE;
 static VkPipeline       s_pipeline = VK_NULL_HANDLE;
-static bool             s_slid = false;
 
 static void plane_fail(const char *what, VkResult res) {
     fprintf(stderr, "[Plane Error] %s: %s (%d)\n", what, vulkan_vkresult_to_str(res), (int)res);
@@ -175,8 +172,10 @@ int plane_init(VulkanContext *vk) {
     VkPipelineDepthStencilStateCreateInfo depth = {
         .sType            = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
         .depthTestEnable  = VK_TRUE,
-        .depthWriteEnable = VK_TRUE,
-        .depthCompareOp   = VK_COMPARE_OP_LESS,
+        // Background: tests against meshes but never writes depth, so
+        // geometry centered on z = 0 is never sliced by its own ground.
+        .depthWriteEnable = VK_FALSE,
+        .depthCompareOp   = VK_COMPARE_OP_LESS_OR_EQUAL,
     };
     VkPipelineColorBlendAttachmentState blend_att = {
         .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
@@ -224,30 +223,18 @@ int plane_init(VulkanContext *vk) {
         plane_shutdown(vk);
         return -1;
     }
-    printf("[Plane] Clipmap %u levels, %u cells, steps 16/64/256. Fixed vertices, snapped to the camera.\n",
-           k_levels, k_cells);
+    printf("[Plane] Universal 6-vertex metric grid on z = 0 (live 10^k subdivisions).\n");
     fflush(stdout);
     return 0;
-}
-
-static float snap_to(float p, float cell) {
-    return floorf(p / cell) * cell;
 }
 
 void plane_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height) {
     if (cmd == VK_NULL_HANDLE || s_pipeline == VK_NULL_HANDLE || width == 0 || height == 0) {
         return;
     }
-    float cam_x = 0.0f;
-    float cam_y = 0.0f;
-    camera_bound_xy(&cam_x, &cam_y);
-    float near_x = snap_to(cam_x, k_step[0]);
-    float near_y = snap_to(cam_y, k_step[0]);
-    if (!s_slid && (near_x != 0.0f || near_y != 0.0f)) {
-        printf("[Plane] Clipmap recentered.\n");
-        fflush(stdout);
-        s_slid = true;
-    }
+    ViewPush view;
+    view_push_fill(&view, 0u);
+    PlaneGrid grid = plane_grid_for(width, height, view.zoom);
 
     VkViewport viewport = {
         .x        = 0.0f,
@@ -264,28 +251,16 @@ void plane_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height) {
     vkCmdSetScissor(cmd, 0, 1, &scissor);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_pipeline);
 
-    for (uint32_t level = 0; level < k_levels; ++level) {
-        float cell = k_step[level];
-        PlanePush push = {
-            .width  = width,
-            .height = height,
-            .cell   = cell,
-            .z      = -170.0f - (float)level * 12.0f,
-            .origin_x = snap_to(cam_x, cell),
-            .origin_y = snap_to(cam_y, cell),
-            .cells  = k_cells,
-        };
-        if (level > 0u) {
-            float finer = k_step[level - 1u];
-            float half = (float)(k_cells / 2u) * finer;
-            push.hole = 1u;
-            push.hole_min_x = snap_to(cam_x, finer) - half;
-            push.hole_min_y = snap_to(cam_y, finer) - half;
-            push.hole_max_x = snap_to(cam_x, finer) + half;
-            push.hole_max_y = snap_to(cam_y, finer) + half;
-        }
-        view_push_fill(&push.view, 0u);
-        vulkan_cmd_push(cmd, s_layout, VK_SHADER_STAGE_VERTEX_BIT, sizeof push, &push);
-        vkCmdDraw(cmd, k_draw, 1, 0, 0);
-    }
+    PlanePush push = {
+        .width      = width,
+        .height     = height,
+        .cell_med   = grid.cell_med,
+        .level_frac = grid.level_frac,
+        .origin_x   = view.cam_x,
+        .origin_y   = view.cam_y,
+        .span       = grid.span,
+        .view       = view,
+    };
+    vulkan_cmd_push(cmd, s_layout, VK_SHADER_STAGE_VERTEX_BIT, sizeof push, &push);
+    vkCmdDraw(cmd, 6u, 1u, 0u, 0u);
 }

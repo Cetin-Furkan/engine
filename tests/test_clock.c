@@ -63,6 +63,17 @@ int main(void) {
     CHECK(fixed.sim_steps == 8);
     CHECK(frame_clock_fixed_steps(&fixed, 16, 0, 5) == 0);
 
+    // Stall decision: no stamp yet is stalled; a stamp older than two
+    // stall windows (2 * 48 ms at 16 ms period) is stalled; fresher is not.
+    FrameClock pacing;
+    frame_clock_reset(&pacing);
+    CHECK(frame_clock_stalled(&pacing, 0));
+    (void)frame_clock_step(&pacing, 1000);
+    (void)frame_clock_step(&pacing, 1016);
+    (void)frame_clock_step(&pacing, 1032);
+    CHECK(!frame_clock_stalled(&pacing, 50));
+    CHECK(frame_clock_stalled(&pacing, 500));
+
     // Reset returns to baseline behaviour.
     frame_clock_reset(&clock);
     FrameStep again = frame_clock_step(&clock, 42);

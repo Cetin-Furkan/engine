@@ -50,6 +50,12 @@ uint32_t frame_clock_stall_after_ms(const FrameClock *clock);
 
 void frame_clock_note_stall(FrameClock *clock);
 
+// True when the age of the last consumed stamp (ms) proves the
+// compositor stopped pacing: more than two stall windows old. The
+// factor of two keeps a healthy callback chain (stamp consumed, next
+// done already pending) from ever tripping the watchdog.
+bool frame_clock_stalled(const FrameClock *clock, uint64_t stamp_age_ms);
+
 // Fixed-timestep consumption: how many whole step_ms steps the carried
 // accumulator plus dt_ms pays for, capped at max_steps. Remainder is
 // carried, except when the cap is hit — then the debt is dropped so a

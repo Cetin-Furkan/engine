@@ -39,20 +39,29 @@ bool turn_wants_step(const WaylandContext *wl) {
 
 int frame_watchdog(WaylandContext *wl, VulkanContext *vk, bool *queued) {
     *queued = false;
-    if (wl == nullptr || vk == nullptr || s_turn_phase == k_turn_done) {
+    if (wl == nullptr || vk == nullptr || s_turn_phase != k_turn_run) {
         return 0;
     }
     if (wl->frame_stamp_valid) {
         return 0;  // A stamp is already waiting; not stalled.
     }
-    frame_clock_note_stall(&s_clock);
-    fprintf(stderr, "[Engine] Frame callback stalled (%u total). Re-arming.\n",
-            s_clock.stalls);
-    if (s_turn_phase == k_turn_arm) {
-        s_turn_phase = k_turn_run;
+    // Stall is measured from the last consumed stamp, not from when
+    // the timer was armed: between callbacks stamp_valid is false most
+    // of the time on a healthy chain, and that is not a stall.
+    uint64_t age_ms = s_last_stamp_mono_ns == 0 ? UINT64_MAX
+        : (ring_mono_ns() - s_last_stamp_mono_ns) / 1000000ull;
+    if (!frame_clock_stalled(&s_clock, age_ms)) {
+        return 0;
+    }
+    if (!s_stall_reported) {
+        s_stall_reported = true;
+        frame_clock_note_stall(&s_clock);
+        fprintf(stderr, "[Engine] Frame callback stalled (%u total). Re-arming.\n",
+                s_clock.stalls);
     }
     int q = queue_frame_only(wl, queued);
     if (q == -EALREADY) {
+        *queued = false;
         return 0;
     }
     return q;
@@ -81,6 +90,8 @@ int turn_step(WaylandContext *wl, VulkanContext *vk, bool *queued) {
         return 0;
     }
     uint32_t stamp = wl->frame_time_ms;
+    s_last_stamp_mono_ns = ring_mono_ns();
+    s_stall_reported = false;
     FrameStep step = frame_clock_step(&s_clock, stamp);
     if (!step.paint) {
         // Duplicate compositor stamp: the pose cannot have moved.

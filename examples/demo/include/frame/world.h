@@ -26,17 +26,10 @@ void world_reset(void);
 [[nodiscard]] int world_load(void);
 
 // One click, in pixels from the window center (+X right, +Y up), on the
-// picture currently shown. cube is set when the ray hit the fillet, and
-// heat_x, heat_y are that hit in posed world pixels. changed is set when
-// the selection or a corner changed and a frame should be presented.
-typedef struct WorldClick {
-    bool  cube;
-    bool  changed;
-    float heat_x;
-    float heat_y;
-} WorldClick;
-
-WorldClick world_click(float screen_x, float screen_y);
+// picture currently shown. Dispatch is through WorldOps: the closest
+// hit is selected, then its on_click (if any) runs. True when the
+// selection or a corner changed and a frame should be presented.
+bool world_click(float screen_x, float screen_y);
 
 // Key 1 is kind 0. Raises that mesh, or selects it if it is already up.
 // True when the picture changed.
@@ -114,8 +107,8 @@ bool world_consume_spin(void);
 // live draws the pose world_advance just computed. Otherwise the shown pose.
 void world_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height, bool live);
 
-// objects is the fillet cube, the OBJ mesh when it is up, the raised solids,
-// and every closed face. vertices adds the OBJ corners to the baked meshes.
+// objects is every live table entry. vertices sums the live objects'
+// own WorldOps vertex counts, so unraised kinds contribute zero.
 void world_stats(uint32_t *objects, uint32_t *vertices);
 
 #endif /* ENGINE_FRAME_WORLD_H */

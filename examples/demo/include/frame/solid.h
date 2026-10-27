@@ -17,5 +17,7 @@ void solid_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height,
                 float origin_x, float origin_y, bool selected);
 
 uint32_t solid_vertex_count(void);
+// Vertices one raised solid of this kind draws (faceted or rounded cage).
+uint32_t solid_vertex_count_for(uint32_t kind, bool curved);
 
 #endif /* ENGINE_FRAME_SOLID_H */

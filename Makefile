@@ -223,5 +223,7 @@ test: $(CONFIG_MK)
 	./build/test_handles
 	$(CC) $(CFLAGS) -o build/test_clock tests/test_clock.c src/frame/loop/clock.c
 	./build/test_clock
+	$(CC) $(CFLAGS) -o build/test_world tests/test_world.c examples/demo/world/table.c examples/demo/world/spin.c -lm
+	./build/test_world
 
 .PHONY: all debug release run run-release release-patch release-minor release-major info help clean clear recheck distclean test

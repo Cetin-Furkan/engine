@@ -277,3 +277,14 @@ uint32_t table_alive_count(void) {
     }
     return n;
 }
+
+uint32_t table_alive_vertices(void) {
+    uint32_t total = 0;
+    for (int i = 0; i < s_n; ++i) {
+        const WorldObj *o = &s_obj[i];
+        if (o->alive && o->ops != nullptr && o->ops->vertices != nullptr) {
+            total += o->ops->vertices(o);
+        }
+    }
+    return total;
+}

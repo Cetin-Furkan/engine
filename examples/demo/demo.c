@@ -167,8 +167,7 @@ static bool demo_advance(uint32_t time_ms, const FrameStep *step) {
 }
 
 static bool demo_click(float origin_x, float origin_y) {
-    WorldClick hit = world_click(origin_x, origin_y);
-    return hit.changed;
+    return world_click(origin_x, origin_y);
 }
 
 static bool demo_key(uint32_t key, EngineKeyContext *ctx) {

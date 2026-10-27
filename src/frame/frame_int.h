@@ -127,6 +127,8 @@ typedef struct FrameState {
     alignas(64) FrameClock   clock;
     bool                     timer_armed;
     bool                     loop_was_busy;
+    uint64_t                 last_stamp_mono_ns;
+    bool                     stall_reported;
 } FrameState;
 
 extern FrameState frame_state;
@@ -167,6 +169,8 @@ extern FrameState frame_state;
 #define s_clock (frame_state.clock)
 #define s_timer_armed (frame_state.timer_armed)
 #define s_loop_was_busy (frame_state.loop_was_busy)
+#define s_last_stamp_mono_ns (frame_state.last_stamp_mono_ns)
+#define s_stall_reported (frame_state.stall_reported)
 
 static inline FrameSlot *shown(void) {
     return &s_slot[s_front];

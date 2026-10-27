@@ -3,26 +3,27 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 #extension GL_GOOGLE_include_directive : require
 
-// One clipmap level. 32 by 32 cells, six vertices each, no vertex buffer.
-// The snap origin is the camera, rounded to this level's cell. A quad
-// that sits inside the finer level is degenerate, so the coarser level
-// is only the ring. Far cells are the ones this index no longer names.
+// Universal 6-vertex infinite ground plane on z = 0. No vertex buffer.
+// The span is computed on the CPU from the viewport diagonal and zoom,
+// so the single quad covers the visible region of the plane at any
+// yaw, pitch, pan, or zoom. Grid lines are analytic in the fragment
+// shader; this stage only places the quad corners on z = 0.
 
 #include "camera.inc"
 
 layout(push_constant, scalar) uniform Screen {
-    layout(offset = 0) uint width;
-    layout(offset = 4) uint height;
-    layout(offset = 8) float cell;
-    layout(offset = 12) float z;
+    layout(offset = 0)  uint width;
+    layout(offset = 4)  uint height;
+    layout(offset = 8)  float cell_med;
+    layout(offset = 12) float level_frac;
     layout(offset = 16) float origin_x;
     layout(offset = 20) float origin_y;
-    layout(offset = 24) float hole_min_x;
-    layout(offset = 28) float hole_min_y;
-    layout(offset = 32) float hole_max_x;
-    layout(offset = 36) float hole_max_y;
-    layout(offset = 40) uint hole;
-    layout(offset = 44) uint cells;
+    layout(offset = 24) float span;
+    layout(offset = 28) float pad0;
+    layout(offset = 32) float pad1;
+    layout(offset = 36) float pad2;
+    layout(offset = 40) uint  pad3;
+    layout(offset = 44) uint  pad4;
     layout(offset = 48) uint64_t materials;
     layout(offset = 56) uint mat_index;
     layout(offset = 60) uint mat_pad;
@@ -37,33 +38,26 @@ layout(push_constant, scalar) uniform Screen {
 } pc;
 
 layout(location = 0) out vec2 v_world;
-layout(location = 1) flat out float v_cell;
+layout(location = 1) flat out float v_cell_med;
+layout(location = 2) flat out float v_frac;
+
+const vec2 k_corner[6] = vec2[](
+    vec2(-1.0, -1.0), vec2( 1.0, -1.0), vec2( 1.0,  1.0),
+    vec2(-1.0, -1.0), vec2( 1.0,  1.0), vec2(-1.0,  1.0)
+);
 
 void main() {
-    uint cells = max(pc.cells, 1u);
-    uint quad = uint(gl_VertexIndex) / 6u;
-    uint corner = uint(gl_VertexIndex) % 6u;
-    uint qx = quad % cells;
-    uint qy = quad / cells;
-    uint cx = (corner == 1u || corner == 2u || corner == 4u) ? 1u : 0u;
-    uint cy = (corner == 2u || corner == 4u || corner == 5u) ? 1u : 0u;
-    float span = float(cells) * 0.5;
-    float x0 = pc.origin_x + (float(qx) - span) * pc.cell;
-    float y0 = pc.origin_y + (float(qy) - span) * pc.cell;
-    float x1 = x0 + pc.cell;
-    float y1 = y0 + pc.cell;
-    bool interior = pc.hole != 0u &&
-                    x0 > pc.hole_min_x && x1 < pc.hole_max_x &&
-                    y0 > pc.hole_min_y && y1 < pc.hole_max_y;
-    float x = x0 + float(cx) * pc.cell;
-    float y = y0 + float(cy) * pc.cell;
-    v_cell = pc.cell;
-    v_world = vec2(x, y);
-    if (interior) {
-        gl_Position = vec4(0.0, 0.0, 0.0, 1.0);
-        return;
-    }
-    vec3 view = view_of(vec3(x, y, pc.z), vec4(pc.qx, pc.qy, pc.qz, pc.qw),
+    vec2 c = k_corner[gl_VertexIndex];
+    vec2 world_xy = vec2(pc.origin_x, pc.origin_y) + c * pc.span;
+
+    v_world    = world_xy;
+    v_cell_med = pc.cell_med;
+    v_frac     = pc.level_frac;
+
+    vec3 view = view_of(vec3(world_xy, 0.0),
+                        vec4(pc.qx, pc.qy, pc.qz, pc.qw),
                         vec3(pc.cam_x, pc.cam_y, pc.cam_z));
-    gl_Position = view_ndc(view, pc.zoom, pc.width, pc.height, 0.0);
+    vec4 ndc = view_ndc(view, pc.zoom, pc.width, pc.height, 0.0);
+    ndc.z = clamp(ndc.z, 0.0001, 0.9999);
+    gl_Position = ndc;
 }

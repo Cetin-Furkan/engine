@@ -71,6 +71,8 @@ int frame_boot(void) {
     engine_app()->reset();
     frame_clock_reset(&s_clock);
     s_timer_armed = false;
+    s_last_stamp_mono_ns = 0;
+    s_stall_reported = false;
     s_sync_point = 0;
     s_orphan_count = 0;
     s_stuck_release_fd = -1;

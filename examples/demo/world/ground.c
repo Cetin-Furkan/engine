@@ -1,14 +1,16 @@
 #include "world/world_int.h"
 #include "frame/plane.h"
 
-// The ground is the clipmap. Its lines are computed from the camera
-// each draw. The world file names the plane. This file does not build a mesh.
+// The ground is the universal z = 0 metric grid: coordinate space
+// itself, not an object a file opts into. It is on from reset; the
+// world file may still name it (ground_set) with no effect change.
+// Its lines are computed from the camera each draw. No mesh is built.
 
-static bool s_on = false;
+static bool s_on = true;
 
 void ground_reset(void) {
-    s_on = false;
-    coord_clear_ground();
+    coord_set_ground(2, 0.0f);
+    s_on = true;
 }
 
 bool ground_set(int axis, float offset) {

@@ -13,6 +13,8 @@
 static const char *k_path = "examples/demo/world/opening.world";
 static const char *k_path_legacy = "world/opening.world";
 
+static bool s_file_ground_seen = false;
+
 static void trim(char *s) {
     char *hash = strchr(s, '#');
     if (hash != nullptr) {
@@ -36,10 +38,15 @@ static int place_ground(const char *line, int number) {
                 k_path, number, axis);
         return -1;
     }
-    if (coord_ground_set()) {
+    // The ground is on by default (universal metric grid), so naming it
+    // in the file confirms the default instead of duplicating it. Only a
+    // second ground record in the same file is an error; ground_set is
+    // idempotent for the same plane, so track file records locally.
+    if (s_file_ground_seen) {
         fprintf(stderr, "[World] %s:%d names the ground twice\n", k_path, number);
         return -1;
     }
+    s_file_ground_seen = true;
     ground_set(2, 0.0f);
     return 0;
 }
@@ -83,10 +90,44 @@ static int place_mesh(const char *line, int number) {
     return 0;
 }
 
+// Compile-time placements. Empty by default: the demo boots into the
+// universal metric grid with zero objects. Register custom C objects
+// here (ops + state pointers, or an init_fn) to spawn them at startup.
+static const WorldBlueprint k_startup_objects[] = {
+    // { .ops = &my_ops, .data = &my_state, .at = { 0.0f, 0.0f, 0.0f }, .spin = &my_state.spin },
+};
+
+static int place_blueprints(void) {
+    const size_t n = sizeof(k_startup_objects) / sizeof(k_startup_objects[0]);
+    for (size_t i = 0; i < n; ++i) {
+        const WorldBlueprint *bp = &k_startup_objects[i];
+        if (bp->init_fn != nullptr) {
+            if (!bp->init_fn(bp->at, bp->data)) {
+                return -1;
+            }
+        } else if (bp->ops != nullptr) {
+            if (table_add(bp->ops, bp->data, bp->at, bp->spin) < 0) {
+                return -1;
+            }
+        }
+    }
+    return 0;
+}
+
 int world_load(void) {
+    s_file_ground_seen = false;
+    if (place_blueprints() != 0) {
+        return -1;
+    }
     FILE *f = fopen(k_path, "r");
     if (f == nullptr) {
         f = fopen(k_path_legacy, "r");
+    }
+    if (f == nullptr) {
+        // No scene file: boot empty over the metric grid. The file is
+        // an optional placement list, not a boot requirement.
+        table_publish();
+        return 0;
     }
     if (f == nullptr) {
         fprintf(stderr, "[World] %s was not opened: %s\n", k_path, strerror(errno));

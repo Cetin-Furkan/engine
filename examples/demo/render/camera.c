@@ -18,8 +18,8 @@ static const float k_yaw_rate    = 1.15f;
 static const float k_pitch_rate  = 0.85f;
 static const float k_zoom_rate   = 1.35f;
 static const float k_move_speed  = 720.0f;
-static const float k_zoom_min    = 0.04f;
-static const float k_zoom_max    = 28.0f;
+static const float k_zoom_min    = 0.0001f;
+static const float k_zoom_max    = 10000.0f;
 
 typedef struct Vec3 {
     float x;

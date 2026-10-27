@@ -3,12 +3,12 @@
 
 #include "vulkan/types.h"
 
-// Infinite drawing plane as a 3-level geometry clipmap. Each level is
-// 32 by 32 cells, cell size 16, 64, and 256 world pixels. The vertices
-// are gl_VertexIndex plus a snap of the camera, so a cell that leaves
-// the window is no longer indexed and a cell that enters is a new index.
-// The buffers do not grow, and nothing is allocated per move.
-// Coarser levels draw only the ring outside the finer patch.
+// Universal metric ground: one 6-vertex quad on the true z = 0 plane,
+// no vertex buffer. The span is computed from the viewport diagonal and
+// zoom (frame/grid_math.h), and the fragment shader draws three nested
+// base-10 decades analytically with screen-pixel line widths. The plane
+// depth-tests but never writes depth, so geometry centered on z = 0 is
+// not sliced by its own ground.
 
 [[nodiscard]] int plane_init(VulkanContext *vk);
 void plane_shutdown(VulkanContext *vk);

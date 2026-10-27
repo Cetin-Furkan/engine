@@ -117,8 +117,14 @@ static const char *solid_name(const WorldObj *o) {
     return k_name[s->kind];
 }
 
+static uint32_t solid_vertices(const WorldObj *o) {
+    const SolidData *sd = o->data;
+    return solid_vertex_count_for(sd->kind, s_shown_curved);
+}
+
 static const WorldOps s_ops = {
     .hit         = solid_hit,
+    .vertices    = solid_vertices,
     .draw        = solid_draw_obj,
     .advance     = solid_advance,
     .toggle_spin = solid_toggle_spin,
@@ -196,5 +202,12 @@ void solid_kind_commit_smooth(void) {
 }
 
 uint32_t solid_kind_stat_vertices(void) {
-    return solid_vertex_count();
+    // Only kinds actually raised count; the baked buffer size does not.
+    uint32_t total = 0;
+    for (int i = 0; i < k_kinds; ++i) {
+        if (find_kind(i) >= 0) {
+            total += solid_vertex_count_for((uint32_t)i, s_shown_curved);
+        }
+    }
+    return total;
 }

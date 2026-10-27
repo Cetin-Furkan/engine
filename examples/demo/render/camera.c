@@ -10,8 +10,10 @@
 // Positive pitch raises the look direction. The view quaternion rotates
 // world into camera, and a positive X rotation points camera -Z downward,
 // so the stored X half-angle is the negation of the pitch angle. Pitch
-// stops before the look axis lies in the plane, where the unproject ray
-// would run along z = 0.
+// Interactive pitch stops short of the plane, where the unproject ray
+// would run along z = 0. A snapped top or bottom view sits on the pole.
+// The first key back toward the range walks in from there. A key
+// outward cannot pass the pole.
 
 enum : uint32_t {
     k_gap_ms = 1000u,
@@ -56,6 +58,10 @@ static bool     s_have_t0 = false;
 static float    s_held_yaw = 0.0f;
 static float    s_held_pitch = 0.0f;
 static bool     s_logged = false;
+// The last numpad 5 put the view on the front. The next 5, while it
+// is still there, sets the back. Home, another view, or a yaw or
+// pitch key clears it.
+static bool     s_kp5_front = false;
 
 static float clampf(float v, float lo, float hi) {
     if (v < lo) {
@@ -242,15 +248,38 @@ static void translate_view(float dt, int move_x, int move_y) {
     s_live.z += right.z * sx + up.z * sy;
 }
 
+// A snapped pole is outside the interactive limit. Clamping it on the
+// first step would jump the view. Outward motion stops at ±π/2.
+static float step_pitch(float pitch, int axis, float dt) {
+    const float pole = 1.57079633f;
+    float next = pitch + (float)axis * k_pitch_rate * dt;
+    bool outside = pitch > k_pitch_limit || pitch < -k_pitch_limit;
+    bool outward = (pitch > 0.0f && axis > 0) || (pitch < 0.0f && axis < 0);
+    if (outside && outward) {
+        return clampf(pitch, -pole, pole);
+    }
+    if (outside) {
+        if (next > k_pitch_limit || next < -k_pitch_limit) {
+            return clampf(next, -pole, pole);
+        }
+        return clampf(next, -k_pitch_limit, k_pitch_limit);
+    }
+    return clampf(next, -k_pitch_limit, k_pitch_limit);
+}
+
 static void integrate(float dt) {
     if (policy_active()->lock_2d_quat) {
         hold_flat();
     }
     CamAxes axes = cam_axes();
     if (axes.yaw != 0 || axes.pitch != 0) {
-        s_held_yaw = wrap_pi(s_held_yaw + (float)axes.yaw * k_yaw_rate * dt);
-        s_held_pitch = clampf(s_held_pitch + (float)axes.pitch * k_pitch_rate * dt,
-                              -k_pitch_limit, k_pitch_limit);
+        s_kp5_front = false;
+        if (axes.yaw != 0) {
+            s_held_yaw = wrap_pi(s_held_yaw + (float)axes.yaw * k_yaw_rate * dt);
+        }
+        if (axes.pitch != 0) {
+            s_held_pitch = step_pitch(s_held_pitch, axes.pitch, dt);
+        }
         store_yaw_pitch(&s_live, s_held_yaw, s_held_pitch);
     }
 
@@ -284,9 +313,21 @@ static void check_identity(void) {
     Vec3 look_down = look_dir(quat_of(&pitched));
     store_yaw_pitch(&pitched, 0.70f, 0.40f);
     Vec3 look_both = look_dir(quat_of(&pitched));
+    store_yaw_pitch(&pitched, 0.0f, -1.57079633f);
+    Vec3 look_top = look_dir(quat_of(&pitched));
+    store_yaw_pitch(&pitched, 0.0f, 1.57079633f);
+    Vec3 look_bottom = look_dir(quat_of(&pitched));
+    store_yaw_pitch(&pitched, 3.14159265f, 0.0f);
+    Vec3 look_back = look_dir(quat_of(&pitched));
+    store_yaw_pitch(&pitched, 1.57079633f, 0.0f);
+    Vec3 look_left = look_dir(quat_of(&pitched));
+    store_yaw_pitch(&pitched, -1.57079633f, 0.0f);
+    Vec3 look_right = look_dir(quat_of(&pitched));
     bool pitched_ok = look_up.y > 0.30f && look_down.y < -0.30f &&
                       look_both.y > 0.25f && look_both.x > 0.50f;
-    bool ok = basis && pitched_ok && fabsf(r.x - 3.0f) < 1.0e-4f &&
+    bool views_ok = look_top.y < -0.9f && look_bottom.y > 0.9f &&
+                    look_back.z > 0.9f && look_left.x > 0.9f && look_right.x < -0.9f;
+    bool ok = basis && pitched_ok && views_ok && fabsf(r.x - 3.0f) < 1.0e-4f &&
               fabsf(r.y + 2.0f) < 1.0e-4f && fabsf(r.z - 7.0f) < 1.0e-4f &&
               fabsf(x.x) < 1.0e-4f && fabsf(x.y) < 1.0e-4f &&
               fabsf(x.z + 1.0f) < 1.0e-4f;
@@ -310,9 +351,11 @@ void camera_reset(void) {
     s_have_t0 = false;
     s_held_yaw = 0.0f;
     s_held_pitch = 0.0f;
+    s_kp5_front = false;
     check_identity();
     if (!s_logged) {
-        printf("[Camera] Yaw and pitch on the view, exponential zoom, view-plane move.\n");
+        printf("[Camera] Yaw and pitch on the view, exponential zoom, view-plane move. "
+               "Home restores the opening pose. The wheel zooms.\n");
         fflush(stdout);
         s_logged = true;
     }
@@ -387,11 +430,102 @@ bool camera_snap_front(void) {
     s_live.z = 0.0f;
     s_held_yaw = 0.0f;
     s_held_pitch = 0.0f;
+    s_kp5_front = false;
     if (!changed) {
         return false;
     }
     printf("[Camera] Front view.\n");
     fflush(stdout);
+    return true;
+}
+
+bool camera_home(void) {
+    bool changed = s_live.qx != 0.0f || s_live.qy != 0.0f || s_live.qz != 0.0f ||
+                   s_live.qw != 1.0f || s_live.x != 0.0f || s_live.y != 0.0f ||
+                   s_live.z != 0.0f || s_live.zoom != 1.0f ||
+                   s_held_yaw != 0.0f || s_held_pitch != 0.0f;
+    s_live = (Pose){
+        .qw   = 1.0f,
+        .zoom = 1.0f,
+    };
+    s_held_yaw = 0.0f;
+    s_held_pitch = 0.0f;
+    s_kp5_front = false;
+    if (!changed) {
+        return false;
+    }
+    printf("[Camera] Home.\n");
+    fflush(stdout);
+    return true;
+}
+
+static bool near_held(float yaw, float pitch) {
+    return fabsf(wrap_pi(s_held_yaw - yaw)) < 0.02f &&
+           fabsf(wrap_pi(s_held_pitch - pitch)) < 0.02f;
+}
+
+static bool apply_view(float yaw, float pitch, const char *label) {
+    if (policy_active()->lock_2d_quat) {
+        return false;
+    }
+    bool changed = !near_held(yaw, pitch);
+    s_held_yaw = yaw;
+    s_held_pitch = pitch;
+    store_yaw_pitch(&s_live, yaw, pitch);
+    if (!changed) {
+        return false;
+    }
+    printf("[Camera] %s\n", label);
+    fflush(stdout);
+    return true;
+}
+
+bool camera_view_top(void) {
+    s_kp5_front = false;
+    return apply_view(0.0f, -1.57079633f, "Top view.");
+}
+
+bool camera_view_bottom(void) {
+    s_kp5_front = false;
+    return apply_view(0.0f, 1.57079633f, "Bottom view.");
+}
+
+bool camera_view_left(void) {
+    s_kp5_front = false;
+    return apply_view(1.57079633f, 0.0f, "Left view.");
+}
+
+bool camera_view_right(void) {
+    s_kp5_front = false;
+    return apply_view(-1.57079633f, 0.0f, "Right view.");
+}
+
+bool camera_view_front(void) {
+    if (policy_active()->lock_2d_quat) {
+        return false;
+    }
+    if (s_kp5_front && near_held(0.0f, 0.0f)) {
+        s_kp5_front = false;
+        return apply_view(3.14159265f, 0.0f, "Back view.");
+    }
+    bool changed = apply_view(0.0f, 0.0f, "Front view.");
+    s_kp5_front = true;
+    if (!changed) {
+        printf("[Camera] Front view.\n");
+        fflush(stdout);
+    }
+    return changed;
+}
+
+bool camera_zoom_steps(float steps) {
+    if (steps == 0.0f || !policy_allows(PERM_CAM_ZOOM)) {
+        return false;
+    }
+    float next = clampf(s_live.zoom * expf(steps * 0.18f), k_camera_zoom_min, k_camera_zoom_max);
+    if (next == s_live.zoom) {
+        return false;
+    }
+    s_live.zoom = next;
     return true;
 }
 

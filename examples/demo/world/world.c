@@ -1,6 +1,7 @@
 #include "world/world_int.h"
 #include "frame/camera.h"
 #include "frame/policy.h"
+#include "frame/text.h"
 #include <stdio.h>
 
 // Starts the world and calls the layers under src/world. Object kinds live
@@ -87,9 +88,7 @@ bool world_click(float screen_x, float screen_y) {
     if (!coord_ground_hit(&ray, &ground, nullptr)) {
         return false;
     }
-    if (!policy_allows(PERM_OBJ_SPAWN)) {
-        printf("[Policy] Grid %+.2f, %+.2f.\n", ground.x, ground.y);
-        fflush(stdout);
+    if (!policy_allows(PERM_DRAW)) {
         return false;
     }
     return face_spawn(ground);
@@ -179,12 +178,12 @@ bool world_toggle_smooth(void) {
 
 bool world_busy(void) {
     return camera_busy() || overlay_busy() || face_chain_busy() ||
-           solid_kind_smooth_dirty() || table_busy();
+           solid_kind_smooth_dirty() || table_busy() || text_busy();
 }
 
 bool world_advance(uint32_t time_ms) {
     bool changed = table_advance(time_ms) || face_chain_busy() || solid_kind_smooth_dirty() ||
-                   overlay_busy();
+                   overlay_busy() || text_busy();
     if (camera_advance(time_ms)) {
         changed = true;
     }
@@ -198,6 +197,7 @@ void world_commit(void) {
     solid_kind_commit_smooth();
     overlay_commit();
     camera_commit();
+    text_commit();
 }
 
 bool world_consume_spin(void) {

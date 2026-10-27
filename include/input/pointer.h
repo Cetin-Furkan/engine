@@ -59,8 +59,27 @@ bool pointer_take_spawn(int32_t *x, int32_t *y);
 // tap set is queued. Returns false when none are waiting.
 bool pointer_take_key(uint32_t *key);
 
+// Vertical wheel or touchpad scroll since the last take, in notches.
+// One notch is about ten wl_fixed surface units. Positive steps zoom in
+// (the finger moved up). Horizontal motion is ignored. The discrete
+// value120 event is not added; the continuous axis already carries it.
+// Returns false when nothing moved.
+bool pointer_take_scroll(float *steps);
+
 // True while this surface has focus and the key is down. Used for held
 // camera motion. A leave or a new enter clears every held key.
 bool pointer_key_down(uint32_t key);
+
+// Last pointer position in surface pixels, top-left origin. False before
+// the pointer has entered this surface.
+bool pointer_client_xy(int32_t *x, int32_t *y);
+
+// Queues a repeated UTF-8 string when the compositor delay has elapsed.
+// Repeat does not queue the evdev key again. The clock is CLOCK_MONOTONIC.
+void pointer_pump_text(void);
+
+// One UTF-8 string from a tap or a repeat. `n` is the byte count, not
+// including the NUL that is written when cap allows it. False when empty.
+bool pointer_take_text(char *utf8, uint32_t cap, uint32_t *n);
 
 #endif /* ENGINE_INPUT_POINTER_H */

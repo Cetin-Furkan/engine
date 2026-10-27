@@ -2,6 +2,8 @@
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_scalar_block_layout : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
 #extension GL_GOOGLE_include_directive : require
 
 #include "camera.inc"
@@ -27,8 +29,8 @@ layout(buffer_reference, scalar, buffer_reference_align = 4) buffer Heat {
     float t[];
 };
 
-layout(buffer_reference, scalar, buffer_reference_align = 4) buffer Field {
-    float v[];
+layout(buffer_reference, scalar, buffer_reference_align = 2) buffer Field {
+    float16_t v[];
 };
 
 layout(push_constant, scalar) uniform Screen {
@@ -43,17 +45,19 @@ layout(push_constant, scalar) uniform Screen {
     float phase;
     float selected;
     uint64_t grid;
-    layout(offset = 56) uint64_t materials;
-    layout(offset = 64) uint mat_index;
-    layout(offset = 68) uint mat_pad;
-    layout(offset = 72) float qx;
-    layout(offset = 76) float qy;
-    layout(offset = 80) float qz;
-    layout(offset = 84) float qw;
-    layout(offset = 88) float cam_x;
-    layout(offset = 92) float cam_y;
-    layout(offset = 96) float cam_z;
-    layout(offset = 100) float zoom;
+    uint grid_n;
+    uint grid_pad;
+    layout(offset = 64) uint64_t materials;
+    layout(offset = 72) uint mat_index;
+    layout(offset = 76) uint mat_pad;
+    layout(offset = 80) float qx;
+    layout(offset = 84) float qy;
+    layout(offset = 88) float qz;
+    layout(offset = 92) float qw;
+    layout(offset = 96) float cam_x;
+    layout(offset = 100) float cam_y;
+    layout(offset = 104) float cam_z;
+    layout(offset = 108) float zoom;
 } screen;
 
 const float k_edge_px = 240.0;
@@ -90,8 +94,13 @@ void main() {
     vec3 spun = in_albedo * c + cross(axis, in_albedo) * s + axis * dot(axis, in_albedo) * (1.0 - c);
     vec3 graded = clamp(spun, 0.0, 1.0);
     vec3 cool = graded;
-    if (screen.grid != 0ul) {
-        float cell = clamp(Field(screen.grid).v[uint(gl_VertexIndex)], 0.0, 1.0);
+    if (screen.grid != 0ul && screen.grid_n > 1u) {
+        float edge = float(screen.grid_n - 1u);
+        uint ix = uint(clamp(in_pos.x * 0.5 + 0.5, 0.0, 1.0) * edge);
+        uint iy = uint(clamp(in_pos.y * 0.5 + 0.5, 0.0, 1.0) * edge);
+        uint iz = uint(clamp(in_pos.z * 0.5 + 0.5, 0.0, 1.0) * edge);
+        uint id = ix + iy * screen.grid_n + iz * screen.grid_n * screen.grid_n;
+        float cell = clamp(float(Field(screen.grid).v[id]), 0.0, 1.0);
         cool = mix(graded, vec3(0.45, 0.72, 1.0), cell);
     }
     float temp = clamp(Heat(screen.heat).t[uint(gl_VertexIndex)], 0.0, 1.0);

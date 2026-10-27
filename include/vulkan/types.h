@@ -134,6 +134,7 @@ typedef struct VulkanDeviceInfo {
     bool supports_shader_int16;
     bool supports_shader_int64;
     bool supports_storage_buffer_16bit;
+    bool supports_shader_float16;
 
     // Linux DRM device node identity (VK_EXT_physical_device_drm) for Wayland matching.
     bool    has_drm_primary_node;

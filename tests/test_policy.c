@@ -47,7 +47,7 @@ static void check_profiles(void) {
     CHECK(strcmp(model->name, "Blender-3D") == 0);
     CHECK(!model->sealed);
     CHECK(!model->lock_2d_quat);
-    CHECK(model->bind_count == 33u);
+    CHECK(model->bind_count == 40u);
 
     CHECK(strcmp(plot->name, "Matplotlib-2D") == 0);
     CHECK(!plot->sealed);
@@ -62,10 +62,17 @@ static void check_profiles(void) {
     CHECK(policy_can(model, ACT_DATA_RELOAD));
     CHECK((model->active_perms & PERM_OBJ_COMPUTE) == PERM_OBJ_COMPUTE);
     CHECK((model->active_perms & PERM_OBJ_SELECT) == PERM_OBJ_SELECT);
+    CHECK((model->active_perms & PERM_DRAW) == 0u);
+    CHECK(policy_can(model, ACT_TOGGLE_DRAW));
+    CHECK(policy_can(model, ACT_HOME));
+    CHECK(policy_can(model, ACT_VIEW_FRONT));
+    CHECK(!policy_can(model, ACT_CLOSE_FACE));
 
     CHECK(policy_can(plot, ACT_PAN_LEFT));
     CHECK(policy_can(plot, ACT_ZOOM_IN));
     CHECK(policy_can(plot, ACT_SNAP_FRONT));
+    CHECK(policy_can(plot, ACT_HOME));
+    CHECK(!policy_can(plot, ACT_TOGGLE_DRAW));
     CHECK(policy_can(plot, ACT_PLOT_CYCLE));
     CHECK(policy_can(plot, ACT_DATA_RELOAD));
     CHECK(policy_can(plot, ACT_SWITCH_MODE));
@@ -104,6 +111,21 @@ static void check_profiles(void) {
     CHECK(policy_lookup(model, KEY_DELETE, false) == ACT_DELETE);
     CHECK(policy_lookup(model, KEY_TAB, false) == ACT_SWITCH_MODE);
     CHECK(policy_lookup(plot, KEY_TAB, false) == ACT_SWITCH_MODE);
+    CHECK(policy_lookup(model, KEY_HOME, false) == ACT_HOME);
+    CHECK(policy_lookup(model, KEY_KP1, false) == ACT_HOME);
+    CHECK(policy_lookup(plot, KEY_HOME, false) == ACT_HOME);
+    CHECK(policy_lookup(plot, KEY_KP1, true) == ACT_HOME);
+    CHECK(policy_lookup(model, KEY_KP8, false) == ACT_VIEW_TOP);
+    CHECK(policy_lookup(model, KEY_KP2, false) == ACT_VIEW_BOTTOM);
+    CHECK(policy_lookup(model, KEY_KP4, false) == ACT_VIEW_LEFT);
+    CHECK(policy_lookup(model, KEY_KP6, false) == ACT_VIEW_RIGHT);
+    CHECK(policy_lookup(model, KEY_KP5, false) == ACT_VIEW_FRONT);
+    CHECK(policy_lookup(model, KEY_KP9, false) == ACT_TOGGLE_DRAW);
+    CHECK(policy_lookup(model, KEY_KP7, false) == ACT_TOGGLE_GIMBAL);
+    CHECK(policy_lookup(plot, KEY_KP8, false) == ACT_NONE);
+    CHECK(policy_lookup(plot, KEY_KP5, false) == ACT_NONE);
+    CHECK(policy_lookup(plot, KEY_KP9, false) == ACT_NONE);
+    CHECK(policy_lookup(plot, KEY_KP7, false) == ACT_NONE);
     CHECK(policy_lookup(nullptr, KEY_Q, false) == ACT_NONE);
 
     CHECK(policy_route(model, KEY_Q, false) == KEY_ROUTE_HOLD);
@@ -112,6 +134,9 @@ static void check_profiles(void) {
     CHECK(policy_route(model, KEY_4, false) == KEY_ROUTE_TAP);
     CHECK(policy_route(model, KEY_ESC, false) == KEY_ROUTE_TAP);
     CHECK(policy_route(model, KEY_X, false) == KEY_ROUTE_TAP);
+    CHECK(policy_route(model, KEY_KP5, false) == KEY_ROUTE_TAP);
+    CHECK(policy_route(model, KEY_KP9, false) == KEY_ROUTE_TAP);
+    CHECK(policy_route(model, KEY_HOME, false) == KEY_ROUTE_TAP);
     CHECK(policy_route(plot, KEY_Q, false) == KEY_ROUTE_IGNORE);
     CHECK(policy_route(plot, KEY_C, true) == KEY_ROUTE_IGNORE);
     CHECK(policy_route(plot, KEY_4, false) == KEY_ROUTE_IGNORE);

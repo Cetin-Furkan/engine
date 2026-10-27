@@ -57,7 +57,25 @@ bool camera_motion_down(void);
 
 // Identity quaternion and camera z = 0. x, y, and zoom stay.
 // True when the pose changed and a frame should be presented.
+// Tab uses this when it enters the flat profile.
 bool camera_snap_front(void);
+
+// Opening pose: origin, zoom 1, identity quaternion. Pan and zoom
+// come back with the orientation. True when the pose changed.
+bool camera_home(void);
+
+// Orientation only. x, y, z, and zoom stay. Refused while the flat
+// profile locks the quaternion. A second front, while the held yaw
+// and pitch are already the front, sets the back.
+bool camera_view_top(void);
+bool camera_view_bottom(void);
+bool camera_view_left(void);
+bool camera_view_right(void);
+bool camera_view_front(void);
+
+// One wheel notch is about one step. Positive steps zoom in.
+// Refused when zoom is not permitted. True when the zoom changed.
+bool camera_zoom_steps(float steps);
 
 // Shown zoom. Clicks use this so a grab stays a few screen pixels.
 float camera_zoom_shown(void);

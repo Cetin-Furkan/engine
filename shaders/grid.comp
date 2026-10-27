@@ -2,89 +2,116 @@
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_scalar_block_layout : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
 
-// 128^3 scalar field. mode 0 diffuses src into dst. A seed writes a ball and
-// ignores src. mode 1 samples dst at each mesh vertex into tint.
-// One invocation per cell, then one per vertex. The draw reads tint.
+// One n^3 lattice. Cells are fp16. n comes from the push constant and must
+// be a multiple of the 8x8 tile. A workgroup owns one Z layer of that tile
+// and keeps the tile plus a one-cell halo in shared memory, so the six
+// neighbors are not gathered from a 64 KiB Z stride.
+// seed writes a ball of radius 10 cells at n = 128, scaled with n.
+// A later step blends each cell toward those neighbors. The vertex shader
+// reads dst. Nothing here writes a per-vertex copy.
 
-layout(local_size_x = 64) in;
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
-layout(buffer_reference, scalar, buffer_reference_align = 4) buffer Field {
-    float v[];
-};
-
-layout(buffer_reference, scalar, buffer_reference_align = 4) buffer Mesh {
-    float f[];
+layout(buffer_reference, scalar, buffer_reference_align = 2) buffer Field {
+    float16_t v[];
 };
 
 layout(push_constant, scalar) uniform Push {
     uint64_t src;
     uint64_t dst;
-    uint64_t tint;
-    uint64_t verts;
     uint dt_ms;
     uint seed;
-    uint mode;
-    uint nverts;
+    uint n;
+    uint pad;
 } pc;
 
-const uint N = 128u;
+const uint BX = 8u;
+const uint BY = 8u;
+const uint SX = BX + 2u;
+const uint SY = BY + 2u;
+const uint SZ = 3u;
 
-uint at(uint x, uint y, uint z) {
-    return x + y * N + z * N * N;
+shared float16_t tile[SX * SY * SZ];
+
+uint tile_at(uint lx, uint ly, uint lz) {
+    return lx + ly * SX + lz * SX * SY;
 }
 
-void diffuse(uint id) {
-    uint cell = N * N * N;
-    if (id >= cell || pc.dst == 0ul) {
-        return;
-    }
-    uint x = id % N;
-    uint y = (id / N) % N;
-    uint z = id / (N * N);
-    if (pc.seed != 0u) {
-        float dx = float(x) - 63.5;
-        float dy = float(y) - 63.5;
-        float dz = float(z) - 63.5;
-        Field(pc.dst).v[id] = (dx * dx + dy * dy + dz * dz) < 100.0 ? 1.0 : 0.0;
-        return;
-    }
-    if (pc.src == 0ul) {
-        return;
-    }
-    float c = Field(pc.src).v[id];
-    float sum = 0.0;
-    uint count = 0u;
-    if (x > 0u) { sum += Field(pc.src).v[at(x - 1u, y, z)]; count++; }
-    if (x + 1u < N) { sum += Field(pc.src).v[at(x + 1u, y, z)]; count++; }
-    if (y > 0u) { sum += Field(pc.src).v[at(x, y - 1u, z)]; count++; }
-    if (y + 1u < N) { sum += Field(pc.src).v[at(x, y + 1u, z)]; count++; }
-    if (z > 0u) { sum += Field(pc.src).v[at(x, y, z - 1u)]; count++; }
-    if (z + 1u < N) { sum += Field(pc.src).v[at(x, y, z + 1u)]; count++; }
-    float avg = count > 0u ? sum / float(count) : c;
-    float alpha = min(float(pc.dt_ms) * 0.02, 1.0);
-    Field(pc.dst).v[id] = clamp(mix(c, avg, alpha), 0.0, 1.0);
+uint cell_at(uint x, uint y, uint z, uint n) {
+    return x + y * n + z * n * n;
 }
 
-void sample_vert(uint id) {
-    if (id >= pc.nverts || pc.dst == 0ul || pc.tint == 0ul || pc.verts == 0ul) {
-        return;
-    }
-    uint o = id * 9u;
-    float px = Mesh(pc.verts).f[o + 0u];
-    float py = Mesh(pc.verts).f[o + 1u];
-    float pz = Mesh(pc.verts).f[o + 2u];
-    uint ix = uint(clamp(px * 0.5 + 0.5, 0.0, 1.0) * 127.0);
-    uint iy = uint(clamp(py * 0.5 + 0.5, 0.0, 1.0) * 127.0);
-    uint iz = uint(clamp(pz * 0.5 + 0.5, 0.0, 1.0) * 127.0);
-    Field(pc.tint).v[id] = Field(pc.dst).v[at(ix, iy, iz)];
+float16_t ball(int x, int y, int z, uint n) {
+    float mid = float(n) * 0.5 - 0.5;
+    float dx = float(x) - mid;
+    float dy = float(y) - mid;
+    float dz = float(z) - mid;
+    float radius = 10.0 * float(n) / 128.0;
+    return (dx * dx + dy * dy + dz * dz) < radius * radius ? float16_t(1.0) : float16_t(0.0);
 }
 
 void main() {
-    uint id = gl_GlobalInvocationID.x;
-    if (pc.mode == 0u) {
-        diffuse(id);
-    } else {
-        sample_vert(id);
+    uint n = pc.n;
+    uint wx = gl_WorkGroupID.x * BX;
+    uint wy = gl_WorkGroupID.y * BY;
+    uint wz = gl_WorkGroupID.z;
+    uint tile_n = SX * SY * SZ;
+    uint lid = gl_LocalInvocationIndex;
+    for (uint i = lid; i < tile_n; i += BX * BY) {
+        uint lx = i % SX;
+        uint ly = (i / SX) % SY;
+        uint lz = i / (SX * SY);
+        int x = int(wx) + int(lx) - 1;
+        int y = int(wy) + int(ly) - 1;
+        int z = int(wz) + int(lz) - 1;
+        float16_t stored = float16_t(0.0);
+        if (n > 0u && x >= 0 && y >= 0 && z >= 0 &&
+            uint(x) < n && uint(y) < n && uint(z) < n) {
+            if (pc.seed != 0u) {
+                stored = ball(x, y, z, n);
+            } else if (pc.src != 0ul) {
+                stored = Field(pc.src).v[cell_at(uint(x), uint(y), uint(z), n)];
+            }
+        }
+        tile[i] = stored;
     }
+    barrier();
+
+    uint x = wx + gl_LocalInvocationID.x;
+    uint y = wy + gl_LocalInvocationID.y;
+    uint z = wz;
+    if (n == 0u || pc.dst == 0ul || x >= n || y >= n || z >= n) {
+        return;
+    }
+    uint center = tile_at(gl_LocalInvocationID.x + 1u, gl_LocalInvocationID.y + 1u, 1u);
+    if (pc.seed != 0u) {
+        Field(pc.dst).v[cell_at(x, y, z, n)] = tile[center];
+        return;
+    }
+    float cur = float(tile[center]);
+    float sum = 0.0;
+    uint count = 0u;
+    const int ox[6] = int[6](-1, 1, 0, 0, 0, 0);
+    const int oy[6] = int[6](0, 0, -1, 1, 0, 0);
+    const int oz[6] = int[6](0, 0, 0, 0, -1, 1);
+    for (uint s = 0u; s < 6u; ++s) {
+        int nx = int(x) + ox[s];
+        int ny = int(y) + oy[s];
+        int nz = int(z) + oz[s];
+        if (nx < 0 || ny < 0 || nz < 0 || uint(nx) >= n || uint(ny) >= n || uint(nz) >= n) {
+            continue;
+        }
+        int lx = int(gl_LocalInvocationID.x) + 1 + ox[s];
+        int ly = int(gl_LocalInvocationID.y) + 1 + oy[s];
+        int lz = 1 + oz[s];
+        sum += float(tile[tile_at(uint(lx), uint(ly), uint(lz))]);
+        count += 1u;
+    }
+    float avg = count > 0u ? sum / float(count) : cur;
+    float alpha = min(float(pc.dt_ms) * 0.02, 1.0);
+    float next = clamp(mix(cur, avg, alpha), 0.0, 1.0);
+    Field(pc.dst).v[cell_at(x, y, z, n)] = float16_t(next);
 }

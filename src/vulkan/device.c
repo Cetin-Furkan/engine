@@ -60,6 +60,7 @@ typedef struct GpuCandidate {
     bool                             supports_shader_int16;
     bool                             supports_shader_int64;
     bool                             supports_storage_buffer_16bit;
+    bool                             supports_shader_float16;
 
     bool                             has_drm_primary;
     bool                             has_drm_render;
@@ -442,22 +443,25 @@ static VulkanResult evaluate_device(GpuCandidate *candidate) {
     candidate->supports_shader_int16                 = (features2.features.shaderInt16 == VK_TRUE);
     candidate->supports_shader_int64                 = (features2.features.shaderInt64 == VK_TRUE);
     candidate->supports_storage_buffer_16bit         = (feat11.storageBuffer16BitAccess == VK_TRUE);
+    candidate->supports_shader_float16               = (feat12.shaderFloat16 == VK_TRUE);
     candidate->features_probed                       = true;
 
     if (!candidate->supports_dyn_render || !candidate->supports_sync2 ||
         !candidate->supports_bda || !candidate->supports_timeline ||
         !candidate->supports_scalar_layout || !candidate->supports_shader_int16 ||
         !candidate->supports_shader_int64 || !candidate->supports_storage_buffer_16bit ||
+        !candidate->supports_shader_float16 ||
         !candidate->supports_maintenance5 || !candidate->supports_maintenance6 ||
         !candidate->supports_push_descriptors || !candidate->supports_host_image_copy ||
         !candidate->supports_dynamic_rendering_local_read) {
-        char reason[320];
+        char reason[384];
         snprintf(reason, sizeof reason,
-                 "Missing Vulkan 1.4 feature (DynRender=%d, Sync2=%d, BDA=%d, Timeline=%d, Scalar=%d, Int16=%d, Int64=%d, Storage16=%d, Maint5=%d, Maint6=%d, PushDesc=%d, HostCopy=%d, LocalRead=%d)",
+                 "Missing Vulkan 1.4 feature (DynRender=%d, Sync2=%d, BDA=%d, Timeline=%d, Scalar=%d, Int16=%d, Int64=%d, Storage16=%d, Float16=%d, Maint5=%d, Maint6=%d, PushDesc=%d, HostCopy=%d, LocalRead=%d)",
                  candidate->supports_dyn_render, candidate->supports_sync2,
                  candidate->supports_bda, candidate->supports_timeline,
                  candidate->supports_scalar_layout, candidate->supports_shader_int16,
                  candidate->supports_shader_int64, candidate->supports_storage_buffer_16bit,
+                 candidate->supports_shader_float16,
                  candidate->supports_maintenance5, candidate->supports_maintenance6,
                  candidate->supports_push_descriptors, candidate->supports_host_image_copy,
                  candidate->supports_dynamic_rendering_local_read);
@@ -610,7 +614,7 @@ static void print_candidate(uint32_t index, const GpuCandidate *candidate) {
     if (!candidate->features_probed) {
         printf("      Features: not probed\n");
     } else {
-        printf("      Features: DynRender=%s, LocalRead=%s, Sync2=%s, BDA=%s, ScalarLayout=%s, Timeline=%s, Anisotropy=%s, Maint5=%s, Maint6=%s, PushDesc=%s, HostImageCopy=%s, Int16=%s, Int64=%s, Storage16=%s\n",
+        printf("      Features: DynRender=%s, LocalRead=%s, Sync2=%s, BDA=%s, ScalarLayout=%s, Timeline=%s, Anisotropy=%s, Maint5=%s, Maint6=%s, PushDesc=%s, HostImageCopy=%s, Int16=%s, Int64=%s, Storage16=%s, Float16=%s\n",
                candidate->supports_dyn_render ? "yes" : "no",
                candidate->supports_dynamic_rendering_local_read ? "yes" : "no",
                candidate->supports_sync2 ? "yes" : "no",
@@ -624,7 +628,8 @@ static void print_candidate(uint32_t index, const GpuCandidate *candidate) {
                candidate->supports_host_image_copy ? "yes" : "no",
                candidate->supports_shader_int16 ? "yes" : "no",
                candidate->supports_shader_int64 ? "yes" : "no",
-               candidate->supports_storage_buffer_16bit ? "yes" : "no");
+               candidate->supports_storage_buffer_16bit ? "yes" : "no",
+               candidate->supports_shader_float16 ? "yes" : "no");
     }
 
     if (!candidate->extensions_probed) {
@@ -875,6 +880,7 @@ VulkanResult vulkan_device_create(VulkanContext *ctx) {
     ctx->device_info.supports_shader_int16 = best.supports_shader_int16;
     ctx->device_info.supports_shader_int64 = best.supports_shader_int64;
     ctx->device_info.supports_storage_buffer_16bit = best.supports_storage_buffer_16bit;
+    ctx->device_info.supports_shader_float16 = best.supports_shader_float16;
     ctx->device_info.has_drm_primary_node = best.has_drm_primary;
     ctx->device_info.has_drm_render_node = best.has_drm_render;
     ctx->device_info.drm_primary_major = best.drm_primary_major;
@@ -951,6 +957,7 @@ VulkanResult vulkan_device_create(VulkanContext *ctx) {
         .pNext               = &feat13,
         .scalarBlockLayout   = VK_TRUE,
         .bufferDeviceAddress = VK_TRUE,
+        .shaderFloat16       = VK_TRUE,
         .timelineSemaphore   = VK_TRUE,
     };
     VkPhysicalDeviceVulkan11Features feat11 = {

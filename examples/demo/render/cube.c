@@ -57,10 +57,12 @@ typedef struct DrawPush {
     float    phase;
     float    selected;
     uint64_t grid;
+    uint32_t grid_n;
+    uint32_t grid_pad;
     ViewPush view;
 } DrawPush;
 
-enum { k_draw_push_bytes = 104 };
+enum { k_draw_push_bytes = 112 };
 
 // Three copies so a frame still reading one buffer is not overwritten by the
 // next step. Two copies can be in flight. The third is the one being written.
@@ -101,7 +103,8 @@ static_assert(offsetof(DrawPush, heat) == 32u, "heat address");
 static_assert(offsetof(DrawPush, phase) == 40u, "hue phase");
 static_assert(offsetof(DrawPush, selected) == 44u, "cube selected");
 static_assert(offsetof(DrawPush, grid) == 48u, "grid address");
-static_assert(offsetof(DrawPush, view) == 56u, "cube view");
+static_assert(offsetof(DrawPush, grid_n) == 56u, "grid n");
+static_assert(offsetof(DrawPush, view) == 64u, "cube view");
 static_assert(offsetof(ViewPush, qx) == 16u, "view quat");
 static_assert(sizeof(ViewPush) == 48u, "view push");
 static_assert(sizeof(DrawPush) == k_draw_push_bytes, "draw push");
@@ -752,7 +755,8 @@ void cube_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height, float yaw_d
         .heat       = heat_at(heat_copy, heat_slot),
         .phase      = phase,
         .selected   = selected ? 1.0f : 0.0f,
-        .grid       = grid_tint_addr(),
+        .grid       = grid_field_addr(),
+        .grid_n     = grid_n(),
     };
     view_push_fill(&draw_push.view, mat);
     vkCmdSetViewport(cmd, 0, 1, &viewport);

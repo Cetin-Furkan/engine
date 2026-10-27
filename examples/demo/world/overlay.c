@@ -8,9 +8,10 @@ void overlay_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height) {
 }
 
 bool overlay_busy(void) {
-    return plot_wants_frame();
+    return plot_wants_frame() || gimbal_busy();
 }
 
 void overlay_commit(void) {
     plot_commit();
+    gimbal_commit();
 }

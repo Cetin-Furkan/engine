@@ -526,11 +526,14 @@ void shape_draw_polygon(VkCommandBuffer cmd, uint32_t width, uint32_t height,
         push.b = edge_b;
         shape_push_draw(cmd, &push, 6u, edges);
     }
-    push.mode = 2;
-    push.half = mark_half;
-    push.depth = mark_depth;
-    push.r = edge_r;
-    push.g = edge_g;
-    push.b = edge_b;
-    shape_push_draw(cmd, &push, 6u, n);
+    if (mark_half > 0.0f) {
+        push.mode = 2;
+        push.half = mark_half;
+        push.depth = mark_depth;
+        push.r = edge_r;
+        push.g = edge_g;
+        push.b = edge_b;
+        // One 12-segment disc per point.
+        shape_push_draw(cmd, &push, 36u, n);
+    }
 }

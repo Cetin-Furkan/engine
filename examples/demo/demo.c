@@ -12,6 +12,7 @@
 #include "frame/plot.h"
 #include "frame/shape.h"
 #include "frame/solid.h"
+#include "frame/text.h"
 #include "frame/world.h"
 #include "input/pointer.h"
 #include "world/world_int.h"
@@ -119,7 +120,7 @@ static int demo_init(VulkanContext *vk, RingCqeFn forward_cqe, void *forward_use
         plane_init(vk) != 0 || material_init(vk) != 0 ||
         plot_init(vk, forward_cqe, forward_user) != 0 ||
         mesh_init(vk, forward_cqe, forward_user) != 0 ||
-        gimbal_init(vk) != 0 || hud_init(vk) != 0 || grid_init(vk) != 0) {
+        gimbal_init(vk) != 0 || hud_init(vk) != 0 || text_init(vk) != 0 || grid_init(vk) != 0) {
         return -1;
     }
     return 0;
@@ -127,6 +128,7 @@ static int demo_init(VulkanContext *vk, RingCqeFn forward_cqe, void *forward_use
 
 static void demo_shutdown(VulkanContext *vk) {
     grid_shutdown(vk);
+    text_shutdown(vk);
     hud_shutdown(vk);
     gimbal_shutdown(vk);
     mesh_shutdown(vk);
@@ -161,6 +163,7 @@ static void demo_draw_overlay(VkCommandBuffer cmd, uint32_t width, uint32_t heig
                               uint64_t modifier) {
     hud_prepare(frame_ms, have_stamp, modifier);
     hud_draw(cmd, width, height, format);
+    text_draw(cmd, width, height, format);
 }
 
 static bool demo_simulation(uint32_t time_ms, const FrameStep *step, uint32_t *heat_dt) {
@@ -170,11 +173,26 @@ static bool demo_simulation(uint32_t time_ms, const FrameStep *step, uint32_t *h
 
 static bool demo_advance(uint32_t time_ms, const FrameStep *step) {
     (void)step;  // Poses are absolute-stamp functions (spin/camera).
+    int32_t px = 0;
+    int32_t py = 0;
+    bool have = pointer_client_xy(&px, &py);
+    text_arm_tick(pointer_key_down(KEY_T), have, px, py);
     return world_advance(time_ms);
 }
 
 static bool demo_click(float origin_x, float origin_y) {
+    if (text_click(origin_x, origin_y, pointer_key_down(KEY_T))) {
+        return true;
+    }
     return world_click(origin_x, origin_y);
+}
+
+static bool demo_text(const char *utf8, uint32_t bytes) {
+    return text_insert(utf8, bytes);
+}
+
+static bool demo_scroll(float steps) {
+    return camera_zoom_steps(steps);
 }
 
 static bool demo_shift_down(void) {
@@ -182,6 +200,15 @@ static bool demo_shift_down(void) {
 }
 
 static uint8_t demo_route_key(uint32_t key) {
+    if (text_editing()) {
+        if (key == KEY_LEFTSHIFT || key == KEY_RIGHTSHIFT) {
+            return ENGINE_KEY_HOLD;
+        }
+        return ENGINE_KEY_TAP;
+    }
+    if (key == KEY_T) {
+        return ENGINE_KEY_HOLD;
+    }
     KeyRoute route = policy_route(policy_active(), (uint16_t)key, demo_shift_down());
     if (route == KEY_ROUTE_HOLD) {
         return ENGINE_KEY_HOLD;
@@ -193,6 +220,9 @@ static uint8_t demo_route_key(uint32_t key) {
 }
 
 static bool demo_key(uint32_t key, EngineKeyContext *ctx) {
+    if (text_on_key(key)) {
+        return true;
+    }
     EngineAction act = policy_lookup(policy_active(), (uint16_t)key, demo_shift_down());
     if (!policy_can(policy_active(), act)) {
         return false;
@@ -233,6 +263,38 @@ static bool demo_key(uint32_t key, EngineKeyContext *ctx) {
     }
     case ACT_SNAP_FRONT:
         return camera_snap_front();
+    case ACT_HOME:
+        return camera_home();
+    case ACT_VIEW_TOP:
+        return camera_view_top();
+    case ACT_VIEW_BOTTOM:
+        return camera_view_bottom();
+    case ACT_VIEW_LEFT:
+        return camera_view_left();
+    case ACT_VIEW_RIGHT:
+        return camera_view_right();
+    case ACT_VIEW_FRONT:
+        return camera_view_front();
+    case ACT_TOGGLE_DRAW: {
+        WorkspacePolicy *live = policy_active();
+        if (policy_allows(PERM_DRAW)) {
+            if (!policy_revoke(live, PERM_DRAW)) {
+                return false;
+            }
+            (void)face_cancel_chain();
+            printf("[Draw] Points are off.\n");
+            fflush(stdout);
+            return true;
+        }
+        if (!policy_grant(live, PERM_DRAW)) {
+            return false;
+        }
+        printf("[Draw] Points are on.\n");
+        fflush(stdout);
+        return true;
+    }
+    case ACT_TOGGLE_GIMBAL:
+        return gimbal_toggle();
     case ACT_SPAWN_SOLID_1:
     case ACT_SPAWN_SOLID_2:
     case ACT_SPAWN_SOLID_3:
@@ -258,19 +320,21 @@ static bool demo_camera_active(void) {
 }
 
 static const EngineApp s_app = {
-    .help = "One turn, then io_uring idle. Clicks on empty space place points. "
-            "F closes those points into a face. A click on a mesh selects it. "
-            "A cube click also plants heat for five seconds, and it can be "
-            "selected while other meshes are up. Its colors sweep on that "
-            "clock, then hold. Keys 1-6 raise a tetrahedron, octahedron, "
-            "icosahedron, cylinder, cone, and torus. R spins until R again. "
-            "S smooths edges. G opens or closes glow. Esc clears, Backspace "
-            "or Delete removes, F5 turns the selection again. M cycles the math plot. "
-            "L reloads the CSV chart and the OBJ mesh. Home or numpad 1 "
-            "snaps the front view. Arrows move on the screen axes. Q and E "
-            "yaw, C and V pitch. Minus zooms out. Plus is numpad plus, "
-            "shift+4, or equals. X removes the selection. Tab switches "
-            "the flat plot workspace and the 3D workspace.",
+    .help = "One turn, then io_uring idle. Points stay off until numpad 9. "
+            "Empty clicks then place points, and F closes them into a face that stays. "
+            "R spins until R again. F5 turns the selection again. A click on a mesh "
+            "selects it. A cube click also plants heat for five seconds, and it can be "
+            "selected while other meshes are up. Its colors sweep on that clock, then hold. "
+            "Keys 1-6 raise a tetrahedron, octahedron, icosahedron, cylinder, cone, and torus. "
+            "S smooths edges. G opens or closes glow. Esc clears. Backspace, Delete, or X removes. "
+            "M cycles the math plot. L reloads the CSV chart and the OBJ mesh. "
+            "Numpad 8, 2, 4, 6, and 5 set top, bottom, left, right, and front. "
+            "Numpad 5 again sets the back. Home or numpad 1 restores the opening camera, "
+            "including zoom and position. Numpad 7 shows or hides the view ball. "
+            "The wheel and the touchpad zoom. Arrows move on the screen axes. Q and E "
+            "yaw, C and V pitch. Minus zooms out. Plus is numpad plus, shift+4, or equals. "
+            "Tab switches the flat plot workspace and the 3D workspace. "
+            "Hold T and click twice to place a text box, then type. Escape leaves it.",
     .init              = demo_init,
     .shutdown          = demo_shutdown,
     .load              = world_load,
@@ -298,6 +362,8 @@ static const EngineApp s_app = {
     .note_cqe          = hud_note_cqe,
     .turn_report       = hud_turn_report,
     .click             = demo_click,
+    .scroll            = demo_scroll,
+    .text              = demo_text,
     .key               = demo_key,
     .camera_active     = demo_camera_active,
     .route_key         = demo_route_key,

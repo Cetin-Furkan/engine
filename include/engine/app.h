@@ -124,6 +124,12 @@ typedef struct EngineApp {
     // Input, already translated by the engine (window-center pixels,
     // +X right, +Y up; Linux key codes). True when the picture changed.
     bool (*click)(float origin_x, float origin_y);
+    // Wheel or touchpad notches. Positive steps zoom in. Null ignores them.
+    // The engine does not name zoom; the hosted program decides.
+    bool (*scroll)(float steps);
+    // One UTF-8 string from a key tap or a repeat. Null ignores it.
+    // The engine does not name text; the hosted program decides.
+    bool (*text)(const char *utf8, uint32_t bytes);
     bool (*key)(uint32_t key, EngineKeyContext *ctx);
     bool (*camera_active)(void);
 

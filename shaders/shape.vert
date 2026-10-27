@@ -60,25 +60,21 @@ vec2 turned(vec2 p) {
     return vec2(pc.center_x + c * d.x - s * d.y, pc.center_y + s * d.x + c * d.y);
 }
 
+float screen_px() {
+    return pc.px / max(pc.zoom, 0.0001);
+}
+
 vec2 stroke_corner(vec2 a, vec2 b, int which) {
     vec2 d = b - a;
     float len = length(d);
     vec2 n = vec2(0.0);
     if (len > 0.001) {
-        n = vec2(-d.y, d.x) / len * pc.px;
+        n = vec2(-d.y, d.x) / len * screen_px();
     }
     if (which == 0) return a - n;
     if (which == 1) return b - n;
     if (which == 2) return b + n;
     return a + n;
-}
-
-vec2 mark_corner(vec2 p, int which) {
-    float h = pc.px;
-    if (which == 0) return p + vec2(-h, -h);
-    if (which == 1) return p + vec2(h, -h);
-    if (which == 2) return p + vec2(h, h);
-    return p + vec2(-h, h);
 }
 
 void main() {
@@ -93,20 +89,33 @@ void main() {
         } else {
             world = pts.p[id];
         }
-    } else {
+    } else if (pc.mode == 1u) {
         int which = k_quad[gl_VertexIndex];
-        if (pc.mode == 1u) {
-            uint i0 = gl_InstanceIndex;
-            uint i1 = pc.closed != 0u ? (i0 + 1u) % pc.count : i0 + 1u;
-            vec2 a = pts.p[i0];
-            vec2 b = pts.p[i1];
-            vec2 d = b - a;
-            if (pc.closed == 0u && dot(d, d) < 0.25) {
-                drop = true;
-            }
-            world = stroke_corner(a, b, which);
-        } else {
-            world = mark_corner(pts.p[gl_InstanceIndex], which);
+        uint i0 = gl_InstanceIndex;
+        uint i1 = pc.closed != 0u ? (i0 + 1u) % pc.count : i0 + 1u;
+        vec2 a = pts.p[i0];
+        vec2 b = pts.p[i1];
+        vec2 d = b - a;
+        if (pc.closed == 0u && dot(d, d) < 0.25) {
+            drop = true;
+        }
+        world = stroke_corner(a, b, which);
+    } else {
+        // Twelve-segment disc. The host draws 36 vertices per point.
+        uint seg = uint(gl_VertexIndex) / 3u;
+        uint corner = uint(gl_VertexIndex) % 3u;
+        float t0 = 6.28318530718 * float(seg) / 12.0;
+        float t1 = 6.28318530718 * float(seg + 1u) / 12.0;
+        float rad = screen_px();
+        vec2 c = pts.p[gl_InstanceIndex];
+        world = c;
+        if (corner == 1u) {
+            world = c + vec2(cos(t0), sin(t0)) * rad;
+        } else if (corner == 2u) {
+            world = c + vec2(cos(t1), sin(t1)) * rad;
+        }
+        if (pc.px <= 0.0) {
+            drop = true;
         }
     }
     world = turned(world);

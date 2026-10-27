@@ -41,7 +41,7 @@ static const uint32_t k_action_perm[ACT_COUNT] = {
     [ACT_SNAP_FRONT]    = PERM_CAM_SNAP,
     [ACT_CANCEL]        = PERM_OBJ_SELECT,
     [ACT_DELETE]        = PERM_OBJ_DELETE,
-    [ACT_CLOSE_FACE]    = PERM_OBJ_SPAWN,
+    [ACT_CLOSE_FACE]    = PERM_DRAW,
     [ACT_RESPIN]        = PERM_OBJ_SPIN,
     [ACT_TOGGLE_SPIN]   = PERM_OBJ_SPIN,
     [ACT_TOGGLE_SMOOTH] = PERM_OBJ_MATERIAL,
@@ -55,6 +55,15 @@ static const uint32_t k_action_perm[ACT_COUNT] = {
     [ACT_SPAWN_SOLID_5] = PERM_OBJ_SPAWN,
     [ACT_SPAWN_SOLID_6] = PERM_OBJ_SPAWN,
     [ACT_SWITCH_MODE]   = PERM_MODE_SWITCH,
+    [ACT_HOME]          = PERM_CAM_SNAP,
+    [ACT_VIEW_TOP]      = PERM_CAM_SNAP,
+    [ACT_VIEW_BOTTOM]   = PERM_CAM_SNAP,
+    [ACT_VIEW_LEFT]     = PERM_CAM_SNAP,
+    [ACT_VIEW_RIGHT]    = PERM_CAM_SNAP,
+    [ACT_VIEW_FRONT]    = PERM_CAM_SNAP,
+    // Select, not draw: the key has to be able to turn the tool back on.
+    [ACT_TOGGLE_DRAW]   = PERM_OBJ_SELECT,
+    [ACT_TOGGLE_GIMBAL] = PERM_CAM_SNAP,
 };
 
 static const KeyBind k_blender_binds[] = {
@@ -71,8 +80,8 @@ static const KeyBind k_blender_binds[] = {
     { .evdev_key = KEY_4,         .need_shift = KEY_SHIFT_DOWN, .action = ACT_ZOOM_IN },
     { .evdev_key = KEY_MINUS,     .need_shift = KEY_SHIFT_ANY,  .action = ACT_ZOOM_OUT },
     { .evdev_key = KEY_KPMINUS,   .need_shift = KEY_SHIFT_ANY,  .action = ACT_ZOOM_OUT },
-    { .evdev_key = KEY_HOME,      .need_shift = KEY_SHIFT_ANY,  .action = ACT_SNAP_FRONT },
-    { .evdev_key = KEY_KP1,       .need_shift = KEY_SHIFT_ANY,  .action = ACT_SNAP_FRONT },
+    { .evdev_key = KEY_HOME,      .need_shift = KEY_SHIFT_ANY,  .action = ACT_HOME },
+    { .evdev_key = KEY_KP1,       .need_shift = KEY_SHIFT_ANY,  .action = ACT_HOME },
     { .evdev_key = KEY_ESC,       .need_shift = KEY_SHIFT_ANY,  .action = ACT_CANCEL },
     { .evdev_key = KEY_BACKSPACE, .need_shift = KEY_SHIFT_ANY,  .action = ACT_DELETE },
     { .evdev_key = KEY_DELETE,    .need_shift = KEY_SHIFT_ANY,  .action = ACT_DELETE },
@@ -91,6 +100,13 @@ static const KeyBind k_blender_binds[] = {
     { .evdev_key = KEY_4,         .need_shift = KEY_SHIFT_UP,   .action = ACT_SPAWN_SOLID_4 },
     { .evdev_key = KEY_5,         .need_shift = KEY_SHIFT_ANY,  .action = ACT_SPAWN_SOLID_5 },
     { .evdev_key = KEY_6,         .need_shift = KEY_SHIFT_ANY,  .action = ACT_SPAWN_SOLID_6 },
+    { .evdev_key = KEY_KP8,       .need_shift = KEY_SHIFT_ANY,  .action = ACT_VIEW_TOP },
+    { .evdev_key = KEY_KP2,       .need_shift = KEY_SHIFT_ANY,  .action = ACT_VIEW_BOTTOM },
+    { .evdev_key = KEY_KP4,       .need_shift = KEY_SHIFT_ANY,  .action = ACT_VIEW_LEFT },
+    { .evdev_key = KEY_KP6,       .need_shift = KEY_SHIFT_ANY,  .action = ACT_VIEW_RIGHT },
+    { .evdev_key = KEY_KP5,       .need_shift = KEY_SHIFT_ANY,  .action = ACT_VIEW_FRONT },
+    { .evdev_key = KEY_KP9,       .need_shift = KEY_SHIFT_ANY,  .action = ACT_TOGGLE_DRAW },
+    { .evdev_key = KEY_KP7,       .need_shift = KEY_SHIFT_ANY,  .action = ACT_TOGGLE_GIMBAL },
 };
 
 static const KeyBind k_plot_binds[] = {
@@ -103,14 +119,14 @@ static const KeyBind k_plot_binds[] = {
     { .evdev_key = KEY_4,       .need_shift = KEY_SHIFT_DOWN, .action = ACT_ZOOM_IN },
     { .evdev_key = KEY_MINUS,   .need_shift = KEY_SHIFT_ANY,  .action = ACT_ZOOM_OUT },
     { .evdev_key = KEY_KPMINUS, .need_shift = KEY_SHIFT_ANY,  .action = ACT_ZOOM_OUT },
-    { .evdev_key = KEY_HOME,    .need_shift = KEY_SHIFT_ANY,  .action = ACT_SNAP_FRONT },
-    { .evdev_key = KEY_KP1,     .need_shift = KEY_SHIFT_ANY,  .action = ACT_SNAP_FRONT },
+    { .evdev_key = KEY_HOME,    .need_shift = KEY_SHIFT_ANY,  .action = ACT_HOME },
+    { .evdev_key = KEY_KP1,     .need_shift = KEY_SHIFT_ANY,  .action = ACT_HOME },
     { .evdev_key = KEY_M,       .need_shift = KEY_SHIFT_ANY,  .action = ACT_PLOT_CYCLE },
     { .evdev_key = KEY_L,       .need_shift = KEY_SHIFT_ANY,  .action = ACT_DATA_RELOAD },
     { .evdev_key = KEY_TAB,     .need_shift = KEY_SHIFT_ANY,  .action = ACT_SWITCH_MODE },
 };
 
-static_assert(sizeof k_blender_binds / sizeof k_blender_binds[0] == 33,
+static_assert(sizeof k_blender_binds / sizeof k_blender_binds[0] == 40,
               "3D workspace bind count");
 static_assert(sizeof k_plot_binds / sizeof k_plot_binds[0] == 14,
               "plot workspace bind count");

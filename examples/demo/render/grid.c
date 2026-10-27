@@ -1,38 +1,41 @@
 #include "frame/grid.h"
-#include "frame/cube.h"
 #include "vulkan/bda.h"
 #include "vulkan/memory.h"
+#include <stddef.h>
 #include <stdio.h>
 
 alignas(uint32_t) static const unsigned char k_grid_spv[] = {
 #embed "grid.comp.spv"
 };
 
+// k_tile matches local_size 8, 8, 1 in shaders/grid.comp. The cube picture
+// stays 128. A later caller can pass 32 or 64 through the same shader.
 enum : uint32_t {
-    k_n        = 128u,
-    k_cells    = k_n * k_n * k_n,
-    k_local    = 64u,
-    k_field_bytes = k_cells * (uint32_t)sizeof(float),
-    k_arena_bytes = k_field_bytes * 2u + (64u * 1024u),
+    k_n           = 128u,
+    k_tile        = 8u,
+    k_cells       = k_n * k_n * k_n,
+    k_cell_bytes  = 2u,
+    k_field_bytes = k_cells * k_cell_bytes,
+    k_arena_bytes = k_field_bytes * 2u,
 };
 
 typedef struct GridPush {
     uint64_t src;
     uint64_t dst;
-    uint64_t tint;
-    uint64_t verts;
     uint32_t dt_ms;
     uint32_t seed;
-    uint32_t mode;
-    uint32_t nverts;
+    uint32_t n;
+    uint32_t pad;
 } GridPush;
 
-static_assert(sizeof(GridPush) == 48u, "grid push");
+static_assert(sizeof(GridPush) == 32u, "grid push");
+static_assert(offsetof(GridPush, n) == 24u, "grid n");
+static_assert(k_n % k_tile == 0u, "lattice edge divides the tile");
+static_assert(k_field_bytes % 256u == 0u, "field alignment");
 static_assert(sizeof k_grid_spv % 4u == 0u, "grid spirv");
 
 static BdaArena         s_arena;
 static VkDeviceAddress  s_field[2];
-static VkDeviceAddress  s_tint;
 static int              s_read = 0;
 static bool             s_step_open = false;
 static bool             s_held = false;
@@ -60,22 +63,19 @@ static void barrier_field(VkCommandBuffer cmd) {
     vkCmdPipelineBarrier2(cmd, &dep);
 }
 
-static void dispatch_grid(VkCommandBuffer cmd, uint32_t mode, uint32_t dt_ms, uint32_t seed,
+static void dispatch_grid(VkCommandBuffer cmd, uint32_t dt_ms, uint32_t seed,
                           VkDeviceAddress src, VkDeviceAddress dst) {
     GridPush push = {
-        .src    = src,
-        .dst    = dst,
-        .tint   = s_tint,
-        .verts  = cube_mesh_addr(),
-        .dt_ms  = dt_ms,
-        .seed   = seed,
-        .mode   = mode,
-        .nverts = cube_vertex_count(),
+        .src   = src,
+        .dst   = dst,
+        .dt_ms = dt_ms,
+        .seed  = seed,
+        .n     = k_n,
+        .pad   = 0u,
     };
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_pipe);
     vulkan_cmd_push(cmd, s_layout, VK_SHADER_STAGE_COMPUTE_BIT, sizeof push, &push);
-    uint32_t n = mode == 0u ? k_cells : cube_vertex_count();
-    vkCmdDispatch(cmd, (n + k_local - 1u) / k_local, 1u, 1u);
+    vkCmdDispatch(cmd, k_n / k_tile, k_n / k_tile, k_n);
 }
 
 static int submit_idle(VulkanContext *vk, VkCommandBuffer cmd) {
@@ -120,7 +120,6 @@ void grid_shutdown(VulkanContext *vk) {
     s_layout = VK_NULL_HANDLE;
     s_field[0] = 0;
     s_field[1] = 0;
-    s_tint = 0;
     s_read = 0;
     s_step_open = false;
     s_held = false;
@@ -135,23 +134,17 @@ int grid_init(VulkanContext *vk) {
     if (s_pipe != VK_NULL_HANDLE) {
         grid_shutdown(vk);
     }
-    if (cube_mesh_addr() == 0 || cube_vertex_count() == 0u) {
-        fprintf(stderr, "[Grid Error] The cube mesh is not ready\n");
-        return -1;
-    }
     if (bda_arena_init(vk, &s_arena, k_arena_bytes) != 0) {
         return -1;
     }
     BdaSlice a = bda_arena_alloc(&s_arena, k_field_bytes, 256u);
     BdaSlice b = bda_arena_alloc(&s_arena, k_field_bytes, 256u);
-    BdaSlice tint = bda_arena_alloc(&s_arena, cube_vertex_count() * (uint32_t)sizeof(float), 256u);
-    if (a.gpu == 0 || b.gpu == 0 || tint.gpu == 0) {
+    if (a.gpu == 0 || b.gpu == 0) {
         grid_shutdown(vk);
         return -1;
     }
     s_field[0] = a.gpu;
     s_field[1] = b.gpu;
-    s_tint = tint.gpu;
 
     VkPushConstantRange range = {
         .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
@@ -224,9 +217,7 @@ int grid_init(VulkanContext *vk) {
         grid_shutdown(vk);
         return -1;
     }
-    dispatch_grid(cmd, 0u, 0u, 1u, 0, s_field[0]);
-    barrier_field(cmd);
-    dispatch_grid(cmd, 1u, 0u, 0u, 0, s_field[0]);
+    dispatch_grid(cmd, 0u, 1u, 0, s_field[0]);
     barrier_field(cmd);
     if (submit_idle(vk, cmd) != 0) {
         vkFreeCommandBuffers(vk->device, vk->cmd_pool, 1, &cmd);
@@ -238,7 +229,7 @@ int grid_init(VulkanContext *vk) {
     s_step_open = false;
     s_held = false;
     s_hold_logged = false;
-    printf("[Grid] 128^3 diffusion, center ball, one sample per cube vertex.\n");
+    printf("[Grid] 128^3 fp16 lattice, center ball. The vertex shader samples it.\n");
     fflush(stdout);
     return 0;
 }
@@ -249,9 +240,7 @@ void grid_record(VkCommandBuffer cmd, uint32_t dt_ms) {
         return;
     }
     int dst = s_read ^ 1;
-    dispatch_grid(cmd, 0u, dt_ms, 0u, s_field[s_read], s_field[dst]);
-    barrier_field(cmd);
-    dispatch_grid(cmd, 1u, dt_ms, 0u, 0, s_field[dst]);
+    dispatch_grid(cmd, dt_ms, 0u, s_field[s_read], s_field[dst]);
     barrier_field(cmd);
     s_step_open = true;
 }
@@ -274,7 +263,7 @@ void grid_hold(void) {
     }
     s_held = true;
     s_step_open = false;
-    if (s_hold_logged || s_tint == 0) {
+    if (s_hold_logged || s_field[0] == 0) {
         return;
     }
     s_hold_logged = true;
@@ -286,6 +275,14 @@ void grid_wake(void) {
     s_held = false;
 }
 
-uint64_t grid_tint_addr(void) {
-    return s_tint;
+uint32_t grid_n(void) {
+    return s_field[0] == 0 ? 0u : k_n;
+}
+
+uint64_t grid_field_addr(void) {
+    if (s_field[0] == 0 || s_field[1] == 0) {
+        return 0;
+    }
+    int copy = s_step_open ? (s_read ^ 1) : s_read;
+    return s_field[copy];
 }

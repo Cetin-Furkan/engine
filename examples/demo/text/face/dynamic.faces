@@ -1,0 +1,8 @@
+# Face paths the program may retarget. The sealed face is the embedded
+# Inter file and is refused here, so a replaced line cannot change it.
+# pattern asks fontconfig. file is a path from the working directory.
+
+system pattern sans
+terminal pattern monospace
+known-sans file examples/demo/text/face/bundled/InterVariable.ttf
+known-mono file examples/demo/text/face/bundled/JetBrainsMono-Regular.ttf

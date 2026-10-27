@@ -98,6 +98,17 @@ $(OBJ_DIR)/examples/demo/render/gimbal.o: $(GEN_DIR)/gimbal.vert.spv $(GEN_DIR)/
 $(OBJ_DIR)/examples/demo/render/mesh.o: $(GEN_DIR)/mesh.vert.spv $(GEN_DIR)/mesh.frag.spv
 $(OBJ_DIR)/examples/demo/render/hud.o: $(GEN_DIR)/hud.vert.spv $(GEN_DIR)/hud.frag.spv
 $(OBJ_DIR)/examples/demo/render/grid.o: $(GEN_DIR)/grid.comp.spv
+
+$(GEN_DIR)/text.vert.spv: examples/demo/text/draw/text.vert
+	@mkdir -p $(dir $@)
+	$(GLSLANG) -V --target-env vulkan1.4 -Ishaders --depfile "$(GEN_DIR)/text.vert.d" -o "$@" "$<"
+
+$(GEN_DIR)/text.frag.spv: examples/demo/text/draw/text.frag
+	@mkdir -p $(dir $@)
+	$(GLSLANG) -V --target-env vulkan1.4 -Ishaders --depfile "$(GEN_DIR)/text.frag.d" -o "$@" "$<"
+
+$(OBJ_DIR)/examples/demo/text/draw/draw.o: $(GEN_DIR)/text.vert.spv $(GEN_DIR)/text.frag.spv
+$(OBJ_DIR)/examples/demo/text/face/face.o: examples/demo/text/face/bundled/InterVariable.ttf
 $(OBJ_DIR)/src/chrome/gpu.o: $(GEN_DIR)/chrome.vert.spv $(GEN_DIR)/chrome.frag.spv
 
 # Compiler & Preprocessor Flags
@@ -116,6 +127,14 @@ ifneq ($(VULKAN_LIB),)
     LDFLAGS += -lvulkan
 endif
 LDFLAGS += -lm
+
+# Text uses FreeType SDF, HarfBuzz, fontconfig, and libxkbcommon. The test
+# target links the libraries itself; these flags are for the engine binary.
+TEXT_PKGS   := freetype2 harfbuzz fontconfig xkbcommon
+TEXT_CFLAGS := $(shell pkg-config --cflags $(TEXT_PKGS))
+TEXT_LIBS   := $(shell pkg-config --libs $(TEXT_PKGS))
+CFLAGS      += $(TEXT_CFLAGS)
+LDFLAGS     += $(TEXT_LIBS)
 
 SRCS := main.c $(shell find src examples/demo -name '*.c')
 OBJS := $(SRCS:%.c=$(OBJ_DIR)/%.o)
@@ -227,5 +246,8 @@ test: $(CONFIG_MK)
 	./build/test_world
 	$(CC) $(CFLAGS) -o build/test_policy tests/test_policy.c examples/demo/world/policy.c
 	./build/test_policy
+	$(CC) $(CFLAGS) -o build/test_text tests/test_text.c \
+		examples/demo/text/face/face.c examples/demo/text/shape/shape.c $(TEXT_LIBS) -lm
+	./build/test_text
 
 .PHONY: all debug release run run-release release-patch release-minor release-major info help clean clear recheck distclean test

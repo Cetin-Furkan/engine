@@ -7,9 +7,10 @@
 // The metric grid is the ground and is on with an empty placement list.
 // examples/demo/world/opening.world names extra objects. Each placed thing
 // is one object with a coordinate and a function table. The closest hit
-// on the click ray wins. Empty ground collects corners.
-// F closes that chain into one face, in click order, and the face turns
-// once in its plane. Keys 1-6 raise a tetrahedron, octahedron, icosahedron,
+// on the click ray wins. Empty ground collects corners while the draw
+// permission is on. It is off at boot. Numpad 9 grants and revokes it.
+// F closes that chain into one face, in click order, and the face stays.
+// R or F5 turns it. Keys 1-6 raise a tetrahedron, octahedron, icosahedron,
 // cylinder, cone, and torus. The OBJ is placed when the file names mesh.
 // It turns once, and L reads it again. R keeps the selection spinning until
 // R again. With nothing selected, R spins the first placed cube. S smooths

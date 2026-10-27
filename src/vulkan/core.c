@@ -82,7 +82,7 @@ VulkanResult vulkan_context_init(VulkanContext *ctx) {
                 "[Vulkan Warn] Two roles share one VkQueue. Concurrent submits on those roles must be externally synchronized.\n");
     }
 
-    printf("[Vulkan] Capabilities: DMA-BUF=%s, DRM-Modifiers=%s, ForeignQueue=%s, Syncobj=%s, BDA=%s, ScalarLayout=%s, Anisotropy=%s, DynRender=%s, LocalRead=%s, Sync2=%s, Timeline=%s, Maint5=%s, Maint6=%s, PushDesc=%s, HostImageCopy=%s, Int16=%s, Int64=%s, Storage16=%s\n",
+    printf("[Vulkan] Capabilities: DMA-BUF=%s, DRM-Modifiers=%s, ForeignQueue=%s, Syncobj=%s, BDA=%s, ScalarLayout=%s, Anisotropy=%s, DynRender=%s, LocalRead=%s, Sync2=%s, Timeline=%s, Maint5=%s, Maint6=%s, PushDesc=%s, HostImageCopy=%s, Int16=%s, Int64=%s, Storage16=%s, Float16=%s\n",
            ctx->device_info.supports_dma_buf ? "yes" : "no",
            ctx->device_info.supports_drm_format_modifiers ? "yes" : "no",
            ctx->device_info.supports_queue_family_foreign ? "yes" : "no",
@@ -100,7 +100,8 @@ VulkanResult vulkan_context_init(VulkanContext *ctx) {
            ctx->device_info.supports_host_image_copy ? "yes" : "no",
            ctx->device_info.supports_shader_int16 ? "yes" : "no",
            ctx->device_info.supports_shader_int64 ? "yes" : "no",
-           ctx->device_info.supports_storage_buffer_16bit ? "yes" : "no");
+           ctx->device_info.supports_storage_buffer_16bit ? "yes" : "no",
+           ctx->device_info.supports_shader_float16 ? "yes" : "no");
 
     if (ctx->device_info.has_drm_render_node || ctx->device_info.has_drm_primary_node) {
         printf("[Vulkan] DRM Device Nodes: Primary=%s (%lld:%lld), Render=%s (%lld:%lld)\n",

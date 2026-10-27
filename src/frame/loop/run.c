@@ -157,6 +157,18 @@ int frame_run(void) {
             if (stop_run) {
                 break;
             }
+            pointer_pump_text();
+            char utf8[16];
+            uint32_t utf8_n = 0;
+            while (pointer_take_text(utf8, sizeof utf8, &utf8_n)) {
+                if (engine_app()->text != nullptr) {
+                    (void)engine_app()->text(utf8, utf8_n);
+                }
+            }
+            float steps = 0.0f;
+            if (pointer_take_scroll(&steps) && engine_app()->scroll != nullptr) {
+                (void)engine_app()->scroll(steps);
+            }
         }
 
         if (s_inotify_fd >= 0 && s_inotify_wd < 0) {

@@ -34,6 +34,9 @@ enum : uint32_t {
     PERM_PLOT_CYCLE   = 1u << 12,
     PERM_DATA_RELOAD  = 1u << 13,
     PERM_MODE_SWITCH  = 1u << 14,
+    // Empty-ground clicks. Off in both compiled profiles, so a boot
+    // places no corners. Numpad 9 grants and revokes it on the live copy.
+    PERM_DRAW         = 1u << 15,
 };
 
 // Held actions stay a contiguous range so a route can tell a hold
@@ -68,6 +71,14 @@ typedef enum EngineAction : uint8_t {
     ACT_SPAWN_SOLID_5,
     ACT_SPAWN_SOLID_6,
     ACT_SWITCH_MODE,
+    ACT_HOME,
+    ACT_VIEW_TOP,
+    ACT_VIEW_BOTTOM,
+    ACT_VIEW_LEFT,
+    ACT_VIEW_RIGHT,
+    ACT_VIEW_FRONT,
+    ACT_TOGGLE_DRAW,
+    ACT_TOGGLE_GIMBAL,
     ACT_COUNT
 } EngineAction;
 

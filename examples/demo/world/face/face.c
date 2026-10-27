@@ -9,8 +9,8 @@ static_assert((uint32_t)32 == (uint32_t)k_mat_faces, "one material slot per face
 
 enum : uint32_t { k_face_cap = 32u };
 
-static const float k_stroke_px = 3.5f;
-static const float k_mark_px   = 5.0f;
+static const float k_stroke_px = 1.25f;
+static const float k_mark_px   = 3.25f;
 static const float k_deg       = 0.01745329251f;
 
 typedef struct FaceData {
@@ -161,7 +161,7 @@ static void face_draw(const WorldObj *o, VkCommandBuffer cmd, uint32_t width, ui
                        face->center.x, face->center.y, ang,
                        fill_bias, fill_bias + 0.0015f, fill_bias + 0.003f,
                        0.96f, 0.71f, 0.28f, rr, gg, bb,
-                       k_stroke_px, k_mark_px, face->mat);
+                       k_stroke_px, 0.0f, face->mat);
 }
 
 static bool face_advance(WorldObj *o, uint32_t time_ms) {
@@ -317,7 +317,7 @@ bool face_close(void) {
     face->n = s_build_n;
     face->tri_n = tri_n;
     face->center = (Coord){ cx, cy, s_build[0].z };
-    face->spin = spin_start(0);
+    face->spin = (Spin){0};
     face->mat = k_mat_face0 + (uint32_t)slot;
     s_serial++;
     face->serial = s_serial;
@@ -343,8 +343,7 @@ bool face_close(void) {
     if (used_count() < k_face_cap) {
         s_logged_full = false;
     }
-    table_mark_spun();
-    printf("[Engine] Face %u closed at %+.0f,%+.0f. One revolution, then it holds.\n",
+    printf("[Engine] Face %u closed at %+.0f,%+.0f. It stays.\n",
            face->serial, (double)cx, (double)cy);
     fflush(stdout);
     return true;

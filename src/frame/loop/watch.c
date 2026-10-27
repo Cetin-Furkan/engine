@@ -122,7 +122,7 @@ void start_inotify(RingContext *ring, bool *armed) {
     }
 }
 
-void forward_reload_cqe(const struct io_uring_cqe *cqe, void *user) {
+void engine_reload_cqe(const struct io_uring_cqe *cqe, void *user) {
     (void)user;
     WaylandContext *wl = wayland_get_context();
     if (s_relay == nullptr) {
@@ -159,8 +159,8 @@ void forward_reload_cqe(const struct io_uring_cqe *cqe, void *user) {
     }
 }
 
-void begin_file_relay(RunRelay *relay, bool *signal_armed, bool *got_signal,
-                             int *signo, bool *inotify_armed) {
+void engine_relay_begin(EngineRelay *relay, bool *signal_armed, bool *got_signal,
+                               int *signo, bool *inotify_armed) {
     *relay = (RunRelay){
         .signal_armed  = signal_armed,
         .got_signal    = got_signal,
@@ -173,7 +173,7 @@ void begin_file_relay(RunRelay *relay, bool *signal_armed, bool *got_signal,
 // True when the idle loop must leave. A stolen send that failed, a signal,
 // or a failed Wayland socket sets why. The two file reads share this so the
 // send completion cannot be finished in one path and dropped in the other.
-bool end_file_relay(RunRelay *relay, WaylandContext *wl, VulkanContext *vk,
+bool engine_relay_end(EngineRelay *relay, WaylandContext *wl, VulkanContext *vk,
                            uint32_t pending_serial, bool *send_in_flight, bool *resend_wire,
                            int *run_rc, const char **why) {
     s_relay = nullptr;
@@ -199,4 +199,20 @@ bool end_file_relay(RunRelay *relay, WaylandContext *wl, VulkanContext *vk,
         return true;
     }
     return false;
+}
+
+void forward_reload_cqe(const struct io_uring_cqe *cqe, void *user) {
+    engine_reload_cqe(cqe, user);
+}
+
+void begin_file_relay(RunRelay *relay, bool *signal_armed, bool *got_signal,
+                             int *signo, bool *inotify_armed) {
+    engine_relay_begin(relay, signal_armed, got_signal, signo, inotify_armed);
+}
+
+bool end_file_relay(RunRelay *relay, WaylandContext *wl, VulkanContext *vk,
+                           uint32_t pending_serial, bool *send_in_flight, bool *resend_wire,
+                           int *run_rc, const char **why) {
+    return engine_relay_end(relay, wl, vk, pending_serial, send_in_flight,
+                            resend_wire, run_rc, why);
 }

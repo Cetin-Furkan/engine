@@ -33,6 +33,7 @@ enum : uint64_t {
     ENG_UD_INOTIFY     = 13,
     ENG_UD_FILE_FENCE  = 14,
     ENG_UD_FILE_CANCEL = 15,
+    ENG_UD_FRAME_TIMER = 16,
 };
 
 typedef struct RingContext {
@@ -79,6 +80,11 @@ typedef struct RingContext {
     int                       enter_fd;
     uint32_t                  pbuf_used[ENG_PBUF_ENTRIES];
     bool                      wait_reg_on;
+    bool                      min_timeout_on;
+    uint32_t                  cq_overflow_total;
+    uint32_t                  sq_dropped_total;
+    bool                      overflow_warned;
+    struct __kernel_timespec  timeout_ts;
     bool                      is_initialized;
 } RingContext;
 
@@ -91,6 +97,9 @@ void ring_context_shutdown(RingContext *r);
 [[nodiscard]] int ring_update_file(RingContext *r, uint32_t slot, int fd);
 [[nodiscard]] int ring_arm_poll(RingContext *r, int fd, uint32_t poll_mask, uint64_t user_data);
 [[nodiscard]] int ring_arm_poll_fixed(RingContext *r, uint32_t slot, uint32_t poll_mask, uint64_t user_data);
+// One absolute CLOCK_MONOTONIC timeout (registered clock). Used as the
+// frame-loop watchdog: it completes even when the compositor goes quiet.
+[[nodiscard]] int ring_arm_timeout_abs(RingContext *r, uint64_t deadline_ns, uint64_t user_data);
 unsigned ring_submit(RingContext *r);
 [[nodiscard]] int ring_enter(RingContext *r, unsigned submit, unsigned min_complete, int timeout_ms);
 [[nodiscard]] bool ring_peek(RingContext *r, struct io_uring_cqe *out);

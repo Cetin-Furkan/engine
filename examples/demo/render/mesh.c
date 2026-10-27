@@ -57,7 +57,6 @@ static VkDeviceMemory   s_memory = VK_NULL_HANDLE;
 static VkDeviceAddress  s_addr = 0;
 static VkQueue          s_queue = VK_NULL_HANDLE;
 static ObjCorner       *s_map = nullptr;
-static bool             s_push2 = false;
 static bool             s_drawn = false;
 static bool             s_logged = false;
 static uint32_t         s_count = 0;
@@ -357,7 +356,6 @@ int mesh_init(VulkanContext *vk, RingCqeFn on_cqe, void *on_user) {
                 props.limits.maxPushConstantsSize, sizeof(MeshPush));
         return -1;
     }
-    s_push2 = vk->device_info.supports_maintenance6;
     s_queue = vk->queues.graphics_queue;
     if (create_buffer(vk) != 0) {
         mesh_shutdown(vk);
@@ -565,20 +563,7 @@ void mesh_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height,
     vkCmdSetViewport(cmd, 0, 1, &viewport);
     vkCmdSetScissor(cmd, 0, 1, &scissor);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_pipeline);
-    if (s_push2) {
-        VkPushConstantsInfo push = {
-            .sType      = VK_STRUCTURE_TYPE_PUSH_CONSTANTS_INFO,
-            .layout     = s_layout,
-            .stageFlags = VK_SHADER_STAGE_VERTEX_BIT,
-            .offset     = 0,
-            .size       = sizeof draw_push,
-            .pValues    = &draw_push,
-        };
-        vkCmdPushConstants2(cmd, &push);
-    } else {
-        vkCmdPushConstants(cmd, s_layout, VK_SHADER_STAGE_VERTEX_BIT, 0,
-                           sizeof draw_push, &draw_push);
-    }
+    vulkan_cmd_push(cmd, s_layout, VK_SHADER_STAGE_VERTEX_BIT, sizeof draw_push, &draw_push);
     vkCmdDraw(cmd, s_count, 1, 0, 0);
     s_drawn = true;
 }

@@ -18,6 +18,10 @@ static float s_vy[k_obj_verts];
 static float s_vz[k_obj_verts];
 
 static bool resolve_plot(const char *name, char *out, size_t cap) {
+    int demo = snprintf(out, cap, "examples/demo/plots/%s", name);
+    if (demo > 0 && (size_t)demo < cap && access(out, R_OK) == 0) {
+        return true;
+    }
     int cwd = snprintf(out, cap, "plots/%s", name);
     if (cwd > 0 && (size_t)cwd < cap && access(out, R_OK) == 0) {
         return true;

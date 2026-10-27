@@ -10,9 +10,10 @@ A modern C23 Vulkan & Wayland engine with self-configuring build system, mode se
 │   └── release/          # Release build (obj, deps, bin)
 ├── .dependencies/        # Persistent system requirements cache
 ├── doc/                  # Documentation & engineer notes
-├── include/              # Public engine headers
+├── include/              # Public engine headers (engine/app.h is the app seam)
+├── examples/demo/        # Hosted demo program (world, renderers, data)
 ├── scripts/              # Environment verification & version scripts
-├── src/                  # Subsystem source implementations
+├── src/                  # Engine subsystem implementations (no demo code)
 ├── .gitignore            # Git ignore specification
 ├── Makefile              # Self-configuring build script
 ├── main.c                # Engine entry point

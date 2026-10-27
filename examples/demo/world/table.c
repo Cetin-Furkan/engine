@@ -3,13 +3,29 @@
 
 static WorldObj s_obj[k_table_cap];
 static int      s_n = 0;
+static uint32_t s_next_generation = 1;
 static int      s_selected = -1;
+static uint32_t s_selected_generation = 0;
 static int      s_shown_selected = -1;
 static bool     s_spun = false;
 
 void table_reset(void) {
+    // Poison every entry: ops nulled and generation bumped, so any
+    // WorldObj* or index held across the reset fails validation instead
+    // of silently naming whatever is placed next.
+    for (int i = 0; i < k_table_cap; ++i) {
+        s_obj[i].ops = nullptr;
+        s_obj[i].data = nullptr;
+        s_obj[i].alive = false;
+        s_obj[i].shown_alive = false;
+        s_obj[i].generation = s_next_generation++;
+        if (s_next_generation == 0) {
+            s_next_generation = 1;
+        }
+    }
     s_n = 0;
     s_selected = -1;
+    s_selected_generation = 0;
     s_shown_selected = -1;
     s_spun = false;
 }
@@ -20,12 +36,16 @@ int table_add(const WorldOps *ops, void *data, Coord at, Spin *spin) {
     }
     int index = s_n++;
     s_obj[index] = (WorldObj){
-        .ops   = ops,
-        .data  = data,
-        .at    = at,
-        .alive = true,
-        .spin  = spin,
+        .ops        = ops,
+        .data       = data,
+        .at         = at,
+        .generation = s_next_generation++,
+        .alive      = true,
+        .spin       = spin,
     };
+    if (s_next_generation == 0) {
+        s_next_generation = 1;
+    }
     return index;
 }
 
@@ -66,7 +86,15 @@ WorldObj *table_find(const WorldOps *ops) {
 }
 
 WorldObj *table_selected(void) {
-    return table_at(s_selected);
+    WorldObj *o = table_at(s_selected);
+    if (o == nullptr || o->generation != s_selected_generation || !o->alive) {
+        // Stale or poisoned selection: drop it rather than acting on an
+        // entry that was reset/reused under the same index.
+        s_selected = -1;
+        s_selected_generation = 0;
+        return nullptr;
+    }
+    return o;
 }
 
 static const char *obj_name(const WorldObj *o) {
@@ -87,6 +115,7 @@ bool table_select(int index) {
     bool changed = s_selected != index;
     if (changed) {
         s_selected = index;
+        s_selected_generation = o->generation;
         printf("[Engine] %s selected.\n", obj_name(o));
         fflush(stdout);
     }
@@ -94,14 +123,17 @@ bool table_select(int index) {
 }
 
 void table_select_quiet(int index) {
-    if (table_at(index) == nullptr) {
+    WorldObj *o = table_at(index);
+    if (o == nullptr) {
         return;
     }
     s_selected = index;
+    s_selected_generation = o->generation;
 }
 
 void table_clear_selection(void) {
     s_selected = -1;
+    s_selected_generation = 0;
 }
 
 bool table_highlight(const WorldObj *o, bool live) {

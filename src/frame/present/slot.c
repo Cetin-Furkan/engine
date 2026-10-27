@@ -52,8 +52,8 @@ int ensure_frame_targets(VulkanContext *vk, FrameSlot *frame) {
     }
     frame->view_format = view_info.format;
     if (view_info.format == VK_FORMAT_B8G8R8A8_SRGB &&
-        (cube_depth_create(vk, &frame->depth, frame->image.width, frame->image.height) != 0 ||
-         cube_coverage_create(vk, &frame->coverage, frame->image.width, frame->image.height) != 0)) {
+        engine_app()->create_targets(vk, &frame->targets,
+                                     frame->image.width, frame->image.height) != 0) {
         return -1;
     }
     return 0;
@@ -76,8 +76,7 @@ static void destroy_frame_gpu(VulkanContext *vk, FrameSlot *frame) {
         if (frame->image_view != VK_NULL_HANDLE) {
             vkDestroyImageView(vk->device, frame->image_view, nullptr);
         }
-        cube_depth_destroy(vk, &frame->depth);
-        cube_coverage_destroy(vk, &frame->coverage);
+        engine_app()->destroy_targets(vk, &frame->targets);
         vulkan_destroy_exportable_image(vk, &frame->image);
     } else if (frame->image.dmabuf_fd >= 0) {
         close(frame->image.dmabuf_fd);
@@ -149,8 +148,7 @@ void clear_pixels(FrameSlot *frame) {
     frame->image         = (VulkanExportableImage){ .dmabuf_fd = -1 };
     frame->image_view    = VK_NULL_HANDLE;
     frame->view_format   = VK_FORMAT_UNDEFINED;
-    frame->depth         = (CubeDepth){0};
-    frame->coverage      = (CubeCoverage){0};
+    frame->targets       = (EngineTargets){0};
     frame->cmd_buf       = VK_NULL_HANDLE;
     frame->acquire_point = 0;
     frame->wl_buffer_id  = 0;
@@ -163,8 +161,8 @@ static bool slot_has_pixels(const FrameSlot *frame) {
             frame->image_view != VK_NULL_HANDLE ||
             frame->cmd_buf != VK_NULL_HANDLE ||
             frame->wl_buffer_id != 0 ||
-            frame->depth.image != VK_NULL_HANDLE ||
-            frame->coverage.image != VK_NULL_HANDLE ||
+            frame->targets.depth_image != VK_NULL_HANDLE ||
+            frame->targets.coverage_image != VK_NULL_HANDLE ||
             frame->image.dmabuf_fd >= 0);
 }
 
@@ -245,7 +243,13 @@ void reap_frame_resources(WaylandContext *wl, VulkanContext *vk, FrameSlot *fram
 void sweep_ready_orphans(WaylandContext *wl, VulkanContext *vk, bool force_all) {
     uint32_t write_idx = 0;
     for (uint32_t i = 0; i < s_orphan_count; ++i) {
-        FrameSlot *orb = &s_orphans[i];
+        // Resolve through the generation-tagged handle: if this orphan
+        // was replaced since the sweep started, the ref is stale and
+        // the entry must not be reaped under its new image.
+        FrameSlot *orb = slot_from_ref(slot_ref(&s_orphans[i]));
+        if (orb == nullptr) {
+            continue;
+        }
         bool ready = poll_release_semaphore(vk, orb->release_semaphore, orb->release_point);
         if (!ready && force_all) {
             (void)wait_own_release(vk, orb, 3000000000ull);
@@ -436,10 +440,33 @@ int retire_pixels(WaylandContext *wl, VulkanContext *vk, FrameSlot *frame) {
 }
 
 void blank_frame(FrameSlot *frame) {
+    uint32_t generation = slot_next_generation(frame->generation);
     *frame = (FrameSlot){
         .image           = { .dmabuf_fd = -1 },
+        .generation      = generation,
         .release_eventfd = -1,
     };
+}
+
+SlotRef slot_ref(const FrameSlot *slot) {
+    if (slot == nullptr || slot->generation == 0) {
+        return 0;
+    }
+    for (int i = 0; i < 2; ++i) {
+        if (&s_slot[i] == slot) {
+            return slot_ref_pack(slot->generation, (uint32_t)(i + 1));
+        }
+    }
+    for (uint32_t i = 0; i < s_orphan_count; ++i) {
+        if (&s_orphans[i] == slot) {
+            return slot_ref_pack(slot->generation, i + 3u);
+        }
+    }
+    return 0;
+}
+
+FrameSlot *slot_from_ref(SlotRef ref) {
+    return slot_resolve(ref, s_slot, s_orphans, s_orphan_count);
 }
 
 void retire_spare(WaylandContext *wl, VulkanContext *vk) {

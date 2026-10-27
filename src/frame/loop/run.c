@@ -47,8 +47,9 @@ int frame_run(void) {
         return 1;
     }
 
-    printf("[Engine] Window %ux%u is up. One turn, then io_uring idle. Clicks on empty space place points. F closes those points into a face. A click on a mesh selects it. The cube click also plants heat for five seconds, and it can be selected while other meshes are up. Its colors sweep on that clock, then hold. Keys 1-6 raise a tetrahedron, octahedron, icosahedron, cylinder, cone, and torus. R spins until R again. S smooths edges. G opens or closes glow. Esc clears, Backspace removes, F5 turns the selection again. M cycles the math plot. L reloads the CSV chart and the OBJ mesh. Home or numpad 1 snaps the front view. Arrows move on the screen axes. Q and E yaw, C and V pitch. Minus zooms out. Plus is numpad plus, shift+4, or equals.\n",
-           shown()->image.width, shown()->image.height);
+    printf("[Engine] Window %ux%u is up. %s\n",
+           shown()->image.width, shown()->image.height,
+           engine_app()->help != nullptr ? engine_app()->help : "");
     fflush(stdout);
 
     const ChromeSpec *spec = chrome_spec();
@@ -69,13 +70,19 @@ int frame_run(void) {
     for (;;) {
         struct io_uring_cqe cqe;
         while (ring_peek(ring, &cqe)) {
-            hud_note_cqe();
+            engine_app()->note_cqe();
             if (cqe.user_data == ENG_UD_SIGNAL) {
                 signal_poll_armed = false;
                 if (cqe.res == (int)sizeof s_siginfo) {
                     signo = (int)s_siginfo.ssi_signo;
                 }
                 got_signal = true;
+            } else if (cqe.user_data == ENG_UD_FRAME_TIMER) {
+                s_timer_armed = false;
+                bool queued = false;
+                if (frame_watchdog(wl, vk, &queued) == 0 && queued) {
+                    send_in_flight = true;
+                }
             } else if (cqe.user_data == ENG_UD_INOTIFY) {
                 note_inotify_cqe(ring, cqe.res, &inotify_armed);
             } else if (cqe.user_data == ENG_UD_WL_SEND) {
@@ -120,59 +127,35 @@ int frame_run(void) {
             while (pointer_take_spawn(&sx, &sy)) {
                 float ox = (float)sx - (float)shown()->image.width * 0.5f;
                 float oy = (float)shown()->image.height * 0.5f - (float)sy;
-                WorldClick hit = world_click(ox, oy);
-                if (hit.changed && s_turn_phase == k_turn_done) {
-                    s_turn_phase = k_turn_arm;
-                }
+                // Continuous loop: the next compositor stamp picks the
+                // change up. No turn needs re-arming.
+                (void)engine_app()->click(ox, oy);
             }
             uint32_t key = 0;
             bool stop_run = false;
             while (pointer_take_key(&key)) {
-                bool changed = false;
-                if (key == KEY_ESC) {
-                    changed = world_cancel();
-                } else if (key == KEY_BACKSPACE) {
-                    changed = world_delete();
-                } else if (key == KEY_F) {
-                    changed = world_close_face();
-                } else if (key == KEY_F5) {
-                    changed = world_respin_selected();
-                } else if (key == KEY_R) {
-                    changed = world_toggle_spin();
-                } else if (key == KEY_S) {
-                    changed = world_toggle_smooth();
-                } else if (key == KEY_G) {
-                    changed = world_toggle_glow();
-                } else if (key == KEY_M) {
-                    changed = plot_cycle();
-                } else if (key == KEY_L) {
-                    RunRelay relay;
-                    begin_file_relay(&relay, &signal_poll_armed, &got_signal, &signo, &inotify_armed);
-                    changed = plot_reload(forward_reload_cqe, nullptr);
-                    bool mesh_has = false;
-                    bool mesh_bytes = mesh_reload(forward_reload_cqe, nullptr, &mesh_has);
-                    if (world_apply_mesh(mesh_has, mesh_bytes)) {
-                        changed = true;
-                    }
-                    if (end_file_relay(&relay, wl, vk, pending_serial, &send_in_flight,
-                                       &resend_wire, &run_rc, &why)) {
-                        stop_run = true;
-                        break;
-                    }
-                } else if (key == KEY_HOME || key == KEY_KP1) {
-                    changed = camera_snap_front();
-                } else if (key >= KEY_1 && key <= KEY_6) {
-                    changed = world_raise_solid(key - KEY_1);
-                }
-                if (changed && s_turn_phase == k_turn_done) {
-                    s_turn_phase = k_turn_arm;
+                EngineKeyContext key_ctx = {
+                    .wl             = wl,
+                    .vk             = vk,
+                    .signal_armed   = &signal_poll_armed,
+                    .got_signal     = &got_signal,
+                    .signo          = &signo,
+                    .inotify_armed  = &inotify_armed,
+                    .pending_serial = pending_serial,
+                    .send_in_flight = &send_in_flight,
+                    .resend_wire    = &resend_wire,
+                    .run_rc         = &run_rc,
+                    .why            = &why,
+                    .stop           = &stop_run,
+                    .reload_cqe     = forward_reload_cqe,
+                };
+                (void)engine_app()->key(key, &key_ctx);
+                if (stop_run) {
+                    break;
                 }
             }
             if (stop_run) {
                 break;
-            }
-            if (s_turn_phase == k_turn_done && (camera_motion_down() || camera_busy())) {
-                s_turn_phase = k_turn_arm;
             }
         }
 
@@ -193,7 +176,7 @@ int frame_run(void) {
                 break;
             }
             if (reloaded == 0 && !send_in_flight && !resend_wire &&
-                s_turn_phase == k_turn_done && !s_spare_live && vk != nullptr) {
+                !s_turn_swap_pending && vk != nullptr) {
                 if (queue_chrome_repaint(wl, vk) == 0) {
                     pending_serial = 0;
                     send_in_flight = true;
@@ -294,6 +277,17 @@ int frame_run(void) {
             break;
         }
 
+        // Frame watchdog: while a turn is active, an absolute timeout
+        // completes even if the compositor stops sending frame stamps.
+        // When the turn is done no timer is armed and the wait is idle.
+        if (s_turn_phase == k_turn_run && !s_timer_armed && !send_in_flight) {
+            uint64_t deadline = ring_mono_ns() +
+                (uint64_t)frame_clock_stall_after_ms(&s_clock) * 1000000ull;
+            if (ring_arm_timeout_abs(ring, deadline, ENG_UD_FRAME_TIMER) == 0) {
+                s_timer_armed = true;
+            }
+        }
+
         unsigned submitted = ring_submit(ring);
         int rc = ring_enter(ring, submitted, 1, -1);
         if (rc < 0) {
@@ -340,7 +334,7 @@ int frame_run(void) {
             }
             continue;
         }
-        hud_note_cqe();
+        engine_app()->note_cqe();
         if (cqe.user_data == ENG_UD_WL_SEND) {
             int noted = finish_idle_send(wl, vk, &cqe, pending_serial);
             if (noted < 0) {
@@ -363,6 +357,8 @@ int frame_run(void) {
                 got_signal = true;
                 why = "signal";
             }
+        } else if (cqe.user_data == ENG_UD_FRAME_TIMER) {
+            s_timer_armed = false;
         } else if (cqe.user_data == k_ud_signal_cancel) {
             cancel_in_flight = false;
         } else if (cqe.user_data == ENG_UD_INOTIFY) {

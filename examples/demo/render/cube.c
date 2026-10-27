@@ -139,8 +139,6 @@ static bool             s_pulse_have_t0 = false;
 static uint32_t         s_pulse_t0 = 0;
 static VkFormat             s_depth_format = VK_FORMAT_UNDEFINED;
 static VkSampleCountFlagBits s_samples = VK_SAMPLE_COUNT_1_BIT;
-static bool             s_push2 = false;
-
 static void cube_fail(const char *what, VkResult res) {
     fprintf(stderr, "[Cube Error] %s: %s (%d)\n", what, vulkan_vkresult_to_str(res), (int)res);
 }
@@ -308,20 +306,7 @@ static void dispatch_heat(VkCommandBuffer cmd, uint32_t dt_ms, uint32_t seed,
         .yaw_deg = yaw_deg,
     };
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_heat_pipe);
-    if (s_push2) {
-        VkPushConstantsInfo push = {
-            .sType      = VK_STRUCTURE_TYPE_PUSH_CONSTANTS_INFO,
-            .layout     = s_heat_layout,
-            .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
-            .offset     = 0,
-            .size       = sizeof heat_push,
-            .pValues    = &heat_push,
-        };
-        vkCmdPushConstants2(cmd, &push);
-    } else {
-        vkCmdPushConstants(cmd, s_heat_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
-                           sizeof heat_push, &heat_push);
-    }
+    vulkan_cmd_push(cmd, s_heat_layout, VK_SHADER_STAGE_COMPUTE_BIT, sizeof heat_push, &heat_push);
     vkCmdDispatch(cmd, (k_verts + k_local - 1u) / k_local, 1u, 1u);
     barrier_heat_to_vertex(cmd);
 }
@@ -361,20 +346,7 @@ static int bake_mesh(VulkanContext *vk) {
         .verts   = s_mesh_addr,
         .indices = s_index_addr,
     };
-    if (s_push2) {
-        VkPushConstantsInfo push = {
-            .sType      = VK_STRUCTURE_TYPE_PUSH_CONSTANTS_INFO,
-            .layout     = s_compute_layout,
-            .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
-            .offset     = 0,
-            .size       = sizeof mesh_push,
-            .pValues    = &mesh_push,
-        };
-        vkCmdPushConstants2(cmd, &push);
-    } else {
-        vkCmdPushConstants(cmd, s_compute_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
-                           sizeof mesh_push, &mesh_push);
-    }
+    vulkan_cmd_push(cmd, s_compute_layout, VK_SHADER_STAGE_COMPUTE_BIT, sizeof mesh_push, &mesh_push);
     vkCmdDispatch(cmd, (k_verts + k_local - 1u) / k_local, 1, 1);
     VkMemoryBarrier2 mesh = {
         .sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
@@ -451,7 +423,6 @@ int cube_init(VulkanContext *vk) {
         vk, s_depth_format, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT);
     s_samples = pick_samples(color_counts & depth_counts);
 
-    s_push2 = vk->device_info.supports_maintenance6;
     if (create_da_buffer(vk, (VkDeviceSize)k_verts * 36u,
                          VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
                          &s_buffer, &s_memory, &s_mesh_addr) != 0 ||
@@ -726,7 +697,6 @@ void cube_shutdown(VulkanContext *vk) {
     s_samples = VK_SAMPLE_COUNT_1_BIT;
     s_mesh_addr = 0;
     s_index_addr = 0;
-    s_push2 = false;
     if (vk == nullptr || vk->device == VK_NULL_HANDLE) {
         s_pipeline = VK_NULL_HANDLE;
         s_layout = VK_NULL_HANDLE;
@@ -1041,7 +1011,7 @@ void cube_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height, float yaw_d
     vkCmdSetScissor(cmd, 0, 1, &scissor);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_pipeline);
     vkCmdBindIndexBuffer(cmd, s_index, 0, VK_INDEX_TYPE_UINT16);
-    vkCmdPushConstants(cmd, s_layout, VK_SHADER_STAGE_VERTEX_BIT, 0, k_draw_push_bytes, &draw_push);
+    vulkan_cmd_push(cmd, s_layout, VK_SHADER_STAGE_VERTEX_BIT, k_draw_push_bytes, &draw_push);
     vkCmdDrawIndexed(cmd, k_indices, 1, 0, 0, 0);
 }
 

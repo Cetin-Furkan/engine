@@ -12,6 +12,9 @@ typedef struct SystemCapabilities {
     uint32_t uring_nr_request_opcodes;
     uint32_t uring_nr_register_opcodes;
     bool     has_no_iowait;
+    bool     has_recvsend_bundle;
+    bool     has_min_timeout;
+    bool     has_cqe_skip;
     bool     is_initialized;
 } SystemCapabilities;
 

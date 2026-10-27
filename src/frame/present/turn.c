@@ -11,7 +11,7 @@ void commit_turn_swap(WaylandContext *wl) {
     spare()->release_point = s_pending_release;
     spare()->release_pending = true;
     swap_front_spare();
-    world_commit();
+    engine_app()->commit();
     if (wl != nullptr) {
         wl->buffer_id = shown()->wl_buffer_id;
         wl->release_timeline_id = shown()->release_timeline_id;
@@ -37,15 +37,35 @@ bool turn_wants_step(const WaylandContext *wl) {
     return wl != nullptr && wl->frame_stamp_valid;
 }
 
+int frame_watchdog(WaylandContext *wl, VulkanContext *vk, bool *queued) {
+    *queued = false;
+    if (wl == nullptr || vk == nullptr || s_turn_phase == k_turn_done) {
+        return 0;
+    }
+    if (wl->frame_stamp_valid) {
+        return 0;  // A stamp is already waiting; not stalled.
+    }
+    frame_clock_note_stall(&s_clock);
+    fprintf(stderr, "[Engine] Frame callback stalled (%u total). Re-arming.\n",
+            s_clock.stalls);
+    if (s_turn_phase == k_turn_arm) {
+        s_turn_phase = k_turn_run;
+    }
+    int q = queue_frame_only(wl, queued);
+    if (q == -EALREADY) {
+        return 0;
+    }
+    return q;
+}
+
 int turn_step(WaylandContext *wl, VulkanContext *vk, bool *queued) {
     *queued = false;
     if (wl == nullptr || vk == nullptr) {
         return -EINVAL;
     }
-    if (s_turn_phase == k_turn_done) {
-        wl->frame_stamp_valid = false;
-        return 0;
-    }
+    // Continuous loop: a frame callback is always outstanding while the
+    // window is presented. k_turn_done no longer parks the loop; it is
+    // only the boot state before the first callback is armed.
     if (!s_spare_live && alloc_spare(wl, vk) != 0) {
         return -1;
     }
@@ -61,28 +81,65 @@ int turn_step(WaylandContext *wl, VulkanContext *vk, bool *queued) {
         return 0;
     }
     uint32_t stamp = wl->frame_time_ms;
+    FrameStep step = frame_clock_step(&s_clock, stamp);
+    if (!step.paint) {
+        // Duplicate compositor stamp: the pose cannot have moved.
+        // Keep the turn armed and wait for a real stamp.
+        int q = queue_frame_only(wl, queued);
+        if (q == 0 || q == -EALREADY) {
+            wl->frame_stamp_valid = false;
+            return 0;
+        }
+        return q;
+    }
     uint32_t heat_dt = 0;
-    bool pulse = world_simulation(stamp, &heat_dt);
-    bool changed = world_advance(stamp);
+    bool pulse = engine_app()->simulation(stamp, &step, &heat_dt);
+    // Fixed-timestep simulation: 8 ms steps (125 Hz) consumed from the
+    // clock's accumulator, at most 5 per callback. Poses are evaluated
+    // at synthetic sub-stamps ending exactly on the compositor stamp,
+    // so the hosted app keeps its absolute-stamp math while the engine
+    // owns step size, clamping, and overload behaviour.
+    bool changed = false;
+    uint32_t steps = frame_clock_fixed_steps(&s_clock, step.dt_ms, 8u, 5u);
+    if (step.first || steps == 0) {
+        changed = engine_app()->advance(stamp, &step);
+    } else {
+        for (uint32_t i = 0; i < steps; ++i) {
+            uint32_t sub = stamp - (steps - 1u - i) * 8u;
+            if (engine_app()->advance(sub, &step)) {
+                changed = true;
+            }
+        }
+    }
     // The pose can stay still. An open pulse still presents, because the
     // spot and the diffusion change the picture. The cube's yaw does not move.
-    bool paint = changed || (pulse && (heat_dt > 0u || world_record_poke_pending()));
+    bool paint = changed || step.first ||
+                 (pulse && (heat_dt > 0u || engine_app()->record_poke_pending()));
     if (!paint) {
-        if (!world_busy() && !pulse) {
+        if (!engine_app()->busy() && !pulse) {
+            // Idle edge, not loop exit: report once, hold the pulse, and
+            // keep the callback chain alive. The spare stays allocated;
+            // retiring it here would realloc on the next interaction.
             wl->frame_stamp_valid = false;
-            s_turn_phase = k_turn_done;
-            retire_spare(wl, vk);
-            uint32_t frames = 0;
-            uint32_t missed = 0;
-            bool spun = world_consume_spin();
-            hud_turn_report(&frames, &missed);
-            if (spun) {
-                printf("[Engine] Turn idle. Pose repeated. Frame callback dropped.\n");
-                printf("[Engine] %u frames, %u missed.\n", frames, missed);
-                fflush(stdout);
-                world_simulation_hold();
+            if (s_loop_was_busy) {
+                s_loop_was_busy = false;
+                uint32_t frames = 0;
+                uint32_t missed = 0;
+                bool spun = engine_app()->consume_spin();
+                engine_app()->turn_report(&frames, &missed);
+                if (spun) {
+                    printf("[Engine] Loop idle. %u frames, %u missed, %u stalls.\n",
+                           frames, missed, s_clock.stalls);
+                    fflush(stdout);
+                    engine_app()->simulation_hold();
+                }
             }
-            return 0;
+            int q = queue_frame_only(wl, queued);
+            if (q == 0 || q == -EALREADY) {
+                wl->frame_stamp_valid = false;
+                return 0;
+            }
+            return q;
         }
         int q = queue_frame_only(wl, queued);
         if (q == 0 || q == -EALREADY) {
@@ -92,6 +149,7 @@ int turn_step(WaylandContext *wl, VulkanContext *vk, bool *queued) {
         return q;
     }
 
+    s_loop_was_busy = true;
     bool spare_free = acquire_point_retired(vk, spare()->acquire_point) &&
         (!spare()->release_pending ||
          poll_release_semaphore(vk, spare()->release_semaphore, spare()->release_point));
@@ -115,7 +173,7 @@ int turn_step(WaylandContext *wl, VulkanContext *vk, bool *queued) {
         spare()->acquire_point = 0;
         return -1;
     }
-    world_simulation_commit(stamp, heat_dt);
+    engine_app()->simulation_commit(stamp, heat_dt);
     s_sync_point = next;
     int q = wayland_queue_turn_commit(
         wl,

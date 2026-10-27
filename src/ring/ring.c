@@ -253,6 +253,7 @@ int ring_context_init(RingContext *r, const char *name, bool with_pbuf) {
     if ((r->features & IORING_FEAT_NO_IOWAIT) != 0) {
         r->wait_flags = IORING_ENTER_NO_IOWAIT;
     }
+    r->min_timeout_on = (r->features & IORING_FEAT_MIN_TIMEOUT) != 0;
 
     r->is_initialized = true;
     printf("[Ring] Initialized '%s' (%s, SQ=%u, CQ=%u, PBUF=%ux%uB%s, FixedFiles=%u, NO_MMAP+SINGLE_ISSUER+DEFER_TASKRUN+REG_WAIT)\n",
@@ -333,6 +334,27 @@ int ring_arm_poll_fixed(RingContext *r, uint32_t slot, uint32_t poll_mask, uint6
     return 0;
 }
 
+int ring_arm_timeout_abs(RingContext *r, uint64_t deadline_ns, uint64_t user_data) {
+    if (r == nullptr || !r->is_initialized) {
+        return -EINVAL;
+    }
+    // The timespec must outlive the submission. One watchdog is armed at
+    // a time, so the per-ring slot is safe (single-issuer ring).
+    struct __kernel_timespec *ts = &r->timeout_ts;
+    ts->tv_sec  = (long long)(deadline_ns / 1000000000ull);
+    ts->tv_nsec = (long long)(deadline_ns % 1000000000ull);
+    struct io_uring_sqe *sqe = ring_sqe(r);
+    if (sqe == nullptr) {
+        return -ENOSPC;
+    }
+    sqe->opcode        = IORING_OP_TIMEOUT;
+    sqe->addr          = (uint64_t)(uintptr_t)ts;
+    sqe->len           = 1;
+    sqe->timeout_flags = IORING_TIMEOUT_ABS;
+    sqe->user_data     = user_data;
+    return 0;
+}
+
 void ring_sqe_unget(RingContext *r, uint32_t n) {
     if (r == nullptr) {
         return;
@@ -357,6 +379,11 @@ struct io_uring_sqe *ring_sqe(RingContext *r) {
 }
 
 unsigned ring_submit(RingContext *r) {
+    uint32_t dropped = __atomic_load_n(r->sq_kdropped, __ATOMIC_ACQUIRE);
+    if (dropped != r->sq_dropped_total) {
+        r->sq_dropped_total = dropped;
+        fprintf(stderr, "[Ring] SQ dropped: %u submission(s) never ran\n", dropped);
+    }
     unsigned n = r->sq_pending;
     if (n == 0) {
         return 0;
@@ -388,7 +415,10 @@ int ring_enter(RingContext *r, unsigned submit, unsigned min_complete, int timeo
                 .tv_sec  = timeout_ms / 1000,
                 .tv_nsec = (long)(timeout_ms % 1000) * 1000000L,
             },
-            .min_wait_usec = 0,
+            // With IORING_FEAT_MIN_TIMEOUT the kernel may batch this
+            // wakeup for up to 500us, trading a hair of latency for far
+            // fewer spurious enter returns on short waits.
+            .min_wait_usec = r->min_timeout_on ? 500u : 0u,
             .flags         = IORING_REG_WAIT_TS,
             .sigmask       = 0,
             .sigmask_sz    = 0,
@@ -412,6 +442,16 @@ int ring_enter(RingContext *r, unsigned submit, unsigned min_complete, int timeo
 }
 
 bool ring_peek(RingContext *r, struct io_uring_cqe *out) {
+    // CQ overflow means completions were dropped by the kernel: count it
+    // and say so once, never silently. SQ dropped is checked on submit.
+    uint32_t overflow = __atomic_load_n(r->cq_koverflow, __ATOMIC_ACQUIRE);
+    if (overflow != r->cq_overflow_total) {
+        r->cq_overflow_total = overflow;
+        if (!r->overflow_warned) {
+            r->overflow_warned = true;
+            fprintf(stderr, "[Ring] CQ overflow: %u completion(s) dropped by the kernel\n", overflow);
+        }
+    }
     uint32_t tail = __atomic_load_n(r->cq_ktail, __ATOMIC_ACQUIRE);
     uint32_t head = r->cq_head;
     if (head == tail) {

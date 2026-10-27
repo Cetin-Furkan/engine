@@ -1,18 +1,8 @@
 #ifndef ENGINE_FRAME_INT_H
 #define ENGINE_FRAME_INT_H
 
-#include "frame/camera.h"
-#include "frame/cube.h"
-#include "frame/gimbal.h"
-#include "frame/grid.h"
-#include "frame/material.h"
-#include "frame/mesh.h"
-#include "frame/plane.h"
-#include "frame/plot.h"
-#include "frame/hud.h"
-#include "frame/shape.h"
-#include "frame/solid.h"
-#include "frame/world.h"
+#include "engine/app.h"
+#include "frame/clock.h"
 #include "chrome/gpu.h"
 #include "chrome/layer.h"
 #include "chrome/spec.h"
@@ -63,8 +53,11 @@ typedef struct FrameSlot {
     VulkanExportableImage image;
     VkImageView           image_view;
     VkFormat              view_format;
-    CubeDepth             depth;
-    CubeCoverage          coverage;
+    EngineTargets         targets;
+    // Bumped every time the slot is blanked/reaped. A SlotRef taken before
+    // the bump no longer resolves, so a stale async release can never be
+    // mistaken for the slot's new image (generation-tagged handle).
+    uint32_t              generation;
     VkCommandBuffer       cmd_buf;
     VkSemaphore           release_semaphore;
     uint32_t              release_handle;
@@ -77,14 +70,7 @@ typedef struct FrameSlot {
     bool                  foreign_owned;
 } FrameSlot;
 
-typedef struct RunRelay {
-    bool *signal_armed;
-    bool *got_signal;
-    int  *signo;
-    bool *inotify_armed;
-    bool  stolen_send;
-    struct io_uring_cqe stolen_cqe;
-} RunRelay;
+typedef EngineRelay RunRelay;
 
 typedef struct FrameState {
     int         drm_fd;
@@ -138,6 +124,9 @@ typedef struct FrameState {
     bool                     inotify_stop;
     bool                     inotify_warned;
     RunRelay                *relay;
+    alignas(64) FrameClock   clock;
+    bool                     timer_armed;
+    bool                     loop_was_busy;
 } FrameState;
 
 extern FrameState frame_state;
@@ -175,6 +164,9 @@ extern FrameState frame_state;
 #define s_inotify_stop (frame_state.inotify_stop)
 #define s_inotify_warned (frame_state.inotify_warned)
 #define s_relay (frame_state.relay)
+#define s_clock (frame_state.clock)
+#define s_timer_armed (frame_state.timer_armed)
+#define s_loop_was_busy (frame_state.loop_was_busy)
 
 static inline FrameSlot *shown(void) {
     return &s_slot[s_front];
@@ -183,6 +175,48 @@ static inline FrameSlot *shown(void) {
 static inline FrameSlot *spare(void) {
     return &s_slot[s_front ^ 1];
 }
+
+// Generation-tagged slot handle: (generation << 8) | (index + 1).
+// Zero is never valid. slot_from_ref returns nullptr for a stale handle,
+// which is how an async completion names a slot across a reap/resize
+// without risking use-after-replace of the DMA-BUF image.
+typedef uint32_t SlotRef;
+
+static inline SlotRef slot_ref_pack(uint32_t generation, uint32_t index_plus_one) {
+    if (generation == 0 || index_plus_one == 0 || index_plus_one > 0xffu) {
+        return 0;
+    }
+    return (generation << 8) | index_plus_one;
+}
+
+static inline uint32_t slot_next_generation(uint32_t generation) {
+    generation += 1u;
+    return generation != 0 ? generation : 1u;
+}
+
+// Table-agnostic resolve shared by slot_from_ref and the handle test:
+// slots are indices 1..2, orphans follow at 3.. in the same handle space.
+static inline FrameSlot *slot_resolve(SlotRef ref, FrameSlot slots[2],
+                                      FrameSlot *orphans, uint32_t orphan_count) {
+    if (ref == 0) {
+        return nullptr;
+    }
+    uint32_t generation = ref >> 8;
+    uint32_t index = ref & 0xffu;
+    FrameSlot *slot = nullptr;
+    if (index >= 1u && index <= 2u) {
+        slot = &slots[index - 1u];
+    } else if (index >= 3u && index - 3u < orphan_count) {
+        slot = &orphans[index - 3u];
+    }
+    if (slot == nullptr || slot->generation != generation) {
+        return nullptr;
+    }
+    return slot;
+}
+
+SlotRef slot_ref(const FrameSlot *slot);
+FrameSlot *slot_from_ref(SlotRef ref);
 
 bool wait_acquire_point(VulkanContext *vk, uint64_t point);
 bool acquire_point_retired(VulkanContext *vk, uint64_t point);
@@ -246,6 +280,10 @@ bool end_file_relay(RunRelay *relay, WaylandContext *wl, VulkanContext *vk,
                            uint32_t pending_serial, bool *send_in_flight, bool *resend_wire,
                            int *run_rc, const char **why);
 void release_persistent_fd(RingContext *ring);
+int frame_run(void);
+// Watchdog for a stalled turn: the compositor stopped sending frame
+// stamps mid-turn. Re-arms one frame callback and counts the stall.
+int frame_watchdog(WaylandContext *wl, VulkanContext *vk, bool *queued);
 int frame_run(void);
 int frame_stop(void);
 

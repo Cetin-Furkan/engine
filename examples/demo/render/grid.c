@@ -73,7 +73,7 @@ static void dispatch_grid(VkCommandBuffer cmd, uint32_t mode, uint32_t dt_ms, ui
         .nverts = cube_vertex_count(),
     };
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_pipe);
-    vkCmdPushConstants(cmd, s_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof push, &push);
+    vulkan_cmd_push(cmd, s_layout, VK_SHADER_STAGE_COMPUTE_BIT, sizeof push, &push);
     uint32_t n = mode == 0u ? k_cells : cube_vertex_count();
     vkCmdDispatch(cmd, (n + k_local - 1u) / k_local, 1u, 1u);
 }

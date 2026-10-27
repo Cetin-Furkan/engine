@@ -48,7 +48,7 @@ TARGET    := $(BIN_DIR)/engine
 
 # Clean include paths and preprocessor flags
 GEN_DIR  := $(BUILD_DIR)/gen
-INCLUDES := -Iinclude -Isrc -I$(GEN_DIR)
+INCLUDES := -Iinclude -Isrc -Iexamples/demo/include -Iexamples/demo -I$(GEN_DIR)
 ifneq ($(VULKAN_INCLUDE_DIR),)
     INCLUDES += -I$(VULKAN_INCLUDE_DIR)
 endif
@@ -89,15 +89,15 @@ $(GEN_DIR)/mesh.vert.spv: shaders/camera.inc shaders/material.inc
 
 -include $(wildcard $(GEN_DIR)/*.d)
 
-$(OBJ_DIR)/src/frame/cube.o: $(GEN_DIR)/cube.vert.spv $(GEN_DIR)/cube.frag.spv $(GEN_DIR)/bevel.comp.spv $(GEN_DIR)/heat.comp.spv
-$(OBJ_DIR)/src/frame/solid.o: $(GEN_DIR)/solid.vert.spv $(GEN_DIR)/solid.frag.spv $(GEN_DIR)/solid.comp.spv
-$(OBJ_DIR)/src/frame/shape.o: $(GEN_DIR)/shape.vert.spv $(GEN_DIR)/shape.frag.spv
-$(OBJ_DIR)/src/frame/plane.o: $(GEN_DIR)/plane.vert.spv $(GEN_DIR)/plane.frag.spv
-$(OBJ_DIR)/src/frame/plot.o: $(GEN_DIR)/plot.vert.spv $(GEN_DIR)/plot.frag.spv $(GEN_DIR)/plot.comp.spv
-$(OBJ_DIR)/src/frame/gimbal.o: $(GEN_DIR)/gimbal.vert.spv $(GEN_DIR)/gimbal.frag.spv
-$(OBJ_DIR)/src/frame/mesh.o: $(GEN_DIR)/mesh.vert.spv $(GEN_DIR)/mesh.frag.spv
-$(OBJ_DIR)/src/frame/hud.o: $(GEN_DIR)/hud.vert.spv $(GEN_DIR)/hud.frag.spv
-$(OBJ_DIR)/src/frame/grid.o: $(GEN_DIR)/grid.comp.spv
+$(OBJ_DIR)/examples/demo/render/cube.o: $(GEN_DIR)/cube.vert.spv $(GEN_DIR)/cube.frag.spv $(GEN_DIR)/bevel.comp.spv $(GEN_DIR)/heat.comp.spv
+$(OBJ_DIR)/examples/demo/render/solid.o: $(GEN_DIR)/solid.vert.spv $(GEN_DIR)/solid.frag.spv $(GEN_DIR)/solid.comp.spv
+$(OBJ_DIR)/examples/demo/render/shape.o: $(GEN_DIR)/shape.vert.spv $(GEN_DIR)/shape.frag.spv
+$(OBJ_DIR)/examples/demo/render/plane.o: $(GEN_DIR)/plane.vert.spv $(GEN_DIR)/plane.frag.spv
+$(OBJ_DIR)/examples/demo/render/plot.o: $(GEN_DIR)/plot.vert.spv $(GEN_DIR)/plot.frag.spv $(GEN_DIR)/plot.comp.spv
+$(OBJ_DIR)/examples/demo/render/gimbal.o: $(GEN_DIR)/gimbal.vert.spv $(GEN_DIR)/gimbal.frag.spv
+$(OBJ_DIR)/examples/demo/render/mesh.o: $(GEN_DIR)/mesh.vert.spv $(GEN_DIR)/mesh.frag.spv
+$(OBJ_DIR)/examples/demo/render/hud.o: $(GEN_DIR)/hud.vert.spv $(GEN_DIR)/hud.frag.spv
+$(OBJ_DIR)/examples/demo/render/grid.o: $(GEN_DIR)/grid.comp.spv
 $(OBJ_DIR)/src/chrome/gpu.o: $(GEN_DIR)/chrome.vert.spv $(GEN_DIR)/chrome.frag.spv
 
 # Compiler & Preprocessor Flags
@@ -117,7 +117,7 @@ ifneq ($(VULKAN_LIB),)
 endif
 LDFLAGS += -lm
 
-SRCS := main.c $(shell find src -name '*.c')
+SRCS := main.c $(shell find src examples/demo -name '*.c')
 OBJS := $(SRCS:%.c=$(OBJ_DIR)/%.o)
 DEPS := $(SRCS:%.c=$(DEP_DIR)/%.d)
 
@@ -218,4 +218,10 @@ recheck:
 distclean: clean
 	rm -rf $(DEPS_CACHE_DIR)
 
-.PHONY: all debug release run run-release release-patch release-minor release-major info help clean clear recheck distclean
+test: $(CONFIG_MK)
+	$(CC) $(CFLAGS) -o build/test_handles tests/test_handles.c
+	./build/test_handles
+	$(CC) $(CFLAGS) -o build/test_clock tests/test_clock.c src/frame/loop/clock.c
+	./build/test_clock
+
+.PHONY: all debug release run run-release release-patch release-minor release-major info help clean clear recheck distclean test

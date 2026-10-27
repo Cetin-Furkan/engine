@@ -8,7 +8,10 @@
 // cube x y z        one fillet. z is stored. The draw sits on the ground, so z is 0.
 // mesh              the OBJ pipeline, at the coordinate that pipeline fitted
 
-static const char *k_path = "world/opening.world";
+// Demo data lives with the demo. The legacy path is still tried so a
+// checkout that keeps world/ at the engine root keeps working.
+static const char *k_path = "examples/demo/world/opening.world";
+static const char *k_path_legacy = "world/opening.world";
 
 static void trim(char *s) {
     char *hash = strchr(s, '#');
@@ -82,6 +85,9 @@ static int place_mesh(const char *line, int number) {
 
 int world_load(void) {
     FILE *f = fopen(k_path, "r");
+    if (f == nullptr) {
+        f = fopen(k_path_legacy, "r");
+    }
     if (f == nullptr) {
         fprintf(stderr, "[World] %s was not opened: %s\n", k_path, strerror(errno));
         return -1;

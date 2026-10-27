@@ -7,20 +7,25 @@
 #include "camera.inc"
 #include "material.inc"
 
-// Four corners. Repeating corner 2 in corner 3 draws one triangle.
-// Corners are world pixels on the plane, +Y up, before the in-plane turn.
-// Framebuffer y = 0 is the top, so Y is negated, matching the cube.
-// Six vertices, no vertex buffer.
+// One polygon lives in a device buffer. The vertex shader turns it into
+// fill triangles, edge quads, and corner marks. The turn about the center
+// happens here. mode 0 fills, mode 1 strokes, mode 2 marks.
+
+layout(buffer_reference, scalar, buffer_reference_align = 8) buffer Points {
+    vec2 p[];
+};
+
+layout(buffer_reference, scalar, buffer_reference_align = 4) buffer Idxs {
+    uint i[];
+};
 
 layout(push_constant, scalar) uniform Push {
-    layout(offset = 0) float x0;
-    layout(offset = 4) float y0;
-    layout(offset = 8) float x1;
-    layout(offset = 12) float y1;
-    layout(offset = 16) float x2;
-    layout(offset = 20) float y2;
-    layout(offset = 24) float x3;
-    layout(offset = 28) float y3;
+    layout(offset = 0) uint64_t points;
+    layout(offset = 8) uint64_t indices;
+    layout(offset = 16) uint count;
+    layout(offset = 20) uint mode;
+    layout(offset = 24) uint closed;
+    layout(offset = 28) float px;
     layout(offset = 32) float center_x;
     layout(offset = 36) float center_y;
     layout(offset = 40) float angle_rad;
@@ -46,20 +51,71 @@ layout(push_constant, scalar) uniform Push {
 
 layout(location = 0) flat out vec3 v_emit;
 
-const int k_id[6] = int[](0, 1, 2, 0, 2, 3);
+const int k_quad[6] = int[](0, 1, 2, 0, 2, 3);
 
-void main() {
-    float xs[4] = float[4](pc.x0, pc.x1, pc.x2, pc.x3);
-    float ys[4] = float[4](pc.y0, pc.y1, pc.y2, pc.y3);
-    int i = k_id[gl_VertexIndex];
-    float dx = xs[i] - pc.center_x;
-    float dy = ys[i] - pc.center_y;
+vec2 turned(vec2 p) {
+    vec2 d = p - vec2(pc.center_x, pc.center_y);
     float c = cos(pc.angle_rad);
     float s = sin(pc.angle_rad);
-    float px = pc.center_x + c * dx - s * dy;
-    float py = pc.center_y + s * dx + c * dy;
-    vec3 view = view_of(vec3(px, py, 0.0), vec4(pc.qx, pc.qy, pc.qz, pc.qw),
-                        vec3(pc.cam_x, pc.cam_y, pc.cam_z));
-    gl_Position = view_ndc(view, pc.zoom, pc.width, pc.height, pc.depth);
+    return vec2(pc.center_x + c * d.x - s * d.y, pc.center_y + s * d.x + c * d.y);
+}
+
+vec2 stroke_corner(vec2 a, vec2 b, int which) {
+    vec2 d = b - a;
+    float len = length(d);
+    vec2 n = vec2(0.0);
+    if (len > 0.001) {
+        n = vec2(-d.y, d.x) / len * pc.px;
+    }
+    if (which == 0) return a - n;
+    if (which == 1) return b - n;
+    if (which == 2) return b + n;
+    return a + n;
+}
+
+vec2 mark_corner(vec2 p, int which) {
+    float h = pc.px;
+    if (which == 0) return p + vec2(-h, -h);
+    if (which == 1) return p + vec2(h, -h);
+    if (which == 2) return p + vec2(h, h);
+    return p + vec2(-h, h);
+}
+
+void main() {
+    Points pts = Points(pc.points);
+    vec2 world = vec2(0.0);
+    bool drop = false;
+    if (pc.mode == 0u) {
+        Idxs ix = Idxs(pc.indices);
+        uint id = ix.i[gl_InstanceIndex * 3u + uint(gl_VertexIndex)];
+        if (id >= pc.count) {
+            drop = true;
+        } else {
+            world = pts.p[id];
+        }
+    } else {
+        int which = k_quad[gl_VertexIndex];
+        if (pc.mode == 1u) {
+            uint i0 = gl_InstanceIndex;
+            uint i1 = pc.closed != 0u ? (i0 + 1u) % pc.count : i0 + 1u;
+            vec2 a = pts.p[i0];
+            vec2 b = pts.p[i1];
+            vec2 d = b - a;
+            if (pc.closed == 0u && dot(d, d) < 0.25) {
+                drop = true;
+            }
+            world = stroke_corner(a, b, which);
+        } else {
+            world = mark_corner(pts.p[gl_InstanceIndex], which);
+        }
+    }
+    world = turned(world);
+    if (drop) {
+        gl_Position = vec4(0.0, 0.0, -2.0, 1.0);
+    } else {
+        vec3 view = view_of(vec3(world, 0.0), vec4(pc.qx, pc.qy, pc.qz, pc.qw),
+                            vec3(pc.cam_x, pc.cam_y, pc.cam_z));
+        gl_Position = view_ndc(view, pc.zoom, pc.width, pc.height, pc.depth);
+    }
     v_emit = material_emit(pc.materials, pc.mat_index);
 }

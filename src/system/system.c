@@ -82,7 +82,10 @@ static int probe_io_uring_kernel(SystemCapabilities *caps) {
     if ((opcodes.feature_flags & IORING_FEAT_NODROP) == 0) {
         return -ENOTSUP;
     }
-    if (opcodes.nr_request_opcodes <= IORING_OP_SOCKET ||
+    // Floor for the modern opcode set this engine uses: multishot recv
+    // with provided buffers, bundle-capable send/recv era, and the
+    // register opcodes for ring fds / wait args / memory regions.
+    if (opcodes.nr_request_opcodes <= IORING_OP_RECV_ZC ||
         opcodes.nr_register_opcodes <= IORING_REGISTER_MEM_REGION) {
         return -ENOTSUP;
     }
@@ -92,6 +95,9 @@ static int probe_io_uring_kernel(SystemCapabilities *caps) {
     caps->uring_nr_request_opcodes  = opcodes.nr_request_opcodes;
     caps->uring_nr_register_opcodes = opcodes.nr_register_opcodes;
     caps->has_no_iowait             = (opcodes.feature_flags & IORING_FEAT_NO_IOWAIT) != 0;
+    caps->has_recvsend_bundle       = (opcodes.feature_flags & IORING_FEAT_RECVSEND_BUNDLE) != 0;
+    caps->has_min_timeout           = (opcodes.feature_flags & IORING_FEAT_MIN_TIMEOUT) != 0;
+    caps->has_cqe_skip              = (opcodes.feature_flags & IORING_FEAT_CQE_SKIP) != 0;
     return 0;
 }
 
@@ -135,7 +141,11 @@ int system_init(void) {
                                 : " MiB | io_uring opcodes: ");
     fmt_u64(&fb, s_sys_caps.uring_nr_request_opcodes);
     fmt_str(&fb, " | NO_IOWAIT: ");
-    fmt_str(&fb, s_sys_caps.has_no_iowait ? "yes\n" : "no\n");
+    fmt_str(&fb, s_sys_caps.has_no_iowait ? "yes" : "no");
+    fmt_str(&fb, " | BUNDLE: ");
+    fmt_str(&fb, s_sys_caps.has_recvsend_bundle ? "yes" : "no");
+    fmt_str(&fb, " | MIN_TIMEOUT: ");
+    fmt_str(&fb, s_sys_caps.has_min_timeout ? "yes\n" : "no\n");
     fmt_flush_stdout(&fb);
 
     s_sys_caps.is_initialized = true;

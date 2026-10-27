@@ -16,7 +16,8 @@ extern "C" {
  * - Requires dynamic rendering, synchronization2, buffer device address, and timeline semaphores.
  * - Requires VK_KHR_external_memory_fd and VK_EXT_external_memory_dma_buf.
  * - Enables DRM-modifier and syncobj extensions only when that device lists them.
- * - Enables maintenance5, maintenance6, and pushDescriptor only when supported.
+ * - Requires maintenance5, maintenance6, push descriptors, host image copy,
+ *   and dynamic rendering local read.
  * - Prefers a pure transfer family, then another non-graphics transfer family,
  *   then the graphics family.
  * - On a shared family, requests one queue per role when queueCount allows it.

@@ -395,9 +395,9 @@ void hud_prepare(uint32_t frame_ms, bool have_stamp, uint64_t modifier) {
 }
 
 static void draw_quad(VkCommandBuffer cmd, HudPush push) {
-    vkCmdPushConstants(cmd, s_layout,
-                       VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-                       0, sizeof push, &push);
+    vulkan_cmd_push(cmd, s_layout,
+                    VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                    sizeof push, &push);
     vkCmdDraw(cmd, 6, 1, 0, 0);
 }
 

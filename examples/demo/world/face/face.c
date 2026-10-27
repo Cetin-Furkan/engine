@@ -133,41 +133,9 @@ static bool face_hit(const WorldObj *o, const CameraRay *ray, float *t, Coord *a
     return true;
 }
 
-static void stroke_corners(float x0, float y0, float x1, float y1, float half,
-                           float x[4], float y[4]) {
-    float dx = x1 - x0;
-    float dy = y1 - y0;
-    float len = sqrtf(dx * dx + dy * dy);
-    float nx = 0.0f;
-    float ny = 0.0f;
-    if (len > 0.001f) {
-        nx = -dy / len * half;
-        ny = dx / len * half;
-    }
-    x[0] = x0 - nx;
-    y[0] = y0 - ny;
-    x[1] = x1 - nx;
-    y[1] = y1 - ny;
-    x[2] = x1 + nx;
-    y[2] = y1 + ny;
-    x[3] = x0 + nx;
-    y[3] = y0 + ny;
-}
-
-static void mark_corners(float px, float py, float half, float x[4], float y[4]) {
-    x[0] = px - half;
-    y[0] = py - half;
-    x[1] = px + half;
-    y[1] = py - half;
-    x[2] = px + half;
-    y[2] = py + half;
-    x[3] = px - half;
-    y[3] = py + half;
-}
-
 static void face_draw(const WorldObj *o, VkCommandBuffer cmd, uint32_t width, uint32_t height, bool live) {
     const FaceData *face = o->data;
-    if (face == nullptr) {
+    if (face == nullptr || face->n == 0u) {
         return;
     }
     int32_t milli = live ? face->spin.live_milli : face->spin.shown_milli;
@@ -178,40 +146,22 @@ static void face_draw(const WorldObj *o, VkCommandBuffer cmd, uint32_t width, ui
     float rr = hot ? 0.55f : 0.98f;
     float gg = hot ? 0.82f : 0.96f;
     float bb = hot ? 1.0f : 0.90f;
-    float fill_bias = 0.004f + (float)face->serial * 0.00002f;
     uint32_t pn = face->n;
     if (pn > k_point_cap) {
         pn = k_point_cap;
     }
-    for (uint32_t t = 0; t < face->tri_n; ++t) {
-        uint32_t i0 = face->idx[t * 3u];
-        uint32_t i1 = face->idx[t * 3u + 1u];
-        uint32_t i2 = face->idx[t * 3u + 2u];
-        if (i0 >= pn || i1 >= pn || i2 >= pn) {
-            continue;
-        }
-        float xs[4] = { face->p[i0].x, face->p[i1].x, face->p[i2].x, face->p[i2].x };
-        float ys[4] = { face->p[i0].y, face->p[i1].y, face->p[i2].y, face->p[i2].y };
-        shape_draw(cmd, width, height, xs, ys, face->center.x, face->center.y, ang, fill_bias,
-                   0.96f, 0.71f, 0.28f, 1.0f, face->mat);
+    float xs[k_point_cap];
+    float ys[k_point_cap];
+    for (uint32_t i = 0; i < pn; ++i) {
+        xs[i] = face->p[i].x;
+        ys[i] = face->p[i].y;
     }
-    float edge_bias = fill_bias + 0.0015f;
-    for (uint32_t e = 0; e < pn; ++e) {
-        uint32_t j = (e + 1u) % pn;
-        float xs[4];
-        float ys[4];
-        stroke_corners(face->p[e].x, face->p[e].y, face->p[j].x, face->p[j].y, k_stroke_px, xs, ys);
-        shape_draw(cmd, width, height, xs, ys, face->center.x, face->center.y, ang, edge_bias,
-                   rr, gg, bb, 1.0f, face->mat);
-    }
-    float mark_bias = fill_bias + 0.003f;
-    for (uint32_t v = 0; v < pn; ++v) {
-        float xs[4];
-        float ys[4];
-        mark_corners(face->p[v].x, face->p[v].y, k_mark_px, xs, ys);
-        shape_draw(cmd, width, height, xs, ys, face->center.x, face->center.y, ang, mark_bias,
-                   rr, gg, bb, 1.0f, face->mat);
-    }
+    float fill_bias = 0.004f + (float)face->serial * 0.00002f;
+    shape_draw_polygon(cmd, width, height, xs, ys, pn, face->idx, face->tri_n, true,
+                       face->center.x, face->center.y, ang,
+                       fill_bias, fill_bias + 0.0015f, fill_bias + 0.003f,
+                       0.96f, 0.71f, 0.28f, rr, gg, bb,
+                       k_stroke_px, k_mark_px, face->mat);
 }
 
 static bool face_advance(WorldObj *o, uint32_t time_ms) {
@@ -463,26 +413,24 @@ void face_reap(void) {
 void face_draw_chain(VkCommandBuffer cmd, uint32_t width, uint32_t height, bool live) {
     const Coord *pts = live ? s_build : s_shown_build;
     uint32_t n = live ? s_build_n : s_shown_build_n;
+    if (n == 0u) {
+        return;
+    }
+    if (n > k_point_cap) {
+        n = k_point_cap;
+    }
+    float xs[k_point_cap];
+    float ys[k_point_cap];
+    for (uint32_t i = 0; i < n; ++i) {
+        xs[i] = pts[i].x;
+        ys[i] = pts[i].y;
+    }
     const float r = 0.98f;
     const float g = 0.96f;
     const float b = 0.90f;
-    for (uint32_t i = 1; i < n; ++i) {
-        float dx = pts[i].x - pts[i - 1u].x;
-        float dy = pts[i].y - pts[i - 1u].y;
-        if (dx * dx + dy * dy < 0.25f) {
-            continue;
-        }
-        float xs[4];
-        float ys[4];
-        stroke_corners(pts[i - 1u].x, pts[i - 1u].y, pts[i].x, pts[i].y, k_stroke_px, xs, ys);
-        shape_draw(cmd, width, height, xs, ys, 0.0f, 0.0f, 0.0f, 0.015f, r, g, b, 1.0f, k_mat_none);
-    }
-    for (uint32_t i = 0; i < n; ++i) {
-        float xs[4];
-        float ys[4];
-        mark_corners(pts[i].x, pts[i].y, k_mark_px, xs, ys);
-        shape_draw(cmd, width, height, xs, ys, 0.0f, 0.0f, 0.0f, 0.018f, r, g, b, 1.0f, k_mat_none);
-    }
+    shape_draw_polygon(cmd, width, height, xs, ys, n, nullptr, 0u, false,
+                       0.0f, 0.0f, 0.0f, 0.0f, 0.015f, 0.018f,
+                       r, g, b, r, g, b, k_stroke_px, k_mark_px, k_mat_none);
 }
 
 uint32_t face_chain_count(void) {

@@ -68,7 +68,9 @@ int frame_boot(void) {
     s_resize_old_w = 0;
     s_resize_old_h = 0;
     s_resize_tranche[0] = '\0';
-    world_reset();
+    engine_app()->reset();
+    frame_clock_reset(&s_clock);
+    s_timer_armed = false;
     s_sync_point = 0;
     s_orphan_count = 0;
     s_stuck_release_fd = -1;
@@ -128,15 +130,12 @@ int frame_boot(void) {
         (void)frame_stop();
         return 1;
     }
-    if (cube_init(vk) != 0 || solid_init(vk) != 0 || shape_init(vk) != 0 ||
-        plane_init(vk) != 0 || material_init(vk) != 0 ||
-        plot_init(vk, forward_init_cqe, wl) != 0 || mesh_init(vk, forward_init_cqe, wl) != 0 ||
-        gimbal_init(vk) != 0 ||
-        chrome_gpu_init(vk) != 0 || hud_init(vk) != 0 || grid_init(vk) != 0) {
+    if (engine_app()->init(vk, forward_init_cqe, wl) != 0 ||
+        chrome_gpu_init(vk) != 0) {
         (void)frame_stop();
         return 1;
     }
-    if (world_load() != 0) {
+    if (engine_app()->load() != 0) {
         (void)frame_stop();
         return 1;
     }
@@ -367,20 +366,10 @@ int frame_stop(void) {
                 shown()->image_view = VK_NULL_HANDLE;
             }
             vulkan_destroy_exportable_image(vk, &shown()->image);
-            cube_depth_destroy(vk, &shown()->depth);
-            cube_coverage_destroy(vk, &shown()->coverage);
+            engine_app()->destroy_targets(vk, &shown()->targets);
         }
         chrome_gpu_shutdown(vk);
-        hud_shutdown(vk);
-        gimbal_shutdown(vk);
-        plot_shutdown(vk);
-        mesh_shutdown(vk);
-        shape_shutdown(vk);
-        plane_shutdown(vk);
-        solid_shutdown(vk);
-        material_shutdown(vk);
-        grid_shutdown(vk);
-        cube_shutdown(vk);
+        engine_app()->shutdown(vk);
     }
 
     s_presented = false;

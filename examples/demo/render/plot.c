@@ -132,7 +132,7 @@ static VkShaderModule make_module(VulkanContext *vk, const uint32_t *code, uint3
 
 static void push_bytes(VkCommandBuffer cmd, VkPipelineLayout layout, VkShaderStageFlags stage,
                        const void *bytes, uint32_t size) {
-    vkCmdPushConstants(cmd, layout, stage, 0, size, bytes);
+    vulkan_cmd_push(cmd, layout, stage, size, bytes);
 }
 
 void plot_shutdown(VulkanContext *vk) {

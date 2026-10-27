@@ -290,9 +290,9 @@ void chrome_gpu_draw(VulkanContext *vk, VkCommandBuffer cmd,
             push.ctl[c].color = pack_rgb(ctl->r, ctl->g, ctl->b, ctl->draw_glyph ? 1u : 0u);
             push.ctl[c].glyph = pack_rgb(ctl->gr, ctl->gg, ctl->gb, 0);
         }
-        vkCmdPushConstants(cmd, s_layout,
-                           VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-                           0, sizeof push, &push);
+        vulkan_cmd_push(cmd, s_layout,
+                        VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                        sizeof push, &push);
         vkCmdDraw(cmd, 6, 1, 0, 0);
         drawn++;
     }

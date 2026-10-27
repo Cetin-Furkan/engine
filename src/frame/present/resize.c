@@ -89,8 +89,7 @@ static int install_resize(WaylandContext *wl, VulkanContext *vk) {
     shown()->image           = fresh.image;
     shown()->image_view      = fresh.image_view;
     shown()->view_format     = fresh.view_format;
-    shown()->depth           = fresh.depth;
-    shown()->coverage        = fresh.coverage;
+    shown()->targets         = fresh.targets;
     shown()->cmd_buf         = fresh.cmd_buf;
     shown()->acquire_point   = fresh.acquire_point;
     shown()->wl_buffer_id    = fresh.wl_buffer_id;

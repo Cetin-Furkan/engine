@@ -49,7 +49,7 @@ int record_and_submit_clear(VulkanContext *vk, FrameSlot *frame, VkSemaphore acq
                 vulkan_vkresult_to_str(res), (int)res);
         return -1;
     }
-    world_record(frame->cmd_buf, heat_dt, draw_live);
+    engine_app()->record_compute(frame->cmd_buf, heat_dt, draw_live);
 
     uint32_t foreign_family = vk->device_info.supports_queue_family_foreign
         ? VK_QUEUE_FAMILY_FOREIGN_EXT
@@ -88,9 +88,9 @@ int record_and_submit_clear(VulkanContext *vk, FrameSlot *frame, VkSemaphore acq
         .pImageMemoryBarriers    = &to_attachment,
     };
     vkCmdPipelineBarrier2(frame->cmd_buf, &dep_to_attachment);
-    if (frame->coverage.image != VK_NULL_HANDLE) {
+    if (frame->targets.coverage_image != VK_NULL_HANDLE) {
         VkImageMemoryBarrier2 to_coverage = to_attachment;
-        to_coverage.image = frame->coverage.image;
+        to_coverage.image = frame->targets.coverage_image;
         to_coverage.srcStageMask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
         to_coverage.srcAccessMask = VK_ACCESS_2_NONE;
         to_coverage.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -102,8 +102,8 @@ int record_and_submit_clear(VulkanContext *vk, FrameSlot *frame, VkSemaphore acq
         };
         vkCmdPipelineBarrier2(frame->cmd_buf, &dep_coverage);
     }
-    if (srgb_view && frame->depth.image != VK_NULL_HANDLE) {
-        cube_prepare_draw(frame->cmd_buf, frame->depth.image);
+    if (srgb_view && frame->targets.depth_image != VK_NULL_HANDLE) {
+        engine_app()->prepare_draw(frame->cmd_buf, frame->targets.depth_image);
     }
 
     VkRenderingAttachmentInfo color_attachment = {
@@ -135,29 +135,27 @@ int record_and_submit_clear(VulkanContext *vk, FrameSlot *frame, VkSemaphore acq
     };
     VkRenderingAttachmentInfo depth_attachment = {
         .sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
-        .imageView   = frame->depth.view,
+        .imageView   = frame->targets.depth_view,
         .imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
         .loadOp      = VK_ATTACHMENT_LOAD_OP_CLEAR,
         .storeOp     = VK_ATTACHMENT_STORE_OP_DONT_CARE,
         .clearValue  = { .depthStencil = { .depth = 1.0f, .stencil = 0 } },
     };
-    if (srgb_view && frame->depth.view != VK_NULL_HANDLE) {
+    if (srgb_view && frame->targets.depth_view != VK_NULL_HANDLE) {
         rendering_info.pDepthAttachment = &depth_attachment;
     }
-    if (frame->coverage.view != VK_NULL_HANDLE) {
-        color_attachment.imageView = frame->coverage.view;
+    if (frame->targets.coverage_view != VK_NULL_HANDLE) {
+        color_attachment.imageView = frame->targets.coverage_view;
         color_attachment.resolveMode = VK_RESOLVE_MODE_AVERAGE_BIT;
         color_attachment.resolveImageView = frame->image_view;
         color_attachment.resolveImageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
         color_attachment.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
     }
 
-    if (rendering_info.pDepthAttachment != nullptr) {
-        plot_prepare(frame->cmd_buf);
-    }
     vkCmdBeginRendering(frame->cmd_buf, &rendering_info);
     if (rendering_info.pDepthAttachment != nullptr) {
-        world_draw(frame->cmd_buf, frame->image.width, frame->image.height, draw_live);
+        engine_app()->claim_frame(acquire, signal_point);
+        engine_app()->draw(frame->cmd_buf, frame->image.width, frame->image.height, draw_live);
     }
     vkCmdEndRendering(frame->cmd_buf);
 
@@ -208,9 +206,10 @@ int record_and_submit_clear(VulkanContext *vk, FrameSlot *frame, VkSemaphore acq
     {
         WaylandContext *wl_hud = wayland_get_context();
         bool have_stamp = wl_hud != nullptr && wl_hud->frame_stamp_valid;
-        hud_prepare(have_stamp ? wl_hud->frame_time_ms : 0u, have_stamp,
-                    frame->image.drm_format_modifier);
-        hud_draw(frame->cmd_buf, frame->image.width, frame->image.height, frame->view_format);
+        engine_app()->draw_overlay(frame->cmd_buf, frame->image.width, frame->image.height,
+                                   frame->view_format,
+                                   have_stamp ? wl_hud->frame_time_ms : 0u, have_stamp,
+                                   frame->image.drm_format_modifier);
     }
     vkCmdEndRendering(frame->cmd_buf);
 
@@ -243,7 +242,8 @@ int record_and_submit_clear(VulkanContext *vk, FrameSlot *frame, VkSemaphore acq
 
     res = vkEndCommandBuffer(frame->cmd_buf);
     if (res != VK_SUCCESS) {
-        world_record_abort();
+        engine_app()->release_frame(signal_point);
+        engine_app()->record_abort();
         fprintf(stderr, "[Engine Error] vkEndCommandBuffer failed: %s (%d)\n",
                 vulkan_vkresult_to_str(res), (int)res);
         return -1;
@@ -260,14 +260,14 @@ int record_and_submit_clear(VulkanContext *vk, FrameSlot *frame, VkSemaphore acq
     // is what makes the write visible. The signal stage is the whole
     // command buffer, so a step waits at compute and a later draw waits
     // at vertex. The bake's seed stays at 0 because that queue was idled.
-    uint64_t heat_point = world_record_published();
+    uint64_t heat_point = engine_app()->record_published();
     bool wait_heat = heat_point != 0 && heat_point < signal_point;
     VkSemaphoreSubmitInfo wait_info = {
         .sType       = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
         .pNext       = nullptr,
         .semaphore   = acquire,
         .value       = heat_point,
-        .stageMask   = world_record_step_open() ? VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT
+        .stageMask   = engine_app()->record_step_open() ? VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT
                                                 : VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT,
         .deviceIndex = 0,
     };
@@ -293,12 +293,13 @@ int record_and_submit_clear(VulkanContext *vk, FrameSlot *frame, VkSemaphore acq
 
     res = vkQueueSubmit2(vk->queues.graphics_queue, 1, &submit_info, VK_NULL_HANDLE);
     if (res != VK_SUCCESS) {
-        world_record_abort();
+        engine_app()->release_frame(signal_point);
+        engine_app()->record_abort();
         fprintf(stderr, "[Engine Error] vkQueueSubmit2 failed: %s (%d)\n",
                 vulkan_vkresult_to_str(res), (int)res);
         return -1;
     }
     frame->foreign_owned = true;
-    world_record_ok(signal_point);
+    engine_app()->record_ok(signal_point);
     return 0;
 }

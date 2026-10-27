@@ -76,8 +76,6 @@ static VkPipeline       s_bake = VK_NULL_HANDLE;
 static VkBuffer         s_buffer = VK_NULL_HANDLE;
 static VkDeviceMemory   s_memory = VK_NULL_HANDLE;
 static VkDeviceAddress  s_addr = 0;
-static bool             s_push2 = false;
-
 static void solid_fail(const char *what, VkResult res) {
     fprintf(stderr, "[Solid Error] %s: %s (%d)\n", what, vulkan_vkresult_to_str(res), (int)res);
 }
@@ -198,20 +196,7 @@ static int bake_mesh(VulkanContext *vk) {
     }
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_bake);
     BakePush bake_push = { .verts = s_addr };
-    if (s_push2) {
-        VkPushConstantsInfo push = {
-            .sType      = VK_STRUCTURE_TYPE_PUSH_CONSTANTS_INFO,
-            .layout     = s_bake_layout,
-            .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
-            .offset     = 0,
-            .size       = sizeof bake_push,
-            .pValues    = &bake_push,
-        };
-        vkCmdPushConstants2(cmd, &push);
-    } else {
-        vkCmdPushConstants(cmd, s_bake_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
-                           sizeof bake_push, &bake_push);
-    }
+    vulkan_cmd_push(cmd, s_bake_layout, VK_SHADER_STAGE_COMPUTE_BIT, sizeof bake_push, &bake_push);
     vkCmdDispatch(cmd, (k_solid_verts + k_local - 1u) / k_local, 1u, 1u);
     VkMemoryBarrier2 mesh = {
         .sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
@@ -310,7 +295,6 @@ int solid_init(VulkanContext *vk) {
         fprintf(stderr, "[Solid Error] Mesh ranges do not cover %u verts\n", k_solid_verts);
         return -1;
     }
-    s_push2 = vk->device_info.supports_maintenance6;
     if (create_da_buffer(vk, (VkDeviceSize)k_solid_verts * 36u,
                          VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
                          &s_buffer, &s_memory, &s_addr) != 0) {
@@ -517,20 +501,7 @@ void solid_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height,
     vkCmdSetViewport(cmd, 0, 1, &viewport);
     vkCmdSetScissor(cmd, 0, 1, &scissor);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_pipeline);
-    if (s_push2) {
-        VkPushConstantsInfo push = {
-            .sType      = VK_STRUCTURE_TYPE_PUSH_CONSTANTS_INFO,
-            .layout     = s_layout,
-            .stageFlags = VK_SHADER_STAGE_VERTEX_BIT,
-            .offset     = 0,
-            .size       = sizeof draw_push,
-            .pValues    = &draw_push,
-        };
-        vkCmdPushConstants2(cmd, &push);
-    } else {
-        vkCmdPushConstants(cmd, s_layout, VK_SHADER_STAGE_VERTEX_BIT, 0,
-                           sizeof draw_push, &draw_push);
-    }
+    vulkan_cmd_push(cmd, s_layout, VK_SHADER_STAGE_VERTEX_BIT, sizeof draw_push, &draw_push);
     vkCmdDraw(cmd, k_count[kind][cage], 1, k_first[kind][cage], 0);
 }
 

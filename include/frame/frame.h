@@ -4,15 +4,15 @@
 [[nodiscard]] int engine_subsystem_init(void);
 
 /**
- * @brief Leaves the presented buffer on screen. The CPU blocks in io_uring
- * until the toplevel is closed or SIGINT, SIGTERM, or SIGHUP arrives.
+ * @brief Runs the continuous frame loop. A wl_surface.frame callback is
+ * always outstanding; each compositor stamp steps the FrameClock,
+ * consumes fixed 8 ms simulation steps, and presents only when the
+ * picture changed. The CPU blocks in io_uring until the toplevel is
+ * closed or SIGINT, SIGTERM, or SIGHUP arrives. An absolute io_uring
+ * timeout watchdog re-arms the callback if the compositor stalls.
  * When the chrome spec allows resize, a configure whose size differs
  * records a new buffer, including while the drag is active. The bar stays
  * at its spec thickness. The toplevel minimum is that chrome size.
- * The cube is drawn into that buffer at a fixed 240px size, centered.
- * Its edges and corners are a GPU fillet; the face interiors stay flat.
- * The first present does not arm a frame callback. The run loop arms one
- * for a single turn, then drops it.
  */
 [[nodiscard]] int engine_subsystem_run(void);
 

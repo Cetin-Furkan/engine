@@ -447,14 +447,20 @@ static VulkanResult evaluate_device(GpuCandidate *candidate) {
     if (!candidate->supports_dyn_render || !candidate->supports_sync2 ||
         !candidate->supports_bda || !candidate->supports_timeline ||
         !candidate->supports_scalar_layout || !candidate->supports_shader_int16 ||
-        !candidate->supports_shader_int64 || !candidate->supports_storage_buffer_16bit) {
-        char reason[256];
+        !candidate->supports_shader_int64 || !candidate->supports_storage_buffer_16bit ||
+        !candidate->supports_maintenance5 || !candidate->supports_maintenance6 ||
+        !candidate->supports_push_descriptors || !candidate->supports_host_image_copy ||
+        !candidate->supports_dynamic_rendering_local_read) {
+        char reason[320];
         snprintf(reason, sizeof reason,
-                 "Missing required feature (DynRender=%d, Sync2=%d, BDA=%d, Timeline=%d, ScalarLayout=%d, Int16=%d, Int64=%d, Storage16=%d)",
+                 "Missing Vulkan 1.4 feature (DynRender=%d, Sync2=%d, BDA=%d, Timeline=%d, Scalar=%d, Int16=%d, Int64=%d, Storage16=%d, Maint5=%d, Maint6=%d, PushDesc=%d, HostCopy=%d, LocalRead=%d)",
                  candidate->supports_dyn_render, candidate->supports_sync2,
                  candidate->supports_bda, candidate->supports_timeline,
                  candidate->supports_scalar_layout, candidate->supports_shader_int16,
-                 candidate->supports_shader_int64, candidate->supports_storage_buffer_16bit);
+                 candidate->supports_shader_int64, candidate->supports_storage_buffer_16bit,
+                 candidate->supports_maintenance5, candidate->supports_maintenance6,
+                 candidate->supports_push_descriptors, candidate->supports_host_image_copy,
+                 candidate->supports_dynamic_rendering_local_read);
         disqualify(candidate, reason);
         return VULKAN_SUCCESS;
     }
@@ -928,11 +934,11 @@ VulkanResult vulkan_device_create(VulkanContext *ctx) {
 
     VkPhysicalDeviceVulkan14Features feat14 = {
         .sType                     = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_4_FEATURES,
-        .maintenance5              = best.supports_maintenance5 ? VK_TRUE : VK_FALSE,
-        .maintenance6              = best.supports_maintenance6 ? VK_TRUE : VK_FALSE,
-        .pushDescriptor            = best.supports_push_descriptors ? VK_TRUE : VK_FALSE,
-        .hostImageCopy             = best.supports_host_image_copy ? VK_TRUE : VK_FALSE,
-        .dynamicRenderingLocalRead = best.supports_dynamic_rendering_local_read ? VK_TRUE : VK_FALSE,
+        .maintenance5              = VK_TRUE,
+        .maintenance6              = VK_TRUE,
+        .pushDescriptor            = VK_TRUE,
+        .hostImageCopy             = VK_TRUE,
+        .dynamicRenderingLocalRead = VK_TRUE,
     };
     VkPhysicalDeviceVulkan13Features feat13 = {
         .sType            = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
@@ -950,15 +956,15 @@ VulkanResult vulkan_device_create(VulkanContext *ctx) {
     VkPhysicalDeviceVulkan11Features feat11 = {
         .sType                     = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
         .pNext                     = &feat12,
-        .storageBuffer16BitAccess  = best.supports_storage_buffer_16bit ? VK_TRUE : VK_FALSE,
+        .storageBuffer16BitAccess  = VK_TRUE,
     };
     VkPhysicalDeviceFeatures2 features2 = {
         .sType    = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
         .pNext    = &feat11,
         .features = {
             .samplerAnisotropy = best.supports_anisotropy ? VK_TRUE : VK_FALSE,
-            .shaderInt16       = best.supports_shader_int16 ? VK_TRUE : VK_FALSE,
-            .shaderInt64       = best.supports_shader_int64 ? VK_TRUE : VK_FALSE,
+            .shaderInt16       = VK_TRUE,
+            .shaderInt64       = VK_TRUE,
         },
     };
 

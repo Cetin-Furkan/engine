@@ -510,7 +510,7 @@ static VulkanResult create_bound_export_image(
             .sType = VK_STRUCTURE_TYPE_SUBRESOURCE_LAYOUT_2,
             .pNext = nullptr,
         };
-        if (ctx->device_info.supports_maintenance5 && !modifier_tiling) {
+        if (!modifier_tiling) {
             VkDeviceImageSubresourceInfo dev_subres_info = {
                 .sType       = VK_STRUCTURE_TYPE_DEVICE_IMAGE_SUBRESOURCE_INFO,
                 .pNext       = nullptr,

@@ -28,6 +28,10 @@ struct WorldObj {
     const WorldOps *ops;
     void           *data;
     Coord           at;
+    // Bumped on every (re)use of this entry. The selection remembers the
+    // generation it picked; a mismatch means the entry was reset/reused
+    // and the old selection is poison, not a pointer to the new object.
+    uint32_t        generation;
     bool            alive;
     bool            shown_alive;
     Spin           *spin;

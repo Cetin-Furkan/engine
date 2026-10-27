@@ -1,45 +1,34 @@
-#include "frame/shape.h"
+#include "frame/gimbal.h"
 #include "frame/camera.h"
 #include "frame/cube.h"
 #include <stddef.h>
 #include <stdio.h>
 
 alignas(uint32_t) static const unsigned char k_vert_spv[] = {
-#embed "shape.vert.spv"
+#embed "gimbal.vert.spv"
 };
 alignas(uint32_t) static const unsigned char k_frag_spv[] = {
-#embed "shape.frag.spv"
+#embed "gimbal.frag.spv"
 };
 
-static_assert(sizeof k_vert_spv % 4u == 0u, "shape vert spirv");
-static_assert(sizeof k_frag_spv % 4u == 0u, "shape frag spirv");
+static_assert(sizeof k_vert_spv % 4u == 0u, "gimbal vert spirv");
+static_assert(sizeof k_frag_spv % 4u == 0u, "gimbal frag spirv");
 
-// Matches shaders/shape.vert. Scalar layout, no padding.
-typedef struct ShapePush {
-    float    x0, y0, x1, y1, x2, y2, x3, y3;
-    float    center_x;
-    float    center_y;
-    float    angle_rad;
-    float    depth;
-    uint32_t width;
-    uint32_t height;
-    float    r, g, b, a;
-    ViewPush view;
-} ShapePush;
+typedef struct GimbalPush {
+    float qx;
+    float qy;
+    float qz;
+    float qw;
+} GimbalPush;
 
-static_assert(offsetof(ShapePush, center_x) == 32u, "shape center");
-static_assert(offsetof(ShapePush, angle_rad) == 40u, "shape angle");
-static_assert(offsetof(ShapePush, depth) == 44u, "shape depth");
-static_assert(offsetof(ShapePush, width) == 48u, "shape width");
-static_assert(offsetof(ShapePush, r) == 56u, "shape color");
-static_assert(offsetof(ShapePush, view) == 72u, "shape view");
-static_assert(sizeof(ShapePush) == 120u, "shape push");
+static_assert(sizeof(GimbalPush) == 16u, "gimbal push");
 
 static VkPipelineLayout s_layout = VK_NULL_HANDLE;
 static VkPipeline       s_pipeline = VK_NULL_HANDLE;
+static bool             s_logged = false;
 
-static void shape_fail(const char *what, VkResult res) {
-    fprintf(stderr, "[Shape Error] %s: %s (%d)\n", what, vulkan_vkresult_to_str(res), (int)res);
+static void gimbal_fail(const char *what, VkResult res) {
+    fprintf(stderr, "[Gimbal Error] %s: %s (%d)\n", what, vulkan_vkresult_to_str(res), (int)res);
 }
 
 static VkShaderModule make_module(VulkanContext *vk, const uint32_t *code, uint32_t bytes) {
@@ -51,13 +40,13 @@ static VkShaderModule make_module(VulkanContext *vk, const uint32_t *code, uint3
     VkShaderModule module = VK_NULL_HANDLE;
     VkResult res = vkCreateShaderModule(vk->device, &info, nullptr, &module);
     if (res != VK_SUCCESS) {
-        shape_fail("vkCreateShaderModule", res);
+        gimbal_fail("vkCreateShaderModule", res);
         return VK_NULL_HANDLE;
     }
     return module;
 }
 
-void shape_shutdown(VulkanContext *vk) {
+void gimbal_shutdown(VulkanContext *vk) {
     if (vk == nullptr || vk->device == VK_NULL_HANDLE) {
         s_layout = VK_NULL_HANDLE;
         s_pipeline = VK_NULL_HANDLE;
@@ -73,7 +62,7 @@ void shape_shutdown(VulkanContext *vk) {
     }
 }
 
-int shape_init(VulkanContext *vk) {
+int gimbal_init(VulkanContext *vk) {
     if (vk == nullptr || vk->device == VK_NULL_HANDLE || vk->physical_device == VK_NULL_HANDLE) {
         return -1;
     }
@@ -83,22 +72,12 @@ int shape_init(VulkanContext *vk) {
     VkFormat depth_format = cube_depth_format();
     VkSampleCountFlagBits samples = cube_raster_samples();
     if (depth_format == VK_FORMAT_UNDEFINED || samples == 0) {
-        fprintf(stderr, "[Shape Error] The cube pass has no depth format yet\n");
+        fprintf(stderr, "[Gimbal Error] The cube pass has no depth format yet\n");
         return -1;
     }
-
-    VkPhysicalDeviceProperties props = {0};
-    vkGetPhysicalDeviceProperties(vk->physical_device, &props);
-    if (props.limits.maxPushConstantsSize < sizeof(ShapePush)) {
-        fprintf(stderr, "[Shape Error] Push constants are %u bytes, the fill needs %zu\n",
-                props.limits.maxPushConstantsSize, sizeof(ShapePush));
-        return -1;
-    }
-
     VkPushConstantRange push = {
-        .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-        .offset     = 0,
-        .size       = sizeof(ShapePush),
+        .stageFlags = VK_SHADER_STAGE_VERTEX_BIT,
+        .size       = sizeof(GimbalPush),
     };
     VkPipelineLayoutCreateInfo layout_info = {
         .sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
@@ -108,11 +87,10 @@ int shape_init(VulkanContext *vk) {
     VkResult res = vkCreatePipelineLayout(vk->device, &layout_info, nullptr, &s_layout);
     if (res != VK_SUCCESS) {
         s_layout = VK_NULL_HANDLE;
-        shape_fail("vkCreatePipelineLayout", res);
-        shape_shutdown(vk);
+        gimbal_fail("vkCreatePipelineLayout", res);
+        gimbal_shutdown(vk);
         return -1;
     }
-
     VkShaderModule vert = make_module(vk, (const uint32_t *)k_vert_spv, (uint32_t)sizeof k_vert_spv);
     VkShaderModule frag = make_module(vk, (const uint32_t *)k_frag_spv, (uint32_t)sizeof k_frag_spv);
     if (vert == VK_NULL_HANDLE || frag == VK_NULL_HANDLE) {
@@ -122,10 +100,9 @@ int shape_init(VulkanContext *vk) {
         if (frag != VK_NULL_HANDLE) {
             vkDestroyShaderModule(vk->device, frag, nullptr);
         }
-        shape_shutdown(vk);
+        gimbal_shutdown(vk);
         return -1;
     }
-
     VkPipelineShaderStageCreateInfo stages[2] = {
         {
             .sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
@@ -165,9 +142,8 @@ int shape_init(VulkanContext *vk) {
     };
     VkPipelineDepthStencilStateCreateInfo depth = {
         .sType            = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
-        .depthTestEnable  = VK_TRUE,
-        .depthWriteEnable = VK_TRUE,
-        .depthCompareOp   = VK_COMPARE_OP_LESS,
+        .depthTestEnable  = VK_FALSE,
+        .depthWriteEnable = VK_FALSE,
     };
     VkPipelineColorBlendAttachmentState blend_att = {
         .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
@@ -211,53 +187,41 @@ int shape_init(VulkanContext *vk) {
     vkDestroyShaderModule(vk->device, frag, nullptr);
     if (res != VK_SUCCESS) {
         s_pipeline = VK_NULL_HANDLE;
-        shape_fail("vkCreateGraphicsPipelines", res);
-        shape_shutdown(vk);
+        gimbal_fail("vkCreateGraphicsPipelines", res);
+        gimbal_shutdown(vk);
         return -1;
     }
-    printf("[Shape] Four-corner fill in the cube pass\n");
-    fflush(stdout);
+    if (!s_logged) {
+        printf("[Gimbal] Screen axes follow the camera. Home or numpad 1 snaps the front view.\n");
+        fflush(stdout);
+        s_logged = true;
+    }
     return 0;
 }
 
-void shape_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height,
-                const float x[4], const float y[4],
-                float center_x, float center_y, float angle_rad, float depth,
-                float r, float g, float b, float a, uint32_t mat_index) {
-    if (cmd == VK_NULL_HANDLE || s_pipeline == VK_NULL_HANDLE || s_layout == VK_NULL_HANDLE ||
-        x == nullptr || y == nullptr || width == 0 || height == 0) {
+void gimbal_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height) {
+    if (cmd == VK_NULL_HANDLE || s_pipeline == VK_NULL_HANDLE || width == 0 || height == 0) {
         return;
     }
     VkViewport viewport = {
-        .x        = 0.0f,
-        .y        = 0.0f,
         .width    = (float)width,
         .height   = (float)height,
-        .minDepth = 0.0f,
         .maxDepth = 1.0f,
     };
     VkRect2D scissor = {
         .extent = { .width = width, .height = height },
     };
-    ShapePush push = {
-        .x0 = x[0], .y0 = y[0],
-        .x1 = x[1], .y1 = y[1],
-        .x2 = x[2], .y2 = y[2],
-        .x3 = x[3], .y3 = y[3],
-        .center_x  = center_x,
-        .center_y  = center_y,
-        .angle_rad = angle_rad,
-        .depth     = depth,
-        .width     = width,
-        .height    = height,
-        .r = r, .g = g, .b = b, .a = a,
+    ViewPush view;
+    view_push_fill(&view, 0);
+    GimbalPush push = {
+        .qx = view.qx,
+        .qy = view.qy,
+        .qz = view.qz,
+        .qw = view.qw,
     };
-    view_push_fill(&push.view, mat_index);
     vkCmdSetViewport(cmd, 0, 1, &viewport);
     vkCmdSetScissor(cmd, 0, 1, &scissor);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_pipeline);
-    vkCmdPushConstants(cmd, s_layout,
-                       VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-                       0, sizeof push, &push);
-    vkCmdDraw(cmd, 6, 1, 0, 0);
+    vulkan_cmd_push(cmd, s_layout, VK_SHADER_STAGE_VERTEX_BIT, sizeof push, &push);
+    vkCmdDraw(cmd, 18, 1, 0, 0);
 }

@@ -162,6 +162,20 @@ typedef struct VulkanContext {
     bool                     is_initialized;
 } VulkanContext;
 
+// Vulkan 1.4 maintenance6. The device refuses to start without it.
+static inline void vulkan_cmd_push(VkCommandBuffer cmd, VkPipelineLayout layout,
+                                   VkShaderStageFlags stage, uint32_t size, const void *values) {
+    VkPushConstantsInfo info = {
+        .sType      = VK_STRUCTURE_TYPE_PUSH_CONSTANTS_INFO,
+        .layout     = layout,
+        .stageFlags = stage,
+        .offset     = 0,
+        .size       = size,
+        .pValues    = values,
+    };
+    vkCmdPushConstants2(cmd, &info);
+}
+
 #ifdef __cplusplus
 }
 #endif

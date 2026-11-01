@@ -289,12 +289,14 @@ int frame_run(void) {
             break;
         }
 
-        // Frame watchdog: while a turn is active, an absolute timeout
-        // completes even if the compositor stops sending frame stamps.
-        // When the turn is done no timer is armed and the wait is idle.
+        // Frame watchdog / simulation tick: while a turn is active, an absolute
+        // timeout completes to advance simulation (every 8ms when busy) or detect
+        // compositor stalls when idle.
         if (frame_state.turn_phase == k_turn_run && !frame_state.timer_armed && !send_in_flight) {
-            uint64_t deadline = ring_mono_ns() +
-                (uint64_t)frame_clock_stall_after_ms(&frame_state.clock) * 1000000ull;
+            uint64_t interval_ns = engine_app()->busy()
+                ? 8000000ull  // 8 ms fixed simulation step when busy (125 Hz)
+                : (uint64_t)frame_clock_stall_after_ms(&frame_state.clock) * 1000000ull;
+            uint64_t deadline = ring_mono_ns() + interval_ns;
             if (ring_arm_timeout_abs(ring, deadline, ENG_UD_FRAME_TIMER) == 0) {
                 frame_state.timer_armed = true;
             }

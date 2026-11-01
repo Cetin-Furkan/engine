@@ -18,10 +18,24 @@ static int create_raw_block(VulkanContext *vk, VkDeviceSize size, VkBufferUsageF
     }
     *out = (BdaBlock){0};
 
+    uint32_t queue_families[3];
+    uint32_t queue_family_count = 0;
+    queue_families[queue_family_count++] = vk->queues.graphics_family_index;
+    if (vk->queues.compute_family_index != vk->queues.graphics_family_index) {
+        queue_families[queue_family_count++] = vk->queues.compute_family_index;
+    }
+    if (vk->queues.transfer_family_index != vk->queues.graphics_family_index &&
+        vk->queues.transfer_family_index != vk->queues.compute_family_index) {
+        queue_families[queue_family_count++] = vk->queues.transfer_family_index;
+    }
+
     VkBufferCreateInfo buffer_info = {
-        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-        .size  = size,
-        .usage = usage,
+        .sType                 = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size                  = size,
+        .usage                 = usage,
+        .sharingMode           = (queue_family_count > 1) ? VK_SHARING_MODE_CONCURRENT : VK_SHARING_MODE_EXCLUSIVE,
+        .queueFamilyIndexCount = (queue_family_count > 1) ? queue_family_count : 0,
+        .pQueueFamilyIndices   = (queue_family_count > 1) ? queue_families : nullptr,
     };
     VkResult res = vkCreateBuffer(vk->device, &buffer_info, nullptr, &out->buffer);
     if (res != VK_SUCCESS) {
@@ -210,7 +224,10 @@ int bda_system_init(VulkanContext *vk) {
         .slab_size      = BDA_DEFAULT_SLAB_SIZE,
         .usage          = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
                           VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-                          VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                          VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                          VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+                          VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |
+                          VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         .mem_flags      = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
         .is_host_mapped = true,
     };
@@ -249,21 +266,27 @@ void bda_system_shutdown(VulkanContext *vk) {
 
 BdaSlice bda_alloc_device(VulkanContext *vk, VkDeviceSize size, VkDeviceSize align) {
     if (!s_bda_sys.is_initialized) {
-        bda_system_init(vk);
+        if (bda_system_init(vk) != 0) {
+            return (BdaSlice){0};
+        }
     }
     return alloc_from_pool(vk, &s_bda_sys.device_pool, size, align);
 }
 
 BdaSlice bda_alloc_staging(VulkanContext *vk, VkDeviceSize size, VkDeviceSize align) {
     if (!s_bda_sys.is_initialized) {
-        bda_system_init(vk);
+        if (bda_system_init(vk) != 0) {
+            return (BdaSlice){0};
+        }
     }
     return alloc_from_pool(vk, &s_bda_sys.staging_pool, size, align);
 }
 
 BdaSlice bda_alloc_transient(VulkanContext *vk, VkDeviceSize size, VkDeviceSize align) {
     if (!s_bda_sys.is_initialized) {
-        bda_system_init(vk);
+        if (bda_system_init(vk) != 0) {
+            return (BdaSlice){0};
+        }
     }
     if (align == 0) {
         align = BDA_CACHE_LINE_ALIGN;
@@ -304,7 +327,9 @@ int da_buffer_create(VulkanContext *vk, VkDeviceSize size, VkBufferUsageFlags us
     // Suballocate from 2026 BDA pool for standard buffers under 16 MiB
     if (size <= 16u * 1024u * 1024u) {
         if (!s_bda_sys.is_initialized) {
-            bda_system_init(vk);
+            if (bda_system_init(vk) != 0) {
+                return -1;
+            }
         }
         BdaSlice slice = host ? bda_alloc_staging(vk, size, BDA_STORAGE_ALIGN)
                               : bda_alloc_device(vk, size, BDA_STORAGE_ALIGN);
@@ -354,7 +379,7 @@ void da_buffer_destroy(VulkanContext *vk, DaBuffer *buf) {
     *buf = (DaBuffer){0};
 }
 
-int bda_arena_init(VulkanContext *vk, BdaArena *arena, uint32_t capacity) {
+int bda_arena_init(VulkanContext *vk, BdaArena *arena, uint32_t capacity, bool host) {
     if (vk == nullptr || vk->device == VK_NULL_HANDLE || arena == nullptr || capacity == 0u) {
         return -1;
     }
@@ -362,8 +387,8 @@ int bda_arena_init(VulkanContext *vk, BdaArena *arena, uint32_t capacity) {
     VkBufferUsageFlags usage = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
                                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
     DaBuffer buf = {0};
-    if (da_buffer_create(vk, capacity, usage, true, &buf) != 0 &&
-        da_buffer_create(vk, capacity, usage, false, &buf) != 0) {
+    if (da_buffer_create(vk, capacity, usage, host, &buf) != 0 &&
+        da_buffer_create(vk, capacity, usage, !host, &buf) != 0) {
         fprintf(stderr, "[BDA Error] No memory type for a %u byte arena\n", capacity);
         return -1;
     }

@@ -77,7 +77,7 @@ void bda_transient_reset(void);
                                    VkBufferUsageFlags usage, bool host, DaBuffer *out);
 void da_buffer_destroy(VulkanContext *vk, DaBuffer *buf);
 
-[[nodiscard]] int bda_arena_init(VulkanContext *vk, BdaArena *arena, uint32_t capacity);
+[[nodiscard]] int bda_arena_init(VulkanContext *vk, BdaArena *arena, uint32_t capacity, bool host);
 void bda_arena_destroy(VulkanContext *vk, BdaArena *arena);
 void bda_arena_reset(BdaArena *arena);
 [[nodiscard]] BdaSlice bda_arena_alloc(BdaArena *arena, uint32_t bytes, uint32_t align);

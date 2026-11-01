@@ -7,8 +7,10 @@
 #include <hb-ft.h>
 #include <hb.h>
 
+#include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 
 // The sealed bytes sit next to this file. A runtime path cannot replace them.
 static const unsigned char k_sealed[] = {
@@ -319,20 +321,63 @@ bool text_face_apply_line(const char *line) {
     return open_role(id, from_file, p);
 }
 
+static bool resolve_face_file(const char *name, char *out, size_t cap) {
+    int cwd = snprintf(out, cap, "%s", name);
+    if (cwd > 0 && (size_t)cwd < cap && access(out, R_OK) == 0) {
+        return true;
+    }
+    char exe[1024];
+    ssize_t n = readlink("/proc/self/exe", exe, sizeof exe - 1u);
+    if (n <= 0 || (size_t)n >= sizeof exe) {
+        return false;
+    }
+    exe[n] = '\0';
+    for (uint32_t up = 0; up < 6u; ++up) {
+        char *slash = strrchr(exe, '/');
+        if (slash == nullptr || slash == exe) {
+            break;
+        }
+        *slash = '\0';
+        int wrote = snprintf(out, cap, "%s/%s", exe, name);
+        if (wrote > 0 && (size_t)wrote < cap && access(out, R_OK) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static void load_dynamic(void) {
-    const char *path = "examples/demo/text/face/dynamic.faces";
-    FILE *file = fopen(path, "r");
-    if (file == nullptr) {
+    char path[1024];
+    if (!resolve_face_file("examples/demo/text/face/dynamic.faces", path, sizeof path) &&
+        !resolve_face_file("text/face/dynamic.faces", path, sizeof path)) {
         return;
     }
-    char line[k_line];
-    while (fgets(line, (int)sizeof line, file) != nullptr) {
-        if (skip_line(line)) {
-            continue;
-        }
-        (void)text_face_apply_line(line);
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        return;
     }
-    fclose(file);
+    char buf[4096];
+    ssize_t n = read(fd, buf, sizeof buf - 1u);
+    close(fd);
+    if (n <= 0) {
+        return;
+    }
+    buf[n] = '\0';
+    char *cursor = buf;
+    char *end = buf + n;
+    while (cursor < end) {
+        char *eol = memchr(cursor, '\n', (size_t)(end - cursor));
+        if (eol != nullptr) {
+            *eol = '\0';
+        }
+        if (!skip_line(cursor)) {
+            (void)text_face_apply_line(cursor);
+        }
+        if (eol == nullptr) {
+            break;
+        }
+        cursor = eol + 1;
+    }
 }
 
 static void log_faces(void) {

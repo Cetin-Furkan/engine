@@ -109,6 +109,9 @@ void ring_pbuf_finish(RingContext *r, uint16_t bid, uint32_t nbytes, bool more);
 [[nodiscard]] int ring_pbuf_drop_inc(RingContext *r);
 void ring_pbuf_recycle(RingContext *r, uint16_t bid);
 void ring_sqe_unget(RingContext *r, uint32_t n);
+[[nodiscard]] int ring_submit_read_file(RingContext *r, const char *path, void *buf, size_t cap,
+                                        uint64_t open_ud, uint64_t read_ud,
+                                        uint64_t close_ud, uint64_t fence_ud);
 [[nodiscard]] int ring_read_file_all(RingContext *r, const char *path, void *buf, size_t cap,
                                      size_t *out_len, RingCqeFn on_cqe, void *on_user);
 [[nodiscard]] int ring_init(void);

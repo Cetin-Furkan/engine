@@ -234,15 +234,16 @@ static void dispatch_heat(VkCommandBuffer cmd, uint32_t dt_ms, uint32_t seed,
 // One submit, then the queue is idle. The seed is visible without an acquire
 // wait. A live step publishes the acquire value of its own submit.
 static int bake_mesh(VulkanContext *vk) {
-    if (vk->cmd_pool == VK_NULL_HANDLE || vk->queues.graphics_queue == VK_NULL_HANDLE ||
-        s_compute == VK_NULL_HANDLE) {
-        fprintf(stderr, "[Cube Error] Mesh bake needs the graphics queue and command pool\n");
+    VkCommandPool pool = vk->compute_cmd_pool != VK_NULL_HANDLE ? vk->compute_cmd_pool : vk->cmd_pool;
+    VkQueue queue = vk->queues.compute_queue != VK_NULL_HANDLE ? vk->queues.compute_queue : vk->queues.graphics_queue;
+    if (pool == VK_NULL_HANDLE || queue == VK_NULL_HANDLE || s_compute == VK_NULL_HANDLE) {
+        fprintf(stderr, "[Cube Error] Mesh bake needs compute queue and command pool\n");
         return -1;
     }
     VkCommandBuffer cmd = VK_NULL_HANDLE;
     VkCommandBufferAllocateInfo alloc_info = {
         .sType              = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-        .commandPool        = vk->cmd_pool,
+        .commandPool        = pool,
         .level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
         .commandBufferCount = 1,
     };
@@ -258,7 +259,7 @@ static int bake_mesh(VulkanContext *vk) {
     res = vkBeginCommandBuffer(cmd, &begin_info);
     if (res != VK_SUCCESS) {
         cube_fail("vkBeginCommandBuffer bake", res);
-        vkFreeCommandBuffers(vk->device, vk->cmd_pool, 1, &cmd);
+        vkFreeCommandBuffers(vk->device, pool, 1, &cmd);
         return -1;
     }
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_compute);
@@ -283,7 +284,7 @@ static int bake_mesh(VulkanContext *vk) {
     vkCmdPipelineBarrier2(cmd, &dep);
     if (s_heat_pipe == VK_NULL_HANDLE || s_heat_addr[0] == 0) {
         fprintf(stderr, "[Cube Error] Heat seed needs its pipeline and buffer\n");
-        vkFreeCommandBuffers(vk->device, vk->cmd_pool, 1, &cmd);
+        vkFreeCommandBuffers(vk->device, pool, 1, &cmd);
         return -1;
     }
     for (uint32_t slot = 0; slot < k_heat_slots; ++slot) {
@@ -292,7 +293,7 @@ static int bake_mesh(VulkanContext *vk) {
     res = vkEndCommandBuffer(cmd);
     if (res != VK_SUCCESS) {
         cube_fail("vkEndCommandBuffer bake", res);
-        vkFreeCommandBuffers(vk->device, vk->cmd_pool, 1, &cmd);
+        vkFreeCommandBuffers(vk->device, pool, 1, &cmd);
         return -1;
     }
     VkCommandBufferSubmitInfo cmd_submit = {
@@ -304,14 +305,14 @@ static int bake_mesh(VulkanContext *vk) {
         .commandBufferInfoCount = 1,
         .pCommandBufferInfos    = &cmd_submit,
     };
-    res = vkQueueSubmit2(vk->queues.graphics_queue, 1, &submit_info, VK_NULL_HANDLE);
+    res = vkQueueSubmit2(queue, 1, &submit_info, VK_NULL_HANDLE);
     if (res != VK_SUCCESS) {
         cube_fail("vkQueueSubmit2 bake", res);
-        vkFreeCommandBuffers(vk->device, vk->cmd_pool, 1, &cmd);
+        vkFreeCommandBuffers(vk->device, pool, 1, &cmd);
         return -1;
     }
-    res = vkQueueWaitIdle(vk->queues.graphics_queue);
-    vkFreeCommandBuffers(vk->device, vk->cmd_pool, 1, &cmd);
+    res = vkQueueWaitIdle(queue);
+    vkFreeCommandBuffers(vk->device, pool, 1, &cmd);
     if (res != VK_SUCCESS) {
         cube_fail("vkQueueWaitIdle bake", res);
         return -1;

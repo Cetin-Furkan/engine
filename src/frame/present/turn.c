@@ -42,6 +42,30 @@ int frame_watchdog(WaylandContext *wl, VulkanContext *vk, bool *queued) {
     if (wl == nullptr || vk == nullptr || frame_state.turn_phase != k_turn_run) {
         return 0;
     }
+
+    if (engine_app()->busy()) {
+        uint64_t now_ns = ring_mono_ns();
+        if (frame_state.last_sim_mono_ns == 0) {
+            frame_state.last_sim_mono_ns = now_ns;
+        }
+        uint32_t dt_ms = (uint32_t)((now_ns - frame_state.last_sim_mono_ns) / 1000000ull);
+        if (dt_ms >= 8u) {
+            frame_state.last_sim_mono_ns = now_ns;
+            uint32_t synth_stamp = (uint32_t)(now_ns / 1000000ull);
+            uint32_t steps = dt_ms / 8u;
+            if (steps > 5u) {
+                steps = 5u;
+            }
+            for (uint32_t s = 0; s < steps; ++s) {
+                uint32_t sub = synth_stamp - (steps - 1u - s) * 8u;
+                FrameStep synth_step = { .dt_ms = 8u, .missed = 0, .paint = false, .first = false };
+                uint32_t heat_dt = 0;
+                (void)engine_app()->simulation(sub, &synth_step, &heat_dt);
+                (void)engine_app()->advance(sub, &synth_step);
+            }
+        }
+    }
+
     if (wl->frame_stamp_valid) {
         return 0;  // A stamp is already waiting; not stalled.
     }
@@ -59,12 +83,18 @@ int frame_watchdog(WaylandContext *wl, VulkanContext *vk, bool *queued) {
         fprintf(stderr, "[Engine] Frame callback stalled (%u total). Re-arming.\n",
                 frame_state.clock.stalls);
     }
-    int q = queue_frame_only(wl, queued);
-    if (q == -EALREADY) {
-        *queued = false;
-        return 0;
+    // Only queue a new frame callback if none is outstanding on the compositor.
+    // If wl->frame_cb_id != 0, the compositor has the callback armed and will fire it
+    // when visible; zeroing it would abandon the callback object and leak IDs!
+    if (wl->frame_cb_id == 0) {
+        int q = queue_frame_only(wl, queued);
+        if (q == -EALREADY) {
+            *queued = false;
+            return 0;
+        }
+        return q;
     }
-    return q;
+    return 0;
 }
 
 int turn_step(WaylandContext *wl, VulkanContext *vk, bool *queued) {
@@ -91,6 +121,7 @@ int turn_step(WaylandContext *wl, VulkanContext *vk, bool *queued) {
     }
     uint32_t stamp = wl->frame_time_ms;
     frame_state.last_stamp_mono_ns = ring_mono_ns();
+    frame_state.last_sim_mono_ns   = frame_state.last_stamp_mono_ns;
     frame_state.stall_reported = false;
     FrameStep step = frame_clock_step(&frame_state.clock, stamp);
     if (!step.paint) {

@@ -196,15 +196,8 @@ int ring_context_init(RingContext *r, const char *name, bool with_pbuf) {
 
     if (with_pbuf) {
         publish_pbufs(r);
-        int prc = register_pbuf(r, true);
-        r->pbuf_inc = prc == 0;
-        if (prc < 0) {
-            fprintf(stderr,
-                    "[Ring] IOU_PBUF_RING_INC was rejected (%s). Provided buffers stay one message per slot.\n",
-                    strerror(-prc));
-            prc = register_pbuf(r, false);
-            r->pbuf_inc = false;
-        }
+        int prc = register_pbuf(r, false);
+        r->pbuf_inc = false;
         if (prc < 0) {
             fprintf(stderr, "[Ring Error] IORING_REGISTER_PBUF_RING failed: %s\n", strerror(-prc));
             ring_context_shutdown(r);
@@ -558,10 +551,11 @@ static int cancel_file_chain(RingContext *r) {
     return 0;
 }
 
-int ring_read_file_all(RingContext *r, const char *path, void *buf, size_t cap, size_t *out_len,
-                       RingCqeFn on_cqe, void *on_user) {
+int ring_submit_read_file(RingContext *r, const char *path, void *buf, size_t cap,
+                          uint64_t open_ud, uint64_t read_ud,
+                          uint64_t close_ud, uint64_t fence_ud) {
     if (r == nullptr || !r->is_initialized || path == nullptr || path[0] == '\0' ||
-        buf == nullptr || out_len == nullptr || cap < 1u || cap > 0xffffffffu) {
+        buf == nullptr || cap < 1u || cap > 0xffffffffu) {
         return -EINVAL;
     }
 
@@ -583,25 +577,49 @@ int ring_read_file_all(RingContext *r, const char *path, void *buf, size_t cap, 
     /* A direct descriptor is not a process fd. O_CLOEXEC is rejected. */
     open_sqe->open_flags = O_RDONLY;
     open_sqe->file_index = ENG_SCRATCH_FD_SLOT + 1u;
-    open_sqe->user_data  = ENG_UD_FILE_OPEN;
+    open_sqe->user_data  = open_ud;
 
     read_sqe->opcode    = IORING_OP_READ;
-    read_sqe->flags     = IOSQE_FIXED_FILE | IOSQE_IO_LINK;
+    read_sqe->flags     = IOSQE_FIXED_FILE | IOSQE_IO_HARDLINK;
     read_sqe->fd        = ENG_SCRATCH_FD_SLOT;
     read_sqe->addr      = (uint64_t)(uintptr_t)buf;
     read_sqe->len       = (uint32_t)cap;
     read_sqe->off       = 0;
-    read_sqe->user_data = ENG_UD_FILE_READ;
+    read_sqe->user_data = read_ud;
 
     close_sqe->opcode     = IORING_OP_CLOSE;
-    close_sqe->flags      = IOSQE_IO_LINK | IOSQE_CQE_SKIP_SUCCESS;
+    close_sqe->flags      = IOSQE_IO_HARDLINK | IOSQE_CQE_SKIP_SUCCESS;
     close_sqe->fd         = 0;
     close_sqe->file_index = ENG_SCRATCH_FD_SLOT + 1u;
-    close_sqe->user_data  = ENG_UD_FILE_CLOSE;
+    close_sqe->user_data  = close_ud;
 
     fence_sqe->opcode    = IORING_OP_NOP;
     fence_sqe->fd        = -1;
-    fence_sqe->user_data = ENG_UD_FILE_FENCE;
+    fence_sqe->user_data = fence_ud;
+
+    unsigned n = ring_submit(r);
+    if (n > 0) {
+        int rc = ring_enter(r, n, 0, -1);
+        if (rc < 0) {
+            return rc;
+        }
+    }
+    return 0;
+}
+
+int ring_read_file_all(RingContext *r, const char *path, void *buf, size_t cap, size_t *out_len,
+                       RingCqeFn on_cqe, void *on_user) {
+    if (r == nullptr || !r->is_initialized || path == nullptr || path[0] == '\0' ||
+        buf == nullptr || out_len == nullptr || cap < 1u || cap > 0xffffffffu) {
+        return -EINVAL;
+    }
+
+    int sub_rc = ring_submit_read_file(r, path, buf, cap,
+                                       ENG_UD_FILE_OPEN, ENG_UD_FILE_READ,
+                                       ENG_UD_FILE_CLOSE, ENG_UD_FILE_FENCE);
+    if (sub_rc != 0) {
+        return sub_rc;
+    }
 
     bool got_read = false;
     bool got_close = false;

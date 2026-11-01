@@ -1,4 +1,5 @@
 #include "vulkan/pipe.h"
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -79,26 +80,24 @@ void vulkan_pipe_cache_open(VulkanContext *vk) {
     size_t blob_bytes = 0;
     char path[512];
     cache_path(path, sizeof path);
-    FILE *in = fopen(path, "rb");
-    if (in != nullptr) {
-        PipeHeader hdr = {0};
-        if (fread(&hdr, sizeof hdr, 1, in) == 1 && header_matches(&hdr, &props)) {
-            if (fseek(in, 0, SEEK_END) == 0) {
-                long end = ftell(in);
-                if (end > (long)sizeof hdr) {
-                    blob_bytes = (size_t)end - sizeof hdr;
-                    if (fseek(in, (long)sizeof hdr, SEEK_SET) == 0) {
-                        blob = malloc(blob_bytes);
-                        if (blob != nullptr && fread(blob, 1, blob_bytes, in) != blob_bytes) {
-                            free(blob);
-                            blob = nullptr;
-                            blob_bytes = 0;
-                        }
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd >= 0) {
+        struct stat st;
+        if (fstat(fd, &st) == 0 && (size_t)st.st_size > sizeof(PipeHeader)) {
+            PipeHeader hdr = {0};
+            if (read(fd, &hdr, sizeof hdr) == (ssize_t)sizeof hdr && header_matches(&hdr, &props)) {
+                blob_bytes = (size_t)st.st_size - sizeof hdr;
+                blob = malloc(blob_bytes);
+                if (blob != nullptr) {
+                    if (read(fd, blob, blob_bytes) != (ssize_t)blob_bytes) {
+                        free(blob);
+                        blob = nullptr;
+                        blob_bytes = 0;
                     }
                 }
             }
         }
-        fclose(in);
+        close(fd);
     }
 
     VkPipelineCacheCreateInfo info = {
@@ -135,17 +134,17 @@ void vulkan_pipe_cache_close(VulkanContext *vk) {
                 mkdir_p(dir);
                 char tmp[540];
                 snprintf(tmp, sizeof tmp, "%s.tmp", path);
-                FILE *out = fopen(tmp, "wb");
-                if (out != nullptr) {
+                int out_fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+                if (out_fd >= 0) {
                     PipeHeader hdr = {
                         .magic  = k_pipe_magic,
                         .vendor = props.vendorID,
                         .device = props.deviceID,
                     };
                     memcpy(hdr.uuid, props.pipelineCacheUUID, VK_UUID_SIZE);
-                    bool ok = fwrite(&hdr, sizeof hdr, 1, out) == 1 &&
-                              fwrite(blob, 1, bytes, out) == bytes;
-                    fclose(out);
+                    bool ok = write(out_fd, &hdr, sizeof hdr) == (ssize_t)sizeof hdr &&
+                              write(out_fd, blob, bytes) == (ssize_t)bytes;
+                    close(out_fd);
                     if (!ok || rename(tmp, path) != 0) {
                         unlink(tmp);
                     }

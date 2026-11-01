@@ -217,10 +217,11 @@ static int bake_math(VulkanContext *vk) {
     if (s_mode == k_mode_off || s_bake == VK_NULL_HANDLE || s_queue == VK_NULL_HANDLE) {
         return 0;
     }
+    VkCommandPool pool = vk->compute_cmd_pool != VK_NULL_HANDLE ? vk->compute_cmd_pool : vk->cmd_pool;
     VkCommandBuffer cmd = VK_NULL_HANDLE;
     VkCommandBufferAllocateInfo alloc_info = {
         .sType              = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-        .commandPool        = vk->cmd_pool,
+        .commandPool        = pool,
         .level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
         .commandBufferCount = 1,
     };
@@ -236,7 +237,7 @@ static int bake_math(VulkanContext *vk) {
     res = vkBeginCommandBuffer(cmd, &begin_info);
     if (res != VK_SUCCESS) {
         plot_fail("vkBeginCommandBuffer bake", res);
-        vkFreeCommandBuffers(vk->device, vk->cmd_pool, 1, &cmd);
+        vkFreeCommandBuffers(vk->device, pool, 1, &cmd);
         return -1;
     }
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_bake);
@@ -263,7 +264,7 @@ static int bake_math(VulkanContext *vk) {
     res = vkEndCommandBuffer(cmd);
     if (res != VK_SUCCESS) {
         plot_fail("vkEndCommandBuffer bake", res);
-        vkFreeCommandBuffers(vk->device, vk->cmd_pool, 1, &cmd);
+        vkFreeCommandBuffers(vk->device, pool, 1, &cmd);
         return -1;
     }
     VkCommandBufferSubmitInfo cmd_submit = {
@@ -278,11 +279,11 @@ static int bake_math(VulkanContext *vk) {
     res = vkQueueSubmit2(s_queue, 1, &submit_info, VK_NULL_HANDLE);
     if (res != VK_SUCCESS) {
         plot_fail("vkQueueSubmit2 bake", res);
-        vkFreeCommandBuffers(vk->device, vk->cmd_pool, 1, &cmd);
+        vkFreeCommandBuffers(vk->device, pool, 1, &cmd);
         return -1;
     }
     res = vkQueueWaitIdle(s_queue);
-    vkFreeCommandBuffers(vk->device, vk->cmd_pool, 1, &cmd);
+    vkFreeCommandBuffers(vk->device, pool, 1, &cmd);
     if (res != VK_SUCCESS) {
         plot_fail("vkQueueWaitIdle bake", res);
         return -1;
@@ -660,7 +661,7 @@ int plot_init(VulkanContext *vk, RingCqeFn on_cqe, void *on_user) {
                 props.limits.maxPushConstantsSize, sizeof(PlotPush));
         return -1;
     }
-    s_queue = vk->queues.graphics_queue;
+    s_queue = vk->queues.compute_queue != VK_NULL_HANDLE ? vk->queues.compute_queue : vk->queues.graphics_queue;
     if (create_buffer(vk) != 0) {
         plot_shutdown(vk);
         return -1;
@@ -721,8 +722,9 @@ int plot_init(VulkanContext *vk, RingCqeFn on_cqe, void *on_user) {
         plot_shutdown(vk);
         return -1;
     }
-    if (vk->cmd_pool == VK_NULL_HANDLE || s_queue == VK_NULL_HANDLE) {
-        fprintf(stderr, "[Plot Error] Math bake needs the graphics queue\n");
+    VkCommandPool pool = vk->compute_cmd_pool != VK_NULL_HANDLE ? vk->compute_cmd_pool : vk->cmd_pool;
+    if (pool == VK_NULL_HANDLE || s_queue == VK_NULL_HANDLE) {
+        fprintf(stderr, "[Plot Error] Math bake needs compute queue and command pool\n");
         plot_shutdown(vk);
         return -1;
     }

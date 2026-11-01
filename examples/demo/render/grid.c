@@ -94,12 +94,13 @@ static int submit_idle(VulkanContext *vk, VkCommandBuffer cmd) {
         .commandBufferInfoCount = 1,
         .pCommandBufferInfos    = &cmd_submit,
     };
-    res = vkQueueSubmit2(vk->queues.graphics_queue, 1, &submit_info, VK_NULL_HANDLE);
+    VkQueue queue = vk->queues.compute_queue != VK_NULL_HANDLE ? vk->queues.compute_queue : vk->queues.graphics_queue;
+    res = vkQueueSubmit2(queue, 1, &submit_info, VK_NULL_HANDLE);
     if (res != VK_SUCCESS) {
         grid_fail("vkQueueSubmit2", res);
         return -1;
     }
-    res = vkQueueWaitIdle(vk->queues.graphics_queue);
+    res = vkQueueWaitIdle(queue);
     if (res != VK_SUCCESS) {
         grid_fail("vkQueueWaitIdle", res);
         return -1;
@@ -128,14 +129,13 @@ void grid_shutdown(VulkanContext *vk) {
 }
 
 int grid_init(VulkanContext *vk) {
-    if (vk == nullptr || vk->device == VK_NULL_HANDLE || vk->cmd_pool == VK_NULL_HANDLE ||
-        vk->queues.graphics_queue == VK_NULL_HANDLE) {
+    if (vk == nullptr || vk->device == VK_NULL_HANDLE) {
         return -1;
     }
     if (s_pipe != VK_NULL_HANDLE) {
         grid_shutdown(vk);
     }
-    if (bda_arena_init(vk, &s_arena, k_arena_bytes) != 0) {
+    if (bda_arena_init(vk, &s_arena, k_arena_bytes, false) != 0) {
         return -1;
     }
     BdaSlice a = bda_arena_alloc(&s_arena, k_field_bytes, 256u);
@@ -169,10 +169,11 @@ int grid_init(VulkanContext *vk) {
         return -1;
     }
 
+    VkCommandPool pool = vk->compute_cmd_pool != VK_NULL_HANDLE ? vk->compute_cmd_pool : vk->cmd_pool;
     VkCommandBuffer cmd = VK_NULL_HANDLE;
     VkCommandBufferAllocateInfo alloc_info = {
         .sType              = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-        .commandPool        = vk->cmd_pool,
+        .commandPool        = pool,
         .level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
         .commandBufferCount = 1,
     };
@@ -189,18 +190,18 @@ int grid_init(VulkanContext *vk) {
     res = vkBeginCommandBuffer(cmd, &begin_info);
     if (res != VK_SUCCESS) {
         grid_fail("vkBeginCommandBuffer", res);
-        vkFreeCommandBuffers(vk->device, vk->cmd_pool, 1, &cmd);
+        vkFreeCommandBuffers(vk->device, pool, 1, &cmd);
         grid_shutdown(vk);
         return -1;
     }
     dispatch_grid(cmd, 0u, 1u, 0, s_field[0]);
     barrier_field(cmd);
     if (submit_idle(vk, cmd) != 0) {
-        vkFreeCommandBuffers(vk->device, vk->cmd_pool, 1, &cmd);
+        vkFreeCommandBuffers(vk->device, pool, 1, &cmd);
         grid_shutdown(vk);
         return -1;
     }
-    vkFreeCommandBuffers(vk->device, vk->cmd_pool, 1, &cmd);
+    vkFreeCommandBuffers(vk->device, pool, 1, &cmd);
     s_read = 0;
     s_step_open = false;
     s_held = false;

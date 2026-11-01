@@ -95,13 +95,16 @@ static int place_mesh(const char *line, int number) {
 // Compile-time placements. Empty by default: the demo boots into the
 // universal metric grid with zero objects. Register custom C objects
 // here (ops + state pointers, or an init_fn) to spawn them at startup.
-static const WorldBlueprint k_startup_objects[] = {
+#define STARTUP_BLUEPRINTS_COUNT 0
+#if STARTUP_BLUEPRINTS_COUNT > 0
+static const WorldBlueprint k_startup_objects[STARTUP_BLUEPRINTS_COUNT] = {
     // { .ops = &my_ops, .data = &my_state, .at = { 0.0f, 0.0f, 0.0f }, .spin = &my_state.spin },
 };
+#endif
 
 static int place_blueprints(void) {
-    const size_t n = sizeof(k_startup_objects) / sizeof(k_startup_objects[0]);
-    for (size_t i = 0; i < n; ++i) {
+#if STARTUP_BLUEPRINTS_COUNT > 0
+    for (size_t i = 0; i < STARTUP_BLUEPRINTS_COUNT; ++i) {
         const WorldBlueprint *bp = &k_startup_objects[i];
         if (bp->init_fn != nullptr) {
             if (!bp->init_fn(bp->at, bp->data)) {
@@ -113,6 +116,7 @@ static int place_blueprints(void) {
             }
         }
     }
+#endif
     return 0;
 }
 

@@ -74,23 +74,10 @@ static VkPipelineLayout s_layout = VK_NULL_HANDLE;
 static VkPipeline       s_pipeline = VK_NULL_HANDLE;
 static VkPipelineLayout s_bake_layout = VK_NULL_HANDLE;
 static VkPipeline       s_bake = VK_NULL_HANDLE;
-static VkBuffer         s_buffer = VK_NULL_HANDLE;
-static VkDeviceMemory   s_memory = VK_NULL_HANDLE;
+static DaBuffer         s_solid_buf = {0};
 static VkDeviceAddress  s_addr = 0;
 static void solid_fail(const char *what, VkResult res) {
     fprintf(stderr, "[Solid Error] %s: %s (%d)\n", what, vulkan_vkresult_to_str(res), (int)res);
-}
-
-static int create_da_buffer(VulkanContext *vk, VkDeviceSize size, VkBufferUsageFlags usage,
-                            VkBuffer *buffer, VkDeviceMemory *memory, VkDeviceAddress *addr) {
-    DaBuffer buf = {0};
-    if (da_buffer_create(vk, size, usage, false, &buf) != 0) {
-        return -1;
-    }
-    *buffer = buf.buffer;
-    *memory = buf.memory;
-    *addr = buf.address;
-    return 0;
 }
 
 static int bake_mesh(VulkanContext *vk) {
@@ -182,19 +169,12 @@ void solid_shutdown(VulkanContext *vk) {
         if (s_layout != VK_NULL_HANDLE) {
             vkDestroyPipelineLayout(vk->device, s_layout, nullptr);
         }
-        if (s_buffer != VK_NULL_HANDLE) {
-            vkDestroyBuffer(vk->device, s_buffer, nullptr);
-        }
-        if (s_memory != VK_NULL_HANDLE) {
-            vkFreeMemory(vk->device, s_memory, nullptr);
-        }
+        da_buffer_destroy(vk, &s_solid_buf);
     }
     s_bake = VK_NULL_HANDLE;
     s_bake_layout = VK_NULL_HANDLE;
     s_pipeline = VK_NULL_HANDLE;
     s_layout = VK_NULL_HANDLE;
-    s_buffer = VK_NULL_HANDLE;
-    s_memory = VK_NULL_HANDLE;
     s_addr = 0;
 }
 
@@ -222,12 +202,13 @@ int solid_init(VulkanContext *vk) {
         fprintf(stderr, "[Solid Error] Mesh ranges do not cover %u verts\n", k_solid_verts);
         return -1;
     }
-    if (create_da_buffer(vk, (VkDeviceSize)k_solid_verts * 36u,
-                         VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-                         &s_buffer, &s_memory, &s_addr) != 0) {
+    if (da_buffer_create(vk, (VkDeviceSize)k_solid_verts * 36u,
+                         VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, false,
+                         &s_solid_buf) != 0) {
         solid_shutdown(vk);
         return -1;
     }
+    s_addr = s_solid_buf.address;
 
     VkPushConstantRange push = {
         .stageFlags = VK_SHADER_STAGE_VERTEX_BIT,

@@ -314,6 +314,7 @@ int da_buffer_create(VulkanContext *vk, VkDeviceSize size, VkBufferUsageFlags us
             out->map             = slice.cpu;
             out->address         = slice.gpu;
             out->bytes           = size;
+            out->offset          = (VkDeviceSize)slice.offset;
             out->is_suballocated = true;
             return 0;
         }
@@ -332,6 +333,7 @@ int da_buffer_create(VulkanContext *vk, VkDeviceSize size, VkBufferUsageFlags us
     out->map             = block.base_cpu;
     out->address         = block.base_gpu;
     out->bytes           = size;
+    out->offset          = 0;
     out->is_suballocated = false;
     return 0;
 }

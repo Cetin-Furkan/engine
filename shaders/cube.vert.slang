@@ -1,15 +1,6 @@
 #include "camera.slang"
 #include "material.slang"
 
-struct ViewPush {
-    uint64_t materials;
-    uint mat_index;
-    uint mat_pad;
-    float4 q;
-    float3 cam;
-    float zoom;
-};
-
 struct DrawPush {
     uint64_t verts;
     uint width;
@@ -38,7 +29,7 @@ struct VSOutput {
 static const float k_edge_px = 240.0;
 
 [shader("vertex")]
-VSOutput main(uint vert_id : SV_VertexID) {
+VSOutput main(uint vert_id : SV_VulkanVertexID) {
     float* mesh_f = (float*)screen.verts;
     uint o = vert_id * 9u;
     float3 in_pos = float3(mesh_f[o + 0u], mesh_f[o + 1u], mesh_f[o + 2u]);
@@ -47,21 +38,17 @@ VSOutput main(uint vert_id : SV_VertexID) {
 
     const float ax = radians(28.0);
     float ay = radians(screen.yaw_deg);
-    float3x3 rx = float3x3(1.0, 0.0, 0.0,
-                           0.0, cos(ax), sin(ax),
-                           0.0, -sin(ax), cos(ax));
-    float3x3 ry = float3x3(cos(ay), 0.0, -sin(ay),
-                           0.0, 1.0, 0.0,
-                           sin(ay), 0.0, cos(ay));
-    float3x3 pose = mul(ry, rx);
-    float3 p = mul(pose, in_pos) * (k_edge_px * 0.5);
+    float3 posed_pos = rotate_pose(in_pos, ax, ay);
+    float3 posed_nrm = rotate_pose(in_nrm, ax, ay);
+
+    float3 p = posed_pos * (k_edge_px * 0.5);
     p.x += screen.origin_x;
     p.y += screen.origin_y;
 
     float3 view = view_of(p, screen.view.q, screen.view.cam);
     VSOutput out;
     out.sv_pos = view_ndc(view, screen.view.zoom, screen.width, screen.height, screen.depth_bias);
-    out.v_nrm = view_rotate(screen.view.q, mul(pose, in_nrm));
+    out.v_nrm = view_rotate(screen.view.q, posed_nrm);
 
     float3 axis = float3(0.57735026919);
     float ang = 6.28318530718 * (screen.phase + dot(in_pos, float3(0.10, 0.14, 0.08)));

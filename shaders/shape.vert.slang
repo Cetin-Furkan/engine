@@ -1,15 +1,6 @@
 #include "camera.slang"
 #include "material.slang"
 
-struct ViewPush {
-    uint64_t materials;
-    uint mat_index;
-    uint mat_pad;
-    float4 q;
-    float3 cam;
-    float zoom;
-};
-
 struct ShapePush {
     uint64_t points;
     uint64_t indices;
@@ -63,7 +54,7 @@ struct VSOutput {
 };
 
 [shader("vertex")]
-VSOutput main(uint inst_id : SV_InstanceID, uint vert_id : SV_VertexID) {
+VSOutput main(uint inst_id : SV_VulkanInstanceID, uint vert_id : SV_VulkanVertexID) {
     float2* pts = (float2*)pc.points;
     float2 world = float2(0.0);
     bool drop = false;

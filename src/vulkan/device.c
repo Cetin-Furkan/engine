@@ -520,7 +520,7 @@ static VulkanResult evaluate_device(GpuCandidate *candidate) {
     device_extension_list_free(&extensions);
 
     if (used > 0) {
-        char reason[256];
+        char reason[512];
         snprintf(reason, sizeof reason, "Missing required device extension: %s", missing);
         disqualify(candidate, reason);
         return VULKAN_SUCCESS;
@@ -944,10 +944,11 @@ VulkanResult vulkan_device_create(VulkanContext *ctx) {
         .dynamicRenderingLocalRead = best.supports_dynamic_rendering_local_read ? VK_TRUE : VK_FALSE,
     };
     VkPhysicalDeviceVulkan13Features feat13 = {
-        .sType            = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
-        .pNext            = &feat14,
-        .dynamicRendering = VK_TRUE,
-        .synchronization2 = VK_TRUE,
+        .sType                          = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
+        .pNext                          = &feat14,
+        .dynamicRendering               = VK_TRUE,
+        .synchronization2               = VK_TRUE,
+        .shaderDemoteToHelperInvocation = VK_TRUE,
     };
     VkPhysicalDeviceVulkan12Features feat12 = {
         .sType               = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
@@ -961,6 +962,7 @@ VulkanResult vulkan_device_create(VulkanContext *ctx) {
         .sType                     = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
         .pNext                     = &feat12,
         .storageBuffer16BitAccess  = VK_TRUE,
+        .shaderDrawParameters      = VK_TRUE,
     };
     VkPhysicalDeviceFeatures2 features2 = {
         .sType    = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,

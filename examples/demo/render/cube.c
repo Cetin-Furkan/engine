@@ -123,16 +123,13 @@ static VkPipelineLayout s_layout = VK_NULL_HANDLE;
 static VkPipeline       s_pipeline = VK_NULL_HANDLE;
 static VkPipelineLayout s_compute_layout = VK_NULL_HANDLE;
 static VkPipeline       s_compute = VK_NULL_HANDLE;
-static VkBuffer         s_buffer = VK_NULL_HANDLE;
-static VkDeviceMemory   s_memory = VK_NULL_HANDLE;
-static VkBuffer         s_index = VK_NULL_HANDLE;
-static VkDeviceMemory   s_index_memory = VK_NULL_HANDLE;
+static DaBuffer         s_mesh_buf = {0};
+static DaBuffer         s_index_buf = {0};
 static VkDeviceAddress  s_mesh_addr = 0;
 static VkDeviceAddress  s_index_addr = 0;
 static VkPipelineLayout s_heat_layout = VK_NULL_HANDLE;
 static VkPipeline       s_heat_pipe = VK_NULL_HANDLE;
-static VkBuffer         s_heat_buf[k_heat_copies] = {0};
-static VkDeviceMemory   s_heat_mem[k_heat_copies] = {0};
+static DaBuffer         s_heat_bufs[k_heat_copies] = {0};
 static VkDeviceAddress  s_heat_addr[k_heat_copies] = {0};
 
 typedef struct HeatLive {
@@ -174,17 +171,6 @@ static uint32_t sample_count_n(VkSampleCountFlagBits samples) {
     return 1u;
 }
 
-static int create_da_buffer(VulkanContext *vk, VkDeviceSize size, VkBufferUsageFlags usage,
-                            VkBuffer *buffer, VkDeviceMemory *memory, VkDeviceAddress *addr) {
-    DaBuffer buf = {0};
-    if (da_buffer_create(vk, size, usage, false, &buf) != 0) {
-        return -1;
-    }
-    *buffer = buf.buffer;
-    *memory = buf.memory;
-    *addr = buf.address;
-    return 0;
-}
 
 // This command buffer only. The vertex read of the buffer just written is
 // in the draw that follows. The next submit's compute read is ordered by
@@ -347,23 +333,27 @@ int cube_init(VulkanContext *vk) {
         return -1;
     }
 
-    if (create_da_buffer(vk, (VkDeviceSize)k_verts * 36u,
-                         VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-                         &s_buffer, &s_memory, &s_mesh_addr) != 0 ||
-        create_da_buffer(vk, (VkDeviceSize)k_indices * sizeof(uint16_t),
-                         VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-                         &s_index, &s_index_memory, &s_index_addr) != 0) {
+    if (da_buffer_create(vk, (VkDeviceSize)k_verts * 36u,
+                         VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, false,
+                         &s_mesh_buf) != 0 ||
+        da_buffer_create(vk, (VkDeviceSize)k_indices * sizeof(uint16_t),
+                         VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, false,
+                         &s_index_buf) != 0) {
         cube_shutdown(vk);
         return -1;
     }
+    s_mesh_addr = s_mesh_buf.address;
+    s_index_addr = s_index_buf.address;
+
     heat_live_clear();
     for (uint32_t i = 0; i < k_heat_copies; ++i) {
-        if (create_da_buffer(vk, (VkDeviceSize)k_heat_slots * (VkDeviceSize)k_heat_stride,
-                             VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-                             &s_heat_buf[i], &s_heat_mem[i], &s_heat_addr[i]) != 0) {
+        if (da_buffer_create(vk, (VkDeviceSize)k_heat_slots * (VkDeviceSize)k_heat_stride,
+                             VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, false,
+                             &s_heat_bufs[i]) != 0) {
             cube_shutdown(vk);
             return -1;
         }
+        s_heat_addr[i] = s_heat_bufs[i].address;
     }
 
     VkResult res = VK_SUCCESS;
@@ -456,18 +446,9 @@ int cube_init(VulkanContext *vk) {
     return 0;
 }
 
-static void release_heat_copies(VulkanContext *vk, bool destroy) {
+static void release_heat_copies(VulkanContext *vk) {
     for (uint32_t i = 0; i < k_heat_copies; ++i) {
-        if (destroy && vk != nullptr && vk->device != VK_NULL_HANDLE) {
-            if (s_heat_buf[i] != VK_NULL_HANDLE) {
-                vkDestroyBuffer(vk->device, s_heat_buf[i], nullptr);
-            }
-            if (s_heat_mem[i] != VK_NULL_HANDLE) {
-                vkFreeMemory(vk->device, s_heat_mem[i], nullptr);
-            }
-        }
-        s_heat_buf[i] = VK_NULL_HANDLE;
-        s_heat_mem[i] = VK_NULL_HANDLE;
+        da_buffer_destroy(vk, &s_heat_bufs[i]);
         s_heat_addr[i] = 0;
     }
     heat_live_clear();
@@ -483,11 +464,9 @@ void cube_shutdown(VulkanContext *vk) {
         s_compute_layout = VK_NULL_HANDLE;
         s_heat_pipe = VK_NULL_HANDLE;
         s_heat_layout = VK_NULL_HANDLE;
-        s_buffer = VK_NULL_HANDLE;
-        s_memory = VK_NULL_HANDLE;
-        s_index = VK_NULL_HANDLE;
-        s_index_memory = VK_NULL_HANDLE;
-        release_heat_copies(vk, false);
+        release_heat_copies(vk);
+        da_buffer_destroy(vk, &s_mesh_buf);
+        da_buffer_destroy(vk, &s_index_buf);
         return;
     }
     if (s_pipeline != VK_NULL_HANDLE) {
@@ -514,23 +493,9 @@ void cube_shutdown(VulkanContext *vk) {
         vkDestroyPipelineLayout(vk->device, s_heat_layout, nullptr);
         s_heat_layout = VK_NULL_HANDLE;
     }
-    release_heat_copies(vk, true);
-    if (s_buffer != VK_NULL_HANDLE) {
-        vkDestroyBuffer(vk->device, s_buffer, nullptr);
-        s_buffer = VK_NULL_HANDLE;
-    }
-    if (s_memory != VK_NULL_HANDLE) {
-        vkFreeMemory(vk->device, s_memory, nullptr);
-        s_memory = VK_NULL_HANDLE;
-    }
-    if (s_index != VK_NULL_HANDLE) {
-        vkDestroyBuffer(vk->device, s_index, nullptr);
-        s_index = VK_NULL_HANDLE;
-    }
-    if (s_index_memory != VK_NULL_HANDLE) {
-        vkFreeMemory(vk->device, s_index_memory, nullptr);
-        s_index_memory = VK_NULL_HANDLE;
-    }
+    release_heat_copies(vk);
+    da_buffer_destroy(vk, &s_mesh_buf);
+    da_buffer_destroy(vk, &s_index_buf);
 }
 
 void cube_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height, float yaw_deg,
@@ -558,7 +523,8 @@ void cube_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height, float yaw_d
     };
     view_push_fill(&draw_push.view, mat);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_pipeline);
-    vkCmdBindIndexBuffer2(cmd, s_index, 0, (VkDeviceSize)k_indices * sizeof(uint16_t),
+    vkCmdBindIndexBuffer2(cmd, s_index_buf.buffer, s_index_buf.offset,
+                          (VkDeviceSize)k_indices * sizeof(uint16_t),
                           VK_INDEX_TYPE_UINT16);
     vulkan_cmd_push(cmd, s_layout, VK_SHADER_STAGE_VERTEX_BIT, k_draw_push_bytes, &draw_push);
     vkCmdDrawIndexed(cmd, k_indices, 1, 0, 0, 0);

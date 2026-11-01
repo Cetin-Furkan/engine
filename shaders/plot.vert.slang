@@ -17,9 +17,17 @@ struct Push {
     float r;
     float g;
     float b;
-    float4 q;
-    float3 cam;
+    float qx;
+    float qy;
+    float qz;
+    float qw;
+    float cam_x;
+    float cam_y;
+    float cam_z;
     float zoom;
+
+    property float4 q { get { return float4(qx, qy, qz, qw); } }
+    property float3 cam { get { return float3(cam_x, cam_y, cam_z); } }
 };
 [[vk::push_constant]] Push pc;
 
@@ -31,7 +39,7 @@ struct VSOutput {
 static const int k_corner[6] = { 0, 1, 2, 0, 2, 3 };
 
 [shader("vertex")]
-VSOutput main(uint vert_id : SV_VertexID) {
+VSOutput main(uint vert_id : SV_VulkanVertexID) {
     VSOutput out;
     out.v_color = float3(pc.r, pc.g, pc.b);
     uint slot = vert_id / 6u;

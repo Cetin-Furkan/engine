@@ -28,7 +28,7 @@ static const int2 k_corner[6] = {
 };
 
 [shader("vertex")]
-float4 main(uint vert_id : SV_VertexID) : SV_Position {
+float4 main(uint vert_id : SV_VulkanVertexID) : SV_Position {
     int2 t = k_corner[vert_id];
     float px = float(pc.rect_x) + float(t.x) * float(pc.rect_w);
     float py = float(pc.rect_y) + float(t.y) * float(pc.rect_h);

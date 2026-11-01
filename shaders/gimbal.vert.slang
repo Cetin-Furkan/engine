@@ -96,7 +96,7 @@ VSOutput make_drop() {
 }
 
 [shader("vertex")]
-VSOutput main(uint vert_id : SV_VertexID) {
+VSOutput main(uint vert_id : SV_VulkanVertexID) {
     uint vid = vert_id;
     if (vid < HUB_VERTS) {
         uint seg = vid / 3u;

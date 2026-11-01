@@ -1,4 +1,5 @@
 #include "face_grid.slang"
+#include "camera.slang"
 
 static const float k_rate = 3.0;
 
@@ -45,13 +46,7 @@ float3 rest_pos(uint id) {
 float2 placed(float3 in_pos, float yaw_deg) {
     const float ax = radians(28.0);
     float ay = radians(yaw_deg);
-    float3x3 rx = float3x3(1.0, 0.0, 0.0,
-                           0.0, cos(ax), sin(ax),
-                           0.0, -sin(ax), cos(ax));
-    float3x3 ry = float3x3(cos(ay), 0.0, -sin(ay),
-                           0.0, 1.0, 0.0,
-                           sin(ay), 0.0, cos(ay));
-    float3 p = mul(mul(ry, rx), in_pos) * (k_edge_px * 0.5);
+    float3 p = rotate_pose(in_pos, ax, ay) * (k_edge_px * 0.5);
     return p.xy;
 }
 

@@ -17,7 +17,7 @@ struct VSOutput {
 };
 
 [shader("vertex")]
-VSOutput main(uint inst_id : SV_InstanceID, uint vert_id : SV_VertexID) {
+VSOutput main(uint inst_id : SV_VulkanInstanceID, uint vert_id : SV_VulkanVertexID) {
     float* quads = (float*)pc.quads;
     uint base = inst_id * 20u;
     float x0 = quads[base + 0u];

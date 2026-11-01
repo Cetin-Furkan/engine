@@ -1,14 +1,5 @@
 #include "camera.slang"
 
-struct ViewPush {
-    uint64_t materials;
-    uint mat_index;
-    uint mat_pad;
-    float4 q;
-    float3 cam;
-    float zoom;
-};
-
 struct ScreenPush {
     uint width;
     uint height;
@@ -58,7 +49,7 @@ struct VSOutput {
 };
 
 [shader("vertex")]
-VSOutput main(uint vert_id : SV_VertexID) {
+VSOutput main(uint vert_id : SV_VulkanVertexID) {
     float2 corner = k_quad[vert_id];
     float3 world_from_cam = float3(corner * pc.span, -pc.view.cam.z);
     float3 view = view_rotate(pc.view.q, world_from_cam);

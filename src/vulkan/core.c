@@ -2,6 +2,7 @@
 #include "vulkan/instance.h"
 #include "vulkan/device.h"
 #include "vulkan/memory.h"
+#include "vulkan/bda.h"
 #include <stdio.h>
 
 static const char *queue_place(uint32_t graphics_family, uint32_t graphics_index,
@@ -130,6 +131,7 @@ void vulkan_context_shutdown(VulkanContext *ctx) {
                         vulkan_vkresult_to_str(wait), (int)wait);
             }
         }
+        bda_system_shutdown(ctx);
         vulkan_command_pool_destroy(ctx);
         vulkan_device_destroy(ctx);
         vulkan_instance_destroy(ctx);

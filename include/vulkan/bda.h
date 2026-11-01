@@ -33,6 +33,7 @@ typedef struct DaBuffer {
     void           *map;
     VkDeviceAddress address;
     VkDeviceSize    bytes;
+    VkDeviceSize    offset;
     bool            is_suballocated;
 } DaBuffer;
 

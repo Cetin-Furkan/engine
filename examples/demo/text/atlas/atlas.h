@@ -2,7 +2,6 @@
 #define ENGINE_TEXT_ATLAS_H
 
 #include "vulkan/types.h"
-#include <stdbool.h>
 #include <stdint.h>
 
 // One append-only R8 atlas in a host-visible device-address buffer.

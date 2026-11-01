@@ -16,10 +16,13 @@ static const float k_deg       = 0.01745329251f;
 typedef struct FaceData {
     bool     used;
     Coord    p[k_point_cap];
+    float    px[k_point_cap];
+    float    py[k_point_cap];
     uint16_t idx[k_tri_cap * 3u];
     uint32_t n;
     uint32_t tri_n;
     Coord    center;
+    float    radius;
     Spin     spin;
     uint32_t mat;
     uint32_t serial;
@@ -60,38 +63,32 @@ static int alloc_slot(void) {
     return -1;
 }
 
-static void placed(const FaceData *face, bool shown_pose, float *x, float *y) {
-    int32_t milli = shown_pose ? face->spin.shown_milli : face->spin.live_milli;
-    float ang = rad_of(milli);
-    float c = cosf(ang);
-    float s = sinf(ang);
-    uint32_t n = face->n;
-    if (n > k_point_cap) {
-        n = k_point_cap;
-    }
-    for (uint32_t i = 0; i < n; ++i) {
-        float dx = face->p[i].x - face->center.x;
-        float dy = face->p[i].y - face->center.y;
-        x[i] = face->center.x + c * dx - s * dy;
-        y[i] = face->center.y + s * dx + c * dy;
-    }
-}
-
 static bool on_face(const FaceData *face, float px, float py) {
     if (face->n < 3u) {
         return false;
     }
-    float x[k_point_cap];
-    float y[k_point_cap];
-    placed(face, true, x, y);
-    if (clip_inside(x, y, face->n, px, py)) {
+    float near = coord_near();
+    float cdx = px - face->center.x;
+    float cdy = py - face->center.y;
+    float reach = face->radius + near;
+    if (cdx * cdx + cdy * cdy > reach * reach) {
+        return false;
+    }
+    // Inverse-rotate the single query point into the face's unrotated frame
+    // instead of rotating all face->n vertices on every hover test.
+    float ang = rad_of(face->spin.shown_milli);
+    float c = cosf(ang);
+    float s = sinf(ang);
+    float lx = face->center.x + c * cdx + s * cdy;
+    float ly = face->center.y - s * cdx + c * cdy;
+    uint32_t n = face->n <= k_point_cap ? face->n : k_point_cap;
+    if (clip_inside(face->px, face->py, n, lx, ly)) {
         return true;
     }
-    float near = coord_near();
     float r2 = near * near;
-    for (uint32_t i = 0; i < face->n; ++i) {
-        uint32_t j = (i + 1u) % face->n;
-        if (clip_dist2_seg(x[i], y[i], x[j], y[j], px, py) < r2) {
+    for (uint32_t i = 0; i < n; ++i) {
+        uint32_t j = (i + 1u) % n;
+        if (clip_dist2_seg(face->px[i], face->py[i], face->px[j], face->py[j], lx, ly) < r2) {
             return true;
         }
     }
@@ -150,14 +147,8 @@ static void face_draw(const WorldObj *o, VkCommandBuffer cmd, uint32_t width, ui
     if (pn > k_point_cap) {
         pn = k_point_cap;
     }
-    float xs[k_point_cap];
-    float ys[k_point_cap];
-    for (uint32_t i = 0; i < pn; ++i) {
-        xs[i] = face->p[i].x;
-        ys[i] = face->p[i].y;
-    }
     float fill_bias = 0.004f + (float)face->serial * 0.00002f;
-    shape_draw_polygon(cmd, width, height, xs, ys, pn, face->idx, face->tri_n, true,
+    shape_draw_polygon(cmd, width, height, face->px, face->py, pn, face->idx, face->tri_n, true,
                        face->center.x, face->center.y, ang,
                        fill_bias, fill_bias + 0.0015f, fill_bias + 0.003f,
                        0.96f, 0.71f, 0.28f, rr, gg, bb,
@@ -322,9 +313,19 @@ bool face_close(void) {
     s_serial++;
     face->serial = s_serial;
     snprintf(face->name, sizeof face->name, "Face %u", face->serial);
+    float max_r2 = 0.0f;
     for (uint32_t i = 0; i < s_build_n; ++i) {
         face->p[i] = s_build[i];
+        face->px[i] = x[i];
+        face->py[i] = y[i];
+        float dx = x[i] - cx;
+        float dy = y[i] - cy;
+        float r2 = dx * dx + dy * dy;
+        if (r2 > max_r2) {
+            max_r2 = r2;
+        }
     }
+    face->radius = sqrtf(max_r2);
     for (uint32_t i = 0; i < tri_n * 3u; ++i) {
         face->idx[i] = idx[i];
     }

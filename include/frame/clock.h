@@ -1,7 +1,6 @@
 #ifndef ENGINE_FRAME_CLOCK_H
 #define ENGINE_FRAME_CLOCK_H
 
-#include <stdbool.h>
 #include <stdint.h>
 
 // Compositor-clock frame pacer. One 64-byte cache-line cell holds the

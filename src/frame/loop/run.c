@@ -3,7 +3,7 @@
 // Idle present. The wait is io_uring. Keys and clicks enter here.
 
 int frame_run(void) {
-    if (!s_presented || !shown()->release_pending) {
+    if (!frame_state.presented || !shown()->release_pending) {
         fprintf(stderr, "[Engine Error] Idle run requires a presented frame\n");
         return 1;
     }
@@ -36,7 +36,7 @@ int frame_run(void) {
 
     bool signal_fixed = (ring_update_file(ring, ENG_SIGNAL_FD_SLOT, signal_fd) == 0);
     int read_rc = arm_slot_read(ring, ENG_SIGNAL_FD_SLOT, signal_fixed, signal_fd,
-                                &s_siginfo, (uint32_t)sizeof s_siginfo, ENG_UD_SIGNAL);
+                                &frame_state.siginfo, (uint32_t)sizeof frame_state.siginfo, ENG_UD_SIGNAL);
     if (read_rc != 0) {
         fprintf(stderr, "[Engine Error] Failed to arm io_uring read on signalfd\n");
         if (signal_fixed) {
@@ -73,12 +73,12 @@ int frame_run(void) {
             engine_app()->note_cqe();
             if (cqe.user_data == ENG_UD_SIGNAL) {
                 signal_poll_armed = false;
-                if (cqe.res == (int)sizeof s_siginfo) {
-                    signo = (int)s_siginfo.ssi_signo;
+                if (cqe.res == (int)sizeof frame_state.siginfo) {
+                    signo = (int)frame_state.siginfo.ssi_signo;
                 }
                 got_signal = true;
             } else if (cqe.user_data == ENG_UD_FRAME_TIMER) {
-                s_timer_armed = false;
+                frame_state.timer_armed = false;
                 bool queued = false;
                 if (frame_watchdog(wl, vk, &queued) == 0 && queued) {
                     send_in_flight = true;
@@ -171,24 +171,24 @@ int frame_run(void) {
             }
         }
 
-        if (s_inotify_fd >= 0 && s_inotify_wd < 0) {
+        if (frame_state.inotify_fd >= 0 && frame_state.inotify_wd < 0) {
             ensure_inotify_watch();
         }
-        if (!send_in_flight && !s_resize_pending && s_chrome_dirty) {
-            s_chrome_dirty = false;
+        if (!send_in_flight && !frame_state.resize_pending && frame_state.chrome_dirty) {
+            frame_state.chrome_dirty = false;
             RunRelay relay;
             begin_file_relay(&relay, &signal_poll_armed, &got_signal, &signo, &inotify_armed);
             int reloaded = chrome_reload(forward_reload_cqe, nullptr);
             if (reloaded == -ENOSPC || reloaded == -ETIMEDOUT || reloaded == -EINTR ||
                 reloaded == -EAGAIN || reloaded == -EBUSY) {
-                s_chrome_dirty = true;
+                frame_state.chrome_dirty = true;
             }
             if (end_file_relay(&relay, wl, vk, pending_serial, &send_in_flight,
                                &resend_wire, &run_rc, &why)) {
                 break;
             }
             if (reloaded == 0 && !send_in_flight && !resend_wire &&
-                !s_turn_swap_pending && vk != nullptr) {
+                !frame_state.turn_swap_pending && vk != nullptr) {
                 if (queue_chrome_repaint(wl, vk) == 0) {
                     pending_serial = 0;
                     send_in_flight = true;
@@ -226,7 +226,7 @@ int frame_run(void) {
                 }
                 break;
             }
-            pending_serial = s_resize_serial;
+            pending_serial = frame_state.resize_serial;
             send_in_flight = true;
             if (consume_noted_signal(wl, &signo)) {
                 signal_poll_armed = false;
@@ -292,11 +292,11 @@ int frame_run(void) {
         // Frame watchdog: while a turn is active, an absolute timeout
         // completes even if the compositor stops sending frame stamps.
         // When the turn is done no timer is armed and the wait is idle.
-        if (s_turn_phase == k_turn_run && !s_timer_armed && !send_in_flight) {
+        if (frame_state.turn_phase == k_turn_run && !frame_state.timer_armed && !send_in_flight) {
             uint64_t deadline = ring_mono_ns() +
-                (uint64_t)frame_clock_stall_after_ms(&s_clock) * 1000000ull;
+                (uint64_t)frame_clock_stall_after_ms(&frame_state.clock) * 1000000ull;
             if (ring_arm_timeout_abs(ring, deadline, ENG_UD_FRAME_TIMER) == 0) {
-                s_timer_armed = true;
+                frame_state.timer_armed = true;
             }
         }
 
@@ -316,13 +316,13 @@ int frame_run(void) {
         why = "signal";
     }
 
-    s_inotify_stop = true;
+    frame_state.inotify_stop = true;
     if (signal_poll_armed &&
         prep_cancel_fd(ring, signal_fd, ENG_SIGNAL_FD_SLOT, signal_fixed, k_ud_signal_cancel) == 0) {
         cancel_in_flight = true;
     }
     if (inotify_armed &&
-        prep_cancel_fd(ring, s_inotify_fd, ENG_INOTIFY_FD_SLOT, s_inotify_fixed,
+        prep_cancel_fd(ring, frame_state.inotify_fd, ENG_INOTIFY_FD_SLOT, frame_state.inotify_fixed,
                        k_ud_inotify_cancel) == 0) {
         inotify_cancel = true;
     }
@@ -364,13 +364,13 @@ int frame_run(void) {
             }
         } else if (cqe.user_data == ENG_UD_SIGNAL) {
             signal_poll_armed = false;
-            if (cqe.res == (int)sizeof s_siginfo) {
-                signo = (int)s_siginfo.ssi_signo;
+            if (cqe.res == (int)sizeof frame_state.siginfo) {
+                signo = (int)frame_state.siginfo.ssi_signo;
                 got_signal = true;
                 why = "signal";
             }
         } else if (cqe.user_data == ENG_UD_FRAME_TIMER) {
-            s_timer_armed = false;
+            frame_state.timer_armed = false;
         } else if (cqe.user_data == k_ud_signal_cancel) {
             cancel_in_flight = false;
         } else if (cqe.user_data == ENG_UD_INOTIFY) {
@@ -386,14 +386,14 @@ int frame_run(void) {
         (void)ring_update_file(ring, ENG_SIGNAL_FD_SLOT, -1);
     }
     close(signal_fd);
-    if (s_inotify_fixed) {
+    if (frame_state.inotify_fixed) {
         (void)ring_update_file(ring, ENG_INOTIFY_FD_SLOT, -1);
-        s_inotify_fixed = false;
+        frame_state.inotify_fixed = false;
     }
-    if (s_inotify_fd >= 0) {
-        close(s_inotify_fd);
-        s_inotify_fd = -1;
-        s_inotify_wd = -1;
+    if (frame_state.inotify_fd >= 0) {
+        close(frame_state.inotify_fd);
+        frame_state.inotify_fd = -1;
+        frame_state.inotify_wd = -1;
     }
     (void)sigprocmask(SIG_SETMASK, &old_mask, nullptr);
 

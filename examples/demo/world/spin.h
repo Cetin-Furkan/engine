@@ -1,7 +1,6 @@
 #ifndef ENGINE_WORLD_SPIN_H
 #define ENGINE_WORLD_SPIN_H
 
-#include <stdbool.h>
 #include <stdint.h>
 
 // One revolution on the compositor clock. 72 milli-degrees per millisecond

@@ -122,11 +122,9 @@ else
     echo -e "  [${YELLOW}WARN${NC}] wayland-protocols not found. The Makefile does not use it."
 fi
 
-# 5. slangc compiles chrome and the cube/solid fragment shaders.
-#    glslangValidator --target-env vulkan1.4 compiles everything else.
+# 5. Native Slang 2026 Compiler (slangc)
 SLANG_BIN=""
 SLANG_VER=""
-GLSLANG=""
 
 if command -v slangc >/dev/null 2>&1; then
     SLANG_BIN=$(command -v slangc)
@@ -136,30 +134,22 @@ else
     FAILURES=$((FAILURES + 1))
 fi
 
-if command -v glslangValidator >/dev/null 2>&1; then
-    GLSLANG=$(command -v glslangValidator)
-else
-    echo -e "  [${RED}FAIL${NC}] glslangValidator not found"
-    FAILURES=$((FAILURES + 1))
-fi
-
-if [[ -n "$SLANG_BIN" && -n "$GLSLANG" ]]; then
+if [[ -n "$SLANG_BIN" ]]; then
     PROBE=$(mktemp -d)
-    cat > "$PROBE/probe.frag" << 'PROBE_EOF'
-#version 450
-layout(location = 0) out vec4 color;
-void main() { color = vec4(1.0); }
+    cat > "$PROBE/probe.slang" << 'PROBE_EOF'
+struct Push { uint64_t addr; };
+[[vk::push_constant]] Push pc;
+[shader("compute")]
+[numthreads(1, 1, 1)]
+void main() {
+    float* p = (float*)pc.addr;
+    p[0] = 1.0;
+}
 PROBE_EOF
-    if "$SLANG_BIN" -lang glsl -target spirv -profile spirv_1_6 -stage fragment -entry main -fvk-use-entrypoint-name -o "$PROBE/slang.spv" "$PROBE/probe.frag"; then
-        echo -e "  [${GREEN}OK${NC}] Slang Compiler: $SLANG_BIN ($SLANG_VER)"
+    if "$SLANG_BIN" "$PROBE/probe.slang" -target spirv -profile spirv_1_6 -stage compute -entry main -fvk-use-entrypoint-name -depfile "$PROBE/probe.d" -o "$PROBE/probe.spv" 2>/dev/null; then
+        echo -e "  [${GREEN}OK${NC}] Slang Compiler: $SLANG_BIN ($SLANG_VER, native BDA & SPIR-V 1.6)"
     else
-        echo -e "  [${RED}FAIL${NC}] slangc could not compile a fragment shader"
-        FAILURES=$((FAILURES + 1))
-    fi
-    if "$GLSLANG" -V --target-env vulkan1.4 --depfile "$PROBE/probe.d" -o "$PROBE/glslang.spv" "$PROBE/probe.frag" >/dev/null; then
-        echo -e "  [${GREEN}OK${NC}] glslangValidator: $GLSLANG (vulkan1.4, depfile)"
-    else
-        echo -e "  [${RED}FAIL${NC}] glslangValidator rejected --target-env vulkan1.4 or --depfile"
+        echo -e "  [${RED}FAIL${NC}] slangc could not compile native BDA SPIR-V 1.6"
         FAILURES=$((FAILURES + 1))
     fi
     rm -rf "$PROBE"
@@ -187,7 +177,6 @@ VULKAN_INCLUDE_DIR := $(dirname "$(dirname "$VULKAN_HEADER")")
 WAYLAND_PROTOCOLS_VERSION := $WP_VER
 WAYLAND_PROTOCOLS_DIR := $WAYLAND_PROTOCOLS_DIR
 SLANG_BIN := $SLANG_BIN
-GLSLANG := $GLSLANG
 CONFIG_ENV_OK := 1
 CONF_EOF
 
@@ -202,8 +191,7 @@ Status: PASSED
   - Library Location: $VULKAN_LIB
 - Wayland Protocols: ${WP_VER:-unused} (Makefile does not read this)
   - Protocol Directory: ${WAYLAND_PROTOCOLS_DIR:-unused}
-- Slang Shader Compiler: ${SLANG_BIN:-missing} (${SLANG_VER:-missing})
-- GLSL Validator: ${GLSLANG:-missing} (vulkan1.4, depfile)
+- Slang Shader Compiler: ${SLANG_BIN:-missing} (${SLANG_VER:-missing}, native BDA & SPIR-V 1.6)
 INFO_EOF
 
 touch "$STAMP"

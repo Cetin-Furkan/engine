@@ -1,7 +1,6 @@
 #ifndef ENGINE_WORLD_FACE_CLIP_H
 #define ENGINE_WORLD_FACE_CLIP_H
 
-#include <stdbool.h>
 #include <stdint.h>
 
 enum : uint32_t {

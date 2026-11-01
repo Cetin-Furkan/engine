@@ -7,22 +7,22 @@ alignas(struct inotify_event) static uint8_t s_inotify_buf[4096];
 static void absorb_inotify(int32_t res);
 
 void ensure_inotify_watch(void) {
-    if (s_inotify_fd < 0 || s_inotify_wd >= 0) {
+    if (frame_state.inotify_fd < 0 || frame_state.inotify_wd >= 0) {
         return;
     }
     const ChromeSpec *spec = chrome_spec();
     if (spec == nullptr || spec->path[0] == '\0') {
         return;
     }
-    int wd = inotify_add_watch(s_inotify_fd, spec->path, k_inotify_mask);
+    int wd = inotify_add_watch(frame_state.inotify_fd, spec->path, k_inotify_mask);
     if (wd < 0) {
-        if (!s_inotify_warned) {
+        if (!frame_state.inotify_warned) {
             fprintf(stderr, "[Chrome] inotify watch failed: %s\n", strerror(errno));
-            s_inotify_warned = true;
+            frame_state.inotify_warned = true;
         }
         return;
     }
-    s_inotify_wd = wd;
+    frame_state.inotify_wd = wd;
 }
 
 static void absorb_inotify(int32_t res) {
@@ -40,10 +40,10 @@ static void absorb_inotify(int32_t res) {
         }
         if ((ev->mask & (IN_IGNORED | IN_DELETE_SELF | IN_MOVE_SELF | IN_Q_OVERFLOW)) != 0) {
             dropped = true;
-            s_inotify_wd = -1;
+            frame_state.inotify_wd = -1;
         }
         if ((ev->mask & (k_inotify_mask | IN_IGNORED | IN_Q_OVERFLOW)) != 0) {
-            s_chrome_dirty = true;
+            frame_state.chrome_dirty = true;
         }
         off += (int)step;
     }
@@ -57,19 +57,19 @@ void note_inotify_cqe(RingContext *ring, int32_t res, bool *armed) {
         *armed = false;
     }
     if (res < 0 && res != -ECANCELED && res != -EINTR) {
-        if (!s_inotify_warned) {
+        if (!frame_state.inotify_warned) {
             fprintf(stderr, "[Chrome] inotify read: %s\n", strerror(-res));
-            s_inotify_warned = true;
+            frame_state.inotify_warned = true;
         }
         return;
     }
     if (res > 0) {
         absorb_inotify(res);
     }
-    if (s_inotify_stop || s_inotify_fd < 0 || ring == nullptr) {
+    if (frame_state.inotify_stop || frame_state.inotify_fd < 0 || ring == nullptr) {
         return;
     }
-    if (arm_slot_read(ring, ENG_INOTIFY_FD_SLOT, s_inotify_fixed, s_inotify_fd,
+    if (arm_slot_read(ring, ENG_INOTIFY_FD_SLOT, frame_state.inotify_fixed, frame_state.inotify_fd,
                       s_inotify_buf, (uint32_t)sizeof s_inotify_buf, ENG_UD_INOTIFY) == 0 &&
         armed != nullptr) {
         *armed = true;
@@ -80,41 +80,41 @@ void start_inotify(RingContext *ring, bool *armed) {
     if (armed != nullptr) {
         *armed = false;
     }
-    s_inotify_stop = false;
+    frame_state.inotify_stop = false;
     const ChromeSpec *spec = chrome_spec();
     if (spec == nullptr || spec->path[0] == '\0') {
         return;
     }
     int fd = inotify_init1(IN_CLOEXEC);
     if (fd < 0) {
-        if (!s_inotify_warned) {
+        if (!frame_state.inotify_warned) {
             fprintf(stderr, "[Chrome] inotify unavailable: %s\n", strerror(errno));
-            s_inotify_warned = true;
+            frame_state.inotify_warned = true;
         }
         return;
     }
-    s_inotify_fd = fd;
-    s_inotify_wd = -1;
-    s_inotify_fixed = false;
+    frame_state.inotify_fd = fd;
+    frame_state.inotify_wd = -1;
+    frame_state.inotify_fixed = false;
     ensure_inotify_watch();
-    if (s_inotify_wd < 0) {
-        close(s_inotify_fd);
-        s_inotify_fd = -1;
+    if (frame_state.inotify_wd < 0) {
+        close(frame_state.inotify_fd);
+        frame_state.inotify_fd = -1;
         return;
     }
-    if (ring_update_file(ring, ENG_INOTIFY_FD_SLOT, s_inotify_fd) == 0) {
-        s_inotify_fixed = true;
+    if (ring_update_file(ring, ENG_INOTIFY_FD_SLOT, frame_state.inotify_fd) == 0) {
+        frame_state.inotify_fixed = true;
     }
-    if (arm_slot_read(ring, ENG_INOTIFY_FD_SLOT, s_inotify_fixed, s_inotify_fd,
+    if (arm_slot_read(ring, ENG_INOTIFY_FD_SLOT, frame_state.inotify_fixed, frame_state.inotify_fd,
                       s_inotify_buf, (uint32_t)sizeof s_inotify_buf, ENG_UD_INOTIFY) != 0) {
         fprintf(stderr, "[Chrome] inotify read was not armed\n");
-        if (s_inotify_fixed) {
+        if (frame_state.inotify_fixed) {
             (void)ring_update_file(ring, ENG_INOTIFY_FD_SLOT, -1);
-            s_inotify_fixed = false;
+            frame_state.inotify_fixed = false;
         }
-        close(s_inotify_fd);
-        s_inotify_fd = -1;
-        s_inotify_wd = -1;
+        close(frame_state.inotify_fd);
+        frame_state.inotify_fd = -1;
+        frame_state.inotify_wd = -1;
         return;
     }
     if (armed != nullptr) {
@@ -125,33 +125,33 @@ void start_inotify(RingContext *ring, bool *armed) {
 void engine_reload_cqe(const struct io_uring_cqe *cqe, void *user) {
     (void)user;
     WaylandContext *wl = wayland_get_context();
-    if (s_relay == nullptr) {
+    if (frame_state.relay == nullptr) {
         if (wl != nullptr) {
             wayland_on_cqe(wl, cqe);
         }
         return;
     }
     if (cqe->user_data == ENG_UD_WL_SEND) {
-        if (!s_relay->stolen_send) {
-            s_relay->stolen_send = true;
-            s_relay->stolen_cqe = *cqe;
+        if (!frame_state.relay->stolen_send) {
+            frame_state.relay->stolen_send = true;
+            frame_state.relay->stolen_cqe = *cqe;
         }
         return;
     }
     if (cqe->user_data == ENG_UD_SIGNAL) {
-        if (s_relay->signal_armed != nullptr) {
-            *s_relay->signal_armed = false;
+        if (frame_state.relay->signal_armed != nullptr) {
+            *frame_state.relay->signal_armed = false;
         }
-        if (cqe->res == (int)sizeof s_siginfo && s_relay->signo != nullptr) {
-            *s_relay->signo = (int)s_siginfo.ssi_signo;
+        if (cqe->res == (int)sizeof frame_state.siginfo && frame_state.relay->signo != nullptr) {
+            *frame_state.relay->signo = (int)frame_state.siginfo.ssi_signo;
         }
-        if (s_relay->got_signal != nullptr) {
-            *s_relay->got_signal = true;
+        if (frame_state.relay->got_signal != nullptr) {
+            *frame_state.relay->got_signal = true;
         }
         return;
     }
     if (cqe->user_data == ENG_UD_INOTIFY) {
-        note_inotify_cqe(ring_get_context(), cqe->res, s_relay->inotify_armed);
+        note_inotify_cqe(ring_get_context(), cqe->res, frame_state.relay->inotify_armed);
         return;
     }
     if (wl != nullptr) {
@@ -167,7 +167,7 @@ void engine_relay_begin(EngineRelay *relay, bool *signal_armed, bool *got_signal
         .signo         = signo,
         .inotify_armed = inotify_armed,
     };
-    s_relay = relay;
+    frame_state.relay = relay;
 }
 
 // True when the idle loop must leave. A stolen send that failed, a signal,
@@ -176,7 +176,7 @@ void engine_relay_begin(EngineRelay *relay, bool *signal_armed, bool *got_signal
 bool engine_relay_end(EngineRelay *relay, WaylandContext *wl, VulkanContext *vk,
                            uint32_t pending_serial, bool *send_in_flight, bool *resend_wire,
                            int *run_rc, const char **why) {
-    s_relay = nullptr;
+    frame_state.relay = nullptr;
     if (relay->stolen_send) {
         int noted = finish_idle_send(wl, vk, &relay->stolen_cqe, pending_serial);
         if (noted < 0) {

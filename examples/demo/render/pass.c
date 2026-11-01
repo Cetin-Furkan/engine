@@ -94,6 +94,7 @@ static void pool_free_all(VulkanContext *vk, PoolSlot *pool) {
 
 static int pool_acquire(VulkanContext *vk, PoolSlot *pool, const VkMemoryRequirements *reqs,
                         VkDeviceMemory *out) {
+    int best_i = -1;
     for (uint32_t i = 0; i < k_pool; ++i) {
         if (pool[i].live || pool[i].memory == VK_NULL_HANDLE) {
             continue;
@@ -104,8 +105,13 @@ static int pool_acquire(VulkanContext *vk, PoolSlot *pool, const VkMemoryRequire
         if ((reqs->memoryTypeBits & (1u << pool[i].type_index)) == 0) {
             continue;
         }
-        pool[i].live = true;
-        *out = pool[i].memory;
+        if (best_i < 0 || pool[i].capacity < pool[best_i].capacity) {
+            best_i = (int)i;
+        }
+    }
+    if (best_i >= 0) {
+        pool[best_i].live = true;
+        *out = pool[best_i].memory;
         return 0;
     }
     int free_i = -1;
@@ -113,6 +119,23 @@ static int pool_acquire(VulkanContext *vk, PoolSlot *pool, const VkMemoryRequire
         if (pool[i].memory == VK_NULL_HANDLE) {
             free_i = (int)i;
             break;
+        }
+    }
+    if (free_i < 0) {
+        // All 16 slots hold smaller retired allocations; evict the smallest
+        // inactive slot (already GPU-idle via destroy_frame_gpu) to make room.
+        int evict_i = -1;
+        for (uint32_t i = 0; i < k_pool; ++i) {
+            if (!pool[i].live && pool[i].memory != VK_NULL_HANDLE) {
+                if (evict_i < 0 || pool[i].capacity < pool[evict_i].capacity) {
+                    evict_i = (int)i;
+                }
+            }
+        }
+        if (evict_i >= 0) {
+            vkFreeMemory(vk->device, pool[evict_i].memory, nullptr);
+            pool[evict_i] = (PoolSlot){0};
+            free_i = evict_i;
         }
     }
     if (free_i < 0) {

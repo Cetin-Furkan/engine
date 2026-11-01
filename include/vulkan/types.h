@@ -156,6 +156,8 @@ typedef struct VulkanContext {
     VkPhysicalDevice         physical_device;
     VkDevice                 device;
     VkCommandPool            cmd_pool;
+    VkCommandPool            compute_cmd_pool;
+    VkCommandPool            transfer_cmd_pool;
     VulkanQueueInfo          queues;
     VulkanDeviceInfo         device_info;
     VulkanDispatchTable      dispatch;

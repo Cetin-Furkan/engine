@@ -49,6 +49,17 @@ int main(void) {
     // Out-of-range orphan index does not resolve.
     CHECK(slot_resolve(slot_ref_pack(3, 4), slots, orphans, 1) == nullptr);
 
+    // Non-compacting orphan retirement: reaping orphans[0] (generation -> 0)
+    // must invalidate orphans[0]'s handle without shifting orphans[1]'s index.
+    orphans[1].generation = 5;
+    SlotRef ref_o0 = slot_ref_pack(3, 3);
+    SlotRef ref_o1 = slot_ref_pack(5, 4);
+    CHECK(slot_resolve(ref_o0, slots, orphans, 2) == &orphans[0]);
+    CHECK(slot_resolve(ref_o1, slots, orphans, 2) == &orphans[1]);
+    orphans[0].generation = 0;
+    CHECK(slot_resolve(ref_o0, slots, orphans, 2) == nullptr);
+    CHECK(slot_resolve(ref_o1, slots, orphans, 2) == &orphans[1]);
+
     if (s_failures != 0) {
         fprintf(stderr, "%d check(s) failed\n", s_failures);
         return 1;

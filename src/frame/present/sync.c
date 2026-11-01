@@ -4,7 +4,7 @@
 
 bool wait_acquire_point(VulkanContext *vk, uint64_t point) {
     if (vk == nullptr || vk->device == VK_NULL_HANDLE ||
-        s_acquire == VK_NULL_HANDLE || point == 0) {
+        frame_state.acquire == VK_NULL_HANDLE || point == 0) {
         return true;
     }
     VkSemaphoreWaitInfo wait_info = {
@@ -12,14 +12,14 @@ bool wait_acquire_point(VulkanContext *vk, uint64_t point) {
         .pNext          = nullptr,
         .flags          = 0,
         .semaphoreCount = 1,
-        .pSemaphores    = &s_acquire,
+        .pSemaphores    = &frame_state.acquire,
         .pValues        = &point,
     };
     return vkWaitSemaphores(vk->device, &wait_info, 3000000000ull) == VK_SUCCESS;
 }
 
 bool acquire_point_retired(VulkanContext *vk, uint64_t point) {
-    if (point == 0 || s_acquire == VK_NULL_HANDLE ||
+    if (point == 0 || frame_state.acquire == VK_NULL_HANDLE ||
         vk == nullptr || vk->device == VK_NULL_HANDLE) {
         return true;
     }
@@ -28,7 +28,7 @@ bool acquire_point_retired(VulkanContext *vk, uint64_t point) {
     VkSemaphoreWaitInfo wait_info = {
         .sType          = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
         .semaphoreCount = 1,
-        .pSemaphores    = &s_acquire,
+        .pSemaphores    = &frame_state.acquire,
         .pValues        = &point,
     };
     return vkWaitSemaphores(vk->device, &wait_info, 0) == VK_SUCCESS;
@@ -223,7 +223,7 @@ int prep_cancel_fd(RingContext *ring, int fd, uint32_t slot, bool fixed, uint64_
 }
 
 int ensure_release_fd(RingContext *ring) {
-    if (s_release_fd >= 0) {
+    if (frame_state.release_fd >= 0) {
         return 0;
     }
     int fd = eventfd(0, EFD_CLOEXEC);
@@ -231,28 +231,28 @@ int ensure_release_fd(RingContext *ring) {
         fprintf(stderr, "[Engine Error] eventfd: %s\n", strerror(errno));
         return -1;
     }
-    s_release_fd = fd;
-    s_release_fixed = false;
+    frame_state.release_fd = fd;
+    frame_state.release_fixed = false;
     if (ring != nullptr && ring->is_initialized &&
         ring_update_file(ring, ENG_RELEASE_FD_SLOT, fd) == 0) {
-        s_release_fixed = true;
+        frame_state.release_fixed = true;
     }
     return 0;
 }
 
 int attach_release_eventfd(const FrameSlot *frame) {
     if (frame == nullptr || frame->release_handle == 0 || frame->release_point == 0 ||
-        s_drm_fd < 0 || s_release_fd < 0) {
+        frame_state.drm_fd < 0 || frame_state.release_fd < 0) {
         return -EINVAL;
     }
     struct drm_syncobj_eventfd release_event = {
         .handle = frame->release_handle,
         .flags  = 0,
         .point  = frame->release_point,
-        .fd     = s_release_fd,
+        .fd     = frame_state.release_fd,
         .pad    = 0,
     };
-    if (ioctl(s_drm_fd, DRM_IOCTL_SYNCOBJ_EVENTFD, &release_event) != 0) {
+    if (ioctl(frame_state.drm_fd, DRM_IOCTL_SYNCOBJ_EVENTFD, &release_event) != 0) {
         fprintf(stderr, "[Engine Error] DRM_IOCTL_SYNCOBJ_EVENTFD: %s\n", strerror(errno));
         return -1;
     }
@@ -260,8 +260,8 @@ int attach_release_eventfd(const FrameSlot *frame) {
 }
 
 int arm_release_read(RingContext *ring) {
-    return arm_slot_read(ring, ENG_RELEASE_FD_SLOT, s_release_fixed, s_release_fd,
-                         &s_release_counter, (uint32_t)sizeof s_release_counter,
+    return arm_slot_read(ring, ENG_RELEASE_FD_SLOT, frame_state.release_fixed, frame_state.release_fd,
+                         &frame_state.release_counter, (uint32_t)sizeof frame_state.release_counter,
                          ENG_UD_GPU_RELEASE);
 }
 
@@ -271,7 +271,7 @@ int wait_gpu_release(RingContext *ring, WaylandContext *wl) {
         struct io_uring_cqe cqe;
         while (ring_peek(ring, &cqe)) {
             if (cqe.user_data == ENG_UD_GPU_RELEASE) {
-                if (cqe.res != (int)sizeof s_release_counter) {
+                if (cqe.res != (int)sizeof frame_state.release_counter) {
                     if (cqe.res < 0) {
                         fprintf(stderr, "[Engine Error] io_uring read on GPU release: %s\n",
                                 strerror(-cqe.res));
@@ -322,7 +322,7 @@ VkResult wait_own_release(VulkanContext *vk, FrameSlot *frame, uint64_t timeout_
 
 int cancel_release_poll(RingContext *ring, WaylandContext *wl, bool *released) {
     *released = false;
-    if (prep_cancel_fd(ring, s_release_fd, ENG_RELEASE_FD_SLOT, s_release_fixed,
+    if (prep_cancel_fd(ring, frame_state.release_fd, ENG_RELEASE_FD_SLOT, frame_state.release_fixed,
                        k_ud_release_cancel) != 0) {
         return -ENOSPC;
     }
@@ -334,7 +334,7 @@ int cancel_release_poll(RingContext *ring, WaylandContext *wl, bool *released) {
         while (ring_peek(ring, &cqe)) {
             if (cqe.user_data == ENG_UD_GPU_RELEASE) {
                 saw_read = true;
-                if (cqe.res == (int)sizeof s_release_counter) {
+                if (cqe.res == (int)sizeof frame_state.release_counter) {
                     *released = true;
                 }
             } else if (cqe.user_data == k_ud_release_cancel) {
@@ -358,13 +358,13 @@ int cancel_release_poll(RingContext *ring, WaylandContext *wl, bool *released) {
 }
 
 void release_persistent_fd(RingContext *ring) {
-    if (s_stuck_release_fd >= 0 || s_release_fd < 0) {
+    if (frame_state.stuck_release_fd >= 0 || frame_state.release_fd < 0) {
         return;
     }
-    if (s_release_fixed && ring != nullptr && ring->is_initialized) {
+    if (frame_state.release_fixed && ring != nullptr && ring->is_initialized) {
         (void)ring_update_file(ring, ENG_RELEASE_FD_SLOT, -1);
-        s_release_fixed = false;
+        frame_state.release_fixed = false;
     }
-    close(s_release_fd);
-    s_release_fd = -1;
+    close(frame_state.release_fd);
+    frame_state.release_fd = -1;
 }

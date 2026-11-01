@@ -1,7 +1,6 @@
 #ifndef ENGINE_TEXT_FACE_H
 #define ENGINE_TEXT_FACE_H
 
-#include <stdbool.h>
 #include <stdint.h>
 
 // Five roles. Sealed is the Inter file compiled into the binary. The other

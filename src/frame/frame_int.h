@@ -102,9 +102,12 @@ typedef struct FrameState {
     // reallocates the images and bumps that same point. It does not import again.
     uint64_t sync_point;
 
-    // Deferred retirement ring for buffers whose compositor release point has
-    // not yet signaled at the moment of resize replacement.
+    // Deferred retirement table for buffers whose compositor release point has
+    // not yet signaled at the moment of resize replacement. Indexed by fixed
+    // bit positions in orphan_mask so SlotRef handles never shift on sweep.
     FrameSlot orphans[k_orphan_cap];
+    uint32_t  orphan_gen[k_orphan_cap];
+    uint32_t  orphan_mask;
     uint32_t  orphan_count;
     int       stuck_release_fd;
 
@@ -133,51 +136,13 @@ typedef struct FrameState {
 
 extern FrameState frame_state;
 
-#define s_drm_fd (frame_state.drm_fd)
-#define s_acquire (frame_state.acquire)
-#define s_presented (frame_state.presented)
-#define s_slot (frame_state.slot)
-#define s_front (frame_state.front)
-#define s_spare_live (frame_state.spare_live)
-#define s_turn_phase (frame_state.turn_phase)
-#define s_turn_swap_pending (frame_state.turn_swap_pending)
-#define s_pending_release (frame_state.pending_release)
-#define s_resize_pending (frame_state.resize_pending)
-#define s_resize_fresh (frame_state.resize_fresh)
-#define s_resize_release (frame_state.resize_release)
-#define s_resize_serial (frame_state.resize_serial)
-#define s_resize_old_buffer (frame_state.resize_old_buffer)
-#define s_resize_old_w (frame_state.resize_old_w)
-#define s_resize_old_h (frame_state.resize_old_h)
-#define s_resize_tranche (frame_state.resize_tranche)
-#define s_sync_point (frame_state.sync_point)
-#define s_orphans (frame_state.orphans)
-#define s_orphan_count (frame_state.orphan_count)
-#define s_stuck_release_fd (frame_state.stuck_release_fd)
-#define s_release_fd (frame_state.release_fd)
-#define s_release_fixed (frame_state.release_fixed)
-#define s_release_counter (frame_state.release_counter)
-#define s_siginfo (frame_state.siginfo)
-#define s_same_repaint (frame_state.same_repaint)
-#define s_chrome_dirty (frame_state.chrome_dirty)
-#define s_inotify_fd (frame_state.inotify_fd)
-#define s_inotify_wd (frame_state.inotify_wd)
-#define s_inotify_fixed (frame_state.inotify_fixed)
-#define s_inotify_stop (frame_state.inotify_stop)
-#define s_inotify_warned (frame_state.inotify_warned)
-#define s_relay (frame_state.relay)
-#define s_clock (frame_state.clock)
-#define s_timer_armed (frame_state.timer_armed)
-#define s_loop_was_busy (frame_state.loop_was_busy)
-#define s_last_stamp_mono_ns (frame_state.last_stamp_mono_ns)
-#define s_stall_reported (frame_state.stall_reported)
 
 static inline FrameSlot *shown(void) {
-    return &s_slot[s_front];
+    return &frame_state.slot[frame_state.front];
 }
 
 static inline FrameSlot *spare(void) {
-    return &s_slot[s_front ^ 1];
+    return &frame_state.slot[frame_state.front ^ 1];
 }
 
 // Generation-tagged slot handle: (generation << 8) | (index + 1).

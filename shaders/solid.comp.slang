@@ -1,7 +1,3 @@
-#version 450
-#extension GL_EXT_buffer_reference : require
-#extension GL_EXT_scalar_block_layout : require
-#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 
 // One invocation writes one vertex. Faceted cages duplicate a face normal.
 // Rounded polyhedra subdivide each face into 4x4 and project onto the
@@ -23,68 +19,63 @@
 // 2892    torus       rounded   3072
 // end 5964
 
-layout(local_size_x = 64) in;
 
-layout(buffer_reference, scalar, buffer_reference_align = 4) buffer Mesh {
-    float f[];
+
+struct BakePush { uint64_t verts; };
+[[vk::push_constant]] BakePush bake;
+
+static const uint k_total = 5964u;
+static const uint k_sub = 4u;
+static const float k_tau = 6.28318530718;
+static const float k_cyl_r = 0.72;
+static const float k_cyl_y = 0.85;
+static const float k_cone_r = 0.78;
+static const float k_cone_y = 0.88;
+static const float k_torus_r = 0.70;
+static const float k_torus_s = 0.26;
+
+static const float3 k_tetra[4] = {
+    float3(0.57735027, 0.57735027, 0.57735027),
+    float3(0.57735027, -0.57735027, -0.57735027),
+    float3(-0.57735027, 0.57735027, -0.57735027),
+    float3(-0.57735027, -0.57735027, 0.57735027)
+};
+static const int3 k_tetra_f[4] = {
+    int3(0, 1, 2), int3(0, 2, 3), int3(0, 3, 1), int3(1, 3, 2)
 };
 
-layout(push_constant, scalar) uniform Bake {
-    uint64_t verts;
-} bake;
+static const float3 k_octa[6] = {
+    float3(1.0, 0.0, 0.0), float3(-1.0, 0.0, 0.0),
+    float3(0.0, 1.0, 0.0), float3(0.0, -1.0, 0.0),
+    float3(0.0, 0.0, 1.0), float3(0.0, 0.0, -1.0)
+};
+static const int3 k_octa_f[8] = {
+    int3(0, 2, 4), int3(0, 5, 2), int3(0, 4, 3), int3(0, 3, 5),
+    int3(1, 4, 2), int3(1, 2, 5), int3(1, 3, 4), int3(1, 5, 3)
+};
 
-const uint k_total = 5964u;
-const uint k_sub = 4u;
-const float k_tau = 6.28318530718;
-const float k_cyl_r = 0.72;
-const float k_cyl_y = 0.85;
-const float k_cone_r = 0.78;
-const float k_cone_y = 0.88;
-const float k_torus_r = 0.70;
-const float k_torus_s = 0.26;
-
-const vec3 k_tetra[4] = vec3[](
-    vec3(0.57735027, 0.57735027, 0.57735027),
-    vec3(0.57735027, -0.57735027, -0.57735027),
-    vec3(-0.57735027, 0.57735027, -0.57735027),
-    vec3(-0.57735027, -0.57735027, 0.57735027)
-);
-const ivec3 k_tetra_f[4] = ivec3[](
-    ivec3(0, 1, 2), ivec3(0, 2, 3), ivec3(0, 3, 1), ivec3(1, 3, 2)
-);
-
-const vec3 k_octa[6] = vec3[](
-    vec3(1.0, 0.0, 0.0), vec3(-1.0, 0.0, 0.0),
-    vec3(0.0, 1.0, 0.0), vec3(0.0, -1.0, 0.0),
-    vec3(0.0, 0.0, 1.0), vec3(0.0, 0.0, -1.0)
-);
-const ivec3 k_octa_f[8] = ivec3[](
-    ivec3(0, 2, 4), ivec3(0, 5, 2), ivec3(0, 4, 3), ivec3(0, 3, 5),
-    ivec3(1, 4, 2), ivec3(1, 2, 5), ivec3(1, 3, 4), ivec3(1, 5, 3)
-);
-
-const vec3 k_ico[12] = vec3[](
-    vec3(-0.52573111, -0.85065081, 0.0),
-    vec3(-0.52573111, 0.85065081, 0.0),
-    vec3(0.52573111, -0.85065081, 0.0),
-    vec3(0.52573111, 0.85065081, 0.0),
-    vec3(0.0, -0.52573111, -0.85065081),
-    vec3(0.0, -0.52573111, 0.85065081),
-    vec3(0.0, 0.52573111, -0.85065081),
-    vec3(0.0, 0.52573111, 0.85065081),
-    vec3(-0.85065081, 0.0, -0.52573111),
-    vec3(0.85065081, 0.0, -0.52573111),
-    vec3(-0.85065081, 0.0, 0.52573111),
-    vec3(0.85065081, 0.0, 0.52573111)
-);
-const ivec3 k_ico_f[20] = ivec3[](
-    ivec3(0, 4, 2), ivec3(0, 2, 5), ivec3(0, 8, 4), ivec3(0, 5, 10), ivec3(0, 10, 8),
-    ivec3(1, 3, 6), ivec3(1, 7, 3), ivec3(1, 6, 8), ivec3(1, 10, 7), ivec3(1, 8, 10),
-    ivec3(2, 4, 9), ivec3(2, 11, 5), ivec3(2, 9, 11),
-    ivec3(3, 9, 6), ivec3(3, 7, 11), ivec3(3, 11, 9),
-    ivec3(4, 8, 6), ivec3(4, 6, 9),
-    ivec3(5, 7, 10), ivec3(5, 11, 7)
-);
+static const float3 k_ico[12] = {
+    float3(-0.52573111, -0.85065081, 0.0),
+    float3(-0.52573111, 0.85065081, 0.0),
+    float3(0.52573111, -0.85065081, 0.0),
+    float3(0.52573111, 0.85065081, 0.0),
+    float3(0.0, -0.52573111, -0.85065081),
+    float3(0.0, -0.52573111, 0.85065081),
+    float3(0.0, 0.52573111, -0.85065081),
+    float3(0.0, 0.52573111, 0.85065081),
+    float3(-0.85065081, 0.0, -0.52573111),
+    float3(0.85065081, 0.0, -0.52573111),
+    float3(-0.85065081, 0.0, 0.52573111),
+    float3(0.85065081, 0.0, 0.52573111)
+};
+static const int3 k_ico_f[20] = {
+    int3(0, 4, 2), int3(0, 2, 5), int3(0, 8, 4), int3(0, 5, 10), int3(0, 10, 8),
+    int3(1, 3, 6), int3(1, 7, 3), int3(1, 6, 8), int3(1, 10, 7), int3(1, 8, 10),
+    int3(2, 4, 9), int3(2, 11, 5), int3(2, 9, 11),
+    int3(3, 9, 6), int3(3, 7, 11), int3(3, 11, 9),
+    int3(4, 8, 6), int3(4, 6, 9),
+    int3(5, 7, 10), int3(5, 11, 7)
+};
 
 bool locate(uint slot, out uint kind, out uint curved, out uint local_id) {
     if (slot < 12u) { kind = 0u; curved = 0u; local_id = slot; return true; }
@@ -99,24 +90,27 @@ bool locate(uint slot, out uint kind, out uint curved, out uint local_id) {
     if (slot < 2604u) { kind = 4u; curved = 1u; local_id = slot - 2316u; return true; }
     if (slot < 2892u) { kind = 5u; curved = 0u; local_id = slot - 2604u; return true; }
     if (slot < k_total) { kind = 5u; curved = 1u; local_id = slot - 2892u; return true; }
+    kind = 0u;
+    curved = 0u;
+    local_id = 0u;
     return false;
 }
 
-vec3 kind_color(uint kind) {
-    if (kind == 0u) return vec3(0.86, 0.32, 0.28);
-    if (kind == 1u) return vec3(0.32, 0.74, 0.42);
-    if (kind == 2u) return vec3(0.36, 0.52, 0.88);
-    if (kind == 3u) return vec3(0.90, 0.74, 0.28);
-    if (kind == 4u) return vec3(0.66, 0.40, 0.84);
-    return vec3(0.26, 0.74, 0.76);
+float3 kind_color(uint kind) {
+    if (kind == 0u) return float3(0.86, 0.32, 0.28);
+    if (kind == 1u) return float3(0.32, 0.74, 0.42);
+    if (kind == 2u) return float3(0.36, 0.52, 0.88);
+    if (kind == 3u) return float3(0.90, 0.74, 0.28);
+    if (kind == 4u) return float3(0.66, 0.40, 0.84);
+    return float3(0.26, 0.74, 0.76);
 }
 
-vec3 face_normal(vec3 a, vec3 b, vec3 c) {
+float3 face_normal(float3 a, float3 b, float3 c) {
     return normalize(cross(b - a, c - a));
 }
 
-void poly_corners(uint kind, uint face, out vec3 a, out vec3 b, out vec3 c) {
-    ivec3 f = ivec3(0);
+void poly_corners(uint kind, uint face, out float3 a, out float3 b, out float3 c) {
+    int3 f = int3(0);
     if (kind == 0u) {
         f = k_tetra_f[face];
         a = k_tetra[f.x];
@@ -135,16 +129,16 @@ void poly_corners(uint kind, uint face, out vec3 a, out vec3 b, out vec3 c) {
     }
 }
 
-vec3 sphere_point(vec3 a, vec3 b, vec3 c, uint i, uint j) {
-    vec3 p = float(k_sub - i - j) * a + float(i) * b + float(j) * c;
+float3 sphere_point(float3 a, float3 b, float3 c, uint i, uint j) {
+    float3 p = float(k_sub - i - j) * a + float(i) * b + float(j) * c;
     return normalize(p);
 }
 
-void poly_vertex(uint kind, uint curved, uint local_id, out vec3 pos, out vec3 nrm) {
+void poly_vertex(uint kind, uint curved, uint local_id, out float3 pos, out float3 nrm) {
     if (curved == 0u) {
         uint face = local_id / 3u;
         uint corner = local_id % 3u;
-        vec3 a, b, c;
+        float3 a, b, c;
         poly_corners(kind, face, a, b, c);
         pos = corner == 0u ? a : (corner == 1u ? b : c);
         nrm = face_normal(a, b, c);
@@ -193,25 +187,25 @@ void poly_vertex(uint kind, uint curved, uint local_id, out vec3 pos, out vec3 n
     }
     uint pi = corner == 0u ? i0 : (corner == 1u ? i1 : i2);
     uint pj = corner == 0u ? j0 : (corner == 1u ? j1 : j2);
-    vec3 a, b, c;
+    float3 a, b, c;
     poly_corners(kind, face, a, b, c);
     pos = sphere_point(a, b, c, pi, pj);
     nrm = pos;
 }
 
-void cylinder_vertex(uint curved, uint local_id, out vec3 pos, out vec3 nrm) {
+void cylinder_vertex(uint curved, uint local_id, out float3 pos, out float3 nrm) {
     uint n = curved == 0u ? 6u : 48u;
     uint s = local_id / 12u;
     uint k = local_id % 12u;
     float a0 = k_tau * float(s) / float(n);
     float a1 = k_tau * float(s + 1u) / float(n);
-    vec3 b0 = vec3(k_cyl_r * cos(a0), -k_cyl_y, k_cyl_r * sin(a0));
-    vec3 b1 = vec3(k_cyl_r * cos(a1), -k_cyl_y, k_cyl_r * sin(a1));
-    vec3 t0 = vec3(k_cyl_r * cos(a0), k_cyl_y, k_cyl_r * sin(a0));
-    vec3 t1 = vec3(k_cyl_r * cos(a1), k_cyl_y, k_cyl_r * sin(a1));
-    vec3 radial0 = vec3(cos(a0), 0.0, sin(a0));
-    vec3 radial1 = vec3(cos(a1), 0.0, sin(a1));
-    vec3 side = face_normal(b0, t0, t1);
+    float3 b0 = float3(k_cyl_r * cos(a0), -k_cyl_y, k_cyl_r * sin(a0));
+    float3 b1 = float3(k_cyl_r * cos(a1), -k_cyl_y, k_cyl_r * sin(a1));
+    float3 t0 = float3(k_cyl_r * cos(a0), k_cyl_y, k_cyl_r * sin(a0));
+    float3 t1 = float3(k_cyl_r * cos(a1), k_cyl_y, k_cyl_r * sin(a1));
+    float3 radial0 = float3(cos(a0), 0.0, sin(a0));
+    float3 radial1 = float3(cos(a1), 0.0, sin(a1));
+    float3 side = face_normal(b0, t0, t1);
     if (k < 3u) {
         pos = k == 0u ? b0 : (k == 1u ? t0 : t1);
         nrm = curved == 0u ? side : (k == 0u ? radial0 : (k == 1u ? radial0 : radial1));
@@ -225,51 +219,51 @@ void cylinder_vertex(uint curved, uint local_id, out vec3 pos, out vec3 nrm) {
     }
     if (k < 9u) {
         uint e = k - 6u;
-        vec3 cap = vec3(0.0, k_cyl_y, 0.0);
+        float3 cap = float3(0.0, k_cyl_y, 0.0);
         pos = e == 0u ? cap : (e == 1u ? t1 : t0);
-        nrm = vec3(0.0, 1.0, 0.0);
+        nrm = float3(0.0, 1.0, 0.0);
         return;
     }
     uint e = k - 9u;
-    vec3 cap = vec3(0.0, -k_cyl_y, 0.0);
+    float3 cap = float3(0.0, -k_cyl_y, 0.0);
     pos = e == 0u ? cap : (e == 1u ? b0 : b1);
-    nrm = vec3(0.0, -1.0, 0.0);
+    nrm = float3(0.0, -1.0, 0.0);
 }
 
-void cone_vertex(uint curved, uint local_id, out vec3 pos, out vec3 nrm) {
+void cone_vertex(uint curved, uint local_id, out float3 pos, out float3 nrm) {
     uint n = curved == 0u ? 6u : 48u;
     uint s = local_id / 6u;
     uint k = local_id % 6u;
     float a0 = k_tau * float(s) / float(n);
     float a1 = k_tau * float(s + 1u) / float(n);
-    vec3 apex = vec3(0.0, k_cone_y, 0.0);
-    vec3 b0 = vec3(k_cone_r * cos(a0), -k_cone_y, k_cone_r * sin(a0));
-    vec3 b1 = vec3(k_cone_r * cos(a1), -k_cone_y, k_cone_r * sin(a1));
+    float3 apex = float3(0.0, k_cone_y, 0.0);
+    float3 b0 = float3(k_cone_r * cos(a0), -k_cone_y, k_cone_r * sin(a0));
+    float3 b1 = float3(k_cone_r * cos(a1), -k_cone_y, k_cone_r * sin(a1));
     float rise = k_cone_y * 2.0;
-    vec3 n0 = normalize(vec3(cos(a0) * rise, k_cone_r, sin(a0) * rise));
-    vec3 n1 = normalize(vec3(cos(a1) * rise, k_cone_r, sin(a1) * rise));
-    vec3 facet = face_normal(apex, b1, b0);
+    float3 n0 = normalize(float3(cos(a0) * rise, k_cone_r, sin(a0) * rise));
+    float3 n1 = normalize(float3(cos(a1) * rise, k_cone_r, sin(a1) * rise));
+    float3 facet = face_normal(apex, b1, b0);
     if (k < 3u) {
         pos = k == 0u ? apex : (k == 1u ? b1 : b0);
         nrm = curved == 0u ? facet : (k == 1u ? n1 : n0);
         return;
     }
     uint e = k - 3u;
-    vec3 cap = vec3(0.0, -k_cone_y, 0.0);
+    float3 cap = float3(0.0, -k_cone_y, 0.0);
     pos = e == 0u ? cap : (e == 1u ? b0 : b1);
-    nrm = vec3(0.0, -1.0, 0.0);
+    nrm = float3(0.0, -1.0, 0.0);
 }
 
-vec3 torus_p(float u, float v) {
+float3 torus_p(float u, float v) {
     float ring = k_torus_r + k_torus_s * cos(v);
-    return vec3(ring * cos(u), k_torus_s * sin(v), ring * sin(u));
+    return float3(ring * cos(u), k_torus_s * sin(v), ring * sin(u));
 }
 
-vec3 torus_n(float u, float v) {
-    return vec3(cos(v) * cos(u), sin(v), cos(v) * sin(u));
+float3 torus_n(float u, float v) {
+    return float3(cos(v) * cos(u), sin(v), cos(v) * sin(u));
 }
 
-void torus_vertex(uint curved, uint local_id, out vec3 pos, out vec3 nrm) {
+void torus_vertex(uint curved, uint local_id, out float3 pos, out float3 nrm) {
     uint nu = curved == 0u ? 8u : 32u;
     uint nv = curved == 0u ? 6u : 16u;
     uint q = local_id / 6u;
@@ -280,11 +274,11 @@ void torus_vertex(uint curved, uint local_id, out vec3 pos, out vec3 nrm) {
     float u1 = k_tau * float(iu + 1u) / float(nu);
     float v0 = k_tau * float(iv) / float(nv);
     float v1 = k_tau * float(iv + 1u) / float(nv);
-    vec3 p00 = torus_p(u0, v0);
-    vec3 p10 = torus_p(u1, v0);
-    vec3 p11 = torus_p(u1, v1);
-    vec3 p01 = torus_p(u0, v1);
-    vec3 facet = face_normal(p00, p01, p10);
+    float3 p00 = torus_p(u0, v0);
+    float3 p10 = torus_p(u1, v0);
+    float3 p11 = torus_p(u1, v1);
+    float3 p01 = torus_p(u0, v1);
+    float3 facet = face_normal(p00, p01, p10);
     if (k < 3u) {
         pos = k == 0u ? p00 : (k == 1u ? p01 : p10);
         nrm = curved == 0u ? facet : (k == 0u ? torus_n(u0, v0) : (k == 1u ? torus_n(u0, v1) : torus_n(u1, v0)));
@@ -296,22 +290,24 @@ void torus_vertex(uint curved, uint local_id, out vec3 pos, out vec3 nrm) {
     nrm = curved == 0u ? facet : (e == 0u ? torus_n(u0, v1) : (e == 1u ? torus_n(u1, v1) : torus_n(u1, v0)));
 }
 
-void store(uint slot, vec3 pos, vec3 nrm, vec3 color) {
-    Mesh mesh = Mesh(bake.verts);
+void store(uint slot, float3 pos, float3 nrm, float3 color) {
+    float* mesh = (float*)bake.verts;
     uint o = slot * 9u;
-    mesh.f[o + 0u] = pos.x;
-    mesh.f[o + 1u] = pos.y;
-    mesh.f[o + 2u] = pos.z;
-    mesh.f[o + 3u] = nrm.x;
-    mesh.f[o + 4u] = nrm.y;
-    mesh.f[o + 5u] = nrm.z;
-    mesh.f[o + 6u] = color.x;
-    mesh.f[o + 7u] = color.y;
-    mesh.f[o + 8u] = color.z;
+    mesh[o + 0u] = pos.x;
+    mesh[o + 1u] = pos.y;
+    mesh[o + 2u] = pos.z;
+    mesh[o + 3u] = nrm.x;
+    mesh[o + 4u] = nrm.y;
+    mesh[o + 5u] = nrm.z;
+    mesh[o + 6u] = color.x;
+    mesh[o + 7u] = color.y;
+    mesh[o + 8u] = color.z;
 }
 
-void main() {
-    uint slot = gl_GlobalInvocationID.x;
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    uint slot = id.x;
     if (slot >= k_total) {
         return;
     }
@@ -321,8 +317,8 @@ void main() {
     if (!locate(slot, kind, curved, local_id)) {
         return;
     }
-    vec3 pos = vec3(0.0);
-    vec3 nrm = vec3(0.0, 1.0, 0.0);
+    float3 pos = float3(0.0);
+    float3 nrm = float3(0.0, 1.0, 0.0);
     if (kind < 3u) {
         poly_vertex(kind, curved, local_id, pos, nrm);
     } else if (kind == 3u) {

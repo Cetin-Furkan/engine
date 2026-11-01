@@ -824,6 +824,22 @@ static void write_mesh(ObjCorner *dst, uint32_t nverts, uint32_t ntri) {
         s_ny[i2] += cy;
         s_nz[i2] += cz;
     }
+    for (uint32_t v = 0; v < nverts; ++v) {
+        float nx = s_nx[v];
+        float ny = s_ny[v];
+        float nz = s_nz[v];
+        float len = sqrtf(nx * nx + ny * ny + nz * nz);
+        if (len < 1.0e-12f) {
+            s_nx[v] = 0.0f;
+            s_ny[v] = 0.0f;
+            s_nz[v] = 1.0f;
+        } else {
+            float inv = 1.0f / len;
+            s_nx[v] = nx * inv;
+            s_ny[v] = ny * inv;
+            s_nz[v] = nz * inv;
+        }
+    }
     for (uint32_t c = 0; c < ntri * 3u; ++c) {
         uint32_t vi = s_tri_idx[c];
         float nx = 0.0f;
@@ -839,16 +855,6 @@ static void write_mesh(ObjCorner *dst, uint32_t nverts, uint32_t ntri) {
             nx = s_nx[vi];
             ny = s_ny[vi];
             nz = s_nz[vi];
-            float len = sqrtf(nx * nx + ny * ny + nz * nz);
-            if (len < 1.0e-12f) {
-                nx = 0.0f;
-                ny = 0.0f;
-                nz = 1.0f;
-            } else {
-                nx /= len;
-                ny /= len;
-                nz /= len;
-            }
         }
         dst[c] = (ObjCorner){
             .x = x, .y = y, .z = z, .nx = nx, .ny = ny, .nz = nz,

@@ -86,14 +86,14 @@ static void free_id(WaylandContext *w, uint32_t id) {
     w->free_id[w->nfree++] = id;
 }
 
+static_assert((ENG_FD_PARK & (ENG_FD_PARK - 1u)) == 0u, "ENG_FD_PARK must be a power of two");
+
 bool wayland_take_parked_fd(WaylandContext *w, int *out_fd) {
     if (w == nullptr || out_fd == nullptr || w->nparked == 0) {
         return false;
     }
-    *out_fd = w->parked_fds[0];
-    for (uint32_t i = 1; i < w->nparked; ++i) {
-        w->parked_fds[i - 1] = w->parked_fds[i];
-    }
+    *out_fd = w->parked_fds[w->parked_head];
+    w->parked_head = (w->parked_head + 1u) & (ENG_FD_PARK - 1u);
     w->nparked--;
     return true;
 }
@@ -315,7 +315,9 @@ static void park_fds(WaylandContext *w, const unsigned char *control, uint32_t c
                 wl_fail(w, "SCM_RIGHTS fd park overflow");
                 continue;
             }
-            w->parked_fds[w->nparked++] = fds[i];
+            uint32_t slot = (w->parked_head + w->nparked) & (ENG_FD_PARK - 1u);
+            w->parked_fds[slot] = fds[i];
+            w->nparked++;
         }
     }
 }
@@ -348,6 +350,174 @@ static void note_key_global(WaylandContext *w, uint32_t name, const char *iface,
     }
 }
 
+static void handle_display_msg(WaylandContext *w, uint16_t opcode,
+                               const unsigned char *p, const unsigned char *end) {
+    if (opcode == 0u) {
+        uint32_t bad_id = 0, code = 0, slen = 0;
+        if (!take_u32(&p, end, &bad_id) || !take_u32(&p, end, &code) ||
+            !take_u32(&p, end, &slen) || slen == 0 || p + slen > end) {
+            wl_fail(w, "truncated wl_display.error");
+            return;
+        }
+        snprintf(w->err, sizeof w->err, "wl_display.error object %u code %u: %.*s",
+                 bad_id, code, (int)(slen - 1u), (const char *)p);
+        w->failed = true;
+    } else if (opcode == 1u) {
+        uint32_t id = 0;
+        if (!take_u32(&p, end, &id)) {
+            wl_fail(w, "truncated wl_display.delete_id");
+            return;
+        }
+        free_id(w, id);
+    }
+}
+
+static void handle_registry_msg(WaylandContext *w, uint16_t opcode,
+                                const unsigned char *p, const unsigned char *end) {
+    if (opcode != 0u) {
+        return;
+    }
+    uint32_t name = 0, slen = 0, version = 0;
+    if (!take_u32(&p, end, &name) || !take_u32(&p, end, &slen) ||
+        slen == 0 || slen > ENG_WL_NAME || p + slen > end || p[slen - 1] != 0) {
+        wl_fail(w, "invalid wl_registry.global");
+        return;
+    }
+    const char *iface = (const char *)p;
+    uint32_t pad = (4u - (slen & 3u)) & 3u;
+    p += slen + pad;
+    if (!take_u32(&p, end, &version) || p != end) {
+        wl_fail(w, "wl_registry.global size mismatch");
+        return;
+    }
+    w->globals_seen++;
+    if (w->nglobals < ENG_WL_GLOBALS) {
+        WaylandGlobal *g = &w->globals[w->nglobals++];
+        g->name    = name;
+        g->version = version;
+        memcpy(g->interface, iface, slen);
+    }
+    note_key_global(w, name, iface, version);
+}
+
+static void handle_xdg_toplevel_msg(WaylandContext *w, uint16_t opcode,
+                                    const unsigned char *p, const unsigned char *end) {
+    if (opcode == 0u) {
+        int32_t width = 0, height = 0;
+        uint32_t states_len = 0;
+        if (!take_i32(&p, end, &width) || !take_i32(&p, end, &height) ||
+            !take_u32(&p, end, &states_len)) {
+            wl_fail(w, "truncated xdg_toplevel.configure");
+            return;
+        }
+        uint32_t pad = (4u - (states_len & 3u)) & 3u;
+        if ((size_t)(end - p) < (size_t)states_len + pad) {
+            wl_fail(w, "xdg_toplevel.configure state array out of bounds");
+            return;
+        }
+        bool resizing = false;
+        uint32_t left = states_len;
+        const unsigned char *sp = p;
+        while (left >= 4u) {
+            uint32_t st = 0;
+            memcpy(&st, sp, 4);
+            if (st == 3u) {
+                resizing = true;
+            }
+            sp += 4;
+            left -= 4u;
+        }
+        w->configure_resizing  = resizing;
+        w->configure_width     = (width > 0) ? (uint32_t)width : 0u;
+        w->configure_height    = (height > 0) ? (uint32_t)height : 0u;
+        w->toplevel_configured = true;
+    } else if (opcode == 1u) {
+        // The client owns the exit. Close is not a protocol failure.
+        w->toplevel_closed = true;
+    }
+}
+
+static void handle_dmabuf_feedback_msg(WaylandContext *w, uint16_t opcode, uint16_t size,
+                                       const unsigned char *p, const unsigned char *end) {
+    if (opcode == 0u) {
+        w->feedback_done = true;
+    } else if (opcode == 1u) {
+        // format_table is an fd plus a uint byte length. The fd is not in the body.
+        uint32_t table_size = 0;
+        int fd = -1;
+        if (size < 12u || !take_u32(&p, end, &table_size) || !wayland_take_parked_fd(w, &fd)) {
+            wl_fail(w, "zwp_linux_dmabuf_feedback_v1.format_table missing size or fd");
+            return;
+        }
+        struct stat st;
+        if (fstat(fd, &st) != 0) {
+            int err = errno;
+            close(fd);
+            wl_fail_err(w, "fstat dmabuf format_table", err);
+            return;
+        }
+        if (table_size == 0u ||
+            (table_size % (uint32_t)sizeof(WaylandFormatTableEntry)) != 0u ||
+            st.st_size < (off_t)table_size) {
+            close(fd);
+            wl_fail(w, "zwp_linux_dmabuf_feedback_v1.format_table bad length");
+            return;
+        }
+        void *map = mmap(nullptr, table_size, PROT_READ, MAP_PRIVATE, fd, 0);
+        if (map == MAP_FAILED) {
+            int err = errno;
+            close(fd);
+            wl_fail_err(w, "mmap dmabuf format_table", err);
+            return;
+        }
+        close_feedback_table(w);
+        w->feedback_table_fd    = fd;
+        w->feedback_table       = (WaylandFormatTableEntry *)map;
+        w->feedback_table_bytes = table_size;
+        w->feedback_table_count = table_size / (uint32_t)sizeof(WaylandFormatTableEntry);
+    } else if (opcode == 2u) {
+        uint32_t arr_len = 0;
+        if (!take_u32(&p, end, &arr_len) || (size_t)(end - p) < arr_len) {
+            wl_fail(w, "truncated zwp_linux_dmabuf_feedback_v1.main_device");
+            return;
+        }
+        if (decode_dev_array(p, arr_len, &w->feedback_main_major, &w->feedback_main_minor)) {
+            w->feedback_has_main_dev = true;
+        }
+    } else if (opcode == 3u) {
+        commit_feedback_tranche(w);
+    } else if (opcode == 4u) {
+        uint32_t arr_len = 0;
+        if (!take_u32(&p, end, &arr_len) || (size_t)(end - p) < arr_len) {
+            wl_fail(w, "truncated zwp_linux_dmabuf_feedback_v1.tranche_target_device");
+            return;
+        }
+        w->tranche_has_dev = decode_dev_array(
+            p, arr_len, &w->tranche_major, &w->tranche_minor);
+    } else if (opcode == 5u) {
+        uint32_t arr_len = 0;
+        if (!take_u32(&p, end, &arr_len) || (size_t)(end - p) < arr_len || (arr_len & 1u) != 0u) {
+            wl_fail(w, "invalid zwp_linux_dmabuf_feedback_v1.tranche_formats");
+            return;
+        }
+        uint32_t count = arr_len / 2u;
+        if (w->tranche_index_count > ENG_WL_MAX_INDICES ||
+            count > ENG_WL_MAX_INDICES - w->tranche_index_count) {
+            wl_fail(w, "zwp_linux_dmabuf_feedback_v1 tranche index list exceeds capacity");
+            return;
+        }
+        memcpy(w->tranche_indices + w->tranche_index_count, p, count * sizeof(uint16_t));
+        w->tranche_index_count += count;
+    } else if (opcode == 6u) {
+        uint32_t flags = 0;
+        if (!take_u32(&p, end, &flags)) {
+            wl_fail(w, "truncated zwp_linux_dmabuf_feedback_v1.tranche_flags");
+            return;
+        }
+        w->tranche_flags = flags;
+    }
+}
+
 static uint32_t parse_span(WaylandContext *w, const unsigned char *data, uint32_t len) {
     uint32_t offset = 0;
     const unsigned char *stream_end = data + len;
@@ -374,46 +544,10 @@ static uint32_t parse_span(WaylandContext *w, const unsigned char *data, uint32_
         const unsigned char *end = msg_start + size;
         p = msg_start + 8;
 
-        if (object == w->display_id && opcode == 0u) {
-            uint32_t bad_id = 0, code = 0, slen = 0;
-            if (!take_u32(&p, end, &bad_id) || !take_u32(&p, end, &code) ||
-                !take_u32(&p, end, &slen) || slen == 0 || p + slen > end) {
-                wl_fail(w, "truncated wl_display.error");
-                break;
-            }
-            snprintf(w->err, sizeof w->err, "wl_display.error object %u code %u: %.*s",
-                     bad_id, code, (int)(slen - 1u), (const char *)p);
-            w->failed = true;
-            break;
-        } else if (object == w->display_id && opcode == 1u) {
-            uint32_t id = 0;
-            if (!take_u32(&p, end, &id)) {
-                wl_fail(w, "truncated wl_display.delete_id");
-                break;
-            }
-            free_id(w, id);
-        } else if (w->registry_id != 0 && object == w->registry_id && opcode == 0u) {
-            uint32_t name = 0, slen = 0, version = 0;
-            if (!take_u32(&p, end, &name) || !take_u32(&p, end, &slen) ||
-                slen == 0 || slen > ENG_WL_NAME || p + slen > end || p[slen - 1] != 0) {
-                wl_fail(w, "invalid wl_registry.global");
-                break;
-            }
-            const char *iface = (const char *)p;
-            uint32_t pad = (4u - (slen & 3u)) & 3u;
-            p += slen + pad;
-            if (!take_u32(&p, end, &version) || p != end) {
-                wl_fail(w, "wl_registry.global size mismatch");
-                break;
-            }
-            w->globals_seen++;
-            if (w->nglobals < ENG_WL_GLOBALS) {
-                WaylandGlobal *g = &w->globals[w->nglobals++];
-                g->name    = name;
-                g->version = version;
-                memcpy(g->interface, iface, slen);
-            }
-            note_key_global(w, name, iface, version);
+        if (object == w->display_id) {
+            handle_display_msg(w, opcode, p, end);
+        } else if (w->registry_id != 0 && object == w->registry_id) {
+            handle_registry_msg(w, opcode, p, end);
         } else if (w->xdg_wm_base_id != 0 && object == w->xdg_wm_base_id && opcode == 0u) {
             uint32_t serial = 0;
             if (!take_u32(&p, end, &serial)) {
@@ -440,39 +574,7 @@ static uint32_t parse_span(WaylandContext *w, const unsigned char *data, uint32_
             // delete_id returns this id. Clear the slot so the next commit can arm one.
             w->frame_cb_id = 0;
         } else if (w->xdg_toplevel_id != 0 && object == w->xdg_toplevel_id) {
-            if (opcode == 0u) {
-                int32_t width = 0, height = 0;
-                uint32_t states_len = 0;
-                if (!take_i32(&p, end, &width) || !take_i32(&p, end, &height) ||
-                    !take_u32(&p, end, &states_len)) {
-                    wl_fail(w, "truncated xdg_toplevel.configure");
-                    break;
-                }
-                uint32_t pad = (4u - (states_len & 3u)) & 3u;
-                if ((size_t)(end - p) < (size_t)states_len + pad) {
-                    wl_fail(w, "xdg_toplevel.configure state array out of bounds");
-                    break;
-                }
-                bool resizing = false;
-                uint32_t left = states_len;
-                const unsigned char *sp = p;
-                while (left >= 4u) {
-                    uint32_t st = 0;
-                    memcpy(&st, sp, 4);
-                    if (st == 3u) {
-                        resizing = true;
-                    }
-                    sp += 4;
-                    left -= 4u;
-                }
-                w->configure_resizing  = resizing;
-                w->configure_width     = (width > 0) ? (uint32_t)width : 0u;
-                w->configure_height    = (height > 0) ? (uint32_t)height : 0u;
-                w->toplevel_configured = true;
-            } else if (opcode == 1u) {
-                // The client owns the exit. Close is not a protocol failure.
-                w->toplevel_closed = true;
-            }
+            handle_xdg_toplevel_msg(w, opcode, p, end);
         } else if (w->xdg_surface_id != 0 && object == w->xdg_surface_id && opcode == 0u) {
             uint32_t serial = 0;
             if (!take_u32(&p, end, &serial)) {
@@ -482,83 +584,7 @@ static uint32_t parse_span(WaylandContext *w, const unsigned char *data, uint32_
             w->configure_serial       = serial;
             w->xdg_surface_configured = true;
         } else if (w->feedback_id != 0 && object == w->feedback_id) {
-            if (opcode == 0u) {
-                w->feedback_done = true;
-            } else if (opcode == 1u) {
-                // format_table is an fd plus a uint byte length. The fd is not in the body.
-                uint32_t table_size = 0;
-                int fd = -1;
-                if (size < 12u || !take_u32(&p, end, &table_size) || !wayland_take_parked_fd(w, &fd)) {
-                    wl_fail(w, "zwp_linux_dmabuf_feedback_v1.format_table missing size or fd");
-                    break;
-                }
-                struct stat st;
-                if (fstat(fd, &st) != 0) {
-                    int err = errno;
-                    close(fd);
-                    wl_fail_err(w, "fstat dmabuf format_table", err);
-                    break;
-                }
-                if (table_size == 0u ||
-                    (table_size % (uint32_t)sizeof(WaylandFormatTableEntry)) != 0u ||
-                    st.st_size < (off_t)table_size) {
-                    close(fd);
-                    wl_fail(w, "zwp_linux_dmabuf_feedback_v1.format_table bad length");
-                    break;
-                }
-                void *map = mmap(nullptr, table_size, PROT_READ, MAP_PRIVATE, fd, 0);
-                if (map == MAP_FAILED) {
-                    int err = errno;
-                    close(fd);
-                    wl_fail_err(w, "mmap dmabuf format_table", err);
-                    break;
-                }
-                close_feedback_table(w);
-                w->feedback_table_fd    = fd;
-                w->feedback_table       = (WaylandFormatTableEntry *)map;
-                w->feedback_table_bytes = table_size;
-                w->feedback_table_count = table_size / (uint32_t)sizeof(WaylandFormatTableEntry);
-            } else if (opcode == 2u) {
-                uint32_t arr_len = 0;
-                if (!take_u32(&p, end, &arr_len) || (size_t)(end - p) < arr_len) {
-                    wl_fail(w, "truncated zwp_linux_dmabuf_feedback_v1.main_device");
-                    break;
-                }
-                if (decode_dev_array(p, arr_len, &w->feedback_main_major, &w->feedback_main_minor)) {
-                    w->feedback_has_main_dev = true;
-                }
-            } else if (opcode == 3u) {
-                commit_feedback_tranche(w);
-            } else if (opcode == 4u) {
-                uint32_t arr_len = 0;
-                if (!take_u32(&p, end, &arr_len) || (size_t)(end - p) < arr_len) {
-                    wl_fail(w, "truncated zwp_linux_dmabuf_feedback_v1.tranche_target_device");
-                    break;
-                }
-                w->tranche_has_dev = decode_dev_array(
-                    p, arr_len, &w->tranche_major, &w->tranche_minor);
-            } else if (opcode == 5u) {
-                uint32_t arr_len = 0;
-                if (!take_u32(&p, end, &arr_len) || (size_t)(end - p) < arr_len || (arr_len & 1u) != 0u) {
-                    wl_fail(w, "invalid zwp_linux_dmabuf_feedback_v1.tranche_formats");
-                    break;
-                }
-                uint32_t count = arr_len / 2u;
-                if (w->tranche_index_count > ENG_WL_MAX_INDICES ||
-                    count > ENG_WL_MAX_INDICES - w->tranche_index_count) {
-                    wl_fail(w, "zwp_linux_dmabuf_feedback_v1 tranche index list exceeds capacity");
-                    break;
-                }
-                memcpy(w->tranche_indices + w->tranche_index_count, p, count * sizeof(uint16_t));
-                w->tranche_index_count += count;
-            } else if (opcode == 6u) {
-                uint32_t flags = 0;
-                if (!take_u32(&p, end, &flags)) {
-                    wl_fail(w, "truncated zwp_linux_dmabuf_feedback_v1.tranche_flags");
-                    break;
-                }
-                w->tranche_flags = flags;
-            }
+            handle_dmabuf_feedback_msg(w, opcode, size, p, end);
         } else if (w->buffer_params_id != 0 && object == w->buffer_params_id && opcode == 1u) {
             wl_fail(w, "zwp_linux_buffer_params_v1.failed received from compositor");
             break;
@@ -568,24 +594,12 @@ static uint32_t parse_span(WaylandContext *w, const unsigned char *data, uint32_
             (void)pointer_dispatch(w, object, opcode, msg_start + 8, (uint16_t)(size - 8u));
         }
 
+        if (w->failed) {
+            break;
+        }
         offset += size;
     }
     return offset;
-}
-
-static void parse_stream(WaylandContext *w) {
-    if (w->stream_len == 0 || w->failed) {
-        return;
-    }
-    uint32_t consumed = parse_span(w, w->stream, w->stream_len);
-    if (consumed == 0) {
-        return;
-    }
-    uint32_t remaining = w->stream_len - consumed;
-    if (remaining > 0) {
-        memmove(w->stream, w->stream + consumed, remaining);
-    }
-    w->stream_len = remaining;
 }
 
 static void arm_recv(WaylandContext *w) {
@@ -700,23 +714,53 @@ void wayland_on_cqe(WaylandContext *w, const struct io_uring_cqe *cqe) {
         ring_pbuf_finish(w->ring, bid, (uint32_t)cqe->res, more);
         return;
     }
-    if (w->stream_len == 0) {
-        uint32_t consumed = parse_span(w, buf + hdr, copied);
-        uint32_t tail = copied - consumed;
-        if (!w->failed && tail > 0) {
+    const unsigned char *payload = buf + hdr;
+    uint32_t left = copied;
+    if (w->stream_len > 0) {
+        // Stitch only the single message that straddled the previous recvmsg,
+        // then parse the rest of the incoming buffer in-place without memmove.
+        if (w->stream_len < 8u && left > 0u) {
+            uint32_t need_hdr = 8u - w->stream_len;
+            uint32_t take = (left < need_hdr) ? left : need_hdr;
+            memcpy(w->stream + w->stream_len, payload, take);
+            w->stream_len += take;
+            payload += take;
+            left -= take;
+        }
+        if (w->stream_len >= 8u) {
+            uint16_t msg_size = 0;
+            memcpy(&msg_size, w->stream + 6, 2);
+            if (msg_size < 8u || (msg_size & 3u) != 0u) {
+                wl_fail(w, "invalid wayland wire message size");
+            } else if (msg_size > sizeof w->stream) {
+                wl_fail(w, "wayland stream buffer overflow");
+            } else {
+                uint32_t need_body = (uint32_t)msg_size - w->stream_len;
+                uint32_t take = (left < need_body) ? left : need_body;
+                if (take > 0u) {
+                    memcpy(w->stream + w->stream_len, payload, take);
+                    w->stream_len += take;
+                    payload += take;
+                    left -= take;
+                }
+                if (w->stream_len == (uint32_t)msg_size) {
+                    (void)parse_span(w, w->stream, msg_size);
+                    w->stream_len = 0;
+                }
+            }
+        }
+    }
+    if (!w->failed && w->stream_len == 0 && left > 0u) {
+        uint32_t consumed = parse_span(w, payload, left);
+        uint32_t tail = left - consumed;
+        if (!w->failed && tail > 0u) {
             if (tail > sizeof w->stream) {
                 wl_fail(w, "wayland stream buffer overflow");
             } else {
-                memcpy(w->stream, buf + hdr + consumed, tail);
+                memcpy(w->stream, payload + consumed, tail);
                 w->stream_len = tail;
             }
         }
-    } else if (w->stream_len + copied <= sizeof w->stream) {
-        memcpy(w->stream + w->stream_len, buf + hdr, copied);
-        w->stream_len += copied;
-        parse_stream(w);
-    } else {
-        wl_fail(w, "wayland stream buffer overflow");
     }
     ring_pbuf_finish(w->ring, bid, (uint32_t)cqe->res, more);
 
@@ -1909,8 +1953,10 @@ void wayland_shutdown(void) {
     pointer_shutdown(w);
     close_feedback_table(w);
     for (uint32_t i = 0; i < w->nparked; ++i) {
-        close(w->parked_fds[i]);
+        uint32_t slot = (w->parked_head + i) & (ENG_FD_PARK - 1u);
+        close(w->parked_fds[slot]);
     }
+    w->parked_head    = 0;
     w->nparked        = 0;
     w->is_initialized = false;
     printf("goodbye from wayland\n");

@@ -54,38 +54,27 @@ ifneq ($(VULKAN_INCLUDE_DIR),)
 endif
 
 SLANGC ?= $(or $(SLANG_BIN),slangc)
-ifeq ($(GLSLANG),)
-GLSLANG := glslangValidator
-endif
 
-# slangc compiles the shaders it accepts. glslangValidator keeps buffer_reference,
-# explicit offsets, and compute. The branch is per source, not a parse-time ifeq.
-SLANG_SRCS := shaders/chrome.vert shaders/chrome.frag shaders/cube.frag shaders/solid.frag
-
-$(GEN_DIR)/%.spv: shaders/%
+$(GEN_DIR)/%.spv: shaders/%.slang
 	@mkdir -p $(dir $@)
 	@set -e; \
-	if printf '%s\n' $(SLANG_SRCS) | grep -Fxq "$<"; then \
-		case "$<" in \
-			*.vert) stage=vertex ;; \
-			*.frag) stage=fragment ;; \
-			*.comp) stage=compute ;; \
-			*) echo "unknown shader stage: $<" >&2; exit 1 ;; \
-		esac; \
-		$(SLANGC) -lang glsl -target spirv -profile spirv_1_6 -stage "$$stage" -entry main -fvk-use-entrypoint-name -o "$@" "$<"; \
-	else \
-		$(GLSLANG) -V --target-env vulkan1.4 -Ishaders --depfile "$(GEN_DIR)/$*.d" -o "$@" "$<"; \
-	fi
+	case "$<" in \
+		*.vert.slang) stage=vertex ;; \
+		*.frag.slang) stage=fragment ;; \
+		*.comp.slang) stage=compute ;; \
+		*) echo "unknown shader stage: $<" >&2; exit 1 ;; \
+	esac; \
+	$(SLANGC) -target spirv -profile spirv_1_6 -stage "$$stage" -entry main -fvk-use-entrypoint-name -depfile "$(GEN_DIR)/$*.d" -Ishaders -o "$@" "$<"
 
-$(GEN_DIR)/bevel.comp.spv: shaders/face_grid.inc
-$(GEN_DIR)/heat.comp.spv: shaders/heat_nbr.inc shaders/face_grid.inc
-$(GEN_DIR)/cube.vert.spv: shaders/camera.inc shaders/material.inc
-$(GEN_DIR)/solid.vert.spv: shaders/camera.inc shaders/material.inc
-$(GEN_DIR)/shape.vert.spv: shaders/camera.inc shaders/material.inc
-$(GEN_DIR)/plane.vert.spv: shaders/camera.inc
-$(GEN_DIR)/plot.vert.spv: shaders/camera.inc
-$(GEN_DIR)/gimbal.vert.spv: shaders/camera.inc
-$(GEN_DIR)/mesh.vert.spv: shaders/camera.inc shaders/material.inc
+$(GEN_DIR)/bevel.comp.spv: shaders/face_grid.slang
+$(GEN_DIR)/heat.comp.spv: shaders/heat_nbr.slang shaders/face_grid.slang
+$(GEN_DIR)/cube.vert.spv: shaders/camera.slang shaders/material.slang
+$(GEN_DIR)/solid.vert.spv: shaders/camera.slang shaders/material.slang
+$(GEN_DIR)/shape.vert.spv: shaders/camera.slang shaders/material.slang
+$(GEN_DIR)/plane.vert.spv: shaders/camera.slang
+$(GEN_DIR)/plot.vert.spv: shaders/camera.slang
+$(GEN_DIR)/gimbal.vert.spv: shaders/camera.slang
+$(GEN_DIR)/mesh.vert.spv: shaders/camera.slang shaders/material.slang
 
 -include $(wildcard $(GEN_DIR)/*.d)
 
@@ -99,13 +88,13 @@ $(OBJ_DIR)/examples/demo/render/mesh.o: $(GEN_DIR)/mesh.vert.spv $(GEN_DIR)/mesh
 $(OBJ_DIR)/examples/demo/render/hud.o: $(GEN_DIR)/hud.vert.spv $(GEN_DIR)/hud.frag.spv
 $(OBJ_DIR)/examples/demo/render/grid.o: $(GEN_DIR)/grid.comp.spv
 
-$(GEN_DIR)/text.vert.spv: examples/demo/text/draw/text.vert
+$(GEN_DIR)/text.vert.spv: examples/demo/text/draw/text.vert.slang
 	@mkdir -p $(dir $@)
-	$(GLSLANG) -V --target-env vulkan1.4 -Ishaders --depfile "$(GEN_DIR)/text.vert.d" -o "$@" "$<"
+	$(SLANGC) -target spirv -profile spirv_1_6 -stage vertex -entry main -fvk-use-entrypoint-name -depfile "$(GEN_DIR)/text.vert.d" -Ishaders -o "$@" "$<"
 
-$(GEN_DIR)/text.frag.spv: examples/demo/text/draw/text.frag
+$(GEN_DIR)/text.frag.spv: examples/demo/text/draw/text.frag.slang
 	@mkdir -p $(dir $@)
-	$(GLSLANG) -V --target-env vulkan1.4 -Ishaders --depfile "$(GEN_DIR)/text.frag.d" -o "$@" "$<"
+	$(SLANGC) -target spirv -profile spirv_1_6 -stage fragment -entry main -fvk-use-entrypoint-name -depfile "$(GEN_DIR)/text.frag.d" -Ishaders -o "$@" "$<"
 
 $(OBJ_DIR)/examples/demo/text/draw/draw.o: $(GEN_DIR)/text.vert.spv $(GEN_DIR)/text.frag.spv
 $(OBJ_DIR)/examples/demo/text/face/face.o: examples/demo/text/face/bundled/InterVariable.ttf
@@ -192,8 +181,7 @@ info: $(CONFIG_MK)
 	@echo "  Vulkan Header:     $(VULKAN_HEADER) (v$(VULKAN_VERSION))"
 	@echo "  Vulkan Library:    $(VULKAN_LIB)"
 	@echo "  Wayland Protocols: $(WAYLAND_PROTOCOLS_VERSION) ($(WAYLAND_PROTOCOLS_DIR))"
-	@echo "  Slang Compiler:    $(SLANGC)"
-	@echo "  GLSL Compiler:     $(GLSLANG)"
+	@echo "  Shader Compiler:   $(SLANGC) (Native Slang 2026 / SPIR-V 1.6)"
 	@echo -e "\033[0;34m==================================\033[0m"
 
 help:

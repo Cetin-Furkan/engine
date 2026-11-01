@@ -452,20 +452,16 @@ static VulkanResult evaluate_device(GpuCandidate *candidate) {
         !candidate->supports_scalar_layout || !candidate->supports_shader_int16 ||
         !candidate->supports_shader_int64 || !candidate->supports_storage_buffer_16bit ||
         !candidate->supports_shader_float16 ||
-        !candidate->supports_maintenance5 || !candidate->supports_maintenance6 ||
-        !candidate->supports_push_descriptors || !candidate->supports_host_image_copy ||
-        !candidate->supports_dynamic_rendering_local_read) {
+        !candidate->supports_maintenance5 || !candidate->supports_maintenance6) {
         char reason[384];
         snprintf(reason, sizeof reason,
-                 "Missing Vulkan 1.4 feature (DynRender=%d, Sync2=%d, BDA=%d, Timeline=%d, Scalar=%d, Int16=%d, Int64=%d, Storage16=%d, Float16=%d, Maint5=%d, Maint6=%d, PushDesc=%d, HostCopy=%d, LocalRead=%d)",
+                 "Missing Vulkan 1.4 core feature (DynRender=%d, Sync2=%d, BDA=%d, Timeline=%d, Scalar=%d, Int16=%d, Int64=%d, Storage16=%d, Float16=%d, Maint5=%d, Maint6=%d)",
                  candidate->supports_dyn_render, candidate->supports_sync2,
                  candidate->supports_bda, candidate->supports_timeline,
                  candidate->supports_scalar_layout, candidate->supports_shader_int16,
                  candidate->supports_shader_int64, candidate->supports_storage_buffer_16bit,
                  candidate->supports_shader_float16,
-                 candidate->supports_maintenance5, candidate->supports_maintenance6,
-                 candidate->supports_push_descriptors, candidate->supports_host_image_copy,
-                 candidate->supports_dynamic_rendering_local_read);
+                 candidate->supports_maintenance5, candidate->supports_maintenance6);
         disqualify(candidate, reason);
         return VULKAN_SUCCESS;
     }
@@ -943,9 +939,9 @@ VulkanResult vulkan_device_create(VulkanContext *ctx) {
         .sType                     = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_4_FEATURES,
         .maintenance5              = VK_TRUE,
         .maintenance6              = VK_TRUE,
-        .pushDescriptor            = VK_TRUE,
-        .hostImageCopy             = VK_TRUE,
-        .dynamicRenderingLocalRead = VK_TRUE,
+        .pushDescriptor            = best.supports_push_descriptors ? VK_TRUE : VK_FALSE,
+        .hostImageCopy             = best.supports_host_image_copy ? VK_TRUE : VK_FALSE,
+        .dynamicRenderingLocalRead = best.supports_dynamic_rendering_local_read ? VK_TRUE : VK_FALSE,
     };
     VkPhysicalDeviceVulkan13Features feat13 = {
         .sType            = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,

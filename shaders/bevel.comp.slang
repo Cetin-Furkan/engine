@@ -1,103 +1,82 @@
-#version 450
-#extension GL_EXT_buffer_reference : require
-#extension GL_EXT_scalar_block_layout : require
-#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
-#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
-#extension GL_GOOGLE_include_directive : require
+#include "face_grid.slang"
 
-// One invocation writes one vertex. Invocations below the quad count also
-// write one quad. Each face is a 16 by 16 grid on the flat inset. Edges
-// stay a constant-radius fillet and corners stay the sphere octant.
-// Nothing here reads the framebuffer.
+static const uint k_arc = 8u;
+static const float k_half_pi = 1.5707963;
+static const uint k_face_verts = 24u;
+static const uint k_edge_verts = 216u;
+static const uint k_face_quads = 6u * k_grid * k_grid;
+static const uint k_quads = k_face_quads + 12u * k_arc + 8u * k_arc * k_arc;
 
-#include "face_grid.inc"
-
-layout(local_size_x = 64) in;
-
-const uint k_arc = 8u;
-const float k_half_pi = 1.5707963;
-const uint k_face_verts = 24u;
-const uint k_edge_verts = 216u;
-const uint k_face_quads = 6u * k_grid * k_grid;
-const uint k_quads = k_face_quads + 12u * k_arc + 8u * k_arc * k_arc;
-
-layout(buffer_reference, scalar, buffer_reference_align = 4) buffer Mesh {
-    float f[];
-};
-
-layout(buffer_reference, scalar, buffer_reference_align = 2) buffer Indices {
-    uint16_t i[];
-};
-
-layout(push_constant, scalar) uniform Push {
+struct Push {
     uint64_t verts;
     uint64_t indices;
-} pc;
+};
+[[vk::push_constant]] Push pc;
 
-void store_vert(uint vi, vec3 p, vec3 n, vec3 c) {
-    Mesh mesh = Mesh(pc.verts);
+void store_vert(uint vi, float3 p, float3 n, float3 c) {
+    float* mesh = (float*)pc.verts;
     uint o = vi * 9u;
-    mesh.f[o + 0u] = p.x;
-    mesh.f[o + 1u] = p.y;
-    mesh.f[o + 2u] = p.z;
-    mesh.f[o + 3u] = n.x;
-    mesh.f[o + 4u] = n.y;
-    mesh.f[o + 5u] = n.z;
-    mesh.f[o + 6u] = c.x;
-    mesh.f[o + 7u] = c.y;
-    mesh.f[o + 8u] = c.z;
+    mesh[o + 0u] = p.x;
+    mesh[o + 1u] = p.y;
+    mesh[o + 2u] = p.z;
+    mesh[o + 3u] = n.x;
+    mesh[o + 4u] = n.y;
+    mesh[o + 5u] = n.z;
+    mesh[o + 6u] = c.x;
+    mesh[o + 7u] = c.y;
+    mesh[o + 8u] = c.z;
 }
 
 void store_quad(uint q, uint a, uint b, uint c, uint d) {
-    Indices idx = Indices(pc.indices);
+    uint16_t* idx = (uint16_t*)pc.indices;
     uint o = q * 6u;
-    idx.i[o + 0u] = uint16_t(a);
-    idx.i[o + 1u] = uint16_t(b);
-    idx.i[o + 2u] = uint16_t(c);
-    idx.i[o + 3u] = uint16_t(a);
-    idx.i[o + 4u] = uint16_t(c);
-    idx.i[o + 5u] = uint16_t(d);
+    idx[o + 0u] = uint16_t(a);
+    idx[o + 1u] = uint16_t(b);
+    idx[o + 2u] = uint16_t(c);
+    idx[o + 3u] = uint16_t(a);
+    idx[o + 4u] = uint16_t(c);
+    idx[o + 5u] = uint16_t(d);
 }
 
-vec3 color_of(vec3 n) {
-    if (n.x > 0.5)  return vec3(0.72, 0.28, 0.22);
-    if (n.x < -0.5) return vec3(0.25, 0.48, 0.32);
-    if (n.y > 0.5)  return vec3(0.78, 0.74, 0.66);
-    if (n.y < -0.5) return vec3(0.30, 0.32, 0.38);
-    if (n.z > 0.5)  return vec3(0.82, 0.62, 0.28);
-    return vec3(0.35, 0.38, 0.62);
+float3 color_of(float3 n) {
+    if (n.x > 0.5)  return float3(0.72, 0.28, 0.22);
+    if (n.x < -0.5) return float3(0.25, 0.48, 0.32);
+    if (n.y > 0.5)  return float3(0.78, 0.74, 0.66);
+    if (n.y < -0.5) return float3(0.30, 0.32, 0.38);
+    if (n.z > 0.5)  return float3(0.82, 0.62, 0.28);
+    return float3(0.35, 0.38, 0.62);
 }
 
-void edge_basis(uint e, out vec3 n0, out vec3 n1, out vec3 d) {
+void edge_basis(uint e, out float3 n0, out float3 n1, out float3 d) {
     uint pair = e / 4u;
     uint bits = e % 4u;
     float a = (bits & 1u) == 0u ? 1.0 : -1.0;
     float bsgn = (bits & 2u) == 0u ? 1.0 : -1.0;
-    if (pair == 0u)      { n0 = vec3(a, 0, 0); n1 = vec3(0, bsgn, 0); }
-    else if (pair == 1u) { n0 = vec3(0, a, 0); n1 = vec3(0, 0, bsgn); }
-    else                 { n0 = vec3(0, 0, a); n1 = vec3(bsgn, 0, 0); }
+    if (pair == 0u)      { n0 = float3(a, 0, 0); n1 = float3(0, bsgn, 0); }
+    else if (pair == 1u) { n0 = float3(0, a, 0); n1 = float3(0, 0, bsgn); }
+    else                 { n0 = float3(0, 0, a); n1 = float3(bsgn, 0, 0); }
     d = cross(n0, n1);
 }
 
-void corner_basis(uint c, out vec3 n0, out vec3 n1, out vec3 n2) {
+void corner_basis(uint c, out float3 n0, out float3 n1, out float3 n2) {
     float sx = (c & 1u) == 0u ? 1.0 : -1.0;
     float sy = (c & 2u) == 0u ? 1.0 : -1.0;
     float sz = (c & 4u) == 0u ? 1.0 : -1.0;
-    n0 = vec3(sx, 0.0, 0.0);
-    n1 = vec3(0.0, sy, 0.0);
-    n2 = vec3(0.0, 0.0, sz);
+    n0 = float3(sx, 0.0, 0.0);
+    n1 = float3(0.0, sy, 0.0);
+    n2 = float3(0.0, 0.0, sz);
     if (dot(n0, cross(n1, n2)) < 0.0) {
-        vec3 swap_n = n1;
+        float3 swap_n = n1;
         n1 = n2;
         n2 = swap_n;
     }
 }
 
-vec3 corner_dir(vec3 n0, vec3 n1, vec3 n2, float a, float b) {
+float3 corner_dir(float3 n0, float3 n1, float3 n2, float a, float b) {
     return normalize(cos(a) * cos(b) * n0 + sin(a) * cos(b) * n1 + sin(b) * n2);
 }
 
-vec3 corner_color(vec3 dir, vec3 n0, vec3 n1, vec3 n2, vec3 c0, vec3 c1, vec3 c2) {
+float3 corner_color(float3 dir, float3 n0, float3 n1, float3 n2, float3 c0, float3 c1, float3 c2) {
     float w0 = max(dot(dir, n0), 0.0);
     float w1 = max(dot(dir, n1), 0.0);
     float w2 = max(dot(dir, n2), 0.0);
@@ -110,9 +89,9 @@ void write_vert(uint id) {
         uint i;
         uint j;
         grid_decode(id, face, i, j);
-        vec3 n;
-        vec3 t;
-        vec3 b;
+        float3 n;
+        float3 t;
+        float3 b;
         face_basis(face, n, t, b);
         store_vert(id, face_point(face, i, j), n, color_of(n));
         return;
@@ -121,9 +100,9 @@ void write_vert(uint id) {
     if (id < k_face_verts) {
         uint face = id / 4u;
         uint corner = id % 4u;
-        vec3 n;
-        vec3 t;
-        vec3 b;
+        float3 n;
+        float3 t;
+        float3 b;
         face_basis(face, n, t, b);
         float tu = (corner == 1u || corner == 2u) ? m : -m;
         float bv = (corner >= 2u) ? m : -m;
@@ -136,16 +115,16 @@ void write_vert(uint id) {
         uint rem = local % 18u;
         uint row = rem / 9u;
         uint col = rem % 9u;
-        vec3 n0;
-        vec3 n1;
-        vec3 d;
+        float3 n0;
+        float3 n1;
+        float3 d;
         edge_basis(e, n0, n1, d);
         float u = float(col) / float(k_arc);
         float ang = u * k_half_pi;
-        vec3 nrm = cos(ang) * n0 + sin(ang) * n1;
+        float3 nrm = cos(ang) * n0 + sin(ang) * n1;
         float s = row == 0u ? -m : m;
-        vec3 p = (n0 + n1) * m + d * s + k_radius * nrm;
-        store_vert(id, p, nrm, mix(color_of(n0), color_of(n1), u));
+        float3 p = (n0 + n1) * m + d * s + k_radius * nrm;
+        store_vert(id, p, nrm, lerp(color_of(n0), color_of(n1), u));
         return;
     }
     uint local = id - (k_face_verts + k_edge_verts);
@@ -153,14 +132,14 @@ void write_vert(uint id) {
     uint rem = local % 81u;
     uint iv = rem / 9u;
     uint iu = rem % 9u;
-    vec3 n0;
-    vec3 n1;
-    vec3 n2;
+    float3 n0;
+    float3 n1;
+    float3 n2;
     corner_basis(c, n0, n1, n2);
-    vec3 dir = corner_dir(n0, n1, n2,
+    float3 dir = corner_dir(n0, n1, n2,
                           float(iu) / float(k_arc) * k_half_pi,
                           float(iv) / float(k_arc) * k_half_pi);
-    vec3 col = corner_color(dir, n0, n1, n2, color_of(n0), color_of(n1), color_of(n2));
+    float3 col = corner_color(dir, n0, n1, n2, color_of(n0), color_of(n1), color_of(n2));
     store_vert(id, (n0 + n1 + n2) * m + k_radius * dir, dir, col);
 }
 
@@ -204,12 +183,14 @@ void write_quad(uint q) {
     store_quad(q, d00, d10, d11, d01);
 }
 
-void main() {
-    uint id = gl_GlobalInvocationID.x;
-    if (id < k_grid_verts) {
-        write_vert(id);
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    uint i = id.x;
+    if (i < k_grid_verts) {
+        write_vert(i);
     }
-    if (id < k_quads) {
-        write_quad(id);
+    if (i < k_quads) {
+        write_quad(i);
     }
 }

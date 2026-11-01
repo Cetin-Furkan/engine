@@ -1,7 +1,6 @@
 #ifndef ENGINE_FRAME_POLICY_H
 #define ENGINE_FRAME_POLICY_H
 
-#include <stdbool.h>
 #include <stdint.h>
 
 // Capability gate for one workspace. A physical evdev key becomes a

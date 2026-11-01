@@ -6,7 +6,7 @@
 // A bit in k_hot_bits is set when that vertex sits on the upper half.
 // Matches bevel.comp with k_arc = 8. Rebuild this file if that layout changes.
 
-const uint k_off[889] = uint[](
+static const uint k_off[889] = uint[](
     0u, 4u, 8u, 12u, 16u, 20u, 24u, 28u, 32u, 43u, 47u, 58u,
     62u, 73u, 77u, 88u, 92u, 103u, 107u, 118u, 122u, 133u, 137u, 148u,
     152u, 156u, 160u, 164u, 168u, 172u, 176u, 180u, 184u, 195u, 199u, 203u,
@@ -84,7 +84,7 @@ const uint k_off[889] = uint[](
     4224u
 );
 
-const uint k_nbr[4224] = uint[](
+static const uint k_nbr[4224] = uint[](
     1u, 3u, 61u, 175u, 0u, 2u, 70u, 202u, 1u, 3u, 25u, 193u,
     0u, 2u, 34u, 184u, 5u, 7u, 79u, 229u, 4u, 6u, 88u, 220u,
     5u, 7u, 43u, 211u, 4u, 6u, 52u, 238u, 9u, 11u, 49u, 97u,
@@ -439,7 +439,7 @@ const uint k_nbr[4224] = uint[](
     877u, 13u, 15u, 85u, 151u, 871u, 872u, 873u, 874u, 875u, 876u, 877u
 );
 
-const uint k_hot_bits[28] = uint[](
+static const uint k_hot_bits[28] = uint[](
     4291563468u, 268435455u, 0u, 262143u, 4194288u, 4294836224u, 2093063u, 4294967168u,
     4294967295u, 4294967295u, 4294967295u, 4294967295u, 262143u, 0u, 0u, 0u,
     0u, 4293918720u, 4294967295u, 4294967295u, 4294967295u, 4294967295u, 4194303u, 0u,

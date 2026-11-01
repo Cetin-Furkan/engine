@@ -105,22 +105,22 @@ static void destroy_wl_buffer_now(WaylandContext *wl, uint32_t buffer_id) {
 
 int create_release_timeline(VulkanContext *vk, WaylandContext *wl, FrameSlot *frame) {
     struct drm_syncobj_create release_create = {0};
-    if (s_drm_fd < 0 || frame == nullptr) {
+    if (frame_state.drm_fd < 0 || frame == nullptr) {
         return -EINVAL;
     }
-    if (ioctl(s_drm_fd, DRM_IOCTL_SYNCOBJ_CREATE, &release_create) != 0) {
+    if (ioctl(frame_state.drm_fd, DRM_IOCTL_SYNCOBJ_CREATE, &release_create) != 0) {
         fprintf(stderr, "[Engine Error] DRM_IOCTL_SYNCOBJ_CREATE: %s\n", strerror(errno));
         return -1;
     }
     frame->release_handle = release_create.handle;
-    int release_fd = drm_syncobj_to_fd(s_drm_fd, frame->release_handle);
+    int release_fd = drm_syncobj_to_fd(frame_state.drm_fd, frame->release_handle);
     if (release_fd < 0) {
-        drm_syncobj_destroy(s_drm_fd, &frame->release_handle);
+        drm_syncobj_destroy(frame_state.drm_fd, &frame->release_handle);
         return -1;
     }
     if (import_release_semaphore_fd(vk, release_fd, &frame->release_semaphore) < 0) {
         close(release_fd);
-        drm_syncobj_destroy(s_drm_fd, &frame->release_handle);
+        drm_syncobj_destroy(frame_state.drm_fd, &frame->release_handle);
         return -1;
     }
     uint32_t timeline_id = 0;
@@ -136,7 +136,7 @@ int create_release_timeline(VulkanContext *vk, WaylandContext *wl, FrameSlot *fr
             vkDestroySemaphore(vk->device, frame->release_semaphore, nullptr);
             frame->release_semaphore = VK_NULL_HANDLE;
         }
-        drm_syncobj_destroy(s_drm_fd, &frame->release_handle);
+        drm_syncobj_destroy(frame_state.drm_fd, &frame->release_handle);
         return -1;
     }
     frame->release_timeline_id = timeline_id;
@@ -182,12 +182,15 @@ static bool same_release(const FrameSlot *a, const FrameSlot *b) {
 
 static bool release_held_elsewhere(const FrameSlot *frame) {
     for (int i = 0; i < 2; ++i) {
-        if (&s_slot[i] != frame && same_release(frame, &s_slot[i])) {
+        if (&frame_state.slot[i] != frame && same_release(frame, &frame_state.slot[i])) {
             return true;
         }
     }
-    for (uint32_t i = 0; i < s_orphan_count; ++i) {
-        if (&s_orphans[i] != frame && same_release(frame, &s_orphans[i])) {
+    uint32_t mask = frame_state.orphan_mask;
+    while (mask != 0u) {
+        uint32_t i = (uint32_t)__builtin_ctz(mask);
+        mask &= mask - 1u;
+        if (&frame_state.orphans[i] != frame && same_release(frame, &frame_state.orphans[i])) {
             return true;
         }
     }
@@ -226,7 +229,7 @@ void reap_frame_resources(WaylandContext *wl, VulkanContext *vk, FrameSlot *fram
                 wl->release_timeline_id = 0;
             }
         }
-        drm_syncobj_destroy(s_drm_fd, &frame->release_handle);
+        drm_syncobj_destroy(frame_state.drm_fd, &frame->release_handle);
         if (vk != nullptr && vk->device != VK_NULL_HANDLE &&
             frame->release_semaphore != VK_NULL_HANDLE) {
             vkDestroySemaphore(vk->device, frame->release_semaphore, nullptr);
@@ -240,13 +243,45 @@ void reap_frame_resources(WaylandContext *wl, VulkanContext *vk, FrameSlot *fram
     frame->release_pending = false;
 }
 
+static void reap_orphan_slot(WaylandContext *wl, VulkanContext *vk, uint32_t idx) {
+    FrameSlot *orb = &frame_state.orphans[idx];
+    reap_frame_resources(wl, vk, orb);
+    *orb = (FrameSlot){
+        .image           = { .dmabuf_fd = -1 },
+        .generation      = 0,
+        .release_eventfd = -1,
+    };
+    frame_state.orphan_mask &= ~(1u << idx);
+    frame_state.orphan_count = (uint32_t)__builtin_popcount(frame_state.orphan_mask);
+}
+
+static int insert_orphan(const FrameSlot *src) {
+    uint32_t free_mask = (~frame_state.orphan_mask) & ((1u << k_orphan_cap) - 1u);
+    if (free_mask == 0u) {
+        return -1;
+    }
+    uint32_t idx = (uint32_t)__builtin_ctz(free_mask);
+    uint32_t gen = slot_next_generation(frame_state.orphan_gen[idx]);
+    if (src->generation >= gen) {
+        gen = slot_next_generation(src->generation);
+    }
+    frame_state.orphan_gen[idx] = gen;
+    frame_state.orphans[idx] = *src;
+    frame_state.orphans[idx].generation = gen;
+    frame_state.orphan_mask |= (1u << idx);
+    frame_state.orphan_count = (uint32_t)__builtin_popcount(frame_state.orphan_mask);
+    return (int)idx;
+}
+
 void sweep_ready_orphans(WaylandContext *wl, VulkanContext *vk, bool force_all) {
-    uint32_t write_idx = 0;
-    for (uint32_t i = 0; i < s_orphan_count; ++i) {
+    uint32_t mask = frame_state.orphan_mask;
+    while (mask != 0u) {
+        uint32_t i = (uint32_t)__builtin_ctz(mask);
+        mask &= mask - 1u;
         // Resolve through the generation-tagged handle: if this orphan
         // was replaced since the sweep started, the ref is stale and
         // the entry must not be reaped under its new image.
-        FrameSlot *orb = slot_from_ref(slot_ref(&s_orphans[i]));
+        FrameSlot *orb = slot_from_ref(slot_ref(&frame_state.orphans[i]));
         if (orb == nullptr) {
             continue;
         }
@@ -261,32 +296,38 @@ void sweep_ready_orphans(WaylandContext *wl, VulkanContext *vk, bool force_all) 
             }
         }
         if (ready) {
-            reap_frame_resources(wl, vk, orb);
-        } else {
-            if (write_idx != i) {
-                s_orphans[write_idx] = *orb;
-            }
-            write_idx++;
+            reap_orphan_slot(wl, vk, i);
         }
     }
-    s_orphan_count = write_idx;
 }
 
 int make_orphan_room(WaylandContext *wl, VulkanContext *vk) {
     sweep_ready_orphans(wl, vk, false);
-    if (s_orphan_count < k_orphan_cap) {
+    if (frame_state.orphan_count < k_orphan_cap) {
         return 0;
     }
-    FrameSlot *oldest = &s_orphans[0];
+    uint32_t mask = frame_state.orphan_mask;
+    if (mask == 0u) {
+        return 0;
+    }
+    uint32_t oldest_idx = (uint32_t)__builtin_ctz(mask);
+    FrameSlot *oldest = &frame_state.orphans[oldest_idx];
+    mask &= mask - 1u;
+    while (mask != 0u) {
+        uint32_t i = (uint32_t)__builtin_ctz(mask);
+        mask &= mask - 1u;
+        if (frame_state.orphans[i].acquire_point < oldest->acquire_point ||
+            (frame_state.orphans[i].acquire_point == oldest->acquire_point &&
+             frame_state.orphans[i].release_point < oldest->release_point)) {
+            oldest_idx = i;
+            oldest = &frame_state.orphans[i];
+        }
+    }
     (void)wait_own_release(vk, oldest, 500000000ull);
     if (!poll_release_semaphore(vk, oldest->release_semaphore, oldest->release_point)) {
         return -1;
     }
-    reap_frame_resources(wl, vk, oldest);
-    for (uint32_t i = 1; i < s_orphan_count; ++i) {
-        s_orphans[i - 1] = s_orphans[i];
-    }
-    s_orphan_count--;
+    reap_orphan_slot(wl, vk, oldest_idx);
     return 0;
 }
 
@@ -298,7 +339,9 @@ static int stash_orphan(WaylandContext *wl, VulkanContext *vk, FrameSlot *frame)
         return -1;
     }
     // The copy keeps the release syncobj. The source must not destroy it.
-    s_orphans[s_orphan_count++] = *frame;
+    if (insert_orphan(frame) < 0) {
+        return -1;
+    }
     frame->release_handle = 0;
     frame->release_semaphore = VK_NULL_HANDLE;
     frame->release_timeline_id = 0;
@@ -435,7 +478,9 @@ int retire_pixels(WaylandContext *wl, VulkanContext *vk, FrameSlot *frame) {
     }
 
     pixels.release_point = old_point;
-    s_orphans[s_orphan_count++] = pixels;
+    if (insert_orphan(&pixels) < 0) {
+        return -1;
+    }
     return 0;
 }
 
@@ -453,12 +498,15 @@ SlotRef slot_ref(const FrameSlot *slot) {
         return 0;
     }
     for (int i = 0; i < 2; ++i) {
-        if (&s_slot[i] == slot) {
+        if (&frame_state.slot[i] == slot) {
             return slot_ref_pack(slot->generation, (uint32_t)(i + 1));
         }
     }
-    for (uint32_t i = 0; i < s_orphan_count; ++i) {
-        if (&s_orphans[i] == slot) {
+    uint32_t mask = frame_state.orphan_mask;
+    while (mask != 0u) {
+        uint32_t i = (uint32_t)__builtin_ctz(mask);
+        mask &= mask - 1u;
+        if (&frame_state.orphans[i] == slot) {
             return slot_ref_pack(slot->generation, i + 3u);
         }
     }
@@ -466,11 +514,11 @@ SlotRef slot_ref(const FrameSlot *slot) {
 }
 
 FrameSlot *slot_from_ref(SlotRef ref) {
-    return slot_resolve(ref, s_slot, s_orphans, s_orphan_count);
+    return slot_resolve(ref, frame_state.slot, frame_state.orphans, k_orphan_cap);
 }
 
 void retire_spare(WaylandContext *wl, VulkanContext *vk) {
-    if (!s_spare_live) {
+    if (!frame_state.spare_live) {
         return;
     }
     bool held = spare()->release_pending &&
@@ -485,7 +533,7 @@ void retire_spare(WaylandContext *wl, VulkanContext *vk) {
         reap_frame_resources(wl, vk, spare());
     }
     blank_frame(spare());
-    s_spare_live = false;
+    frame_state.spare_live = false;
 }
 
 int alloc_spare(WaylandContext *wl, VulkanContext *vk) {
@@ -494,7 +542,7 @@ int alloc_spare(WaylandContext *wl, VulkanContext *vk) {
     }
     // The first spare imports one timeline. A later call at a new size keeps
     // that timeline and replaces the images.
-    if (s_spare_live &&
+    if (frame_state.spare_live &&
         spare()->image.image != VK_NULL_HANDLE &&
         spare()->image.width == shown()->image.width &&
         spare()->image.height == shown()->image.height) {
@@ -515,7 +563,7 @@ int alloc_spare(WaylandContext *wl, VulkanContext *vk) {
                             &spare()->image, &tranche_kind) != 0) {
         if (!keep_timeline) {
             blank_frame(spare());
-            s_spare_live = false;
+            frame_state.spare_live = false;
         }
         return -1;
     }
@@ -524,7 +572,7 @@ int alloc_spare(WaylandContext *wl, VulkanContext *vk) {
         spare()->acquire_point = 0;
         destroy_frame_gpu(vk, spare());
         blank_frame(spare());
-        s_spare_live = false;
+        frame_state.spare_live = false;
         return -1;
     }
     uint32_t front_buffer = wl->buffer_id;
@@ -553,17 +601,17 @@ int alloc_spare(WaylandContext *wl, VulkanContext *vk) {
         } else {
             reap_frame_resources(wl, vk, spare());
             blank_frame(spare());
-            s_spare_live = false;
+            frame_state.spare_live = false;
         }
         return -1;
     }
     spare()->wl_buffer_id = spare_buffer;
     spare()->release_pending = false;
-    s_spare_live = true;
+    frame_state.spare_live = true;
     return 0;
 }
 
 void swap_front_spare(void) {
-    s_front ^= 1;
-    s_spare_live = true;
+    frame_state.front ^= 1;
+    frame_state.spare_live = true;
 }

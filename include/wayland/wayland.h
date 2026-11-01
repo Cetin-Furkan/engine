@@ -179,6 +179,7 @@ typedef struct WaylandContext {
     uint32_t      globals_seen;
 
     int      parked_fds[ENG_FD_PARK];
+    uint32_t parked_head;
     uint32_t nparked;
     uint32_t recv_cqes;
     bool     is_initialized;

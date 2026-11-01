@@ -42,41 +42,45 @@ int frame_boot(void) {
         return 1;
     }
 
-    s_front = 0;
-    s_drm_fd = -1;
-    s_acquire = VK_NULL_HANDLE;
+    frame_state.front = 0;
+    frame_state.drm_fd = -1;
+    frame_state.acquire = VK_NULL_HANDLE;
     blank_frame(shown());
     blank_frame(spare());
-    s_spare_live = false;
-    s_turn_phase = k_turn_arm;
-    s_turn_swap_pending = false;
-    s_pending_release = 0;
-    s_resize_pending = false;
-    s_same_repaint = false;
-    s_chrome_dirty = false;
-    s_release_fd = -1;
-    s_release_fixed = false;
-    s_release_counter = 0;
-    s_inotify_fd = -1;
-    s_inotify_wd = -1;
-    s_inotify_fixed = false;
-    s_inotify_stop = false;
-    blank_frame(&s_resize_fresh);
-    s_resize_release = 0;
-    s_resize_serial = 0;
-    s_resize_old_buffer = 0;
-    s_resize_old_w = 0;
-    s_resize_old_h = 0;
-    s_resize_tranche[0] = '\0';
+    frame_state.spare_live = false;
+    frame_state.turn_phase = k_turn_arm;
+    frame_state.turn_swap_pending = false;
+    frame_state.pending_release = 0;
+    frame_state.resize_pending = false;
+    frame_state.same_repaint = false;
+    frame_state.chrome_dirty = false;
+    frame_state.release_fd = -1;
+    frame_state.release_fixed = false;
+    frame_state.release_counter = 0;
+    frame_state.inotify_fd = -1;
+    frame_state.inotify_wd = -1;
+    frame_state.inotify_fixed = false;
+    frame_state.inotify_stop = false;
+    blank_frame(&frame_state.resize_fresh);
+    frame_state.resize_release = 0;
+    frame_state.resize_serial = 0;
+    frame_state.resize_old_buffer = 0;
+    frame_state.resize_old_w = 0;
+    frame_state.resize_old_h = 0;
+    frame_state.resize_tranche[0] = '\0';
     engine_app()->reset();
-    frame_clock_reset(&s_clock);
-    s_timer_armed = false;
-    s_last_stamp_mono_ns = 0;
-    s_stall_reported = false;
-    s_sync_point = 0;
-    s_orphan_count = 0;
-    s_stuck_release_fd = -1;
-    s_presented = true;
+    frame_clock_reset(&frame_state.clock);
+    frame_state.timer_armed = false;
+    frame_state.last_stamp_mono_ns = 0;
+    frame_state.stall_reported = false;
+    frame_state.sync_point = 0;
+    frame_state.orphan_mask = 0;
+    frame_state.orphan_count = 0;
+    for (uint32_t i = 0; i < k_orphan_cap; ++i) {
+        frame_state.orphans[i] = (FrameSlot){ .image = { .dmabuf_fd = -1 }, .release_eventfd = -1 };
+    }
+    frame_state.stuck_release_fd = -1;
+    frame_state.presented = true;
 
     uint32_t width = 0, height = 0, serial = 0;
     if (spec->resize) {
@@ -128,7 +132,7 @@ int frame_boot(void) {
         return 1;
     }
 
-    if (create_acquire_semaphore(vk, &s_acquire) < 0) {
+    if (create_acquire_semaphore(vk, &frame_state.acquire) < 0) {
         (void)frame_stop();
         return 1;
     }
@@ -142,11 +146,11 @@ int frame_boot(void) {
         (void)frame_stop();
         return 1;
     }
-    if (record_and_submit_clear(vk, shown(), s_acquire, 1u, false, 0u) < 0) {
+    if (record_and_submit_clear(vk, shown(), frame_state.acquire, 1u, false, 0u) < 0) {
         (void)frame_stop();
         return 1;
     }
-    s_sync_point = 1u;
+    frame_state.sync_point = 1u;
 
     char render_path[64];
     int path_n = snprintf(render_path, sizeof render_path, "/dev/dri/renderD%lld",
@@ -156,27 +160,27 @@ int frame_boot(void) {
         (void)frame_stop();
         return 1;
     }
-    s_drm_fd = open(render_path, O_RDWR | O_CLOEXEC);
-    if (s_drm_fd < 0) {
+    frame_state.drm_fd = open(render_path, O_RDWR | O_CLOEXEC);
+    if (frame_state.drm_fd < 0) {
         fprintf(stderr, "[Engine Error] open %s: %s\n", render_path, strerror(errno));
         (void)frame_stop();
         return 1;
     }
 
-    int acquire_vk_fd = export_semaphore_fd(vk, s_acquire);
+    int acquire_vk_fd = export_semaphore_fd(vk, frame_state.acquire);
     if (acquire_vk_fd < 0) {
         (void)frame_stop();
         return 1;
     }
     uint32_t acquire_handle = 0;
-    int imported = drm_syncobj_from_fd(s_drm_fd, acquire_vk_fd, &acquire_handle);
+    int imported = drm_syncobj_from_fd(frame_state.drm_fd, acquire_vk_fd, &acquire_handle);
     close(acquire_vk_fd);
     if (imported < 0) {
         (void)frame_stop();
         return 1;
     }
-    int acquire_fd = drm_syncobj_to_fd(s_drm_fd, acquire_handle);
-    drm_syncobj_destroy(s_drm_fd, &acquire_handle);
+    int acquire_fd = drm_syncobj_to_fd(frame_state.drm_fd, acquire_handle);
+    drm_syncobj_destroy(frame_state.drm_fd, &acquire_handle);
     if (acquire_fd < 0) {
         (void)frame_stop();
         return 1;
@@ -225,7 +229,7 @@ int frame_boot(void) {
             shown()->image.height,
             present_serial,
             wl->acquire_timeline_id,
-            s_sync_point,
+            frame_state.sync_point,
             shown()->release_timeline_id,
             shown()->release_point) < 0) {
         (void)frame_stop();
@@ -249,7 +253,7 @@ int frame_boot(void) {
            (size_t)shown()->image.row_pitch,
            (size_t)shown()->image.offset,
            shown()->image.dmabuf_fd,
-           (unsigned long long)s_sync_point,
+           (unsigned long long)frame_state.sync_point,
            (unsigned long long)shown()->release_point,
            shown()->release_timeline_id);
     printf("hello init from engine\n");
@@ -257,7 +261,7 @@ int frame_boot(void) {
 }
 
 int frame_stop(void) {
-    if (!s_presented) {
+    if (!frame_state.presented) {
         return 0;
     }
     WaylandContext *wl   = wayland_get_context();
@@ -268,7 +272,7 @@ int frame_stop(void) {
     if (wl != nullptr) {
         pointer_shutdown(wl);
     }
-    if (s_resize_pending) {
+    if (frame_state.resize_pending) {
         drop_resize_attempt(wl, vk);
     }
     chrome_set_buffer_size(0, 0);
@@ -278,7 +282,7 @@ int frame_stop(void) {
         retire_spare(wl, vk);
     }
 
-    if (s_stuck_release_fd >= 0) {
+    if (frame_state.stuck_release_fd >= 0) {
         fprintf(stderr, "[Engine Error] GPU release poll could not be removed\n");
         release_rc = 1;
     } else if (shown()->release_pending) {
@@ -299,16 +303,16 @@ int frame_stop(void) {
             printf("[Engine] GPU release point signalled (io_uring poll)\n");
         } else {
             release_rc = 1;
-            if (!armed && s_release_fd < 0) {
+            if (!armed && frame_state.release_fd < 0) {
                 fprintf(stderr, "[Engine Error] GPU release eventfd is closed\n");
             }
             if (armed) {
                 bool late = false;
                 if (cancel_release_poll(ring, wl, &late) != 0) {
                     fprintf(stderr, "[Engine Error] GPU release poll is still armed\n");
-                    s_stuck_release_fd = s_release_fd;
-                    s_release_fd = -1;
-                    s_release_fixed = false;
+                    frame_state.stuck_release_fd = frame_state.release_fd;
+                    frame_state.release_fd = -1;
+                    frame_state.release_fixed = false;
                 } else if (late || poll_release_semaphore(vk, shown()->release_semaphore, shown()->release_point)) {
                     printf("[Engine] GPU release point signalled (io_uring poll)\n");
                     release_rc = 0;
@@ -331,7 +335,7 @@ int frame_stop(void) {
                 (unsigned long long)shown()->acquire_point);
         acquire_held = true;
     }
-    uint32_t left_alive = s_orphan_count + (release_held ? 1u : 0u);
+    uint32_t left_alive = frame_state.orphan_count + (release_held ? 1u : 0u);
     if (left_alive > 0u) {
         fprintf(stderr, "[Engine Error] %u compositor-held image(s) were left alive\n", left_alive);
     }
@@ -342,11 +346,11 @@ int frame_stop(void) {
     }
 
     if (!release_held) {
-        drm_syncobj_destroy(s_drm_fd, &shown()->release_handle);
+        drm_syncobj_destroy(frame_state.drm_fd, &shown()->release_handle);
     }
-    if (s_drm_fd >= 0) {
-        close(s_drm_fd);
-        s_drm_fd = -1;
+    if (frame_state.drm_fd >= 0) {
+        close(frame_state.drm_fd);
+        frame_state.drm_fd = -1;
     }
 
     if (vk != nullptr && vk->device != VK_NULL_HANDLE) {
@@ -355,9 +359,9 @@ int frame_stop(void) {
             vkDestroySemaphore(vk->device, shown()->release_semaphore, nullptr);
             shown()->release_semaphore = VK_NULL_HANDLE;
         }
-        if (!acquire_held && s_acquire != VK_NULL_HANDLE) {
-            vkDestroySemaphore(vk->device, s_acquire, nullptr);
-            s_acquire = VK_NULL_HANDLE;
+        if (!acquire_held && frame_state.acquire != VK_NULL_HANDLE) {
+            vkDestroySemaphore(vk->device, frame_state.acquire, nullptr);
+            frame_state.acquire = VK_NULL_HANDLE;
         }
         if (destroy_shown) {
             if (shown()->cmd_buf != VK_NULL_HANDLE && vk->cmd_pool != VK_NULL_HANDLE) {
@@ -375,7 +379,7 @@ int frame_stop(void) {
         engine_app()->shutdown(vk);
     }
 
-    s_presented = false;
+    frame_state.presented = false;
     shown()->release_pending = false;
     printf("goodbye from engine\n");
     return release_rc;

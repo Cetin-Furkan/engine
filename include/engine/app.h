@@ -4,7 +4,6 @@
 #include "frame/clock.h"
 #include "ring/ring.h"
 #include "vulkan/types.h"
-#include <stdbool.h>
 #include <stdint.h>
 
 // The one seam between the engine and the program it hosts.

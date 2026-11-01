@@ -686,19 +686,50 @@ VulkanResult vulkan_command_pool_create(VulkanContext *ctx) {
 
     VkResult res = vkCreateCommandPool(ctx->device, &pool_info, nullptr, &ctx->cmd_pool);
     if (res != VK_SUCCESS) {
-        fprintf(stderr, "[Vulkan Error] vkCreateCommandPool failed: %s (%d)\n",
+        fprintf(stderr, "[Vulkan Error] vkCreateCommandPool (graphics) failed: %s (%d)\n",
                 vulkan_vkresult_to_str(res), (int)res);
         VulkanResult mapped = vulkan_result_from_vkresult(res);
         return mapped == VULKAN_ERROR_UNKNOWN ? VULKAN_ERROR_INITIALIZATION_FAILED : mapped;
+    }
+
+    // Dedicated compute command pool
+    pool_info.queueFamilyIndex = ctx->queues.compute_family_index;
+    res = vkCreateCommandPool(ctx->device, &pool_info, nullptr, &ctx->compute_cmd_pool);
+    if (res != VK_SUCCESS) {
+        fprintf(stderr, "[Vulkan Error] vkCreateCommandPool (compute) failed: %s (%d)\n",
+                vulkan_vkresult_to_str(res), (int)res);
+        ctx->compute_cmd_pool = ctx->cmd_pool; // fallback alias
+    }
+
+    // Dedicated transfer command pool
+    pool_info.queueFamilyIndex = ctx->queues.transfer_family_index;
+    pool_info.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT | VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+    res = vkCreateCommandPool(ctx->device, &pool_info, nullptr, &ctx->transfer_cmd_pool);
+    if (res != VK_SUCCESS) {
+        fprintf(stderr, "[Vulkan Error] vkCreateCommandPool (transfer) failed: %s (%d)\n",
+                vulkan_vkresult_to_str(res), (int)res);
+        ctx->transfer_cmd_pool = ctx->cmd_pool; // fallback alias
     }
 
     return VULKAN_SUCCESS;
 }
 
 void vulkan_command_pool_destroy(VulkanContext *ctx) {
-    if (ctx == nullptr || ctx->device == VK_NULL_HANDLE || ctx->cmd_pool == VK_NULL_HANDLE) {
+    if (ctx == nullptr || ctx->device == VK_NULL_HANDLE) {
         return;
     }
-    vkDestroyCommandPool(ctx->device, ctx->cmd_pool, nullptr);
-    ctx->cmd_pool = VK_NULL_HANDLE;
+    if (ctx->transfer_cmd_pool != VK_NULL_HANDLE && ctx->transfer_cmd_pool != ctx->cmd_pool) {
+        vkDestroyCommandPool(ctx->device, ctx->transfer_cmd_pool, nullptr);
+    }
+    ctx->transfer_cmd_pool = VK_NULL_HANDLE;
+
+    if (ctx->compute_cmd_pool != VK_NULL_HANDLE && ctx->compute_cmd_pool != ctx->cmd_pool) {
+        vkDestroyCommandPool(ctx->device, ctx->compute_cmd_pool, nullptr);
+    }
+    ctx->compute_cmd_pool = VK_NULL_HANDLE;
+
+    if (ctx->cmd_pool != VK_NULL_HANDLE) {
+        vkDestroyCommandPool(ctx->device, ctx->cmd_pool, nullptr);
+        ctx->cmd_pool = VK_NULL_HANDLE;
+    }
 }

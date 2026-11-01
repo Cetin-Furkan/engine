@@ -2,7 +2,6 @@
 #define ENGINE_FRAME_SHAPE_H
 
 #include "vulkan/types.h"
-#include <stdbool.h>
 
 // Polygons are expanded on the GPU. Points are world pixels, +Y up, before
 // the in-plane turn. idx has 3 entries per triangle. tri_n 0 draws no fill.

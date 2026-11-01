@@ -1,33 +1,33 @@
 // 16 by 16 samples on each flat face. The 888 fillet vertices stay where
-// bevel.comp put them, and shaders/heat_nbr.inc is not extended.
+// bevel.comp put them, and shaders/heat_nbr.slang is not extended.
 // Corners of this grid are those fillet vertices. Every other sample is
 // appended after them, per face: bottom edge, top edge, left edge, right
 // edge, then the interior. cube.c k_grid must stay 16.
 
-const float k_radius = 0.10;
-const uint k_grid = 16u;
-const uint k_fillet_verts = 888u;
-const uint k_span = k_grid + 1u;
-const uint k_face_samples = k_span * k_span - 4u;
-const uint k_grid_verts = k_fillet_verts + 6u * k_face_samples;
+static const float k_radius = 0.10;
+static const uint k_grid = 16u;
+static const uint k_fillet_verts = 888u;
+static const uint k_span = k_grid + 1u;
+static const uint k_face_samples = k_span * k_span - 4u;
+static const uint k_grid_verts = k_fillet_verts + 6u * k_face_samples;
 
-void face_basis(uint face, out vec3 n, out vec3 t, out vec3 b) {
-    if (face == 0u)      { n = vec3( 1, 0, 0); t = vec3(0, 0,-1); b = vec3(0, 1, 0); }
-    else if (face == 1u) { n = vec3(-1, 0, 0); t = vec3(0, 0, 1); b = vec3(0, 1, 0); }
-    else if (face == 2u) { n = vec3(0,  1, 0); t = vec3(1, 0, 0); b = vec3(0, 0,-1); }
-    else if (face == 3u) { n = vec3(0, -1, 0); t = vec3(1, 0, 0); b = vec3(0, 0, 1); }
-    else if (face == 4u) { n = vec3(0, 0,  1); t = vec3(1, 0, 0); b = vec3(0, 1, 0); }
-    else                 { n = vec3(0, 0, -1); t = vec3(-1, 0, 0); b = vec3(0, 1, 0); }
+void face_basis(uint face, out float3 n, out float3 t, out float3 b) {
+    if (face == 0u)      { n = float3( 1, 0, 0); t = float3(0, 0,-1); b = float3(0, 1, 0); }
+    else if (face == 1u) { n = float3(-1, 0, 0); t = float3(0, 0, 1); b = float3(0, 1, 0); }
+    else if (face == 2u) { n = float3(0,  1, 0); t = float3(1, 0, 0); b = float3(0, 0,-1); }
+    else if (face == 3u) { n = float3(0, -1, 0); t = float3(1, 0, 0); b = float3(0, 0, 1); }
+    else if (face == 4u) { n = float3(0, 0,  1); t = float3(1, 0, 0); b = float3(0, 1, 0); }
+    else                 { n = float3(0, 0, -1); t = float3(-1, 0, 0); b = float3(0, 1, 0); }
 }
 
-vec3 face_point(uint face, uint i, uint j) {
-    vec3 n;
-    vec3 t;
-    vec3 b;
+float3 face_point(uint face, uint i, uint j) {
+    float3 n;
+    float3 t;
+    float3 b;
     face_basis(face, n, t, b);
     float m = 1.0 - k_radius;
-    float tu = mix(-m, m, float(i) / float(k_grid));
-    float bv = mix(-m, m, float(j) / float(k_grid));
+    float tu = lerp(-m, m, float(i) / float(k_grid));
+    float bv = lerp(-m, m, float(j) / float(k_grid));
     return n + t * tu + b * bv;
 }
 
@@ -91,10 +91,7 @@ void grid_decode(uint id, out uint face, out uint i, out uint j) {
     j = (t / edge) + 1u;
 }
 
-// True when p is an inset face corner. Fillet copies that share that
-// position (edge end, corner-patch corner) match too, so they take the
-// same extra samples and stay at one temperature.
-bool face_corner_at(vec3 p, out uint face, out uint i, out uint j) {
+bool face_corner_at(float3 p, out uint face, out uint i, out uint j) {
     float m = 1.0 - k_radius;
     const float e = 0.0001;
     float ax = abs(p.x);
@@ -110,11 +107,14 @@ bool face_corner_at(vec3 p, out uint face, out uint i, out uint j) {
     } else if (on_z) {
         face = p.z > 0.0 ? 4u : 5u;
     } else {
+        face = 0u;
+        i = 0u;
+        j = 0u;
         return false;
     }
-    vec3 n;
-    vec3 t;
-    vec3 b;
+    float3 n;
+    float3 t;
+    float3 b;
     face_basis(face, n, t, b);
     float tu = dot(p - n, t);
     float bv = dot(p - n, b);

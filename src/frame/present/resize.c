@@ -27,8 +27,8 @@ bool consume_noted_signal(WaylandContext *wl, int *signo) {
         return false;
     }
     wl->noted_signal = false;
-    if (wl->noted_signal_res == (int)sizeof s_siginfo && signo != nullptr) {
-        *signo = (int)s_siginfo.ssi_signo;
+    if (wl->noted_signal_res == (int)sizeof frame_state.siginfo && signo != nullptr) {
+        *signo = (int)frame_state.siginfo.ssi_signo;
     }
     wl->noted_signal_res = 0;
     return true;
@@ -55,30 +55,30 @@ bool content_size_pending(const ChromeSpec *spec, const WaylandContext *wl) {
 }
 
 void drop_resize_attempt(WaylandContext *wl, VulkanContext *vk) {
-    if (!s_resize_pending) {
+    if (!frame_state.resize_pending) {
         return;
     }
-    chrome_set_buffer_size(s_resize_old_w, s_resize_old_h);
+    chrome_set_buffer_size(frame_state.resize_old_w, frame_state.resize_old_h);
     if (wl != nullptr) {
-        wl->buffer_id = s_resize_old_buffer;
+        wl->buffer_id = frame_state.resize_old_buffer;
     }
-    reap_frame_resources(wl, vk, &s_resize_fresh);
-    blank_frame(&s_resize_fresh);
-    s_resize_pending = false;
-    s_same_repaint = false;
+    reap_frame_resources(wl, vk, &frame_state.resize_fresh);
+    blank_frame(&frame_state.resize_fresh);
+    frame_state.resize_pending = false;
+    frame_state.same_repaint = false;
 }
 
 static int install_resize(WaylandContext *wl, VulkanContext *vk) {
-    if (!s_resize_pending) {
+    if (!frame_state.resize_pending) {
         return 0;
     }
-    FrameSlot fresh = s_resize_fresh;
-    uint64_t rel = s_resize_release;
-    uint32_t serial = s_resize_serial;
+    FrameSlot fresh = frame_state.resize_fresh;
+    uint64_t rel = frame_state.resize_release;
+    uint32_t serial = frame_state.resize_serial;
     char tranche[16];
-    snprintf(tranche, sizeof tranche, "%s", s_resize_tranche);
-    blank_frame(&s_resize_fresh);
-    s_resize_pending = false;
+    snprintf(tranche, sizeof tranche, "%s", frame_state.resize_tranche);
+    blank_frame(&frame_state.resize_fresh);
+    frame_state.resize_pending = false;
 
     if (retire_pixels(wl, vk, shown()) != 0) {
         fprintf(stderr,
@@ -101,8 +101,8 @@ static int install_resize(WaylandContext *wl, VulkanContext *vk) {
         wl->buffer_id           = fresh.wl_buffer_id;
     }
 
-    if (s_same_repaint) {
-        s_same_repaint = false;
+    if (frame_state.same_repaint) {
+        frame_state.same_repaint = false;
         printf("[Chrome] Repainted %ux%u\n", shown()->image.width, shown()->image.height);
     } else {
         printf("[Engine] Resized buffer to %ux%u (serial=%u), modifier=0x%llx (%s tranche), stride=%zu, explicit-sync acquire=%llu release=%llu timeline=%u\n",
@@ -112,12 +112,12 @@ static int install_resize(WaylandContext *wl, VulkanContext *vk) {
                (unsigned long long)shown()->image.drm_format_modifier,
                tranche[0] != '\0' ? tranche : "general",
                (size_t)shown()->image.row_pitch,
-               (unsigned long long)s_sync_point,
+               (unsigned long long)frame_state.sync_point,
                (unsigned long long)shown()->release_point,
                shown()->release_timeline_id);
     }
 
-    if (s_turn_phase != k_turn_done) {
+    if (frame_state.turn_phase != k_turn_done) {
         if (alloc_spare(wl, vk) != 0) {
             return -1;
         }
@@ -127,17 +127,17 @@ static int install_resize(WaylandContext *wl, VulkanContext *vk) {
 
 int finish_idle_send(WaylandContext *wl, VulkanContext *vk,
                             const struct io_uring_cqe *cqe, uint32_t pending_serial) {
-    uint32_t serial = s_resize_pending ? s_resize_serial : pending_serial;
+    uint32_t serial = frame_state.resize_pending ? frame_state.resize_serial : pending_serial;
     int noted = note_idle_send(wl, cqe, serial);
     if (noted < 0) {
         drop_resize_attempt(wl, vk);
-        s_turn_swap_pending = false;
+        frame_state.turn_swap_pending = false;
         return noted;
     }
     if (noted == 1) {
         return 1;
     }
-    if (s_resize_pending) {
+    if (frame_state.resize_pending) {
         return install_resize(wl, vk);
     }
     commit_turn_swap(wl);
@@ -150,7 +150,7 @@ int finish_idle_send(WaylandContext *wl, VulkanContext *vk,
 static int queue_replacement(WaylandContext *wl, VulkanContext *vk, uint32_t width,
                              uint32_t height, bool with_configure, uint32_t serial,
                              bool same_repaint) {
-    if (s_resize_pending || width == 0 || height == 0 || s_acquire == VK_NULL_HANDLE ||
+    if (frame_state.resize_pending || width == 0 || height == 0 || frame_state.acquire == VK_NULL_HANDLE ||
         shown()->release_timeline_id == 0 ||
         shown()->release_semaphore == VK_NULL_HANDLE) {
         return -EINVAL;
@@ -169,13 +169,13 @@ static int queue_replacement(WaylandContext *wl, VulkanContext *vk, uint32_t wid
         return -1;
     }
 
-    uint64_t next_point = s_sync_point + 1u;
-    if (record_and_submit_clear(vk, &fresh, s_acquire, next_point, false, 0u) != 0) {
+    uint64_t next_point = frame_state.sync_point + 1u;
+    if (record_and_submit_clear(vk, &fresh, frame_state.acquire, next_point, false, 0u) != 0) {
         fresh.acquire_point = 0;
         reap_frame_resources(wl, vk, &fresh);
         return -1;
     }
-    s_sync_point = next_point;
+    frame_state.sync_point = next_point;
 
     const uint32_t previous_buffer = shown()->wl_buffer_id;
     uint32_t new_buffer = 0;
@@ -210,7 +210,7 @@ static int queue_replacement(WaylandContext *wl, VulkanContext *vk, uint32_t wid
         fresh.image.width,
         fresh.image.height,
         wl->acquire_timeline_id,
-        s_sync_point,
+        frame_state.sync_point,
         shown()->release_timeline_id,
         rel,
         false,
@@ -223,15 +223,15 @@ static int queue_replacement(WaylandContext *wl, VulkanContext *vk, uint32_t wid
         return -1;
     }
 
-    s_resize_fresh = fresh;
-    s_resize_release = rel;
-    s_resize_serial = serial;
-    s_resize_old_buffer = previous_buffer;
-    s_resize_old_w = old_w;
-    s_resize_old_h = old_h;
-    snprintf(s_resize_tranche, sizeof s_resize_tranche, "%s", tranche_kind != nullptr ? tranche_kind : "general");
-    s_same_repaint = same_repaint;
-    s_resize_pending = true;
+    frame_state.resize_fresh = fresh;
+    frame_state.resize_release = rel;
+    frame_state.resize_serial = serial;
+    frame_state.resize_old_buffer = previous_buffer;
+    frame_state.resize_old_w = old_w;
+    frame_state.resize_old_h = old_h;
+    snprintf(frame_state.resize_tranche, sizeof frame_state.resize_tranche, "%s", tranche_kind != nullptr ? tranche_kind : "general");
+    frame_state.same_repaint = same_repaint;
+    frame_state.resize_pending = true;
     return 0;
 }
 

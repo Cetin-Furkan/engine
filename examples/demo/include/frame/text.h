@@ -3,7 +3,6 @@
 
 #include "text/face/face.h"
 #include "vulkan/types.h"
-#include <stdbool.h>
 #include <stdint.h>
 
 // Screen text. The sealed run is the embedded face and the word

@@ -175,10 +175,60 @@ static bool open_role(uint32_t role, bool from_file, const char *value) {
     return true;
 }
 
+static uint32_t sdf_hash(uint32_t face, uint32_t glyph) {
+    uint32_t h = face * 0x9E3779B1u ^ (glyph + 0x7F4A7C15u);
+    h ^= h >> 16;
+    return h;
+}
+
 static void tombstone_face(uint32_t face) {
+    // Collect surviving slots and sort by ascending slab offset so s_slab can
+    // be compacted in-place (write_off <= slot->offset) and s_sdf rebuilt with
+    // zero tombstones.
+    uint16_t live_idx[k_sdf_slots];
+    uint32_t live_n = 0;
     for (uint32_t i = 0; i < k_sdf_slots; ++i) {
-        if (s_sdf[i].state == k_used && s_sdf[i].face == face) {
-            s_sdf[i].state = k_tomb;
+        if (s_sdf[i].state == k_used && s_sdf[i].face != face) {
+            live_idx[live_n++] = (uint16_t)i;
+        }
+    }
+    for (uint32_t i = 1; i < live_n; ++i) {
+        uint16_t cur = live_idx[i];
+        uint32_t off = s_sdf[cur].offset;
+        uint32_t j = i;
+        while (j > 0 && s_sdf[live_idx[j - 1u]].offset > off) {
+            live_idx[j] = live_idx[j - 1u];
+            j--;
+        }
+        live_idx[j] = cur;
+    }
+    SdfSlot saved[k_sdf_slots];
+    uint32_t write_off = 0;
+    for (uint32_t i = 0; i < live_n; ++i) {
+        SdfSlot slot = s_sdf[live_idx[i]];
+        uint32_t bytes = (uint32_t)slot.width * (uint32_t)slot.rows;
+        if (bytes > 0u) {
+            if (write_off != slot.offset) {
+                memmove(s_slab + write_off, s_slab + slot.offset, bytes);
+            }
+            slot.offset = write_off;
+            write_off += bytes;
+        } else {
+            slot.offset = 0;
+        }
+        saved[i] = slot;
+    }
+    s_slab_used = write_off;
+    s_sdf_warned = false;
+    memset(s_sdf, 0, sizeof s_sdf);
+    for (uint32_t i = 0; i < live_n; ++i) {
+        uint32_t idx = sdf_hash(saved[i].face, saved[i].glyph) & (k_sdf_slots - 1u);
+        for (uint32_t n = 0; n < k_sdf_slots; ++n) {
+            if (s_sdf[idx].state == k_empty) {
+                s_sdf[idx] = saved[i];
+                break;
+            }
+            idx = (idx + 1u) & (k_sdf_slots - 1u);
         }
     }
 }
@@ -388,12 +438,6 @@ bool text_face_metrics(uint32_t face, TextFaceMetrics *out) {
     out->ascender = asc;
     out->descender = desc;
     return true;
-}
-
-static uint32_t sdf_hash(uint32_t face, uint32_t glyph) {
-    uint32_t h = face * 0x9E3779B1u ^ (glyph + 0x7F4A7C15u);
-    h ^= h >> 16;
-    return h;
 }
 
 static SdfSlot *sdf_find(uint32_t face, uint32_t glyph, bool insert) {

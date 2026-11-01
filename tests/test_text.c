@@ -28,6 +28,10 @@ int main(void) {
     CHECK(adv < 400.0f);
     float mono = text_shape_advance(TEXT_FACE_KNOWN_MONO, "Hello", 32.0f);
     CHECK(mono > 20.0f);
+    uint32_t e0 = text_face_epoch(TEXT_FACE_SYSTEM);
+    CHECK(text_face_apply_line("system pattern sans"));
+    CHECK(text_face_epoch(TEXT_FACE_SYSTEM) == e0 + 1u);
+    CHECK(text_face_sdf_check());
     text_face_shutdown();
     if (s_failures != 0) {
         fprintf(stderr, "%d text checks failed\n", s_failures);

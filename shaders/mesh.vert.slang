@@ -26,19 +26,15 @@ struct VSOutput {
 
 [shader("vertex")]
 VSOutput main(uint vert_id : SV_VulkanVertexID) {
-    float* mesh = (float*)screen.verts;
-    uint o = vert_id * 9u;
-    float3 in_pos = float3(mesh[o + 0u], mesh[o + 1u], mesh[o + 2u]);
-    float3 in_nrm = float3(mesh[o + 3u], mesh[o + 4u], mesh[o + 5u]);
-    float3 in_albedo = float3(mesh[o + 6u], mesh[o + 7u], mesh[o + 8u]);
+    MeshVertex v = ((MeshVertex*)screen.verts)[vert_id];
+    float3 in_pos = v.pos;
+    float3 in_nrm = v.nrm;
+    float3 in_albedo = v.albedo;
 
     float ay = radians(screen.yaw_deg);
-    float3 posed_pos = rotate_yaw(in_pos, ay);
+    float3 center = float3(screen.origin_x, screen.origin_y, 0.0);
+    float3 p = rotate_yaw(in_pos - center, ay) + center;
     float3 posed_nrm = rotate_yaw(in_nrm, ay);
-
-    float3 p = posed_pos;
-    p.x += screen.origin_x;
-    p.y += screen.origin_y;
 
     float3 view = view_of(p, screen.view.q, screen.view.cam);
     VSOutput out;

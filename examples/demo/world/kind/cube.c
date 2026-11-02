@@ -254,7 +254,7 @@ static bool cube_on_click(WorldObj *o, Coord hit) {
     if (c == nullptr) {
         return false;
     }
-    return cube_heat_poke(c->heat, hit.x - o->at.x, hit.y - o->at.y);
+    return cube_heat_poke(c->heat, hit.x - o->at.x, hit.y - o->at.y, hit.z - o->at.z);
 }
 
 static uint32_t cube_vertices(const WorldObj *o) {

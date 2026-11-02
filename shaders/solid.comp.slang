@@ -1,4 +1,6 @@
 
+#include "camera.slang"
+
 // One invocation writes one vertex. Faceted cages duplicate a face normal.
 // Rounded polyhedra subdivide each face into 4x4 and project onto the
 // circumsphere, so the silhouette becomes an arc. Rounded lathes use a
@@ -291,17 +293,8 @@ void torus_vertex(uint curved, uint local_id, out float3 pos, out float3 nrm) {
 }
 
 void store(uint slot, float3 pos, float3 nrm, float3 color) {
-    float* mesh = (float*)bake.verts;
-    uint o = slot * 9u;
-    mesh[o + 0u] = pos.x;
-    mesh[o + 1u] = pos.y;
-    mesh[o + 2u] = pos.z;
-    mesh[o + 3u] = nrm.x;
-    mesh[o + 4u] = nrm.y;
-    mesh[o + 5u] = nrm.z;
-    mesh[o + 6u] = color.x;
-    mesh[o + 7u] = color.y;
-    mesh[o + 8u] = color.z;
+    MeshVertex mv = { pos, nrm, color };
+    ((MeshVertex*)bake.verts)[slot] = mv;
 }
 
 [shader("compute")]

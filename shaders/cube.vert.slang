@@ -1,5 +1,6 @@
 #include "camera.slang"
 #include "material.slang"
+#include "face_grid.slang"
 
 struct DrawPush {
     uint64_t verts;
@@ -30,11 +31,30 @@ static const float k_edge_px = 240.0;
 
 [shader("vertex")]
 VSOutput main(uint vert_id : SV_VulkanVertexID) {
-    float* mesh_f = (float*)screen.verts;
-    uint o = vert_id * 9u;
-    float3 in_pos = float3(mesh_f[o + 0u], mesh_f[o + 1u], mesh_f[o + 2u]);
-    float3 in_nrm = float3(mesh_f[o + 3u], mesh_f[o + 4u], mesh_f[o + 5u]);
-    float3 in_albedo = float3(mesh_f[o + 6u], mesh_f[o + 7u], mesh_f[o + 8u]);
+    MeshVertex mv = ((MeshVertex*)screen.verts)[vert_id];
+    SoftVertexState* soft = (SoftVertexState*)screen.heat;
+    SoftVertexState sv = soft[vert_id];
+
+    float3 in_pos = mv.pos + sv.disp;
+    float3 in_nrm = mv.nrm;
+    float3 in_albedo = mv.albedo;
+
+    // Reconstruct deformed surface normal from neighbor displacements on face grids
+    if (vert_id >= k_fillet_verts) {
+        uint face, i, j;
+        grid_decode(vert_id, face, i, j);
+        float3 n, t, b;
+        face_basis(face, n, t, b);
+        uint i0 = i > 0u ? i - 1u : i;
+        uint i1 = i < k_grid ? i + 1u : i;
+        uint j0 = j > 0u ? j - 1u : j;
+        uint j1 = j < k_grid ? j + 1u : j;
+        float du = dot(soft[grid_vertex(face, i1, j)].disp - soft[grid_vertex(face, i0, j)].disp, n);
+        float dv = dot(soft[grid_vertex(face, i, j1)].disp - soft[grid_vertex(face, i, j0)].disp, n);
+        float step_u = float(i1 - i0) * (2.0 * (1.0 - k_radius) / float(k_grid));
+        float step_v = float(j1 - j0) * (2.0 * (1.0 - k_radius) / float(k_grid));
+        in_nrm = normalize(n - t * (du / max(step_u, 1e-4)) - b * (dv / max(step_v, 1e-4)));
+    }
 
     const float ax = radians(28.0);
     float ay = radians(screen.yaw_deg);
@@ -69,8 +89,7 @@ VSOutput main(uint vert_id : SV_VulkanVertexID) {
         cool = lerp(graded, float3(0.45, 0.72, 1.0), cell);
     }
 
-    float* heat_t = (float*)screen.heat;
-    float temp = clamp(heat_t[vert_id], 0.0, 1.0);
+    float temp = clamp(sv.temp, 0.0, 1.0);
     out.v_albedo = lerp(cool, float3(1.0, 0.42, 0.12), temp);
     out.v_albedo = lerp(out.v_albedo, float3(1.0), clamp(screen.selected, 0.0, 1.0) * 0.42);
     out.v_emit = material_emit(screen.view.materials, screen.view.mat_index);

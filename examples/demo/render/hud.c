@@ -2,6 +2,7 @@
 #include "frame/pass.h"
 #include "frame/world.h"
 #include "ring/ring.h"
+#include "vulkan/bda.h"
 #include "vulkan/pipe.h"
 #include <stddef.h>
 #include <stdio.h>
@@ -24,22 +25,21 @@ static_assert(sizeof k_font == 95u * 8u, "hud font bytes");
 // I915_FORMAT_MOD_Y_TILED. This machine presents that general modifier.
 static const uint64_t k_intel_y_tile = 0x0100000000000002ull;
 
+typedef struct HudInstance {
+    uint32_t x, y, w, h;
+    uint32_t rows0, rows1, rgb, solid;
+} HudInstance;
+
 typedef struct HudPush {
+    uint64_t instances;
     uint32_t fb_w;
     uint32_t fb_h;
-    uint32_t x;
-    uint32_t y;
-    uint32_t w;
-    uint32_t h;
-    uint32_t rows0;
-    uint32_t rows1;
-    uint32_t rgb;
-    uint32_t solid;
 } HudPush;
 
-static_assert(offsetof(HudPush, rows0) == 24u, "hud rows");
-static_assert(offsetof(HudPush, rgb) == 32u, "hud rgb");
-static_assert(sizeof(HudPush) == 40u, "hud push");
+static_assert(sizeof(HudInstance) == 32u, "hud instance");
+static_assert(sizeof(HudPush) == 16u, "hud push");
+
+static VulkanContext *s_vk = nullptr;
 
 enum { k_text_cap = 80 };
 
@@ -151,12 +151,14 @@ void hud_shutdown(VulkanContext *vk) {
         vkDestroyPipelineLayout(vk->device, s_layout, nullptr);
         s_layout = VK_NULL_HANDLE;
     }
+    s_vk = nullptr;
 }
 
 int hud_init(VulkanContext *vk) {
     if (vk == nullptr || vk->device == VK_NULL_HANDLE || vk->physical_device == VK_NULL_HANDLE) {
         return -1;
     }
+    s_vk = vk;
     if (s_layout != VK_NULL_HANDLE) {
         return 0;
     }
@@ -334,13 +336,6 @@ void hud_prepare(uint32_t frame_ms, bool have_stamp, uint64_t modifier) {
     }
 }
 
-static void draw_quad(VkCommandBuffer cmd, HudPush push) {
-    vulkan_cmd_push(cmd, s_layout,
-                    VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-                    sizeof push, &push);
-    vkCmdDraw(cmd, 6, 1, 0, 0);
-}
-
 static VkPipeline pick_pipeline(VkFormat format, VkFormat depth_format,
                                 VkSampleCountFlagBits samples) {
     bool scene = depth_format != VK_FORMAT_UNDEFINED;
@@ -358,59 +353,40 @@ static VkPipeline pick_pipeline(VkFormat format, VkFormat depth_format,
 
 void hud_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height, VkFormat format,
               VkFormat depth_format, VkSampleCountFlagBits samples) {
-    if (cmd == VK_NULL_HANDLE || s_layout == VK_NULL_HANDLE || s_nchars == 0 ||
-        width < 80u || height < 48u) {
+    if (cmd == VK_NULL_HANDLE || s_vk == nullptr || s_layout == VK_NULL_HANDLE ||
+        s_nchars == 0 || width < 80u || height < 48u) {
         return;
     }
     VkPipeline pipeline = pick_pipeline(format, depth_format, samples);
-    if (pipeline == VK_NULL_HANDLE) {
-        return;
-    }
+    if (pipeline == VK_NULL_HANDLE) return;
+
     uint32_t n = s_nchars;
     uint32_t max_chars = (width - 20u - 4u) / 8u;
-    if (n > max_chars) {
-        n = max_chars;
-    }
-    if (n == 0) {
-        return;
-    }
+    if (n > max_chars) n = max_chars;
+    if (n == 0) return;
+
+    BdaSlice slice = bda_alloc_transient(s_vk, (VkDeviceSize)(n + 1u) * sizeof(HudInstance), 16u);
+    if (slice.cpu == nullptr || slice.gpu == 0) return;
+
+    HudInstance *inst = (HudInstance *)slice.cpu;
     uint32_t plate_w = n * 8u + 4u;
     uint32_t plate_h = 12u;
     uint32_t plate_x = 10u;
     uint32_t plate_y = height - 10u - plate_h;
 
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-
-    HudPush plate = {
-        .fb_w  = width,
-        .fb_h  = height,
-        .x     = plate_x,
-        .y     = plate_y,
-        .w     = plate_w,
-        .h     = plate_h,
-        .solid = 1u,
+    uint32_t count = 0;
+    inst[count++] = (HudInstance){
+        .x = plate_x, .y = plate_y, .w = plate_w, .h = plate_h, .solid = 1u,
     };
-    draw_quad(cmd, plate);
 
     for (uint32_t i = 0; i < n; ++i) {
         unsigned char ch = (unsigned char)s_text[i];
-        if (ch < 32u || ch > 126u) {
-            continue;
-        }
+        if (ch < 32u || ch > 126u) continue;
         const uint8_t *rows = k_font[ch - 32u];
-        bool blank = true;
-        for (int r = 0; r < 8; ++r) {
-            if (rows[r] != 0) {
-                blank = false;
-                break;
-            }
-        }
-        if (blank) {
+        if ((rows[0] | rows[1] | rows[2] | rows[3] | rows[4] | rows[5] | rows[6] | rows[7]) == 0) {
             continue;
         }
-        HudPush glyph = {
-            .fb_w  = width,
-            .fb_h  = height,
+        inst[count++] = (HudInstance){
             .x     = plate_x + 2u + i * 8u,
             .y     = plate_y + 2u,
             .w     = 8u,
@@ -422,6 +398,11 @@ void hud_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height, VkFormat for
             .rgb   = 0x00f4f1eau,
             .solid = 0u,
         };
-        draw_quad(cmd, glyph);
     }
+
+    HudPush push = { .instances = slice.gpu, .fb_w = width, .fb_h = height };
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+    vulkan_cmd_push(cmd, s_layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                    sizeof push, &push);
+    vkCmdDraw(cmd, 6, count, 0, 0);
 }

@@ -69,6 +69,7 @@ int frame_boot(void) {
     frame_state.resize_old_h = 0;
     frame_state.resize_tranche[0] = '\0';
     engine_app()->reset();
+    bda_transient_reset();
     frame_clock_reset(&frame_state.clock);
     frame_state.timer_armed = false;
     frame_state.last_stamp_mono_ns = 0;

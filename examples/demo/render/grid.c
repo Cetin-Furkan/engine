@@ -48,12 +48,13 @@ static void grid_fail(const char *what, VkResult res) {
     fprintf(stderr, "[Grid Error] %s: %s (%d)\n", what, vulkan_vkresult_to_str(res), (int)res);
 }
 
-static void barrier_field(VkCommandBuffer cmd) {
+static void barrier_field(VkCommandBuffer cmd, bool to_vertex) {
     VkMemoryBarrier2 barrier = {
         .sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
         .srcStageMask  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
         .srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-        .dstStageMask  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT,
+        .dstStageMask  = to_vertex ? (VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT)
+                                   : VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
         .dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
     };
     VkDependencyInfo dep = {
@@ -138,6 +139,7 @@ int grid_init(VulkanContext *vk) {
     if (bda_arena_init(vk, &s_arena, k_arena_bytes, false) != 0) {
         return -1;
     }
+    bda_arena_reset(&s_arena);
     BdaSlice a = bda_arena_alloc(&s_arena, k_field_bytes, 256u);
     BdaSlice b = bda_arena_alloc(&s_arena, k_field_bytes, 256u);
     if (a.gpu == 0 || b.gpu == 0) {
@@ -195,7 +197,7 @@ int grid_init(VulkanContext *vk) {
         return -1;
     }
     dispatch_grid(cmd, 0u, 1u, 0, s_field[0]);
-    barrier_field(cmd);
+    barrier_field(cmd, false);
     if (submit_idle(vk, cmd) != 0) {
         vkFreeCommandBuffers(vk->device, pool, 1, &cmd);
         grid_shutdown(vk);
@@ -218,7 +220,7 @@ void grid_record(VkCommandBuffer cmd, uint32_t dt_ms) {
     }
     int dst = s_read ^ 1;
     dispatch_grid(cmd, dt_ms, 0u, s_field[s_read], s_field[dst]);
-    barrier_field(cmd);
+    barrier_field(cmd, true);
     s_step_open = true;
 }
 

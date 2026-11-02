@@ -28,11 +28,10 @@ static const float k_edge_px = 168.0;
 
 [shader("vertex")]
 VSOutput main(uint vert_id : SV_VulkanVertexID) {
-    float* mesh = (float*)screen.verts;
-    uint o = vert_id * 9u;
-    float3 in_pos = float3(mesh[o + 0u], mesh[o + 1u], mesh[o + 2u]);
-    float3 in_nrm = float3(mesh[o + 3u], mesh[o + 4u], mesh[o + 5u]);
-    float3 in_albedo = float3(mesh[o + 6u], mesh[o + 7u], mesh[o + 8u]);
+    MeshVertex v = ((MeshVertex*)screen.verts)[vert_id];
+    float3 in_pos = v.pos;
+    float3 in_nrm = v.nrm;
+    float3 in_albedo = v.albedo;
 
     const float ax = radians(28.0);
     float ay = radians(screen.yaw_deg);

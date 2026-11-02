@@ -47,25 +47,27 @@ void main(uint3 id : SV_DispatchThreadID) {
         return;
     }
     if (i == 4u) {
-        write_point(buf, i, float3(c.x, c.y, -30.0), 1.0);
+        write_point(buf, i, float3(c, -40.0), 1.0);
         return;
     }
     if (i == 5u) {
-        write_point(buf, i, float3(c.x, c.y, 30.0), 0.0);
+        write_point(buf, i, float3(c, 40.0), 0.0);
         return;
     }
-    uint k = i - 6u;
-    float t = float(k) / float(pc.count - 1u);
-    float u = lerp(-3.14159265 * 2.0, 3.14159265 * 2.0, t);
-    float x = c.x + lerp(-h.x, h.x, t);
-    float y = c.y;
-    if (pc.mode == 1u) {
-        y += sin(u) * (h.y * 0.85);
-    } else if (pc.mode == 2u) {
-        float su = abs(u) < 1.0e-4 ? 1.0 : sin(u) / u;
-        y += su * (h.y * 0.85);
+    uint s = i - 6u;
+    float t = float(s) / float(pc.count - 1u);
+    float u = t * 2.0 - 1.0;
+    float x = 0.0;
+    float y = 0.0;
+    if (pc.mode == 2u) {
+        x = u * 12.0;
+        y = abs(x) < 1.0e-4 ? 1.0 : sin(x) / x;
     } else if (pc.mode == 3u) {
-        y += exp(-u * u * 0.5) * (h.y * 0.85);
+        x = u * 3.0;
+        y = exp(-0.5 * x * x);
+    } else {
+        x = u * 6.28318530718;
+        y = sin(x);
     }
-    write_point(buf, i, float3(x, y, 0.0), k == 0u ? 1.0 : 0.0);
+    write_point(buf, i, float3(c.x + u * h.x, c.y + y * h.y, 0.0), s == 0u ? 1.0 : 0.0);
 }

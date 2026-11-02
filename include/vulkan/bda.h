@@ -37,6 +37,11 @@ typedef struct DaBuffer {
     bool            is_suballocated;
 } DaBuffer;
 
+typedef struct BdaRange {
+    VkDeviceSize offset;
+    VkDeviceSize size;
+} BdaRange;
+
 typedef struct BdaBlock {
     VkBuffer         buffer;
     VkDeviceMemory   memory;
@@ -44,6 +49,8 @@ typedef struct BdaBlock {
     uint8_t         *base_cpu;
     VkDeviceSize     capacity;
     VkDeviceSize     allocated;
+    uint32_t         free_count;
+    BdaRange         free_list[64];
     struct BdaBlock *next;
 } BdaBlock;
 

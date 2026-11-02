@@ -11,6 +11,7 @@
 #include "wayland/wayland.h"
 #include "vulkan/core.h"
 #include "vulkan/memory.h"
+#include "vulkan/bda.h"
 #include <drm/drm.h>
 #include <errno.h>
 #include <linux/input-event-codes.h>
@@ -131,7 +132,6 @@ typedef struct FrameState {
     bool                     timer_armed;
     bool                     loop_was_busy;
     uint64_t                 last_stamp_mono_ns;
-    uint64_t                 last_sim_mono_ns;
     bool                     stall_reported;
 } FrameState;
 

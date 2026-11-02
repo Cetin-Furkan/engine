@@ -54,7 +54,7 @@ float2 hub_px() {
 float2 to_ndc(float2 px) {
     float w = max(pc.fb_w, 1.0);
     float h = max(pc.fb_h, 1.0);
-    return float2(px.x / w * 2.0 - 1.0, 1.0 - px.y / h * 2.0);
+    return float2(px.x / w * 2.0 - 1.0, px.y / h * 2.0 - 1.0);
 }
 
 float3 turned(float3 dir) {

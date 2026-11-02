@@ -43,29 +43,6 @@ int frame_watchdog(WaylandContext *wl, VulkanContext *vk, bool *queued) {
         return 0;
     }
 
-    if (engine_app()->busy()) {
-        uint64_t now_ns = ring_mono_ns();
-        if (frame_state.last_sim_mono_ns == 0) {
-            frame_state.last_sim_mono_ns = now_ns;
-        }
-        uint32_t dt_ms = (uint32_t)((now_ns - frame_state.last_sim_mono_ns) / 1000000ull);
-        if (dt_ms >= 8u) {
-            frame_state.last_sim_mono_ns = now_ns;
-            uint32_t synth_stamp = (uint32_t)(now_ns / 1000000ull);
-            uint32_t steps = dt_ms / 8u;
-            if (steps > 5u) {
-                steps = 5u;
-            }
-            for (uint32_t s = 0; s < steps; ++s) {
-                uint32_t sub = synth_stamp - (steps - 1u - s) * 8u;
-                FrameStep synth_step = { .dt_ms = 8u, .missed = 0, .paint = false, .first = false };
-                uint32_t heat_dt = 0;
-                (void)engine_app()->simulation(sub, &synth_step, &heat_dt);
-                (void)engine_app()->advance(sub, &synth_step);
-            }
-        }
-    }
-
     if (wl->frame_stamp_valid) {
         return 0;  // A stamp is already waiting; not stalled.
     }
@@ -119,9 +96,19 @@ int turn_step(WaylandContext *wl, VulkanContext *vk, bool *queued) {
     if (!wl->frame_stamp_valid) {
         return 0;
     }
+    bool spare_free = acquire_point_retired(vk, spare()->acquire_point) &&
+        (!spare()->release_pending ||
+         poll_release_semaphore(vk, spare()->release_semaphore, spare()->release_point));
+    if (!spare_free) {
+        int q = queue_frame_only(wl, queued);
+        if (q == 0 || q == -EALREADY) {
+            wl->frame_stamp_valid = false;
+            return 0;
+        }
+        return q;
+    }
     uint32_t stamp = wl->frame_time_ms;
     frame_state.last_stamp_mono_ns = ring_mono_ns();
-    frame_state.last_sim_mono_ns   = frame_state.last_stamp_mono_ns;
     frame_state.stall_reported = false;
     FrameStep step = frame_clock_step(&frame_state.clock, stamp);
     if (!step.paint) {
@@ -192,17 +179,6 @@ int turn_step(WaylandContext *wl, VulkanContext *vk, bool *queued) {
     }
 
     frame_state.loop_was_busy = true;
-    bool spare_free = acquire_point_retired(vk, spare()->acquire_point) &&
-        (!spare()->release_pending ||
-         poll_release_semaphore(vk, spare()->release_semaphore, spare()->release_point));
-    if (!spare_free) {
-        int q = queue_frame_only(wl, queued);
-        if (q == 0 || q == -EALREADY) {
-            wl->frame_stamp_valid = false;
-            return 0;
-        }
-        return q;
-    }
 
     // A resize stores the point it presented and leaves release_pending false,
     // so this bump runs once per present.

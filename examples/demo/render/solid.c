@@ -117,7 +117,7 @@ static int bake_mesh(VulkanContext *vk) {
         .sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
         .srcStageMask  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
         .srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-        .dstStageMask  = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT,
+        .dstStageMask  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
         .dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
     };
     VkDependencyInfo dep = {

@@ -68,7 +68,7 @@ $(GEN_DIR)/%.spv: shaders/%.slang
 
 $(GEN_DIR)/bevel.comp.spv: shaders/face_grid.slang
 $(GEN_DIR)/heat.comp.spv: shaders/heat_nbr.slang shaders/face_grid.slang
-$(GEN_DIR)/cube.vert.spv: shaders/camera.slang shaders/material.slang
+$(GEN_DIR)/cube.vert.spv: shaders/camera.slang shaders/material.slang shaders/face_grid.slang
 $(GEN_DIR)/solid.vert.spv: shaders/camera.slang shaders/material.slang
 $(GEN_DIR)/shape.vert.spv: shaders/camera.slang shaders/material.slang
 $(GEN_DIR)/plane.vert.spv: shaders/camera.slang
@@ -101,8 +101,8 @@ $(OBJ_DIR)/examples/demo/text/face/face.o: examples/demo/text/face/bundled/Inter
 $(OBJ_DIR)/src/chrome/gpu.o: $(GEN_DIR)/chrome.vert.spv $(GEN_DIR)/chrome.frag.spv
 
 # Compiler & Preprocessor Flags
-CFLAGS ?= $(C23_FLAGS) -D_GNU_SOURCE -Wall -Wextra $(OPT_FLAGS) $(INCLUDES) \
-          --embed-dir=$(GEN_DIR) \
+CFLAGS ?= $(C23_FLAGS) -D_GNU_SOURCE -Wall -Wextra -Wunused-function -Werror=unused-function -Wmissing-declarations \
+          $(OPT_FLAGS) $(INCLUDES) --embed-dir=$(GEN_DIR) \
           -ffunction-sections -fdata-sections \
           -DENGINE_VERSION_STR=\"$(FULL_VERSION)\" \
           -DENGINE_BUILD_MODE=\"$(MODE)\"
@@ -133,7 +133,15 @@ all: $(TARGET)
 
 $(TARGET): $(OBJS)
 	@mkdir -p $(BIN_DIR)
-	$(CC) $(CFLAGS) -o $@ $(OBJS) $(LDFLAGS)
+	@if ! $(CC) $(CFLAGS) -o $@ $(OBJS) $(LDFLAGS) -Wl,--print-gc-sections > $(BUILD_DIR)/link.log 2>&1; then \
+		cat $(BUILD_DIR)/link.log >&2; \
+		exit 1; \
+	fi
+	@dead=$$(grep -E "removing unused section '\.text\.[^']*' in file '.*(src/vulkan|src/frame)" $(BUILD_DIR)/link.log || true); \
+	if [ -n "$$dead" ]; then \
+		echo -e "\033[0;31m[Link Error] Dead/hallucinated functions detected:\033[0m" >&2; \
+		echo "$$dead" >&2; rm -f $@; exit 1; \
+	fi
 ifneq ($(NATIVE),1)
 	objcopy --remove-section .note.gnu.property $@
 endif
@@ -237,5 +245,7 @@ test: $(CONFIG_MK)
 	$(CC) $(CFLAGS) -o build/test_text tests/test_text.c \
 		examples/demo/text/face/face.c examples/demo/text/shape/shape.c $(TEXT_LIBS) -lm
 	./build/test_text
+	$(CC) $(CFLAGS) -o build/test_bda tests/test_bda.c -lvulkan
+	./build/test_bda
 
 .PHONY: all debug release run run-release release-patch release-minor release-major info help clean clear recheck distclean test

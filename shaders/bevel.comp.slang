@@ -1,4 +1,5 @@
 #include "face_grid.slang"
+#include "camera.slang"
 
 static const uint k_arc = 8u;
 static const float k_half_pi = 1.5707963;
@@ -14,17 +15,8 @@ struct Push {
 [[vk::push_constant]] Push pc;
 
 void store_vert(uint vi, float3 p, float3 n, float3 c) {
-    float* mesh = (float*)pc.verts;
-    uint o = vi * 9u;
-    mesh[o + 0u] = p.x;
-    mesh[o + 1u] = p.y;
-    mesh[o + 2u] = p.z;
-    mesh[o + 3u] = n.x;
-    mesh[o + 4u] = n.y;
-    mesh[o + 5u] = n.z;
-    mesh[o + 6u] = c.x;
-    mesh[o + 7u] = c.y;
-    mesh[o + 8u] = c.z;
+    MeshVertex mv = { p, n, c };
+    ((MeshVertex*)pc.verts)[vi] = mv;
 }
 
 void store_quad(uint q, uint a, uint b, uint c, uint d) {

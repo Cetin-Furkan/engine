@@ -74,10 +74,10 @@ enum { k_draw_push_bytes = 112 };
 enum : uint32_t {
     k_heat_copies = 3u,
     k_heat_slots  = k_cube_heat_slots,
-    k_heat_stride = ((k_verts * (uint32_t)sizeof(float)) + 15u) & ~15u,
+    k_heat_stride = ((k_verts * 32u) + 255u) & ~255u,
 };
 static_assert(k_heat_stride % 16u == 0u, "heat slice align");
-static_assert(k_heat_stride >= k_verts * (uint32_t)sizeof(float), "heat slice fits");
+static_assert(k_heat_stride >= k_verts * 32u, "heat slice fits");
 
 typedef struct MeshPush {
     uint64_t verts;
@@ -93,7 +93,9 @@ typedef struct HeatPush {
     uint32_t poke;
     float    poke_x;
     float    poke_y;
+    float    poke_z;
     float    yaw_deg;
+    uint32_t pad;
 } HeatPush;
 
 static_assert(offsetof(DrawPush, yaw_deg) == 16u, "yaw offset");
@@ -116,8 +118,9 @@ static_assert(offsetof(HeatPush, seed) == 28u, "heat seed");
 static_assert(offsetof(HeatPush, poke) == 32u, "heat poke");
 static_assert(offsetof(HeatPush, poke_x) == 36u, "heat poke x");
 static_assert(offsetof(HeatPush, poke_y) == 40u, "heat poke y");
-static_assert(offsetof(HeatPush, yaw_deg) == 44u, "heat yaw");
-static_assert(sizeof(HeatPush) == 48u, "heat push");
+static_assert(offsetof(HeatPush, poke_z) == 44u, "heat poke z");
+static_assert(offsetof(HeatPush, yaw_deg) == 48u, "heat yaw");
+static_assert(sizeof(HeatPush) == 56u, "heat push");
 
 static VkPipelineLayout s_layout = VK_NULL_HANDLE;
 static VkPipeline       s_pipeline = VK_NULL_HANDLE;
@@ -144,6 +147,7 @@ typedef struct HeatLive {
     bool     need_seed;
     float    poke_x;
     float    poke_y;
+    float    poke_z;
     bool     poke_pending;
     bool     poke_armed;
     bool     pulse;
@@ -223,12 +227,13 @@ static void dispatch_heat(VkCommandBuffer cmd, uint32_t dt_ms, uint32_t seed,
         .poke    = poke,
         .poke_x  = poke != 0u ? live->poke_x : 0.0f,
         .poke_y  = poke != 0u ? live->poke_y : 0.0f,
+        .poke_z  = poke != 0u ? live->poke_z : 0.0f,
         .yaw_deg = yaw_deg,
+        .pad     = 0u,
     };
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_heat_pipe);
     vulkan_cmd_push(cmd, s_heat_layout, VK_SHADER_STAGE_COMPUTE_BIT, sizeof heat_push, &heat_push);
     vkCmdDispatch(cmd, (k_verts + k_local - 1u) / k_local, 1u, 1u);
-    barrier_heat_to_vertex(cmd);
 }
 
 // One submit, then the queue is idle. The seed is visible without an acquire
@@ -273,8 +278,8 @@ static int bake_mesh(VulkanContext *vk) {
         .sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
         .srcStageMask  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
         .srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-        .dstStageMask  = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_INDEX_INPUT_BIT,
-        .dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_INDEX_READ_BIT,
+        .dstStageMask  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        .dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
     };
     VkDependencyInfo dep = {
         .sType              = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
@@ -607,6 +612,7 @@ bool cube_heat_record(VkCommandBuffer cmd, uint32_t slot, float yaw_deg) {
     }
     if (h->need_seed) {
         dispatch_heat(cmd, 0, 1u, -1, dst, slot, 0u, yaw_deg);
+        barrier_heat_to_vertex(cmd);
         h->draw = dst;
         h->need_seed = false;
         return true;
@@ -616,6 +622,7 @@ bool cube_heat_record(VkCommandBuffer cmd, uint32_t slot, float yaw_deg) {
         return false;
     }
     dispatch_heat(cmd, h->step_dt, 0u, h->read, dst, slot, poke ? 1u : 0u, yaw_deg);
+    barrier_heat_to_vertex(cmd);
     h->draw = dst;
     if (poke) {
         h->poke_pending = false;
@@ -659,18 +666,20 @@ void cube_heat_record_abort(uint32_t slot) {
     }
 }
 
-bool cube_heat_poke(uint32_t slot, float origin_x, float origin_y) {
+bool cube_heat_poke(uint32_t slot, float origin_x, float origin_y, float origin_z) {
     if (!heat_slot_ok(slot) || s_heat_pipe == VK_NULL_HANDLE) {
         return false;
     }
     HeatLive *h = &s_live[slot];
     h->poke_x = origin_x;
     h->poke_y = origin_y;
+    h->poke_z = origin_z;
     h->poke_pending = true;
     h->held = false;
     h->pulse = true;
     h->pulse_have_t0 = false;
-    printf("[Cube] Fillet heat poked at %+.0f,%+.0f.\n", (double)origin_x, (double)origin_y);
+    printf("[Cube] Non-rigid impulse & heat poked at %+.0f,%+.0f,%+.0f.\n",
+           (double)origin_x, (double)origin_y, (double)origin_z);
     fflush(stdout);
     return true;
 }

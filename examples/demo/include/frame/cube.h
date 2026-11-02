@@ -63,7 +63,7 @@ bool cube_heat_slot_open(uint32_t slot);
 // vertices and diffuses for five seconds of callback time. Other slots are
 // left as they are. The cube's yaw is not moved. A click during an open
 // pulse restarts those five seconds.
-bool cube_heat_poke(uint32_t slot, float origin_x, float origin_y);
+bool cube_heat_poke(uint32_t slot, float origin_x, float origin_y, float origin_z);
 bool cube_heat_poke_pending(void);
 bool cube_heat_slot_pending(uint32_t slot);
 

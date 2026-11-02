@@ -261,11 +261,43 @@ static void test_kind_listen(void) {
     CHECK(s_kind_checks == 1);
 }
 
+static void test_spin_lifecycle(void) {
+    Spin s = spin_start(0);
+    CHECK(s.spinning);
+    CHECK(!s.have_t0);
+
+    // Initial stamp latches t0
+    CHECK(!spin_advance(&s, 5000u, false));
+    CHECK(s.have_t0);
+    CHECK(s.t0 == 5000u);
+    CHECK(s.spinning);
+    spin_commit(&s);
+
+    // Substep progression: 8 ms later
+    CHECK(spin_advance(&s, 5008u, false));
+    CHECK(s.spinning);
+    CHECK(s.live_milli == (int32_t)(72u * 8u));
+    spin_commit(&s);
+
+    // After 4992 ms total delta
+    CHECK(spin_advance(&s, 9992u, false));
+    CHECK(s.spinning);
+    spin_commit(&s);
+
+    // Reaching exactly 5000 ms completes one full turn
+    CHECK(spin_advance(&s, 10000u, false));
+    spin_commit(&s);
+    // Next advance detects completion and stops spinning
+    CHECK(!spin_advance(&s, 10008u, false));
+    CHECK(!s.spinning);
+}
+
 int main(void) {
     test_grid_math();
     test_table_stats();
     test_table_compute();
     test_kind_listen();
+    test_spin_lifecycle();
     if (s_failures != 0) {
         fprintf(stderr, "%d check(s) failed\n", s_failures);
         return 1;

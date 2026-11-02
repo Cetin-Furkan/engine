@@ -43,3 +43,16 @@ float3 rotate_yaw(float3 v, float ay) {
     float cy = cos(ay), sy = sin(ay);
     return float3(v.x * cy + v.z * sy, v.y, -v.x * sy + v.z * cy);
 }
+
+struct MeshVertex {
+    float3 pos;
+    float3 nrm;
+    float3 albedo;
+};
+
+struct SoftVertexState {
+    float3 disp;
+    float  temp;
+    float3 vel;
+    float  pad;
+};

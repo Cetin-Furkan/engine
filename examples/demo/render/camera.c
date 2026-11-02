@@ -1,6 +1,7 @@
 #include "frame/camera.h"
 #include "frame/material.h"
 #include "frame/policy.h"
+#include "engine/app.h"
 #include "input/pointer.h"
 #include <linux/input-event-codes.h>
 #include <math.h>
@@ -250,6 +251,23 @@ static void translate_view(float dt, int move_x, int move_y) {
 
 // A snapped pole is outside the interactive limit. Clamping it on the
 // first step would jump the view. Outward motion stops at ±π/2.
+static float add_pitch(float pitch, float delta) {
+    const float pole = 1.57079633f;
+    float next = pitch + delta;
+    bool outside = pitch > k_pitch_limit || pitch < -k_pitch_limit;
+    bool outward = (pitch > 0.0f && delta > 0.0f) || (pitch < 0.0f && delta < 0.0f);
+    if (outside && outward) {
+        return clampf(pitch, -pole, pole);
+    }
+    if (outside) {
+        if (next > k_pitch_limit || next < -k_pitch_limit) {
+            return clampf(next, -pole, pole);
+        }
+        return clampf(next, -k_pitch_limit, k_pitch_limit);
+    }
+    return clampf(next, -k_pitch_limit, k_pitch_limit);
+}
+
 static float step_pitch(float pitch, int axis, float dt) {
     const float pole = 1.57079633f;
     float next = pitch + (float)axis * k_pitch_rate * dt;
@@ -355,7 +373,8 @@ void camera_reset(void) {
     check_identity();
     if (!s_logged) {
         printf("[Camera] Yaw and pitch on the view, exponential zoom, view-plane move. "
-               "Home restores the opening pose. The wheel zooms.\n");
+               "Home restores the opening pose. The wheel zooms. "
+               "Right-drag orbits. Middle-drag pans.\n");
         fflush(stdout);
         s_logged = true;
     }
@@ -513,6 +532,41 @@ bool camera_view_front(void) {
     if (!changed) {
         printf("[Camera] Front view.\n");
         fflush(stdout);
+    }
+    return changed;
+}
+
+bool camera_pointer_drag(float dx, float dy, uint32_t buttons) {
+    if ((dx == 0.0f && dy == 0.0f) || buttons == 0) {
+        return false;
+    }
+    bool changed = false;
+    if ((buttons & ENG_BUTTON_RIGHT) != 0 && !policy_active()->lock_2d_quat) {
+        float yaw_d = policy_allows(PERM_CAM_YAW) ? dx * 0.005f : 0.0f;
+        float pitch_d = policy_allows(PERM_CAM_PITCH) ? -dy * 0.005f : 0.0f;
+        if (yaw_d != 0.0f || pitch_d != 0.0f) {
+            s_kp5_front = false;
+            s_held_yaw = wrap_pi(s_held_yaw + yaw_d);
+            s_held_pitch = add_pitch(s_held_pitch, pitch_d);
+            store_yaw_pitch(&s_live, s_held_yaw, s_held_pitch);
+            changed = true;
+        }
+    }
+    if ((buttons & ENG_BUTTON_MIDDLE) != 0) {
+        float sx = policy_allows(PERM_CAM_PAN_X) ? dx : 0.0f;
+        float sy = policy_allows(PERM_CAM_PAN_Y) ? -dy : 0.0f;
+        if ((sx != 0.0f || sy != 0.0f) && s_live.zoom != 0.0f) {
+            Vec3 right;
+            Vec3 up;
+            Vec3 look;
+            view_basis(quat_of(&s_live), &right, &up, &look);
+            (void)look;
+            float scale = 1.0f / s_live.zoom;
+            s_live.x += (right.x * sx + up.x * sy) * scale;
+            s_live.y += (right.y * sx + up.y * sy) * scale;
+            s_live.z += (right.z * sx + up.z * sy) * scale;
+            changed = true;
+        }
     }
     return changed;
 }

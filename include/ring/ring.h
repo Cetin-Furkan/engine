@@ -17,6 +17,7 @@ enum : uint32_t {
     ENG_SIGNAL_FD_SLOT   = 2,
     ENG_SCRATCH_FD_SLOT  = 3,
     ENG_INOTIFY_FD_SLOT  = 4,
+    ENG_SIM_FD_SLOT      = 5,
 };
 
 enum : uint64_t {
@@ -34,6 +35,7 @@ enum : uint64_t {
     ENG_UD_FILE_FENCE  = 14,
     ENG_UD_FILE_CANCEL = 15,
     ENG_UD_FRAME_TIMER = 16,
+    ENG_UD_SIM_TIMER   = 17,
 };
 
 typedef struct RingContext {

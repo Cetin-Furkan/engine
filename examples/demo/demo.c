@@ -339,6 +339,10 @@ static bool demo_camera_active(void) {
     return camera_motion_down() || camera_busy();
 }
 
+static bool demo_drag(float dx, float dy, uint32_t buttons) {
+    return camera_pointer_drag(dx, dy, buttons);
+}
+
 static const EngineApp s_app = {
     .help = "One turn, then io_uring idle. Points stay off until numpad 9. "
             "Empty clicks then place points, and F closes them into a face that stays. "
@@ -351,7 +355,8 @@ static const EngineApp s_app = {
             "Numpad 8, 2, 4, 6, and 5 set top, bottom, left, right, and front. "
             "Numpad 5 again sets the back. Home or numpad 1 restores the opening camera, "
             "including zoom and position. Numpad 7 shows or hides the view ball. "
-            "The wheel and the touchpad zoom. Arrows move on the screen axes. Q and E "
+            "The wheel and the touchpad zoom. Right-drag orbits. Middle-drag pans. "
+            "Arrows move on the screen axes. Q and E "
             "yaw, C and V pitch. Minus zooms out. Plus is numpad plus, shift+4, or equals. "
             "Tab switches the flat plot workspace and the 3D workspace. "
             "Hold T and click twice to place a text box, then type. Escape leaves it.",
@@ -382,6 +387,7 @@ static const EngineApp s_app = {
     .note_cqe          = hud_note_cqe,
     .turn_report       = hud_turn_report,
     .click             = demo_click,
+    .drag              = demo_drag,
     .scroll            = demo_scroll,
     .text              = demo_text,
     .key               = demo_key,

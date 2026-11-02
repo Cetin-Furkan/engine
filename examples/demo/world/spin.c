@@ -33,7 +33,7 @@ bool spin_advance(Spin *s, uint32_t time_ms, bool log_start) {
         s->have_t0 = true;
         s->live_milli = s->shown_milli;
         if (log_start && !s_logged_start) {
-            printf("[Engine] Turn started. One revolution, wl_surface.frame clock, %u ms.\n",
+            printf("[Engine] Turn started. One revolution, 8 ms simulation timer, %u ms.\n",
                    k_turn_period_ms);
             fflush(stdout);
             s_logged_start = true;

@@ -1,8 +1,10 @@
 #include "frame/frame_int.h"
 
-// One command buffer: world, clear, chrome, HUD, then the acquire signal.
+// One command buffer: world, clear, HUD, then the acquire signal.
+// The bar is a separate surface and is not recorded here.
 
-// heat_dt is the callback interval. Zero draws the field as it stands.
+// heat_dt is the simulation interval accumulated since the last present.
+// Zero draws the field as it stands.
 int record_and_submit_clear(VulkanContext *vk, FrameSlot *frame, VkSemaphore acquire,
                                    uint64_t signal_point, bool draw_live, uint32_t heat_dt) {
     frame->acquire_point = signal_point;
@@ -175,17 +177,15 @@ int record_and_submit_clear(VulkanContext *vk, FrameSlot *frame, VkSemaphore acq
     if (rendering_info.pDepthAttachment != nullptr) {
         engine_app()->draw(frame->cmd_buf, frame->image.width, frame->image.height, draw_live);
     }
-    // Chrome, the readout, and text are drawn in this pass. Sample shading
-    // is off, so one fragment covers every sample and the resolve at
-    // vkCmdEndRendering is the only color store.
+    // The bar is its own surface. This pass is the scene and the readout.
+    // Sample shading is off, so one fragment covers every sample and the
+    // resolve at vkCmdEndRendering is the only color store.
     VkFormat overlay_depth = VK_FORMAT_UNDEFINED;
     VkSampleCountFlagBits overlay_samples = VK_SAMPLE_COUNT_1_BIT;
     if (rendering_info.pDepthAttachment != nullptr) {
         overlay_depth = frame->targets.depth_format;
         overlay_samples = frame->targets.samples;
     }
-    chrome_gpu_draw(vk, frame->cmd_buf, frame->image.width, frame->image.height,
-                    frame->view_format, overlay_depth, overlay_samples);
     {
         WaylandContext *wl_hud = wayland_get_context();
         bool have_stamp = wl_hud != nullptr && wl_hud->frame_stamp_valid;

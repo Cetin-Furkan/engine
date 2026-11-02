@@ -51,6 +51,12 @@ void pointer_shutdown(WaylandContext *w);
  */
 bool pointer_take_spawn(int32_t *x, int32_t *y);
 
+// Motion since the last take while the right or middle button is held on
+// the scene surface, in surface pixels. buttons is ENG_BUTTON_RIGHT,
+// ENG_BUTTON_MIDDLE, or both. A left press is not included. False when
+// nothing moved.
+bool pointer_take_drag(float *dx, float *dy, uint32_t *buttons);
+
 // One key press while this surface has keyboard focus. The code is an
 // evdev keycode. route_key on the hosted program says whether the press
 // is ignored, held for polling, or queued as one tap. Shift is always

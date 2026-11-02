@@ -32,6 +32,7 @@ enum : uint64_t {
     k_ud_signal_cancel  = UINT64_MAX,
     k_ud_release_cancel = UINT64_MAX - 1u,
     k_ud_inotify_cancel = UINT64_MAX - 2u,
+    k_ud_sim_cancel     = UINT64_MAX - 3u,
 };
 
 enum : uint32_t {
@@ -133,6 +134,26 @@ typedef struct FrameState {
     bool                     loop_was_busy;
     uint64_t                 last_stamp_mono_ns;
     bool                     stall_reported;
+
+    // Window size includes the bar. The scene image is the part under it.
+    uint32_t window_w;
+    uint32_t window_h;
+    uint32_t bar_px;
+    FrameSlot bar_slot[2];
+    int       bar_front;
+    bool      bar_live;
+    bool      bar_dirty;
+    bool      bar_swap_on_send;
+    // The scene picture changed and a present is owed. The bar does not set this.
+    bool      scene_dirty;
+    bool      sim_latched;
+    bool      sim_hot;
+    bool      sim_timer_on;
+    bool      sim_poll_armed;
+    bool      sim_fixed;
+    int       sim_fd;
+    uint64_t  mono0_ns;
+    uint32_t  pending_heat;
 } FrameState;
 
 extern FrameState frame_state;
@@ -254,6 +275,28 @@ int frame_run(void);
 // Watchdog for a stalled turn: the compositor stopped sending frame
 // stamps mid-turn. Re-arms one frame callback and counts the stall.
 int frame_watchdog(WaylandContext *wl, VulkanContext *vk, bool *queued);
+
+// Top bar: its own DMA-BUF and a desynced subsurface. Scene frames do not record it.
+void frame_apply_layout(WaylandContext *wl, uint32_t window_w, uint32_t window_h,
+                        uint32_t *content_w, uint32_t *content_h);
+[[nodiscard]] int bar_open_surface(WaylandContext *wl);
+[[nodiscard]] int bar_record_first(WaylandContext *wl, VulkanContext *vk);
+void bar_note_presented(void);
+// 1 when a bar attach is armed and the caller must send it. 0 when the bar
+// is unchanged. -EAGAIN when the spare buffer is still on screen.
+[[nodiscard]] int bar_prepare(WaylandContext *wl, VulkanContext *vk, bool force);
+void bar_drop_unsent(WaylandContext *wl, VulkanContext *vk);
+void bar_install(void);
+void bar_shutdown(WaylandContext *wl, VulkanContext *vk);
+
+// Simulation quanta. The compositor callback does not call these.
+void sim_on_timer(uint64_t expirations);
+void sim_timer_set(struct RingContext *ring, bool want);
+void frame_note_picture(void);
+bool frame_sim_wanted(void);
+// One POLLIN on the simulation timerfd. A completion reads the expirations.
+[[nodiscard]] int frame_arm_sim_poll(struct RingContext *ring);
+bool frame_note_sim_cqe(struct RingContext *ring, const struct io_uring_cqe *cqe, bool rearm);
 int frame_run(void);
 int frame_stop(void);
 

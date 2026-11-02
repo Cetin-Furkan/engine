@@ -116,9 +116,10 @@ typedef struct EngineApp {
     bool (*record_poke_pending)(void);
     void (*release_frame)(uint64_t signal_point);
 
-    // Compositor-clock turn: simulation/advance decide whether a new
-    // frame is painted; commit folds the landed frame into shown state.
-    // time_ms on simulation is the compositor stamp (pulse windows).
+    // The 8 ms timer calls simulation and advance. A frame callback only
+    // presents. commit folds the landed frame into shown state.
+    // time_ms on simulation is monotonic milliseconds since the first
+    // timer sample, for pulse windows. It is not a compositor stamp.
     // step->sim_dt_ms is the only interval the solver may integrate.
     // time_ms on advance is the simulation cursor, not the wall stamp.
     bool (*simulation)(uint32_t time_ms, const FrameStep *step, uint32_t *heat_dt);
@@ -134,6 +135,11 @@ typedef struct EngineApp {
     // Input, already translated by the engine (window-center pixels,
     // +X right, +Y up; Linux key codes). True when the picture changed.
     bool (*click)(float origin_x, float origin_y);
+    // Motion while the right or middle button is held, in surface pixels.
+    // buttons is ENG_BUTTON_RIGHT, ENG_BUTTON_MIDDLE, or both. A left press
+    // is a click, not a drag. Null ignores the motion. True when the picture
+    // changed. The engine does not name the camera.
+    bool (*drag)(float dx, float dy, uint32_t buttons);
     // Wheel or touchpad notches. Positive steps zoom in. Null ignores them.
     // The engine does not name zoom; the hosted program decides.
     bool (*scroll)(float steps);
@@ -154,6 +160,13 @@ enum : uint8_t {
     ENGINE_KEY_IGNORE = 0,
     ENGINE_KEY_HOLD   = 1,
     ENGINE_KEY_TAP    = 2,
+};
+
+// wl_pointer buttons the drag hook can see. A left press stays a click.
+enum : uint32_t {
+    ENG_BUTTON_LEFT   = 1u << 0,
+    ENG_BUTTON_RIGHT  = 1u << 1,
+    ENG_BUTTON_MIDDLE = 1u << 2,
 };
 
 // Implemented by the hosted program (exactly one per binary).

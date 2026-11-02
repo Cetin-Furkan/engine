@@ -80,6 +80,28 @@ void chrome_min_size(uint32_t *width, uint32_t *height) {
     }
 }
 
+void chrome_band_thickness(uint32_t *top, uint32_t *bottom) {
+    uint32_t t = 0;
+    uint32_t b = 0;
+    const ChromeSpec *spec = chrome_spec();
+    if (spec != nullptr) {
+        for (uint32_t i = 0; i < spec->nlayers; ++i) {
+            uint32_t thick = spec->layers[i].thickness;
+            if (strcmp(spec->layers[i].edge, "bottom") == 0) {
+                b = sat_add(b, thick);
+            } else {
+                t = sat_add(t, thick);
+            }
+        }
+    }
+    if (top != nullptr) {
+        *top = t;
+    }
+    if (bottom != nullptr) {
+        *bottom = b;
+    }
+}
+
 void chrome_clamp_size(uint32_t *width, uint32_t *height) {
     uint32_t min_w = 1;
     uint32_t min_h = 1;
@@ -142,9 +164,13 @@ bool chrome_paint_layer(uint32_t width, uint32_t height, uint32_t index, ChromeP
 }
 
 static void surface_size(const WaylandContext *w, uint32_t *surf_w, uint32_t *surf_h) {
-    (void)w;
+    if (w != nullptr && w->geom_w != 0 && w->geom_h != 0) {
+        *surf_w = w->geom_w;
+        *surf_h = w->geom_h;
+        return;
+    }
     *surf_w = s_buf_w;
-    *surf_h = s_buf_h;
+    *surf_h = (w != nullptr && w->bar_surface_id != 0) ? sat_add(s_buf_h, w->bar_px) : s_buf_h;
 }
 
 void chrome_hit_test(
@@ -165,8 +191,15 @@ void chrome_hit_test(
     if (spec == nullptr || w == nullptr || s_buf_w == 0 || s_buf_h == 0) {
         return;
     }
-    if (surface == 0 || surface != w->surface_id) {
+    bool on_bar = w->bar_surface_id != 0 && surface == w->bar_surface_id;
+    bool on_main = surface == w->surface_id;
+    if (surface == 0 || (!on_bar && !on_main)) {
         return;
+    }
+    // The bar surface is window-local at the top. The scene surface starts
+    // under that band, so its pointer y is short by the band.
+    if (on_main && w->bar_px > 0) {
+        y += (int32_t)w->bar_px;
     }
 
     uint32_t surf_w = 0;
@@ -189,7 +222,10 @@ void chrome_hit_test(
         wy = (int32_t)surf_h - 1;
     }
 
-    if (spec->resize && surf_w > 4u && surf_h > 4u) {
+    uint32_t locked = ENG_TOP_MAXIMIZED | ENG_TOP_FULLSCREEN | ENG_TOP_TILED_LEFT |
+                      ENG_TOP_TILED_RIGHT | ENG_TOP_TILED_TOP | ENG_TOP_TILED_BOTTOM;
+    bool edges = spec->resize && (w->toplevel_states & locked) == 0;
+    if (edges && surf_w > 4u && surf_h > 4u) {
         const int32_t box = 4;
         const int32_t ww = (int32_t)surf_w;
         const int32_t wh = (int32_t)surf_h;
@@ -218,7 +254,7 @@ void chrome_hit_test(
     }
 
     BoxNode nodes[BOX_CAP];
-    uint32_t node_count = box_layout(spec, s_buf_w, s_buf_h, surf_w, surf_h, nodes, BOX_CAP, nullptr);
+    uint32_t node_count = box_layout(spec, surf_w, surf_h, surf_w, surf_h, nodes, BOX_CAP, nullptr);
     for (uint32_t n = spec->ncontrols; n > 0; --n) {
         const ChromeControlSpec *ctl = &spec->controls[n - 1u];
         const BoxNode *cb = find_named(nodes, node_count, BOX_DOCK_CONTROL, ctl->name);
@@ -232,7 +268,7 @@ void chrome_hit_test(
         return;
     }
 
-    if (spec->resize) {
+    if (edges) {
         uint32_t band = spec->resize_band;
         bool left   = (uint32_t)wx < band;
         bool right  = wx >= (int32_t)surf_w - (int32_t)band;

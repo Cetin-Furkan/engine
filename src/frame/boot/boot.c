@@ -61,6 +61,21 @@ int frame_boot(void) {
     frame_state.inotify_wd = -1;
     frame_state.inotify_fixed = false;
     frame_state.inotify_stop = false;
+    blank_frame(&frame_state.bar_slot[0]);
+    blank_frame(&frame_state.bar_slot[1]);
+    frame_state.bar_front = 0;
+    frame_state.bar_live = false;
+    frame_state.bar_dirty = false;
+    frame_state.bar_swap_on_send = false;
+    frame_state.scene_dirty = false;
+    frame_state.sim_latched = false;
+    frame_state.sim_hot = false;
+    frame_state.sim_timer_on = false;
+    frame_state.sim_poll_armed = false;
+    frame_state.sim_fixed = false;
+    frame_state.sim_fd = -1;
+    frame_state.mono0_ns = 0;
+    frame_state.pending_heat = 0;
     blank_frame(&frame_state.resize_fresh);
     frame_state.resize_release = 0;
     frame_state.resize_serial = 0;
@@ -127,8 +142,16 @@ int frame_boot(void) {
         return 1;
     }
 
+    uint32_t content_w = 0;
+    uint32_t content_h = 0;
+    frame_apply_layout(wl, width, height, &content_w, &content_h);
+    if (bar_open_surface(wl) != 0) {
+        (void)frame_stop();
+        return 1;
+    }
+
     const char *tranche_kind = "general";
-    if (alloc_content_image(vk, wl, width, height, &shown()->image, &tranche_kind) != 0) {
+    if (alloc_content_image(vk, wl, content_w, content_h, &shown()->image, &tranche_kind) != 0) {
         (void)frame_stop();
         return 1;
     }
@@ -215,11 +238,15 @@ int frame_boot(void) {
         return 1;
     }
 
-    chrome_set_buffer_size(shown()->image.width, shown()->image.height);
     if (!spec->resize) {
         wl->lock_toplevel_size = true;
-        wl->lock_width = (int32_t)shown()->image.width;
-        wl->lock_height = (int32_t)shown()->image.height;
+        wl->lock_width = (int32_t)frame_state.window_w;
+        wl->lock_height = (int32_t)frame_state.window_h;
+    }
+
+    if (bar_record_first(wl, vk) != 0) {
+        (void)frame_stop();
+        return 1;
     }
 
     uint32_t present_serial = (wl->configure_serial != 0u) ? wl->configure_serial : serial;
@@ -230,7 +257,7 @@ int frame_boot(void) {
             shown()->image.height,
             present_serial,
             wl->acquire_timeline_id,
-            frame_state.sync_point,
+            shown()->acquire_point,
             shown()->release_timeline_id,
             shown()->release_point) < 0) {
         (void)frame_stop();
@@ -244,7 +271,10 @@ int frame_boot(void) {
     }
 
     shown()->release_pending = true;
-    printf("[Engine] Presented 1 visible frame: size=%ux%u (serial=%u), fourcc=0x%08x (ARGB8888), modifier=0x%llx (%s tranche), stride=%zu, offset=%zu, fd=%d, explicit-sync acquire=%llu release=%llu timeline=%u\n",
+    bar_note_presented();
+    printf("[Engine] Presented 1 visible frame: window=%ux%u scene=%ux%u (serial=%u), fourcc=0x%08x (ARGB8888), modifier=0x%llx (%s tranche), stride=%zu, offset=%zu, fd=%d, explicit-sync acquire=%llu release=%llu timeline=%u\n",
+           frame_state.window_w,
+           frame_state.window_h,
            shown()->image.width,
            shown()->image.height,
            present_serial,
@@ -254,7 +284,7 @@ int frame_boot(void) {
            (size_t)shown()->image.row_pitch,
            (size_t)shown()->image.offset,
            shown()->image.dmabuf_fd,
-           (unsigned long long)frame_state.sync_point,
+           (unsigned long long)shown()->acquire_point,
            (unsigned long long)shown()->release_point,
            shown()->release_timeline_id);
     printf("hello init from engine\n");
@@ -278,6 +308,13 @@ int frame_stop(void) {
     }
     chrome_set_buffer_size(0, 0);
 
+    // Unmap first. The GPU idle and the release wait can take the rest
+    // of the shutdown, and the window should already be gone.
+    if (wl != nullptr && wl->is_initialized && !wl->failed &&
+        wayland_detach_buffer(wl) < 0) {
+        fprintf(stderr, "[Engine Error] Buffer detach failed before GPU release wait\n");
+    }
+
     if (vk != nullptr && vk->device != VK_NULL_HANDLE) {
         (void)vkDeviceWaitIdle(vk->device);
         retire_spare(wl, vk);
@@ -287,9 +324,6 @@ int frame_stop(void) {
         fprintf(stderr, "[Engine Error] GPU release poll could not be removed\n");
         release_rc = 1;
     } else if (shown()->release_pending) {
-        if (wl == nullptr || !wl->is_initialized || wayland_detach_buffer(wl) < 0) {
-            fprintf(stderr, "[Engine Error] Buffer detach failed before GPU release wait\n");
-        }
         bool released_now = poll_release_semaphore(vk, shown()->release_semaphore, shown()->release_point);
         bool armed = false;
         if (!released_now &&
@@ -341,6 +375,7 @@ int frame_stop(void) {
         fprintf(stderr, "[Engine Error] %u compositor-held image(s) were left alive\n", left_alive);
     }
 
+    bar_shutdown(wl, vk);
     if (wl != nullptr && wl->is_initialized) {
         wayland_destroy_frame_objects(wl);
         shown()->wl_buffer_id = 0;

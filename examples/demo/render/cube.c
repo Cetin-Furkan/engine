@@ -565,12 +565,22 @@ uint32_t cube_heat_interval(uint32_t slot, uint32_t sim_dt_ms) {
         return 0;
     }
     HeatLive *h = &s_live[slot];
-    if (h->held || sim_dt_ms == 0u) {
+    if (h->held) {
         h->step_dt = 0;
         return 0;
     }
-    h->step_dt = sim_dt_ms;
-    return sim_dt_ms;
+    if (sim_dt_ms == 0u) {
+        return h->step_dt;
+    }
+    // Several timer ticks can land before one present. Keep the sum, and
+    // let the record clear it. A hitch stops at five quanta.
+    uint32_t cap = FRAME_SIM_STEP_MS * FRAME_SIM_MAX_STEPS;
+    uint32_t sum = h->step_dt + sim_dt_ms;
+    if (sum < h->step_dt || sum > cap) {
+        sum = cap;
+    }
+    h->step_dt = sum;
+    return sum;
 }
 
 uint32_t cube_heat_step_dt(uint32_t slot) {
@@ -636,7 +646,7 @@ bool cube_heat_record(VkCommandBuffer cmd, uint32_t slot, float yaw_deg, uint32_
         break;
     }
     h->draw = src;
-    h->step_dt = dt_ms;
+    h->step_dt = 0;
     if (consumed_poke) {
         h->poke_pending = false;
         h->poke_armed = true;

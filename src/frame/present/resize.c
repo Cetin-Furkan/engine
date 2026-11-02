@@ -47,7 +47,7 @@ bool pending_content_size(const WaylandContext *wl, uint32_t *width, uint32_t *h
     if (height != nullptr) {
         *height = h;
     }
-    return w != shown()->image.width || h != shown()->image.height;
+    return w != frame_state.window_w || h != frame_state.window_h;
 }
 
 bool content_size_pending(const ChromeSpec *spec, const WaylandContext *wl) {
@@ -58,7 +58,9 @@ void drop_resize_attempt(WaylandContext *wl, VulkanContext *vk) {
     if (!frame_state.resize_pending) {
         return;
     }
-    chrome_set_buffer_size(frame_state.resize_old_w, frame_state.resize_old_h);
+    if (frame_state.resize_old_w != 0 && frame_state.resize_old_h != 0) {
+        frame_apply_layout(wl, frame_state.resize_old_w, frame_state.resize_old_h, nullptr, nullptr);
+    }
     if (wl != nullptr) {
         wl->buffer_id = frame_state.resize_old_buffer;
     }
@@ -66,6 +68,7 @@ void drop_resize_attempt(WaylandContext *wl, VulkanContext *vk) {
     blank_frame(&frame_state.resize_fresh);
     frame_state.resize_pending = false;
     frame_state.same_repaint = false;
+    bar_drop_unsent(wl, vk);
 }
 
 static int install_resize(WaylandContext *wl, VulkanContext *vk) {
@@ -131,6 +134,7 @@ int finish_idle_send(WaylandContext *wl, VulkanContext *vk,
     int noted = note_idle_send(wl, cqe, serial);
     if (noted < 0) {
         drop_resize_attempt(wl, vk);
+        bar_drop_unsent(wl, vk);
         frame_state.turn_swap_pending = false;
         return noted;
     }
@@ -138,8 +142,11 @@ int finish_idle_send(WaylandContext *wl, VulkanContext *vk,
         return 1;
     }
     if (frame_state.resize_pending) {
-        return install_resize(wl, vk);
+        int installed = install_resize(wl, vk);
+        bar_install();
+        return installed;
     }
+    bar_install();
     commit_turn_swap(wl);
     return 0;
 }
@@ -160,12 +167,19 @@ static int queue_replacement(WaylandContext *wl, VulkanContext *vk, uint32_t wid
         return -1;
     }
 
+    uint32_t old_w = frame_state.window_w;
+    uint32_t old_h = frame_state.window_h;
+    uint32_t content_w = 0;
+    uint32_t content_h = 0;
+    frame_apply_layout(wl, width, height, &content_w, &content_h);
+
     FrameSlot fresh = {
         .image           = { .dmabuf_fd = -1 },
         .release_eventfd = -1,
     };
     const char *tranche_kind = "general";
-    if (alloc_content_image(vk, wl, width, height, &fresh.image, &tranche_kind) != 0) {
+    if (alloc_content_image(vk, wl, content_w, content_h, &fresh.image, &tranche_kind) != 0) {
+        frame_apply_layout(wl, old_w, old_h, nullptr, nullptr);
         return -1;
     }
 
@@ -173,9 +187,17 @@ static int queue_replacement(WaylandContext *wl, VulkanContext *vk, uint32_t wid
     if (record_and_submit_clear(vk, &fresh, frame_state.acquire, next_point, false, 0u) != 0) {
         fresh.acquire_point = 0;
         reap_frame_resources(wl, vk, &fresh);
+        frame_apply_layout(wl, old_w, old_h, nullptr, nullptr);
         return -1;
     }
     frame_state.sync_point = next_point;
+
+    int prepared = bar_prepare(wl, vk, true);
+    if (prepared < 0 && prepared != -EAGAIN) {
+        reap_frame_resources(wl, vk, &fresh);
+        frame_apply_layout(wl, old_w, old_h, nullptr, nullptr);
+        return -1;
+    }
 
     const uint32_t previous_buffer = shown()->wl_buffer_id;
     uint32_t new_buffer = 0;
@@ -191,7 +213,9 @@ static int queue_replacement(WaylandContext *wl, VulkanContext *vk, uint32_t wid
         &new_buffer);
     wl->buffer_id = previous_buffer;
     if (imported < 0) {
+        bar_drop_unsent(wl, vk);
         reap_frame_resources(wl, vk, &fresh);
+        frame_apply_layout(wl, old_w, old_h, nullptr, nullptr);
         return -1;
     }
     fresh.wl_buffer_id = new_buffer;
@@ -201,25 +225,23 @@ static int queue_replacement(WaylandContext *wl, VulkanContext *vk, uint32_t wid
         rel += 1u;
     }
 
-    uint32_t old_w = shown()->image.width;
-    uint32_t old_h = shown()->image.height;
-    chrome_set_buffer_size(fresh.image.width, fresh.image.height);
     int queued = wayland_queue_turn_commit(
         wl,
         new_buffer,
         fresh.image.width,
         fresh.image.height,
         wl->acquire_timeline_id,
-        frame_state.sync_point,
+        fresh.acquire_point,
         shown()->release_timeline_id,
         rel,
         false,
         with_configure,
         serial);
     if (queued != 0) {
-        chrome_set_buffer_size(old_w, old_h);
+        bar_drop_unsent(wl, vk);
         wl->buffer_id = previous_buffer;
         reap_frame_resources(wl, vk, &fresh);
+        frame_apply_layout(wl, old_w, old_h, nullptr, nullptr);
         return -1;
     }
 
@@ -243,5 +265,21 @@ int queue_resize_frame(WaylandContext *wl, VulkanContext *vk) {
 }
 
 int queue_chrome_repaint(WaylandContext *wl, VulkanContext *vk) {
-    return queue_replacement(wl, vk, shown()->image.width, shown()->image.height, false, 0, true);
+    uint32_t top = 0;
+    uint32_t bottom = 0;
+    chrome_band_thickness(&top, &bottom);
+    (void)bottom;
+    uint32_t content_h = frame_state.window_h > top ? frame_state.window_h - top : 1u;
+    if (shown()->image.width != frame_state.window_w || shown()->image.height != content_h ||
+        top != frame_state.bar_px) {
+        return queue_replacement(wl, vk, frame_state.window_w, frame_state.window_h, false, 0, true);
+    }
+    int prepared = bar_prepare(wl, vk, true);
+    if (prepared == 1) {
+        return wayland_queue_bar_commit(wl);
+    }
+    if (prepared == 0) {
+        return -EAGAIN;
+    }
+    return prepared;
 }

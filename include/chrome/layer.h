@@ -57,6 +57,12 @@ void chrome_min_size(uint32_t *width, uint32_t *height);
 void chrome_clamp_size(uint32_t *width, uint32_t *height);
 
 /**
+ * @brief Sum of top-edge and bottom-edge layer thicknesses, in buffer pixels.
+ * A null pointer skips that edge. Empty chrome reports zero.
+ */
+void chrome_band_thickness(uint32_t *top, uint32_t *bottom);
+
+/**
  * @brief One spec layer in buffer pixels, including the controls on it.
  * index walks the spec in paint order. Returns false when that layer is absent
  * or thicker than the buffer. The fragment shader fills these rectangles.

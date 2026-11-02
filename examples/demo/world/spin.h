@@ -3,9 +3,9 @@
 
 #include <stdint.h>
 
-// One revolution on the compositor clock. 72 milli-degrees per millisecond
-// is one turn in 5000 ms. A finite spin rests at rest_milli. An infinite
-// spin wraps. The shown fields are the picture already on screen.
+// One revolution on the 8 ms simulation timer. 72 milli-degrees per
+// millisecond is one turn in 5000 ms. A finite spin rests at rest_milli.
+// An infinite spin wraps. The shown fields are the picture already on screen.
 
 typedef struct Spin {
     int32_t  rest_milli;

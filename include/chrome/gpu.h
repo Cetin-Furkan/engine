@@ -17,10 +17,15 @@ void chrome_gpu_shutdown(VulkanContext *vk);
                                        VkSampleCountFlagBits samples);
 
 // Records one quad per visible layer into the open rendering pass.
-// format is the view format. depth_format and samples select the scene
-// pipelines; zero selects the flat 1-sample pair.
+// window_w/window_h are the layout the spec was measured in. origin is the
+// top-left of this framebuffer inside that window, and fb_w/fb_h are the
+// framebuffer. A layer that misses the framebuffer is skipped. format is
+// the view format. depth_format and samples select the scene pipelines;
+// zero selects the flat 1-sample pair.
 void chrome_gpu_draw(VulkanContext *vk, VkCommandBuffer cmd,
-                     uint32_t width, uint32_t height, VkFormat format,
+                     uint32_t window_w, uint32_t window_h,
+                     int32_t origin_x, int32_t origin_y,
+                     uint32_t fb_w, uint32_t fb_h, VkFormat format,
                      VkFormat depth_format, VkSampleCountFlagBits samples);
 
 #endif /* ENGINE_CHROME_GPU_H */

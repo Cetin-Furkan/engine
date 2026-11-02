@@ -4,6 +4,11 @@
 
 static void destroy_frame_gpu(VulkanContext *vk, FrameSlot *frame);
 static void destroy_wl_buffer_now(WaylandContext *wl, uint32_t buffer_id);
+static void destroy_object_wire(WaylandContext *wl, uint32_t id);
+
+// Shutdown may block in a send. The running loop must not: a second
+// ENG_UD_WL_SEND steals the completion the idle loop is waiting on.
+static bool s_sync_destroy = false;
 static bool slot_has_pixels(const FrameSlot *frame);
 static bool same_release(const FrameSlot *a, const FrameSlot *b);
 static bool release_held_elsewhere(const FrameSlot *frame);
@@ -88,17 +93,29 @@ static void destroy_frame_gpu(VulkanContext *vk, FrameSlot *frame) {
     frame->acquire_point = 0;
 }
 
-static void destroy_wl_buffer_now(WaylandContext *wl, uint32_t buffer_id) {
-    if (wl == nullptr || !wl->is_initialized || wl->failed || buffer_id == 0) {
+static void destroy_object_wire(WaylandContext *wl, uint32_t id) {
+    if (wl == nullptr || !wl->is_initialized || wl->failed || id == 0) {
         return;
     }
-    if (wl->send_len > 0) {
-        (void)wayland_send_batch(wl);
+    bool idle = s_sync_destroy && !wl->send_queued && !wl->noted_send && wl->send_len == 0;
+    if (!idle) {
+        if (!wayland_defer_destroy(wl, id)) {
+            fprintf(stderr, "[Engine Error] Wayland object %u destroy was not queued\n", id);
+        }
+        return;
     }
-    if (!wl->failed && wayland_put_raw(wl, buffer_id, 0u, nullptr, 0u)) {
-        (void)wayland_send_batch(wl);
+    if (!wayland_put_raw(wl, id, 0u, nullptr, 0u)) {
+        (void)wayland_defer_destroy(wl, id);
+        return;
     }
-    if (wl->buffer_id == buffer_id) {
+    if (wayland_send_batch(wl) < 0 && wl->send_len == 0) {
+        (void)wayland_defer_destroy(wl, id);
+    }
+}
+
+static void destroy_wl_buffer_now(WaylandContext *wl, uint32_t buffer_id) {
+    destroy_object_wire(wl, buffer_id);
+    if (wl != nullptr && wl->buffer_id == buffer_id) {
         wl->buffer_id = 0;
     }
 }
@@ -219,12 +236,7 @@ void reap_frame_resources(WaylandContext *wl, VulkanContext *vk, FrameSlot *fram
     if (last_release) {
         if (frame->release_timeline_id != 0 && wl != nullptr && wl->is_initialized && !wl->failed) {
             uint32_t id = frame->release_timeline_id;
-            if (wl->send_len > 0) {
-                (void)wayland_send_batch(wl);
-            }
-            if (!wl->failed && wayland_put_raw(wl, id, 0u, nullptr, 0u)) {
-                (void)wayland_send_batch(wl);
-            }
+            destroy_object_wire(wl, id);
             if (wl->release_timeline_id == id) {
                 wl->release_timeline_id = 0;
             }
@@ -274,6 +286,8 @@ static int insert_orphan(const FrameSlot *src) {
 }
 
 void sweep_ready_orphans(WaylandContext *wl, VulkanContext *vk, bool force_all) {
+    bool previous = s_sync_destroy;
+    s_sync_destroy = force_all;
     uint32_t mask = frame_state.orphan_mask;
     while (mask != 0u) {
         uint32_t i = (uint32_t)__builtin_ctz(mask);
@@ -299,6 +313,7 @@ void sweep_ready_orphans(WaylandContext *wl, VulkanContext *vk, bool force_all) 
             reap_orphan_slot(wl, vk, i);
         }
     }
+    s_sync_destroy = previous;
 }
 
 int make_orphan_room(WaylandContext *wl, VulkanContext *vk) {

@@ -22,8 +22,9 @@ static struct {
     uint32_t enter_serial;
     bool     have_enter;
     uint32_t focus;
-    int32_t  x;
-    int32_t  y;
+    float    x;
+    float    y;
+    uint32_t buttons;
     uint32_t wanted_shape;
     uint32_t last_shape;
     bool     have_last;
@@ -55,6 +56,9 @@ static struct {
     int32_t y;
 } s_spawn[k_spawn_cap];
 static uint32_t s_spawn_n = 0;
+static float    s_drag_dx = 0.0f;
+static float    s_drag_dy = 0.0f;
+static uint32_t s_drag_buttons = 0;
 
 // Presses only. Held slots cover a full workspace bind table plus both
 // shift keys. A press past this cap is dropped; 32 is the whole evdev set
@@ -129,8 +133,26 @@ static void held_clear(void) {
     s_held_n = 0;
 }
 
-static int32_t fixed_to_int(int32_t v) {
-    return v >> 8;
+static float fixed_to_px(int32_t v) {
+    return (float)v / 256.0f;
+}
+
+static int32_t px_floor_i32(float v) {
+    int32_t i = (int32_t)v;
+    return (v < (float)i) ? (i - 1) : i;
+}
+
+static uint32_t button_bit(uint32_t button) {
+    if (button == BTN_LEFT) {
+        return ENG_BUTTON_LEFT;
+    }
+    if (button == BTN_RIGHT) {
+        return ENG_BUTTON_RIGHT;
+    }
+    if (button == BTN_MIDDLE) {
+        return ENG_BUTTON_MIDDLE;
+    }
+    return 0;
 }
 
 static bool take_u32(const unsigned char **p, const unsigned char *end, uint32_t *o) {
@@ -153,7 +175,7 @@ static bool take_i32(const unsigned char **p, const unsigned char *end, int32_t 
 
 static void retarget(WaylandContext *w, bool entering) {
     ChromeHit hit;
-    chrome_hit_test(w, s_ptr.focus, s_ptr.x, s_ptr.y, &hit);
+    chrome_hit_test(w, s_ptr.focus, px_floor_i32(s_ptr.x), px_floor_i32(s_ptr.y), &hit);
     s_ptr.wanted_shape = hit.cursor_shape;
     s_ptr.edge = hit.resize_edge;
     s_ptr.close_hit = hit.close;
@@ -276,8 +298,8 @@ static bool on_pointer(WaylandContext *w, uint16_t opcode,
         s_ptr.enter_serial = serial;
         s_ptr.have_enter = true;
         s_ptr.focus = surface;
-        s_ptr.x = fixed_to_int(fx);
-        s_ptr.y = fixed_to_int(fy);
+        s_ptr.x = fixed_to_px(fx);
+        s_ptr.y = fixed_to_px(fy);
         s_ptr.frame_pending_retarget = true;
         s_ptr.frame_entering = true;
         retarget(w, true);
@@ -286,6 +308,7 @@ static bool on_pointer(WaylandContext *w, uint16_t opcode,
     if (opcode == 1u) {
         // wl_pointer.leave
         s_ptr.focus = 0;
+        s_ptr.buttons = 0;
         s_ptr.cursor_dirty = false;
         s_ptr.frame_pending_retarget = false;
         s_ptr.frame_entering = false;
@@ -306,8 +329,18 @@ static bool on_pointer(WaylandContext *w, uint16_t opcode,
         if (s_ptr.focus == 0) {
             return true;
         }
-        s_ptr.x = fixed_to_int(fx);
-        s_ptr.y = fixed_to_int(fy);
+        float nx = fixed_to_px(fx);
+        float ny = fixed_to_px(fy);
+        float dx = nx - s_ptr.x;
+        float dy = ny - s_ptr.y;
+        uint32_t drag = s_ptr.buttons & (ENG_BUTTON_RIGHT | ENG_BUTTON_MIDDLE);
+        if (s_ptr.focus == w->surface_id && drag != 0 && (dx != 0.0f || dy != 0.0f)) {
+            s_drag_dx += dx;
+            s_drag_dy += dy;
+            s_drag_buttons |= drag;
+        }
+        s_ptr.x = nx;
+        s_ptr.y = ny;
         s_ptr.frame_pending_retarget = true;
         retarget(w, false);
         return true;
@@ -321,6 +354,14 @@ static bool on_pointer(WaylandContext *w, uint16_t opcode,
             return true;
         }
         (void)time_ms;
+        uint32_t bit = button_bit(button);
+        if (bit != 0) {
+            if (state == 1u) {
+                s_ptr.buttons |= bit;
+            } else {
+                s_ptr.buttons &= ~bit;
+            }
+        }
         if (state == 1u && button == BTN_LEFT) {
             if (s_ptr.frame_pending_retarget && s_ptr.focus != 0) {
                 retarget(w, s_ptr.frame_entering);
@@ -342,8 +383,8 @@ static bool on_pointer(WaylandContext *w, uint16_t opcode,
                 s_ptr.move_pending = true;
                 s_ptr.move_serial = serial;
             } else if (s_ptr.focus == w->surface_id && s_spawn_n < k_spawn_cap) {
-                s_spawn[s_spawn_n].x = s_ptr.x;
-                s_spawn[s_spawn_n].y = s_ptr.y;
+                s_spawn[s_spawn_n].x = px_floor_i32(s_ptr.x);
+                s_spawn[s_spawn_n].y = px_floor_i32(s_ptr.y);
                 s_spawn_n++;
             }
         }
@@ -362,7 +403,8 @@ static bool on_pointer(WaylandContext *w, uint16_t opcode,
             return true;
         }
         (void)time_ms;
-        if (axis == 0u && s_ptr.focus != 0) {
+        // The bar is its own surface. A wheel there must not zoom the scene.
+        if (axis == 0u && s_ptr.focus == w->surface_id) {
             s_scroll += (double)value / 256.0;
         }
         return true;
@@ -504,7 +546,10 @@ static bool on_keyboard(WaylandContext *w, uint16_t opcode,
             return true;
         }
         (void)serial;
-        s_key_focus = surface != 0 && surface == w->surface_id;
+        // Accept keyboard focus on both the scene surface and the bar subsurface.
+        s_key_focus = surface != 0 &&
+                      (surface == w->surface_id ||
+                       (w->bar_surface_id != 0 && surface == w->bar_surface_id));
         held_clear();
         reset_xkb_state();
         return true;
@@ -738,6 +783,8 @@ int pointer_encode(WaylandContext *w) {
     }
     uint32_t send_mark = w->send_len;
     bool any = false;
+    bool sent_resize = false;
+    bool sent_move   = false;
     if (s_ptr.cursor_dirty && s_ptr.have_enter && s_ptr.focus != 0) {
         bool wrote = false;
         if (w->cursor_shape_device_id != 0) {
@@ -767,7 +814,7 @@ int pointer_encode(WaylandContext *w) {
             s_ptr.cursor_inflight = false;
             return -EIO;
         }
-        s_ptr.resize_pending = false;
+        sent_resize = true;
         any = true;
     }
     if (s_ptr.move_pending && w->xdg_toplevel_id != 0 && w->seat_id != 0) {
@@ -778,8 +825,14 @@ int pointer_encode(WaylandContext *w) {
             s_ptr.cursor_inflight = false;
             return -EIO;
         }
-        s_ptr.move_pending = false;
+        sent_move = true;
         any = true;
+    }
+    if (sent_resize) {
+        s_ptr.resize_pending = false;
+    }
+    if (sent_move) {
+        s_ptr.move_pending = false;
     }
     return any ? 1 : 0;
 }
@@ -795,6 +848,22 @@ void pointer_on_send_done(bool ok) {
         }
         s_ptr.cursor_inflight = false;
     }
+}
+
+bool pointer_take_drag(float *dx, float *dy, uint32_t *buttons) {
+    if (dx == nullptr || dy == nullptr || buttons == nullptr) {
+        return false;
+    }
+    if (s_drag_dx == 0.0f && s_drag_dy == 0.0f) {
+        return false;
+    }
+    *dx = s_drag_dx;
+    *dy = s_drag_dy;
+    *buttons = s_drag_buttons;
+    s_drag_dx = 0.0f;
+    s_drag_dy = 0.0f;
+    s_drag_buttons = 0;
+    return true;
 }
 
 bool pointer_take_spawn(int32_t *x, int32_t *y) {
@@ -835,8 +904,14 @@ bool pointer_client_xy(int32_t *x, int32_t *y) {
     if (x == nullptr || y == nullptr || s_ptr.focus == 0) {
         return false;
     }
-    *x = s_ptr.x;
-    *y = s_ptr.y;
+    const WaylandContext *w = wayland_get_context();
+    int32_t px = px_floor_i32(s_ptr.x);
+    int32_t py = px_floor_i32(s_ptr.y);
+    if (w != nullptr && w->bar_surface_id != 0 && s_ptr.focus == w->bar_surface_id) {
+        py -= (int32_t)w->bar_px;
+    }
+    *x = px;
+    *y = py;
     return true;
 }
 
@@ -907,7 +982,7 @@ int pointer_flush(WaylandContext *w) {
 }
 
 void pointer_shutdown(WaylandContext *w) {
-    if (w != nullptr && w->is_initialized && !w->failed) {
+    if (w != nullptr && w->is_initialized && !w->failed && !w->send_queued && !w->noted_send) {
         if (w->send_len > 0) {
             (void)wayland_send_batch(w);
         }
@@ -951,6 +1026,10 @@ void pointer_shutdown(WaylandContext *w) {
     s_ptr.move_pending = false;
     s_ptr.have_enter = false;
     s_ptr.focus = 0;
+    s_ptr.buttons = 0;
+    s_drag_dx = 0.0f;
+    s_drag_dy = 0.0f;
+    s_drag_buttons = 0;
     s_spawn_n = 0;
     s_key_n = 0;
     s_key_focus = false;

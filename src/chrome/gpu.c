@@ -208,9 +208,12 @@ static VkPipeline pick_pipeline(VkFormat format, VkFormat depth_format,
 }
 
 void chrome_gpu_draw(VulkanContext *vk, VkCommandBuffer cmd,
-                     uint32_t width, uint32_t height, VkFormat format,
+                     uint32_t window_w, uint32_t window_h,
+                     int32_t origin_x, int32_t origin_y,
+                     uint32_t fb_w, uint32_t fb_h, VkFormat format,
                      VkFormat depth_format, VkSampleCountFlagBits samples) {
-    if (vk == nullptr || cmd == VK_NULL_HANDLE || width == 0 || height == 0) {
+    if (vk == nullptr || cmd == VK_NULL_HANDLE || window_w == 0 || window_h == 0 ||
+        fb_w == 0 || fb_h == 0) {
         return;
     }
     VkPipeline pipeline = pick_pipeline(format, depth_format, samples);
@@ -222,24 +225,31 @@ void chrome_gpu_draw(VulkanContext *vk, VkCommandBuffer cmd,
     uint32_t drawn = 0;
     for (uint32_t i = 0; i < ENG_CHROME_LAYERS; ++i) {
         ChromePaintLayer layer;
-        if (!chrome_paint_layer(width, height, i, &layer)) {
+        if (!chrome_paint_layer(window_w, window_h, i, &layer)) {
+            continue;
+        }
+        if (layer.w <= 0 || layer.h <= 0) {
+            continue;
+        }
+        if (layer.x + layer.w <= origin_x || layer.y + layer.h <= origin_y ||
+            layer.x >= origin_x + (int32_t)fb_w || layer.y >= origin_y + (int32_t)fb_h) {
             continue;
         }
         ChromeGpuPush push = {
-            .rect_x      = layer.x,
-            .rect_y      = layer.y,
+            .rect_x      = layer.x - origin_x,
+            .rect_y      = layer.y - origin_y,
             .rect_w      = layer.w,
             .rect_h      = layer.h,
-            .fb_w        = width,
-            .fb_h        = height,
+            .fb_w        = fb_w,
+            .fb_h        = fb_h,
             .layer_color = pack_rgb(layer.r, layer.g, layer.b, 0),
             .ncontrols   = layer.ncontrols,
             .srgb        = (format == VK_FORMAT_B8G8R8A8_SRGB) ? 1u : 0u,
         };
         for (uint32_t c = 0; c < layer.ncontrols && c < ENG_CHROME_CONTROLS; ++c) {
             const ChromePaintControl *ctl = &layer.controls[c];
-            push.ctl[c].x = ctl->x;
-            push.ctl[c].y = ctl->y;
+            push.ctl[c].x = ctl->x - origin_x;
+            push.ctl[c].y = ctl->y - origin_y;
             push.ctl[c].w = ctl->w;
             push.ctl[c].h = ctl->h;
             push.ctl[c].color = pack_rgb(ctl->r, ctl->g, ctl->b, ctl->draw_glyph ? 1u : 0u);
@@ -251,10 +261,10 @@ void chrome_gpu_draw(VulkanContext *vk, VkCommandBuffer cmd,
         vkCmdDraw(cmd, 6, 1, 0, 0);
         drawn++;
     }
-    if (drawn > 0 && (width != s_logged_w || height != s_logged_h)) {
+    if (drawn > 0 && (fb_w != s_logged_w || fb_h != s_logged_h)) {
         printf("[Chrome] GPU bar and X into %ux%u (%u layer%s)\n",
-               width, height, drawn, drawn == 1u ? "" : "s");
-        s_logged_w = width;
-        s_logged_h = height;
+               fb_w, fb_h, drawn, drawn == 1u ? "" : "s");
+        s_logged_w = fb_w;
+        s_logged_h = fb_h;
     }
 }

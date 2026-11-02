@@ -11,7 +11,8 @@
 # at thickness pixels for the whole drag. The band is ignored while resize
 # is off, and it is still required so turning resize on does not invent a width.
 #
-# Layers are drawn by a fragment shader into the Vulkan dma-buf, bottom to top. There is no wl_shm bar.
+# The top bar is its own Vulkan dma-buf on a desynced wl_subsurface. The scene
+# buffer is the window under that bar. A fragment shader fills the bar. There is no wl_shm bar.
 # thickness is the layer's cross size in buffer pixels. span = full means the window width.
 # A later top layer sits under the one before it. A later bottom layer sits above the one before it.
 # A control's span is its width along the bar. Its height is the layer thickness.

@@ -14,7 +14,28 @@ enum : uint32_t {
     ENG_ID_FREE             = 64,
     ENG_WL_MAX_MODIFIERS    = 64,
     ENG_WL_MAX_INDICES      = 512,
+    ENG_WL_DESTROY_LATER    = 16,
     ENG_DRM_FORMAT_ARGB8888 = 0x34325241u,
+};
+
+// xdg_toplevel state values, one bit each. Tiled is any of the four edges.
+enum : uint32_t {
+    ENG_TOP_MAXIMIZED    = 1u << 1,
+    ENG_TOP_FULLSCREEN   = 1u << 2,
+    ENG_TOP_RESIZING     = 1u << 3,
+    ENG_TOP_ACTIVATED    = 1u << 4,
+    ENG_TOP_TILED_LEFT   = 1u << 5,
+    ENG_TOP_TILED_RIGHT  = 1u << 6,
+    ENG_TOP_TILED_TOP    = 1u << 7,
+    ENG_TOP_TILED_BOTTOM = 1u << 8,
+    ENG_TOP_SUSPENDED    = 1u << 9,
+};
+
+// zxdg_toplevel_decoration_v1.mode. Client-side is 1. Server-side is 2.
+enum : uint32_t {
+    ENG_DECOR_NONE   = 0,
+    ENG_DECOR_CLIENT = 1,
+    ENG_DECOR_SERVER = 2,
 };
 
 typedef struct WaylandGlobal {
@@ -60,6 +81,10 @@ typedef struct WaylandContext {
     uint32_t cursor_shape_version;
     uint32_t viewporter_global_name;
     uint32_t viewporter_version;
+    uint32_t subcompositor_global_name;
+    uint32_t subcompositor_version;
+    uint32_t decoration_global_name;
+    uint32_t decoration_version;
 
     // Bound global object IDs
     uint32_t compositor_id;
@@ -75,14 +100,34 @@ typedef struct WaylandContext {
     uint32_t cursor_shape_bound_version;
     uint32_t viewporter_id;
     uint32_t viewport_id;
+    uint32_t subcompositor_id;
+    uint32_t decoration_manager_id;
     uint32_t pointer_id;
     uint32_t keyboard_id;
     uint32_t cursor_shape_device_id;
     uint32_t seat_capabilities;
     bool     shm_argb8888;
     bool     configure_resizing;
+    // xdg_toplevel.configure states. ENG_TOP_* bits. Empty means floating.
+    uint32_t toplevel_states;
     bool     noted_signal;
     int      noted_signal_res;
+    // Completions a blocking io_uring wait took off the ring. The idle loop
+    // applies them. They are not handled inside the wait, because that wait
+    // can be in the middle of a send buffer.
+    bool     noted_timer;
+    bool     noted_inotify;
+    int      noted_inotify_res;
+    bool     noted_sim;
+    int      noted_sim_res;
+    bool     noted_send;
+    int      noted_send_res;
+    // True from the moment an ENG_UD_WL_SEND SQE is queued until its CQE is seen.
+    // A second send over the same buffer is refused while this is set.
+    bool     send_queued;
+    bool     buffers_detached;
+    uint32_t destroy_later[ENG_WL_DESTROY_LATER];
+    uint32_t destroy_later_n;
     bool     send_tracks_ack;
     bool     lock_toplevel_size;
     int32_t  lock_width;
@@ -96,12 +141,45 @@ typedef struct WaylandContext {
 
     // Active window, feedback, buffer, and frame callback object IDs
     uint32_t surface_id;
+    uint32_t bar_surface_id;
+    uint32_t bar_subsurface_id;
+    uint32_t bar_sync_id;
+    // Top band in window pixels. The scene surface's pointer y is short by this.
+    uint32_t bar_px;
+    // Window geometry in the scene surface's coordinate space. y is negative
+    // when the bar subsurface sits above the scene buffer. Zero width means
+    // "use the buffer size at 0,0" (no bar yet).
+    int32_t  geom_x;
+    int32_t  geom_y;
+    uint32_t geom_w;
+    uint32_t geom_h;
+    // Included in the next scene commit, or sent alone by wayland_queue_bar_commit.
+    uint32_t bar_attach_buffer;
+    uint32_t bar_attach_w;
+    uint32_t bar_attach_h;
+    uint32_t bar_attach_acquire_tl;
+    uint64_t bar_attach_acquire_pt;
+    uint32_t bar_attach_release_tl;
+    uint64_t bar_attach_release_pt;
     uint32_t xdg_surface_id;
     uint32_t xdg_toplevel_id;
     uint32_t feedback_id;
     uint32_t buffer_params_id;
     uint32_t buffer_id;
     uint32_t frame_cb_id;
+    // zxdg_toplevel_decoration_v1. Mode stays NONE until the configure event.
+    uint32_t decoration_id;
+    uint32_t decoration_mode;
+    bool     decoration_configured;
+    bool     decoration_server_noted;
+    // Live wl_region objects. Zero means the next commit creates one.
+    // A later commit reuses the object while the pixel size is unchanged.
+    uint32_t scene_opaque_id;
+    uint32_t scene_opaque_w;
+    uint32_t scene_opaque_h;
+    uint32_t bar_opaque_id;
+    uint32_t bar_opaque_w;
+    uint32_t bar_opaque_h;
 
     // Toplevel & xdg_surface configure state
     uint32_t configure_width;
@@ -328,6 +406,15 @@ void wayland_rewind_send(WaylandContext *w, uint32_t mark);
 
 [[nodiscard]] int wayland_send_batch(WaylandContext *w);
 
+// Remembers an opcode-0 destroy until the send buffer is idle.
+// False when the list is full.
+bool wayland_defer_destroy(WaylandContext *w, uint32_t id);
+
+// Encodes every deferred destroy and queues one ENG_UD_WL_SEND.
+// 1 when that send was queued, 0 when nothing is waiting,
+// -EBUSY when a send already owns the buffer.
+[[nodiscard]] int wayland_queue_destroys(WaylandContext *w);
+
 /**
  * @brief Appends a wl_display.sync and waits for it. fd_to_send is SCM_RIGHTS, or -1.
  */
@@ -349,6 +436,33 @@ void wayland_rewind_send(WaylandContext *w, uint32_t mark);
  * Returns -EBUSY when a send is already buffered, -EALREADY when a callback
  * is already armed, and 0 after the bytes are queued as ENG_UD_WL_SEND.
  */
+/**
+ * @brief Remembers the window geometry. The scene buffer is smaller than this
+ * when a bar subsurface sits outside it. y may be negative.
+ */
+void wayland_set_window_geom(WaylandContext *w, int32_t x, int32_t y,
+                             uint32_t width, uint32_t height);
+
+/**
+ * @brief Creates the top-bar wl_surface, a desynced wl_subsurface at (x, y),
+ * and its explicit-sync object. The parent surface must already exist.
+ */
+[[nodiscard]] int wayland_create_bar(WaylandContext *w, int32_t x, int32_t y);
+
+/**
+ * @brief Arms one bar-surface attach. The next scene commit includes it, or
+ * wayland_queue_bar_commit sends it alone. Zero buffer clears the arm.
+ */
+void wayland_arm_bar(WaylandContext *w, uint32_t buffer, uint32_t width, uint32_t height,
+                     uint32_t acquire_timeline, uint64_t acquire_point,
+                     uint32_t release_timeline, uint64_t release_point);
+
+/**
+ * @brief Queues the armed bar attach and commit. Does not touch the scene surface
+ * and does not arm a frame callback. Returns -EAGAIN when nothing is armed.
+ */
+[[nodiscard]] int wayland_queue_bar_commit(WaylandContext *w);
+
 [[nodiscard]] int wayland_queue_turn_commit(
     WaylandContext *w,
     uint32_t        buffer_id,

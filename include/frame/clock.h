@@ -3,19 +3,16 @@
 
 #include <stdint.h>
 
-// Compositor-clock frame pacer. One 64-byte cache-line cell holds the
-// whole pacing state (the stateful-cell idea: state that is always read
-// together should live together, in one line, not scattered across the
-// frame state). Pure logic, no io_uring, no Vulkan: unit-tested.
+// Present pacing and the simulation cursor share this 64-byte cell.
+// Pure logic, no io_uring, no Vulkan: unit-tested.
 //
-// The compositor's wl_surface.frame timestamp is the only clock that
-// matters for animation. This cell learns the refresh period from those
-// stamps, clamps pathological gaps, counts missed refreshes, and tells
-// the turn when a stamp is a duplicate that must not paint again.
+// A wl_surface.frame stamp teaches the refresh period and the stall
+// watchdog. It does not advance the simulation. frame_clock_issue does
+// that from the 8 ms timer. Pose and the solver both integrate the
+// issued total. A hitch past the cap is dropped, not replayed.
 
-// One simulation quantum. The turn issues at most FRAME_SIM_MAX_STEPS of
-// these per compositor stamp. Pose and solver both integrate that total.
-// A hitch past the cap is dropped, not replayed.
+// One simulation quantum. The timer issues at most FRAME_SIM_MAX_STEPS
+// of these per wake.
 enum : uint32_t {
     FRAME_SIM_STEP_MS   = 8u,
     FRAME_SIM_MAX_STEPS = 5u,
@@ -46,8 +43,8 @@ static_assert(sizeof(FrameClock) == 64, "frame clock is one cache line");
 
 void frame_clock_reset(FrameClock *clock);
 
-// Fold one compositor stamp in. The returned step drives the turn:
-// paint decides whether a new image is recorded this callback.
+// Fold one compositor stamp in. paint is false for a duplicate. The
+// simulation cursor does not move here.
 FrameStep frame_clock_step(FrameClock *clock, uint32_t stamp_ms);
 
 // Learned refresh period in whole ms (0 before the second stamp).
@@ -75,10 +72,10 @@ uint32_t frame_clock_fixed_steps(FrameClock *clock, uint32_t dt_ms,
 // Simulation cursor. It moves only when frame_clock_issue accepts time.
 uint32_t frame_clock_sim_stamp(const FrameClock *clock);
 
-// Consume dt_ms as FRAME_SIM_STEP_MS quanta, at most FRAME_SIM_MAX_STEPS.
-// Writes the absolute sim stamps for those quanta, ending on the new
-// cursor, and returns the count. A null out_stamps still advances the cursor.
-// The stamps are not compositor sub-stamps: dropped debt is not in them.
+// Consume dt_ms from the simulation timer as FRAME_SIM_STEP_MS quanta,
+// at most FRAME_SIM_MAX_STEPS. Writes the absolute sim stamps for those
+// quanta, ending on the new cursor, and returns the count. A null
+// out_stamps still advances the cursor. Dropped debt is not in the stamps.
 uint32_t frame_clock_issue(FrameClock *clock, uint32_t dt_ms, uint32_t *out_stamps);
 
 #endif /* ENGINE_FRAME_CLOCK_H */

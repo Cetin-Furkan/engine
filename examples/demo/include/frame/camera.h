@@ -16,8 +16,9 @@ static const float k_camera_zoom_max = 10000.0f;
 // plane keeps a stable up and a positive pitch looks up. Zoom multiplies
 // by an exponential of the key axis. Move follows the camera's right and up,
 // depth included, so an arrow stays on the screen axis. The step is
-// scaled by 1/zoom. The clock is the wl_surface.frame stamp. Nothing
-// here starts the cube's revolution.
+// scaled by 1/zoom. The simulation cursor moves the pose. A frame stamp
+// does not. Nothing here starts the cube's revolution. Right-drag orbits
+// and middle-drag pans.
 
 typedef struct ViewPush {
     uint64_t materials;
@@ -76,6 +77,11 @@ bool camera_view_front(void);
 // One wheel notch is about one step. Positive steps zoom in.
 // Refused when zoom is not permitted. True when the zoom changed.
 bool camera_zoom_steps(float steps);
+
+// Right-drag orbits. Middle-drag pans. dx is surface pixels to the right,
+// dy is surface pixels down. buttons is ENG_BUTTON_RIGHT, ENG_BUTTON_MIDDLE,
+// or both. True when the pose changed.
+bool camera_pointer_drag(float dx, float dy, uint32_t buttons);
 
 // Shown zoom. Clicks use this so a grab stays a few screen pixels.
 float camera_zoom_shown(void);

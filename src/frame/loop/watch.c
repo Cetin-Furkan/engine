@@ -154,6 +154,14 @@ void engine_reload_cqe(const struct io_uring_cqe *cqe, void *user) {
         note_inotify_cqe(ring_get_context(), cqe->res, frame_state.relay->inotify_armed);
         return;
     }
+    // The simulation timer and the frame watchdog share this ring. Running
+    // either inside a file-load wait would encode Wayland mid-batch.
+    if (cqe->user_data == ENG_UD_SIM_TIMER || cqe->user_data == ENG_UD_FRAME_TIMER) {
+        if (wl != nullptr) {
+            wayland_on_cqe(wl, cqe);
+        }
+        return;
+    }
     if (wl != nullptr) {
         wayland_on_cqe(wl, cqe);
     }

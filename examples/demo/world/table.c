@@ -362,7 +362,7 @@ bool table_record_poke_pending(void) {
     return false;
 }
 
-bool table_simulate(uint32_t time_ms, uint32_t *heat_dt) {
+bool table_simulate(uint32_t time_ms, uint32_t sim_dt_ms, uint32_t *heat_dt) {
     bool pulse = false;
     uint32_t dt = 0;
     for (int i = 0; i < s_n; ++i) {
@@ -371,7 +371,7 @@ bool table_simulate(uint32_t time_ms, uint32_t *heat_dt) {
             continue;
         }
         uint32_t one = 0;
-        if (o->ops->simulate(o, time_ms, &one)) {
+        if (o->ops->simulate(o, time_ms, sim_dt_ms, &one)) {
             pulse = true;
         }
         if (one > dt) {

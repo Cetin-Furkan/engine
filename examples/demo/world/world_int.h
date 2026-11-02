@@ -39,10 +39,10 @@ typedef struct WorldOps {
     uint64_t (*record_published)(const WorldObj *o);
     bool (*record_step_open)(const WorldObj *o);
     bool (*record_poke_pending)(const WorldObj *o);
-    // Compositor stamp. True while this object wants another frame.
-    // heat_dt is the interval a submit records. hold freezes the field.
-    // commit moves the stamp baseline after that submit lands.
-    bool (*simulate)(WorldObj *o, uint32_t time_ms, uint32_t *heat_dt);
+    // time_ms is the compositor stamp. sim_dt_ms is the issued interval.
+    // True while this object wants another frame. heat_dt is the part of
+    // that interval this object will record. hold freezes the field.
+    bool (*simulate)(WorldObj *o, uint32_t time_ms, uint32_t sim_dt_ms, uint32_t *heat_dt);
     void (*simulate_hold)(WorldObj *o);
     void (*simulate_commit)(WorldObj *o, uint32_t stamp, uint32_t heat_dt);
     // R and G reach this object when the selection does not handle them.
@@ -101,7 +101,7 @@ void table_record_abort(void);
 uint64_t table_record_published(void);
 bool table_record_step_open(void);
 bool table_record_poke_pending(void);
-bool table_simulate(uint32_t time_ms, uint32_t *heat_dt);
+bool table_simulate(uint32_t time_ms, uint32_t sim_dt_ms, uint32_t *heat_dt);
 void table_simulate_hold(void);
 void table_simulate_commit(uint32_t stamp, uint32_t heat_dt);
 WorldObj *table_fallback(void);

@@ -289,9 +289,8 @@ int frame_run(void) {
             break;
         }
 
-        // Frame watchdog / simulation tick: while a turn is active, an absolute
-        // timeout completes to advance simulation (every 8ms when busy) or detect
-        // compositor stalls when idle.
+        // Watchdog only. The timeout re-arms a stalled wl_surface.frame.
+        // It does not step the pose or the solver. Those move in turn_step.
         if (frame_state.turn_phase == k_turn_run && !frame_state.timer_armed && !send_in_flight) {
             uint64_t deadline = ring_mono_ns() +
                 (uint64_t)frame_clock_stall_after_ms(&frame_state.clock) * 1000000ull;

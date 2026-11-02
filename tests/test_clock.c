@@ -63,6 +63,26 @@ int main(void) {
     CHECK(fixed.sim_steps == 8);
     CHECK(frame_clock_fixed_steps(&fixed, 16, 0, 5) == 0);
 
+    // Issued stamps are the sim cursor, 8 ms apart, and a 100 ms hitch
+    // stops at 40 ms. The debt is not appended to the last stamp.
+    CHECK(FRAME_SIM_STEP_MS == 8u);
+    CHECK(FRAME_SIM_MAX_STEPS == 5u);
+    FrameClock issued;
+    frame_clock_reset(&issued);
+    uint32_t stamps[FRAME_SIM_MAX_STEPS] = {0};
+    CHECK(frame_clock_issue(&issued, 16u, stamps) == 2u);
+    CHECK(stamps[0] == 8u && stamps[1] == 16u);
+    CHECK(frame_clock_sim_stamp(&issued) == 16u);
+    CHECK(frame_clock_issue(&issued, 4u, stamps) == 0u);
+    CHECK(frame_clock_sim_stamp(&issued) == 16u);
+    CHECK(frame_clock_issue(&issued, 4u, stamps) == 1u);
+    CHECK(stamps[0] == 24u);
+    CHECK(frame_clock_sim_stamp(&issued) == 24u);
+    CHECK(frame_clock_issue(&issued, 100u, stamps) == 5u);
+    CHECK(stamps[0] == 32u && stamps[4] == 64u);
+    CHECK(frame_clock_sim_stamp(&issued) == 64u);
+    CHECK(issued.accum_ms == 0u);
+
     // Stall decision: no stamp yet is stalled; a stamp older than two
     // stall windows (2 * 48 ms at 16 ms period) is stalled; fresher is not.
     FrameClock pacing;

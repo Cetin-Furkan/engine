@@ -121,21 +121,22 @@ int turn_step(WaylandContext *wl, VulkanContext *vk, bool *queued) {
         }
         return q;
     }
+    // The compositor stamp paces the callback. Integration uses the sim
+    // cursor: at most five 8 ms steps, and a hitch past that is dropped
+    // for the pose and the solver together. The stamps are not a
+    // subdivision of the wall stamp, so an absolute integrator cannot
+    // catch the debt back up on the last call.
+    uint32_t sim_stamps[FRAME_SIM_MAX_STEPS];
+    uint32_t steps = frame_clock_issue(&frame_state.clock, step.dt_ms, sim_stamps);
+    step.sim_dt_ms = steps * FRAME_SIM_STEP_MS;
     uint32_t heat_dt = 0;
     bool pulse = engine_app()->simulation(stamp, &step, &heat_dt);
-    // Fixed-timestep simulation: 8 ms steps (125 Hz) consumed from the
-    // clock's accumulator, at most 5 per callback. Poses are evaluated
-    // at synthetic sub-stamps ending exactly on the compositor stamp,
-    // so the hosted app keeps its absolute-stamp math while the engine
-    // owns step size, clamping, and overload behaviour.
     bool changed = false;
-    uint32_t steps = frame_clock_fixed_steps(&frame_state.clock, step.dt_ms, 8u, 5u);
-    if (step.first || steps == 0) {
-        changed = engine_app()->advance(stamp, &step);
+    if (step.first) {
+        changed = engine_app()->advance(frame_clock_sim_stamp(&frame_state.clock), &step);
     } else {
         for (uint32_t i = 0; i < steps; ++i) {
-            uint32_t sub = stamp - (steps - 1u - i) * 8u;
-            if (engine_app()->advance(sub, &step)) {
+            if (engine_app()->advance(sim_stamps[i], &step)) {
                 changed = true;
             }
         }

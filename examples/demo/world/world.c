@@ -45,8 +45,8 @@ bool world_record_poke_pending(void) {
     return table_record_poke_pending();
 }
 
-bool world_simulation(uint32_t time_ms, uint32_t *heat_dt) {
-    return table_simulate(time_ms, heat_dt);
+bool world_simulation(uint32_t time_ms, uint32_t sim_dt_ms, uint32_t *heat_dt) {
+    return table_simulate(time_ms, sim_dt_ms, heat_dt);
 }
 
 void world_simulation_hold(void) {

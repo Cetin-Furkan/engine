@@ -173,9 +173,10 @@ static bool fake_poke(const WorldObj *o) {
     (void)o;
     return true;
 }
-static bool fake_sim(WorldObj *o, uint32_t time_ms, uint32_t *heat_dt) {
+static bool fake_sim(WorldObj *o, uint32_t time_ms, uint32_t sim_dt_ms, uint32_t *heat_dt) {
     (void)o;
     (void)time_ms;
+    (void)sim_dt_ms;
     if (heat_dt != nullptr) {
         *heat_dt = 7u;
     }
@@ -210,7 +211,7 @@ static const WorldOps k_ops_low = { .record_published = fake_published_low };
 static void test_table_compute(void) {
     table_reset();
     uint32_t dt = 99u;
-    CHECK(!table_simulate(1u, &dt));
+    CHECK(!table_simulate(1u, 0u, &dt));
     CHECK(dt == 0u);
     CHECK(table_record_published() == 0u);
     CHECK(!table_record_step_open());
@@ -231,7 +232,7 @@ static void test_table_compute(void) {
     table_record_abort();
     CHECK(s_aborts == 1);
     dt = 0u;
-    CHECK(table_simulate(10u, &dt));
+    CHECK(table_simulate(10u, 8u, &dt));
     CHECK(dt == 7u);
     table_simulate_hold();
     CHECK(s_holds == 1);

@@ -118,6 +118,9 @@ typedef struct EngineApp {
 
     // Compositor-clock turn: simulation/advance decide whether a new
     // frame is painted; commit folds the landed frame into shown state.
+    // time_ms on simulation is the compositor stamp (pulse windows).
+    // step->sim_dt_ms is the only interval the solver may integrate.
+    // time_ms on advance is the simulation cursor, not the wall stamp.
     bool (*simulation)(uint32_t time_ms, const FrameStep *step, uint32_t *heat_dt);
     void (*simulation_hold)(void);
     void (*simulation_commit)(uint32_t time_ms, uint32_t heat_dt);

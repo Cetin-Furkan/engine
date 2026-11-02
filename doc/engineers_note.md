@@ -22,7 +22,7 @@
 - Automatically updates `VERSION`, generates Git tag `vX.Y.Z`, and produces the release binary.
 
 ### 3. Git Isolation & `.gitignore`
-- Dedicated repository initialized inside `projects/antigravity/engine/` on branch `main`.
+- The workspace is `engine-v2` on branch `main`. The remote is `git@github.com:Cetin-Furkan/engine.git`.
 - Clean `.gitignore` ignores `build/`, `.dependencies/`, object files, and IDE artifacts.
 
 ## Runtime Contract

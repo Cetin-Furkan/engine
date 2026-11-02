@@ -43,7 +43,7 @@ static void cube_record_abort(WorldObj *o);
 static uint64_t cube_record_published(const WorldObj *o);
 static bool cube_record_step_open(const WorldObj *o);
 static bool cube_record_poke_pending(const WorldObj *o);
-static bool cube_simulate(WorldObj *o, uint32_t time_ms, uint32_t *heat_dt);
+static bool cube_simulate(WorldObj *o, uint32_t time_ms, uint32_t sim_dt_ms, uint32_t *heat_dt);
 static void cube_simulate_hold(WorldObj *o);
 static void cube_simulate_commit(WorldObj *o, uint32_t stamp, uint32_t heat_dt);
 
@@ -349,15 +349,20 @@ static void cube_kind_self_check(void) {
 }
 
 static void cube_record_compute(WorldObj *o, VkCommandBuffer cmd, uint32_t heat_dt, bool live) {
-    (void)heat_dt;
     const CubeData *c = o->data;
     if (c == nullptr) {
         return;
     }
-    if (!cube_heat_record(cmd, c->heat, spin_deg(&c->spin, live))) {
+    // heat_dt is the interval the table was given. This slot never
+    // integrates more than that, and a held slot stays at zero.
+    uint32_t dt = cube_heat_step_dt(c->heat);
+    if (dt > heat_dt) {
+        dt = heat_dt;
+    }
+    if (!cube_heat_record(cmd, c->heat, spin_deg(&c->spin, live), dt)) {
         return;
     }
-    grid_record(cmd, cube_heat_step_dt(c->heat));
+    grid_record(cmd, dt);
 }
 
 static void cube_record_ok(WorldObj *o, uint64_t signal_point) {
@@ -399,7 +404,7 @@ static bool cube_record_poke_pending(const WorldObj *o) {
     return cube_heat_slot_pending(c->heat);
 }
 
-static bool cube_simulate(WorldObj *o, uint32_t time_ms, uint32_t *heat_dt) {
+static bool cube_simulate(WorldObj *o, uint32_t time_ms, uint32_t sim_dt_ms, uint32_t *heat_dt) {
     CubeData *c = o->data;
     if (c == nullptr) {
         if (heat_dt != nullptr) {
@@ -417,7 +422,7 @@ static bool cube_simulate(WorldObj *o, uint32_t time_ms, uint32_t *heat_dt) {
     } else if (pulse) {
         grid_wake();
     }
-    uint32_t one = cube_heat_interval(c->heat, time_ms);
+    uint32_t one = cube_heat_interval(c->heat, sim_dt_ms);
     if (heat_dt != nullptr) {
         *heat_dt = one;
     }
@@ -434,12 +439,10 @@ static void cube_simulate_hold(WorldObj *o) {
 }
 
 static void cube_simulate_commit(WorldObj *o, uint32_t stamp, uint32_t heat_dt) {
+    // The issued interval was stored in simulate. There is no private stamp.
+    (void)o;
+    (void)stamp;
     (void)heat_dt;
-    CubeData *c = o->data;
-    if (c == nullptr) {
-        return;
-    }
-    cube_heat_commit_stamp(c->heat, stamp);
 }
 
 // The kind opts itself in. An empty boot and world.c do not name it.

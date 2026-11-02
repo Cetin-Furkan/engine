@@ -13,11 +13,20 @@
 // stamps, clamps pathological gaps, counts missed refreshes, and tells
 // the turn when a stamp is a duplicate that must not paint again.
 
+// One simulation quantum. The turn issues at most FRAME_SIM_MAX_STEPS of
+// these per compositor stamp. Pose and solver both integrate that total.
+// A hitch past the cap is dropped, not replayed.
+enum : uint32_t {
+    FRAME_SIM_STEP_MS   = 8u,
+    FRAME_SIM_MAX_STEPS = 5u,
+};
+
 typedef struct FrameStep {
-    uint32_t dt_ms;   // Clamped interval since the previous stamp.
-    uint32_t missed;  // Whole refreshes skipped inside that interval.
-    bool     paint;   // False for a duplicate stamp (dt == 0 after baseline).
-    bool     first;   // True for the baseline stamp (establishes the clock).
+    uint32_t dt_ms;     // Clamped interval since the previous stamp.
+    uint32_t missed;    // Whole refreshes skipped inside that interval.
+    bool     paint;     // False for a duplicate stamp (dt == 0 after baseline).
+    bool     first;     // True for the baseline stamp (establishes the clock).
+    uint32_t sim_dt_ms; // Fixed steps actually issued. Pose and solver share it.
 } FrameStep;
 
 typedef struct FrameClock {
@@ -29,7 +38,8 @@ typedef struct FrameClock {
     bool     have_stamp;
     uint32_t accum_ms;     // Fixed-step accumulator (carried remainder).
     uint32_t sim_steps;    // Fixed steps issued since reset.
-    uint8_t  reserved[31];
+    uint32_t sim_ms;       // Monotonic simulation cursor. Advances by issued steps only.
+    uint8_t  reserved[27];
 } FrameClock;
 
 static_assert(sizeof(FrameClock) == 64, "frame clock is one cache line");
@@ -61,5 +71,14 @@ bool frame_clock_stalled(const FrameClock *clock, uint64_t stamp_age_ms);
 // hitch degrades to slow motion instead of a spiral of death.
 uint32_t frame_clock_fixed_steps(FrameClock *clock, uint32_t dt_ms,
                                  uint32_t step_ms, uint32_t max_steps);
+
+// Simulation cursor. It moves only when frame_clock_issue accepts time.
+uint32_t frame_clock_sim_stamp(const FrameClock *clock);
+
+// Consume dt_ms as FRAME_SIM_STEP_MS quanta, at most FRAME_SIM_MAX_STEPS.
+// Writes the absolute sim stamps for those quanta, ending on the new
+// cursor, and returns the count. A null out_stamps still advances the cursor.
+// The stamps are not compositor sub-stamps: dropped debt is not in them.
+uint32_t frame_clock_issue(FrameClock *clock, uint32_t dt_ms, uint32_t *out_stamps);
 
 #endif /* ENGINE_FRAME_CLOCK_H */

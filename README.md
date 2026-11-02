@@ -75,7 +75,7 @@ The embedded Inter face and a `WorkspacePolicy` with `sealed` set ignore later r
 
 ## Build and run
 
-`scripts/check_env.sh` requires Linux 7.2 or newer, a compiler that accepts `-std=c23`, and a Vulkan header that defines `VK_API_VERSION_1_4`. The shader build uses `glslangValidator` for buffer-reference shaders and `slangc` for four others. The link also needs `freetype2`, `harfbuzz`, `fontconfig`, and `xkbcommon`. A Wayland session has to be running. `wayland-protocols` is not used.
+`scripts/check_env.sh` requires Linux 7.2 or newer, a compiler that accepts `-std=c23`, and a Vulkan header that defines `VK_API_VERSION_1_4`. Every `.slang` shader is compiled with `slangc` to SPIR-V 1.6. The link also needs `freetype2`, `harfbuzz`, `fontconfig`, and `xkbcommon`. A Wayland session has to be running. `wayland-protocols` is not used.
 
 ```bash
 make

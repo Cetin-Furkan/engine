@@ -103,7 +103,9 @@ void main(uint3 group_id : SV_DispatchThreadID) {
         if (j < k_grid) { SoftVertexState nb = in_field[grid_vertex(face, i, j + 1u)]; sum_t += nb.temp; sum_disp += nb.disp; n++; }
     }
 
-    float dt = clamp(float(pc.dt_ms) * 0.001, 0.0, 0.05);
+    // One issued quantum is 8 ms (FRAME_SIM_STEP_MS). The host splits a
+    // callback into steps of that size, so this clamp is that quantum.
+    float dt = clamp(float(pc.dt_ms) * 0.001, 0.0, 0.008);
     float next_t = cur.temp;
     float3 avg_disp = cur.disp;
     if (n > 0u) {

@@ -53,6 +53,7 @@ static void free_mock_pool(BdaPool *pool) {
     while (b != nullptr) {
         BdaBlock *next = b->next;
         if (b->base_cpu) free(b->base_cpu);
+        free(b->free_extra);
         free(b);
         b = next;
     }
@@ -203,10 +204,133 @@ static void test_bda_padding_preservation(void) {
     free_mock_pool(&pool);
 }
 
+static bool range_found(BdaBlock *b, VkDeviceSize offset, VkDeviceSize size) {
+    BdaRange *ranges = block_ranges(b);
+    for (uint32_t i = 0; i < b->free_count; ++i) {
+        if (ranges[i].offset == offset && ranges[i].size == size) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void test_bda_free_list_grows(void) {
+    BdaPool pool = {
+        .slab_size = 1024 * 1024,
+        .is_host_mapped = true,
+    };
+    add_mock_block(&pool, 1024 * 1024);
+    BdaBlock *b = pool.blocks;
+    b->allocated = 100000;
+    b->free_count = 64;
+    for (uint32_t i = 0; i < 64u; ++i) {
+        b->free_list[i] = (BdaRange){ 10u + (VkDeviceSize)i * 4u, 1u };
+    }
+    return_to_pool(&pool, b->buffer, 5000, 8);
+    CHECK(b->free_count == 65u);
+    CHECK(b->free_extra != nullptr);
+    CHECK(range_found(b, 5000, 8));
+    CHECK(b->allocated == 100000);
+
+    // A full inline list must still keep both sides of an aligned split.
+    b->free_count = 64;
+    free(b->free_extra);
+    b->free_extra = nullptr;
+    b->free_cap = 0;
+    b->free_list[0] = (BdaRange){ 64, 960 };
+    for (uint32_t i = 1; i < 64u; ++i) {
+        b->free_list[i] = (BdaRange){ 20000u + (VkDeviceSize)i * 4u, 1u };
+    }
+    BdaSlice sub = alloc_from_pool(nullptr, &pool, 256, 256);
+    CHECK(sub.offset == 256);
+    CHECK(sub.bytes == 256);
+    CHECK(b->free_count == 65u);
+    CHECK(range_found(b, 64, 192));
+    CHECK(range_found(b, 512, 512));
+
+    free_mock_pool(&pool);
+}
+
+static void test_bda_arena_returns_slice(void) {
+    s_bda_sys = (BdaSystem){0};
+    s_bda_sys.is_initialized = true;
+    add_mock_block(&s_bda_sys.device_pool, 64 * 1024);
+    BdaSlice slab = alloc_from_pool(nullptr, &s_bda_sys.device_pool, 4096, 256);
+    BdaSlice keep = alloc_from_pool(nullptr, &s_bda_sys.device_pool, 256, 256);
+    CHECK(slab.offset == 0);
+    CHECK(keep.offset == 4096);
+    BdaArena arena = {
+        .buffer         = slab.buffer,
+        .address        = slab.gpu,
+        .capacity       = (uint32_t)slab.bytes,
+        .slice_offset   = slab.offset,
+        .slice_bytes    = slab.bytes,
+        .suballocated   = true,
+    };
+    bda_arena_destroy(nullptr, &arena);
+    CHECK(s_bda_sys.device_pool.blocks->allocated == 4096 + 256);
+    CHECK(range_found(s_bda_sys.device_pool.blocks, 0, 4096));
+    CHECK(arena.buffer == VK_NULL_HANDLE);
+
+    free_mock_pool(&s_bda_sys.device_pool);
+    s_bda_sys = (BdaSystem){0};
+}
+
+static void test_bda_usage_and_transient(void) {
+    VkBufferUsageFlags slab = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+                              VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                              VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                              VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                              VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+                              VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
+    CHECK(usage_fits_slab(VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, slab));
+    CHECK(usage_fits_slab(VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, slab));
+    CHECK(!usage_fits_slab(VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, slab));
+
+    s_bda_sys = (BdaSystem){0};
+    s_bda_sys.is_initialized = true;
+    s_bda_sys.device_pool.usage = slab;
+    s_bda_sys.device_pool.is_host_mapped = true;
+    add_mock_block(&s_bda_sys.device_pool, 64 * 1024);
+    VulkanContext vk = {0};
+    vk.device = (VkDevice)(uintptr_t)0x1;
+    DaBuffer buf = {0};
+    CHECK(da_buffer_create(&vk, 256, VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, false, &buf) == 0);
+    CHECK(buf.is_suballocated);
+    CHECK(buf.offset == 0);
+    CHECK(s_bda_sys.device_pool.blocks->allocated == 256);
+
+    s_bda_sys.transient_ring.buffer = (VkBuffer)(uintptr_t)0x2;
+    s_bda_sys.transient_ring.capacity = 2048;
+    s_bda_sys.transient_ring.base_cpu = malloc(2048);
+    s_bda_sys.transient_ring.base_gpu = 0x8000;
+    bda_transient_begin_frame(1);
+    BdaSlice hi = bda_alloc_transient(&vk, 64, 16);
+    CHECK(hi.offset == 1024);
+    BdaSlice hi_more = bda_alloc_transient(&vk, 64, 16);
+    CHECK(hi_more.offset == 1088);
+    bda_transient_begin_frame(2);
+    BdaSlice lo = bda_alloc_transient(&vk, 64, 16);
+    CHECK(lo.offset == 0);
+    BdaSlice lo_more = bda_alloc_transient(&vk, 64, 16);
+    CHECK(lo_more.offset == 64);
+    bda_transient_begin_frame(1);
+    BdaSlice hi_again = bda_alloc_transient(&vk, 64, 16);
+    CHECK(hi_again.offset == 1024);
+    CHECK(lo_more.offset + lo_more.bytes <= 1024);
+
+    free(s_bda_sys.transient_ring.base_cpu);
+    free_mock_pool(&s_bda_sys.device_pool);
+    s_bda_sys = (BdaSystem){0};
+}
+
 int main(void) {
     test_bda_alloc_and_free();
     test_bda_two_way_coalescing();
     test_bda_padding_preservation();
+    test_bda_free_list_grows();
+    test_bda_arena_returns_slice();
+    test_bda_usage_and_transient();
     if (s_failures != 0) {
         fprintf(stderr, "%d check(s) failed\n", s_failures);
         return 1;

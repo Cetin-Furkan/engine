@@ -1,3 +1,4 @@
+#include "frame/clock.h"
 #include "frame/cube.h"
 #include "frame/camera.h"
 #include "frame/grid.h"
@@ -138,8 +139,6 @@ static VkDeviceAddress  s_heat_addr[k_heat_copies] = {0};
 typedef struct HeatLive {
     int      read;
     int      draw;
-    bool     have_stamp;
-    uint32_t stamp_ms;
     uint32_t step_dt;
     bool     started;
     bool     held;
@@ -176,15 +175,15 @@ static uint32_t sample_count_n(VkSampleCountFlagBits samples) {
 }
 
 
-// This command buffer only. The vertex read of the buffer just written is
-// in the draw that follows. The next submit's compute read is ordered by
-// waiting s_heat_published, not by widening this barrier.
-static void barrier_heat_to_vertex(VkCommandBuffer cmd) {
+// Inside one command buffer, a later step reads the previous step, so
+// that edge targets compute. The draw reads the last write, so that edge
+// targets the vertex shader. The next submit waits s_heat_published.
+static void barrier_heat(VkCommandBuffer cmd, VkPipelineStageFlags2 dst_stage) {
     VkMemoryBarrier2 barrier = {
         .sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
         .srcStageMask  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
         .srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-        .dstStageMask  = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT,
+        .dstStageMask  = dst_stage,
         .dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
     };
     VkDependencyInfo dep = {
@@ -193,6 +192,14 @@ static void barrier_heat_to_vertex(VkCommandBuffer cmd) {
         .pMemoryBarriers    = &barrier,
     };
     vkCmdPipelineBarrier2(cmd, &dep);
+}
+
+static void barrier_heat_to_vertex(VkCommandBuffer cmd) {
+    barrier_heat(cmd, VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT);
+}
+
+static void barrier_heat_to_compute(VkCommandBuffer cmd) {
+    barrier_heat(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
 }
 
 static bool heat_slot_ok(uint32_t slot) {
@@ -553,30 +560,17 @@ static bool heat_still_running(void) {
     return false;
 }
 
-uint32_t cube_heat_interval(uint32_t slot, uint32_t time_ms) {
+uint32_t cube_heat_interval(uint32_t slot, uint32_t sim_dt_ms) {
     if (!heat_slot_ok(slot)) {
         return 0;
     }
     HeatLive *h = &s_live[slot];
-    if (h->held) {
+    if (h->held || sim_dt_ms == 0u) {
         h->step_dt = 0;
         return 0;
     }
-    if (!h->have_stamp) {
-        h->have_stamp = true;
-        h->stamp_ms = time_ms;
-        h->step_dt = 0;
-        return 0;
-    }
-    uint32_t delta = time_ms - h->stamp_ms;
-    // A gap between revolutions is not a heat step.
-    if (delta == 0u || delta > 1000u) {
-        h->stamp_ms = time_ms;
-        h->step_dt = 0;
-        return 0;
-    }
-    h->step_dt = delta;
-    return delta;
+    h->step_dt = sim_dt_ms;
+    return sim_dt_ms;
 }
 
 uint32_t cube_heat_step_dt(uint32_t slot) {
@@ -586,24 +580,12 @@ uint32_t cube_heat_step_dt(uint32_t slot) {
     return s_live[slot].step_dt;
 }
 
-void cube_heat_commit_stamp(uint32_t slot, uint32_t time_ms) {
-    if (!heat_slot_ok(slot)) {
-        return;
-    }
-    HeatLive *h = &s_live[slot];
-    if (h->held || h->step_dt == 0u) {
-        return;
-    }
-    h->have_stamp = true;
-    h->stamp_ms = time_ms;
-}
-
-bool cube_heat_record(VkCommandBuffer cmd, uint32_t slot, float yaw_deg) {
+bool cube_heat_record(VkCommandBuffer cmd, uint32_t slot, float yaw_deg, uint32_t dt_ms) {
     if (!heat_slot_ok(slot) || cmd == VK_NULL_HANDLE || s_heat_pipe == VK_NULL_HANDLE) {
         return false;
     }
     HeatLive *h = &s_live[slot];
-    if (h->draw >= 0 || s_mesh_addr == 0) {
+    if (h->draw >= 0 || s_mesh_addr == 0 || h->held) {
         return false;
     }
     int dst = (h->read + 1) % (int)k_heat_copies;
@@ -618,13 +600,44 @@ bool cube_heat_record(VkCommandBuffer cmd, uint32_t slot, float yaw_deg) {
         return true;
     }
     bool poke = h->poke_pending;
-    if ((h->step_dt == 0u && !poke) || h->held || heat_at(h->read, slot) == 0) {
+    uint32_t cap = FRAME_SIM_STEP_MS * FRAME_SIM_MAX_STEPS;
+    if (dt_ms > cap) {
+        dt_ms = cap;
+    }
+    if ((dt_ms == 0u && !poke) || heat_at(h->read, slot) == 0) {
         return false;
     }
-    dispatch_heat(cmd, h->step_dt, 0u, h->read, dst, slot, poke ? 1u : 0u, yaw_deg);
-    barrier_heat_to_vertex(cmd);
-    h->draw = dst;
-    if (poke) {
+    int src = h->read;
+    uint32_t left = dt_ms;
+    bool consumed_poke = false;
+    for (;;) {
+        uint32_t step = 0;
+        if (left > 0u) {
+            step = left > FRAME_SIM_STEP_MS ? FRAME_SIM_STEP_MS : left;
+        } else if (!poke) {
+            break;
+        }
+        dst = (src + 1) % (int)k_heat_copies;
+        if (heat_at(dst, slot) == 0) {
+            return false;
+        }
+        dispatch_heat(cmd, step, 0u, src, dst, slot, poke ? 1u : 0u, yaw_deg);
+        if (poke) {
+            consumed_poke = true;
+            poke = false;
+        }
+        src = dst;
+        left -= step;
+        if (left > 0u) {
+            barrier_heat_to_compute(cmd);
+            continue;
+        }
+        barrier_heat_to_vertex(cmd);
+        break;
+    }
+    h->draw = src;
+    h->step_dt = dt_ms;
+    if (consumed_poke) {
         h->poke_pending = false;
         h->poke_armed = true;
     }
@@ -650,7 +663,7 @@ void cube_heat_record_ok(uint32_t slot, uint64_t signal_point) {
         return;
     }
     s_heat_announced = true;
-    printf("[Cube] Fillet heat started. Each cube keeps its own field. Upper half, callback step, then it holds.\n");
+    printf("[Cube] Fillet heat started. Each cube keeps its own field. Upper half, 8 ms steps, then it holds.\n");
     fflush(stdout);
 }
 

@@ -83,6 +83,27 @@ void frame_clock_note_stall(FrameClock *clock) {
     }
 }
 
+uint32_t frame_clock_sim_stamp(const FrameClock *clock) {
+    if (clock == nullptr) {
+        return 0;
+    }
+    return clock->sim_ms;
+}
+
+uint32_t frame_clock_issue(FrameClock *clock, uint32_t dt_ms, uint32_t *out_stamps) {
+    uint32_t steps = frame_clock_fixed_steps(clock, dt_ms, FRAME_SIM_STEP_MS, FRAME_SIM_MAX_STEPS);
+    uint32_t base = clock == nullptr ? 0u : clock->sim_ms;
+    if (clock != nullptr) {
+        clock->sim_ms = base + steps * FRAME_SIM_STEP_MS;
+    }
+    if (out_stamps != nullptr) {
+        for (uint32_t i = 0; i < steps; ++i) {
+            out_stamps[i] = base + (i + 1u) * FRAME_SIM_STEP_MS;
+        }
+    }
+    return steps;
+}
+
 uint32_t frame_clock_fixed_steps(FrameClock *clock, uint32_t dt_ms,
                                  uint32_t step_ms, uint32_t max_steps) {
     if (clock == nullptr || step_ms == 0 || max_steps == 0) {

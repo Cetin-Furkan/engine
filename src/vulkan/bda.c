@@ -146,7 +146,49 @@ static void destroy_raw_block(VulkanContext *vk, BdaBlock *block) {
     if (block->memory != VK_NULL_HANDLE) {
         vkFreeMemory(vk->device, block->memory, nullptr);
     }
+    free(block->free_extra);
     *block = (BdaBlock){0};
+}
+
+enum : uint32_t { k_free_inline = 64u };
+
+static BdaRange *block_ranges(BdaBlock *b) {
+    return b->free_extra != nullptr ? b->free_extra : b->free_list;
+}
+
+static bool usage_fits_slab(VkBufferUsageFlags usage, VkBufferUsageFlags slab) {
+    return (usage & ~slab) == 0;
+}
+
+static bool free_push(BdaBlock *b, BdaRange range) {
+    if (b->free_extra == nullptr) {
+        if (b->free_count < k_free_inline) {
+            b->free_list[b->free_count++] = range;
+            return true;
+        }
+        uint32_t cap = k_free_inline * 2u;
+        BdaRange *extra = malloc((size_t)cap * sizeof(BdaRange));
+        if (extra == nullptr) {
+            fprintf(stderr, "[BDA Error] Free list cannot grow; %llu bytes not returned\n",
+                    (unsigned long long)range.size);
+            return false;
+        }
+        memcpy(extra, b->free_list, sizeof b->free_list);
+        b->free_extra = extra;
+        b->free_cap = cap;
+    } else if (b->free_count >= b->free_cap) {
+        uint32_t cap = b->free_cap * 2u;
+        BdaRange *extra = realloc(b->free_extra, (size_t)cap * sizeof(BdaRange));
+        if (extra == nullptr) {
+            fprintf(stderr, "[BDA Error] Free list cannot grow; %llu bytes not returned\n",
+                    (unsigned long long)range.size);
+            return false;
+        }
+        b->free_extra = extra;
+        b->free_cap = cap;
+    }
+    b->free_extra[b->free_count++] = range;
+    return true;
 }
 
 static BdaSlice alloc_from_pool(VulkanContext *vk, BdaPool *pool, VkDeviceSize size, VkDeviceSize align) {
@@ -160,9 +202,10 @@ static BdaSlice alloc_from_pool(VulkanContext *vk, BdaPool *pool, VkDeviceSize s
 
     for (BdaBlock *b = pool->blocks; b != nullptr; b = b->next) {
         for (uint32_t i = 0; i < b->free_count; ++i) {
-            VkDeviceSize cur = (b->free_list[i].offset + align - 1u) & ~(align - 1u);
-            VkDeviceSize pad = cur - b->free_list[i].offset;
-            if (pad + alloc_size <= b->free_list[i].size) {
+            BdaRange *ranges = block_ranges(b);
+            VkDeviceSize cur = (ranges[i].offset + align - 1u) & ~(align - 1u);
+            VkDeviceSize pad = cur - ranges[i].offset;
+            if (pad + alloc_size <= ranges[i].size) {
                 BdaSlice slice = {
                     .cpu    = b->base_cpu != nullptr ? b->base_cpu + cur : nullptr,
                     .gpu    = b->base_gpu != 0 ? b->base_gpu + cur : 0,
@@ -170,19 +213,21 @@ static BdaSlice alloc_from_pool(VulkanContext *vk, BdaPool *pool, VkDeviceSize s
                     .offset = (uint32_t)cur,
                     .buffer = b->buffer,
                 };
-                VkDeviceSize rem = b->free_list[i].size - (pad + alloc_size);
+                VkDeviceSize rem = ranges[i].size - (pad + alloc_size);
                 if (pad > 0 && rem > 0) {
-                    b->free_list[i].size = pad;
-                    if (b->free_count < 64u) {
-                        b->free_list[b->free_count++] = (BdaRange){ cur + alloc_size, rem };
+                    ranges[i].size = pad;
+                    if (!free_push(b, (BdaRange){ cur + alloc_size, rem })) {
+                        ranges = block_ranges(b);
+                        ranges[i].size = pad + alloc_size + rem;
+                        continue;
                     }
                 } else if (pad > 0) {
-                    b->free_list[i].size = pad;
+                    ranges[i].size = pad;
                 } else if (rem > 0) {
-                    b->free_list[i].offset = cur + alloc_size;
-                    b->free_list[i].size   = rem;
+                    ranges[i].offset = cur + alloc_size;
+                    ranges[i].size   = rem;
                 } else {
-                    b->free_list[i] = b->free_list[--b->free_count];
+                    ranges[i] = ranges[--b->free_count];
                 }
                 return slice;
             }
@@ -321,15 +366,20 @@ BdaSlice bda_alloc_transient(VulkanContext *vk, VkDeviceSize size, VkDeviceSize 
         align = BDA_CACHE_LINE_ALIGN;
     }
     BdaBlock *ring = &s_bda_sys.transient_ring;
-    if (ring->buffer == VK_NULL_HANDLE) {
+    if (ring->buffer == VK_NULL_HANDLE || ring->capacity < 2u) {
         return bda_alloc_staging(vk, size, align);
     }
-    VkDeviceSize cur = (ring->allocated + align - 1u) & ~(align - 1u);
-    if (cur + size > ring->capacity) {
-        cur = 0;
-        if (size > ring->capacity) {
-            return bda_alloc_staging(vk, size, align);
-        }
+    uint32_t slot = s_bda_sys.transient_slot & 1u;
+    VkDeviceSize half = ring->capacity / 2u;
+    VkDeviceSize base = half * (VkDeviceSize)slot;
+    VkDeviceSize end = base + half;
+    VkDeviceSize at = s_bda_sys.transient_at[slot];
+    if (at < base) {
+        at = base;
+    }
+    VkDeviceSize cur = (at + align - 1u) & ~(align - 1u);
+    if (cur < at || cur + size > end || size > half) {
+        return bda_alloc_staging(vk, size, align);
     }
     BdaSlice slice = {
         .cpu    = ring->base_cpu != nullptr ? ring->base_cpu + cur : nullptr,
@@ -338,14 +388,27 @@ BdaSlice bda_alloc_transient(VulkanContext *vk, VkDeviceSize size, VkDeviceSize 
         .offset = (uint32_t)cur,
         .buffer = ring->buffer,
     };
-    ring->allocated = cur + size;
+    s_bda_sys.transient_at[slot] = cur + size;
     return slice;
 }
 
 void bda_transient_reset(void) {
-    if (s_bda_sys.is_initialized) {
-        s_bda_sys.transient_ring.allocated = 0;
+    if (!s_bda_sys.is_initialized) {
+        return;
     }
+    s_bda_sys.transient_slot = 0;
+    s_bda_sys.transient_at[0] = 0;
+    s_bda_sys.transient_at[1] = 0;
+}
+
+void bda_transient_begin_frame(uint64_t signal_point) {
+    if (!s_bda_sys.is_initialized) {
+        return;
+    }
+    uint32_t slot = (uint32_t)(signal_point & 1ull);
+    s_bda_sys.transient_slot = slot;
+    VkDeviceSize half = s_bda_sys.transient_ring.capacity / 2u;
+    s_bda_sys.transient_at[slot] = half * (VkDeviceSize)slot;
 }
 
 int da_buffer_create(VulkanContext *vk, VkDeviceSize size, VkBufferUsageFlags usage,
@@ -355,13 +418,21 @@ int da_buffer_create(VulkanContext *vk, VkDeviceSize size, VkBufferUsageFlags us
     }
     *out = (DaBuffer){0};
 
-    // Suballocate from 2026 BDA pool for standard buffers under 16 MiB
+    // A suballocation shares the slab's VkBuffer, so the request has to be
+    // a subset of that usage. Anything else gets its own buffer with the
+    // flags the caller passed. The slab still carries storage, transfer,
+    // index, and indirect for the requests that fit.
+    bool usage_fits = false;
     if (size <= 16u * 1024u * 1024u) {
         if (!s_bda_sys.is_initialized) {
             if (bda_system_init(vk) != 0) {
                 return -1;
             }
         }
+        const BdaPool *pool = host ? &s_bda_sys.staging_pool : &s_bda_sys.device_pool;
+        usage_fits = usage_fits_slab(usage, pool->usage);
+    }
+    if (usage_fits) {
         BdaSlice slice = host ? bda_alloc_staging(vk, size, BDA_STORAGE_ALIGN)
                               : bda_alloc_device(vk, size, BDA_STORAGE_ALIGN);
         if (slice.buffer != VK_NULL_HANDLE) {
@@ -403,34 +474,35 @@ static void return_to_pool(BdaPool *pool, VkBuffer buffer, VkDeviceSize offset, 
 
         VkDeviceSize end = offset + size;
         bool merged = false;
+        BdaRange *ranges = block_ranges(b);
 
         for (uint32_t i = 0; i < b->free_count; ++i) {
-            if (b->free_list[i].offset + b->free_list[i].size == offset) {
-                b->free_list[i].size += size;
-                offset = b->free_list[i].offset;
-                size = b->free_list[i].size;
+            if (ranges[i].offset + ranges[i].size == offset) {
+                ranges[i].size += size;
+                offset = ranges[i].offset;
+                size = ranges[i].size;
                 end = offset + size;
                 for (uint32_t j = 0; j < b->free_count; ++j) {
-                    if (j != i && end == b->free_list[j].offset) {
-                        b->free_list[i].size += b->free_list[j].size;
-                        b->free_list[j] = b->free_list[--b->free_count];
+                    if (j != i && end == ranges[j].offset) {
+                        ranges[i].size += ranges[j].size;
+                        ranges[j] = ranges[--b->free_count];
                         break;
                     }
                 }
                 merged = true;
                 break;
             }
-            if (end == b->free_list[i].offset) {
-                b->free_list[i].offset = offset;
-                b->free_list[i].size += size;
-                offset = b->free_list[i].offset;
-                size = b->free_list[i].size;
+            if (end == ranges[i].offset) {
+                ranges[i].offset = offset;
+                ranges[i].size += size;
+                offset = ranges[i].offset;
+                size = ranges[i].size;
                 end = offset + size;
                 for (uint32_t j = 0; j < b->free_count; ++j) {
-                    if (j != i && b->free_list[j].offset + b->free_list[j].size == offset) {
-                        b->free_list[i].offset = b->free_list[j].offset;
-                        b->free_list[i].size += b->free_list[j].size;
-                        b->free_list[j] = b->free_list[--b->free_count];
+                    if (j != i && ranges[j].offset + ranges[j].size == offset) {
+                        ranges[i].offset = ranges[j].offset;
+                        ranges[i].size += ranges[j].size;
+                        ranges[j] = ranges[--b->free_count];
                         break;
                     }
                 }
@@ -439,17 +511,22 @@ static void return_to_pool(BdaPool *pool, VkBuffer buffer, VkDeviceSize offset, 
             }
         }
 
-        if (!merged && b->free_count < 64u) {
-            b->free_list[b->free_count++] = (BdaRange){ offset, size };
+        if (!merged) {
+            if (offset + size == b->allocated) {
+                b->allocated = offset;
+            } else if (!free_push(b, (BdaRange){ offset, size })) {
+                return;
+            }
         }
 
         bool shrank = true;
         while (shrank) {
             shrank = false;
+            ranges = block_ranges(b);
             for (uint32_t i = 0; i < b->free_count; ++i) {
-                if (b->free_list[i].offset + b->free_list[i].size == b->allocated) {
-                    b->allocated = b->free_list[i].offset;
-                    b->free_list[i] = b->free_list[--b->free_count];
+                if (ranges[i].offset + ranges[i].size == b->allocated) {
+                    b->allocated = ranges[i].offset;
+                    ranges[i] = ranges[--b->free_count];
                     shrank = true;
                     break;
                 }
@@ -491,12 +568,15 @@ int bda_arena_init(VulkanContext *vk, BdaArena *arena, uint32_t capacity, bool h
         fprintf(stderr, "[BDA Error] No memory type for a %u byte arena\n", capacity);
         return -1;
     }
-    arena->buffer   = buf.buffer;
-    arena->memory   = buf.memory;
-    arena->address  = buf.address;
-    arena->map      = (uint8_t *)buf.map;
-    arena->capacity = capacity;
-    arena->offset   = 0;
+    arena->buffer        = buf.buffer;
+    arena->memory        = buf.memory;
+    arena->address       = buf.address;
+    arena->map           = (uint8_t *)buf.map;
+    arena->capacity      = capacity;
+    arena->offset        = 0;
+    arena->slice_offset  = buf.offset;
+    arena->slice_bytes   = buf.bytes;
+    arena->suballocated  = buf.is_suballocated;
     return 0;
 }
 
@@ -509,7 +589,9 @@ void bda_arena_destroy(VulkanContext *vk, BdaArena *arena) {
             .buffer          = arena->buffer,
             .memory          = arena->memory,
             .map             = arena->map,
-            .is_suballocated = (arena->memory == VK_NULL_HANDLE),
+            .bytes           = arena->slice_bytes,
+            .offset          = arena->slice_offset,
+            .is_suballocated = arena->suballocated,
         };
         da_buffer_destroy(vk, &buf);
     }

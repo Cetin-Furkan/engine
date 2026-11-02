@@ -82,9 +82,10 @@ uint64_t world_record_published(void);
 bool world_record_step_open(void);
 bool world_record_poke_pending(void);
 
-// One compositor stamp for the heat pulse. Sets the interval a submit records.
-// True while that pulse still wants a frame.
-bool world_simulation(uint32_t time_ms, uint32_t *heat_dt);
+// time_ms is the compositor stamp and closes the heat pulse. sim_dt_ms is
+// the interval the frame clock issued. A submit records that interval and
+// no other. True while a pulse still wants a frame.
+bool world_simulation(uint32_t time_ms, uint32_t sim_dt_ms, uint32_t *heat_dt);
 void world_simulation_hold(void);
 void world_simulation_commit(uint32_t time_ms, uint32_t heat_dt);
 
@@ -92,7 +93,8 @@ void world_simulation_commit(uint32_t time_ms, uint32_t heat_dt);
 // or a click preview is not yet on screen.
 bool world_busy(void);
 
-// Fold one wl_surface.frame timestamp into every spinning object.
+// Fold one simulation-cursor stamp into every spinning object.
+// The cursor moves by the interval the frame clock issued.
 // True when the picture differs from the image already on screen.
 bool world_advance(uint32_t time_ms);
 

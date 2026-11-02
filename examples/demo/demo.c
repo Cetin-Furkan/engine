@@ -1,5 +1,6 @@
 #include "chrome/gpu.h"
 #include "engine/app.h"
+#include "vulkan/bda.h"
 #include "frame/camera.h"
 #include "frame/cube.h"
 #include "frame/gimbal.h"
@@ -156,6 +157,9 @@ static void demo_prepare_draw(VkCommandBuffer cmd, VkImage depth_image) {
 }
 
 static void demo_claim_frame(VkSemaphore acquire, uint64_t signal_point) {
+    // This slot's previous acquire has already retired. Rewind only its
+    // half of the transient bump. The other slot may still be reading.
+    bda_transient_begin_frame(signal_point);
     shape_begin(acquire, signal_point);
     text_begin(acquire, signal_point);
     plot_begin(acquire, signal_point);
@@ -183,12 +187,12 @@ static void demo_draw_overlay(VkCommandBuffer cmd, uint32_t width, uint32_t heig
 }
 
 static bool demo_simulation(uint32_t time_ms, const FrameStep *step, uint32_t *heat_dt) {
-    (void)step;  // Heat diffusion is stamp-driven; dt arrives clamped.
-    return world_simulation(time_ms, heat_dt);
+    uint32_t sim_dt = step != nullptr ? step->sim_dt_ms : 0u;
+    return world_simulation(time_ms, sim_dt, heat_dt);
 }
 
 static bool demo_advance(uint32_t time_ms, const FrameStep *step) {
-    (void)step;  // Poses are absolute-stamp functions (spin/camera).
+    (void)step;  // time_ms is the sim cursor issued with step->sim_dt_ms.
     int32_t px = 0;
     int32_t py = 0;
     bool have = pointer_client_xy(&px, &py);

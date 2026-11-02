@@ -23,8 +23,13 @@ typedef struct BdaArena {
     VkDeviceMemory  memory;
     VkDeviceAddress address;
     uint8_t        *map;
+    // Bump limit. Stays under 4 GiB because a BdaSlice offset is a uint32.
     uint32_t        capacity;
     uint32_t        offset;
+    // The pool reservation. Destroy returns this range, not a zero size.
+    VkDeviceSize    slice_offset;
+    VkDeviceSize    slice_bytes;
+    bool            suballocated;
 } BdaArena;
 
 typedef struct DaBuffer {
@@ -50,7 +55,9 @@ typedef struct BdaBlock {
     VkDeviceSize     capacity;
     VkDeviceSize     allocated;
     uint32_t         free_count;
+    uint32_t         free_cap;     // 0: the inline list holds 64. Else free_extra holds free_cap.
     BdaRange         free_list[64];
+    BdaRange        *free_extra;   // Grown when 64 ranges will not coalesce.
     struct BdaBlock *next;
 } BdaBlock;
 
@@ -67,7 +74,9 @@ typedef struct BdaPool {
 typedef struct BdaSystem {
     BdaPool  device_pool;   // Dedicated device-local VRAM
     BdaPool  staging_pool;  // Host-visible coherent RAM
-    BdaBlock transient_ring;// Per-frame bump memory
+    BdaBlock transient_ring;// Two frame halves. See bda_transient_begin_frame.
+    uint32_t transient_slot;
+    VkDeviceSize transient_at[2];
     bool     is_initialized;
 } BdaSystem;
 
@@ -78,6 +87,12 @@ void bda_system_shutdown(VulkanContext *vk);
 [[nodiscard]] BdaSlice bda_alloc_staging(VulkanContext *vk, VkDeviceSize size, VkDeviceSize align);
 [[nodiscard]] BdaSlice bda_alloc_transient(VulkanContext *vk, VkDeviceSize size, VkDeviceSize align);
 void bda_transient_reset(void);
+
+// Rewind one half of the transient bump. signal_point & 1 selects the half.
+// Call it after that slot's previous acquire has retired. The other half
+// is left for the frame that may still be reading it. An allocation that
+// does not fit the half comes from the staging pool and does not wrap.
+void bda_transient_begin_frame(uint64_t signal_point);
 
 // Compatible wrappers
 [[nodiscard]] int da_buffer_create(VulkanContext *vk, VkDeviceSize size,

@@ -35,13 +35,11 @@ void cube_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height, float yaw_d
                float origin_x, float origin_y, float depth_bias, float phase, bool selected,
                uint32_t mat, uint32_t heat_slot);
 
-// Fold one wl_surface.frame stamp for this slot. The returned interval is
-// the heat step for a frame that actually submits. Zero is a baseline, a
-// repeated stamp, or a gap longer than a second. cube_heat_commit_stamp
-// moves that slot's baseline after the submit lands. A held slot stays at 0.
-uint32_t cube_heat_interval(uint32_t slot, uint32_t time_ms);
+// Remember the interval the frame clock issued for this slot. The returned
+// value is what a submit records. Zero is a held slot or an issued interval
+// of zero. The slot does not keep its own stamp.
+uint32_t cube_heat_interval(uint32_t slot, uint32_t sim_dt_ms);
 uint32_t cube_heat_step_dt(uint32_t slot);
-void cube_heat_commit_stamp(uint32_t slot, uint32_t time_ms);
 
 // Record this slot's step into the command buffer. The draw in that buffer
 // reads the temperatures the step writes. A slot with no interval and no
@@ -51,8 +49,10 @@ void cube_heat_commit_stamp(uint32_t slot, uint32_t time_ms);
 // the previous field and keeps the click. cube_heat_published is 0 until the
 // first step lands; the bake idles the queue, so the seed needs no wait.
 // A later submit waits that value before it reads any slot.
-// True when this call wrote a field.
-bool cube_heat_record(VkCommandBuffer cmd, uint32_t slot, float yaw_deg);
+// True when this call wrote a field. dt_ms is the issued interval. The
+// dispatch splits it into FRAME_SIM_STEP_MS steps. The lattice takes the
+// whole interval in one dispatch.
+bool cube_heat_record(VkCommandBuffer cmd, uint32_t slot, float yaw_deg, uint32_t dt_ms);
 void cube_heat_record_ok(uint32_t slot, uint64_t signal_point);
 void cube_heat_record_abort(uint32_t slot);
 uint64_t cube_heat_published(void);

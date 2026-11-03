@@ -83,6 +83,11 @@ VulkanResult vulkan_context_init(VulkanContext *ctx) {
                 "[Vulkan Warn] Two roles share one VkQueue. Concurrent submits on those roles must be externally synchronized.\n");
     }
 
+    printf("[Vulkan] Shader 1.4: ExpectAssume=%s, FloatControls2=%s, SubgroupRotate=%s, RotateClustered=%s\n",
+           ctx->device_info.supports_shader_expect_assume ? "yes" : "no",
+           ctx->device_info.supports_shader_float_controls2 ? "yes" : "no",
+           ctx->device_info.supports_shader_subgroup_rotate ? "yes" : "no",
+           ctx->device_info.supports_shader_subgroup_rotate_clustered ? "yes" : "no");
     printf("[Vulkan] Capabilities: DMA-BUF=%s, DRM-Modifiers=%s, ForeignQueue=%s, Syncobj=%s, BDA=%s, ScalarLayout=%s, Anisotropy=%s, DynRender=%s, LocalRead=%s, Sync2=%s, Timeline=%s, Maint5=%s, Maint6=%s, PushDesc=%s, HostImageCopy=%s, Int16=%s, Int64=%s, Storage16=%s, Float16=%s\n",
            ctx->device_info.supports_dma_buf ? "yes" : "no",
            ctx->device_info.supports_drm_format_modifiers ? "yes" : "no",

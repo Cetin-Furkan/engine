@@ -70,8 +70,9 @@ static const uint32_t k_count[6][2] = {
     { 288u, 3072u },
 };
 
+static VulkanContext   *s_vk = nullptr;
 static VkPipelineLayout s_layout = VK_NULL_HANDLE;
-static VkPipeline       s_pipeline = VK_NULL_HANDLE;
+static VulkanGfxLive    s_gfx;
 static VkPipelineLayout s_bake_layout = VK_NULL_HANDLE;
 static VkPipeline       s_bake = VK_NULL_HANDLE;
 static DaBuffer         s_solid_buf = {0};
@@ -159,22 +160,20 @@ static int bake_mesh(VulkanContext *vk) {
 void solid_shutdown(VulkanContext *vk) {
     if (vk != nullptr && vk->device != VK_NULL_HANDLE) {
         if (s_bake != VK_NULL_HANDLE) {
-            vkDestroyPipeline(vk->device, s_bake, nullptr);
+            vulkan_pipe_release(vk, s_bake);
         }
         if (s_bake_layout != VK_NULL_HANDLE) {
             vkDestroyPipelineLayout(vk->device, s_bake_layout, nullptr);
-        }
-        if (s_pipeline != VK_NULL_HANDLE) {
-            vkDestroyPipeline(vk->device, s_pipeline, nullptr);
         }
         if (s_layout != VK_NULL_HANDLE) {
             vkDestroyPipelineLayout(vk->device, s_layout, nullptr);
         }
         da_buffer_destroy(vk, &s_solid_buf);
     }
+    vulkan_gfx_disarm(vk, &s_gfx);
+    s_vk = nullptr;
     s_bake = VK_NULL_HANDLE;
     s_bake_layout = VK_NULL_HANDLE;
-    s_pipeline = VK_NULL_HANDLE;
     s_layout = VK_NULL_HANDLE;
     s_addr = 0;
 }
@@ -183,7 +182,8 @@ int solid_init(VulkanContext *vk) {
     if (vk == nullptr || vk->device == VK_NULL_HANDLE || vk->physical_device == VK_NULL_HANDLE) {
         return -1;
     }
-    if (s_pipeline != VK_NULL_HANDLE) {
+    s_vk = vk;
+    if (s_layout != VK_NULL_HANDLE) {
         return 0;
     }
     VkFormat depth_format = pass_depth_format();
@@ -227,7 +227,6 @@ int solid_init(VulkanContext *vk) {
         solid_shutdown(vk);
         return -1;
     }
-    VkFormat color_format = VK_FORMAT_B8G8R8A8_SRGB;
     VulkanGfxPipe gfx = {
         .vert          = k_vert_spv,
         .vert_bytes    = sizeof k_vert_spv,
@@ -242,10 +241,7 @@ int solid_init(VulkanContext *vk) {
         .depth_compare = VK_COMPARE_OP_LESS,
         .blend         = VK_FALSE,
     };
-    if (vulkan_gfx_pipelines(vk, &gfx, &color_format, nullptr, 1, &s_pipeline) != 0) {
-        solid_shutdown(vk);
-        return -1;
-    }
+    vulkan_gfx_arm(&s_gfx, &gfx, VK_FORMAT_B8G8R8A8_SRGB, nullptr);
 
     VkPushConstantRange bake_range = {
         .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
@@ -280,7 +276,8 @@ int solid_init(VulkanContext *vk) {
 void solid_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height,
                 uint32_t kind, bool curved, float yaw_deg,
                 float origin_x, float origin_y, bool selected) {
-    if (cmd == VK_NULL_HANDLE || s_pipeline == VK_NULL_HANDLE || width == 0 || height == 0 ||
+    VkPipeline pipeline = vulkan_gfx_use(s_vk, &s_gfx);
+    if (cmd == VK_NULL_HANDLE || pipeline == VK_NULL_HANDLE || width == 0 || height == 0 ||
         kind >= 6u) {
         return;
     }
@@ -297,7 +294,7 @@ void solid_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height,
         .pad        = 0,
     };
     view_push_fill(&draw_push.view, k_mat_solid0 + kind);
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_pipeline);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
     vulkan_cmd_push(cmd, s_layout, VK_SHADER_STAGE_VERTEX_BIT, sizeof draw_push, &draw_push);
     vkCmdDraw(cmd, k_count[kind][cage], 1, k_first[kind][cage], 0);
 }

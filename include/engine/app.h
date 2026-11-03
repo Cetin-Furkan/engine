@@ -147,6 +147,10 @@ typedef struct EngineApp {
     // The engine does not name text; the hosted program decides.
     bool (*text)(const char *utf8, uint32_t bytes);
     bool (*key)(uint32_t key, EngineKeyContext *ctx);
+    // True while a held move, yaw, pitch, or zoom key should keep the
+    // 8 ms timer armed. The idle loop polls this. A null hook means
+    // those keys do not wake a still picture. The key press itself is
+    // not a tap and does not note a picture.
     bool (*camera_active)(void);
 
     // How a press is classified. The engine does not name the action.

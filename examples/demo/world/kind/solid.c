@@ -2,6 +2,7 @@
 #include "frame/material.h"
 #include "frame/solid.h"
 #include <stdio.h>
+#include <string.h>
 
 enum { k_kinds = 6 };
 
@@ -171,6 +172,54 @@ bool solid_kind_raise(uint32_t kind) {
     return true;
 }
 
+const char *solid_kind_name(uint32_t kind) {
+    if (kind >= k_kinds) {
+        return nullptr;
+    }
+    return k_name[kind];
+}
+
+int solid_kind_index(const char *name) {
+    if (name == nullptr) {
+        return -1;
+    }
+    for (uint32_t i = 0; i < k_kinds; ++i) {
+        if (strcmp(name, k_name[i]) == 0) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+bool solid_kind_place(uint32_t kind, Coord at, int32_t yaw_milli, bool spinning, bool infinite, bool glow) {
+    if (kind >= k_kinds) {
+        return false;
+    }
+    if (find_kind(kind) >= 0) {
+        fprintf(stderr, "[World] %s is already placed.\n", k_name[kind]);
+        return false;
+    }
+    SolidData *s = &s_solid[kind];
+    *s = (SolidData){0};
+    s->used = true;
+    s->kind = kind;
+    s->spin = spin_pose(yaw_milli, spinning, infinite, glow);
+    int index = table_add(&s_ops, s, at, &s->spin);
+    if (index < 0) {
+        s->used = false;
+        fprintf(stderr, "[World] No room for %s.\n", k_name[kind]);
+        return false;
+    }
+    if (spinning) {
+        table_mark_spun();
+    }
+    return true;
+}
+
+const WorldOps *solid_ops(void) {
+    return &s_ops;
+}
+
 bool solid_kind_toggle_smooth(void) {
     s_curved = !s_curved;
     if (s_curved) {
@@ -191,6 +240,15 @@ bool solid_kind_toggle_smooth(void) {
         return false;
     }
     return true;
+}
+
+bool solid_kind_smooth(void) {
+    return s_curved;
+}
+
+void solid_kind_set_smooth(bool curved) {
+    s_curved = curved;
+    s_shown_curved = curved;
 }
 
 bool solid_kind_smooth_dirty(void) {

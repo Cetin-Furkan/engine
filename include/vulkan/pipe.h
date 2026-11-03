@@ -5,7 +5,11 @@
 #include <stddef.h>
 
 // Vulkan 1.4 maintenance5. SPIR-V is chained as VkShaderModuleCreateInfo.
-// There is no VkShaderModule. The device pipeline cache is shared.
+// There is no VkShaderModule. Pipelines are created the first time a
+// situation is drawn, then reused from a bank. The device pipeline cache
+// is shared, so a second process start does not compile the same key again.
+// Viewport and scissor stay dynamic. Other state is part of the key, because
+// the draws do not set it on the command buffer.
 
 typedef struct VulkanGfxPipe {
     const void                  *vert;
@@ -24,9 +28,22 @@ typedef struct VulkanGfxPipe {
     const VkSpecializationInfo  *frag_spec;
 } VulkanGfxPipe;
 
+// One graphics situation. Armed at init, created on the first draw of this
+// format, depth, and specialization. The SPIR-V and specialization bytes
+// must outlive the armed record. A second format is a second record.
+typedef struct VulkanGfxLive {
+    VulkanGfxPipe                info;
+    VkFormat                     format;
+    const VkSpecializationInfo  *spec;
+    VkPipeline                   pipeline;
+    bool                         armed;
+    bool                         failed;
+} VulkanGfxLive;
+
 // Creates one graphics pipeline per color format. Same SPIR-V, same state.
 // specs is null, or one entry per format (each entry may be null).
-// out[i] matches formats[i]. On failure every out[i] is null.
+// out[i] matches formats[i]. A matching bank entry is reused and its
+// reference count goes up. On failure every out[i] is null.
 [[nodiscard]] int vulkan_gfx_pipelines(VulkanContext *vk, const VulkanGfxPipe *info,
                                        const VkFormat *formats,
                                        const VkSpecializationInfo *const *specs,
@@ -34,6 +51,16 @@ typedef struct VulkanGfxPipe {
 
 [[nodiscard]] VkPipeline vulkan_compute_pipeline(VulkanContext *vk, const void *spv,
                                                  size_t bytes, VkPipelineLayout layout);
+
+void vulkan_gfx_arm(VulkanGfxLive *live, const VulkanGfxPipe *info, VkFormat format,
+                    const VkSpecializationInfo *spec);
+// Creates the pipeline on the first call. Later calls return the same one.
+[[nodiscard]] VkPipeline vulkan_gfx_use(VulkanContext *vk, VulkanGfxLive *live);
+void vulkan_gfx_disarm(VulkanContext *vk, VulkanGfxLive *live);
+
+// Drops one bank reference. The pipeline is destroyed at zero.
+// A null handle is ignored.
+void vulkan_pipe_release(VulkanContext *vk, VkPipeline pipeline);
 
 void vulkan_pipe_cache_open(VulkanContext *vk);
 void vulkan_pipe_cache_close(VulkanContext *vk);

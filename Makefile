@@ -66,12 +66,17 @@ $(GEN_DIR)/%.spv: shaders/%.slang
 	esac; \
 	$(SLANGC) -target spirv -profile spirv_1_6 -stage "$$stage" -entry main -fvk-use-entrypoint-name -depfile "$(GEN_DIR)/$*.d" -Ishaders -o "$@" "$<"
 
+# plane.frag calls WaveRotate. The rotate profile keeps slangc from
+# auto-upgrading spirv_1_6 and warning on that one module.
+$(GEN_DIR)/plane.frag.spv: shaders/plane.frag.slang
+	@mkdir -p $(dir $@)
+	$(SLANGC) -target spirv -profile spirv_1_6+spvGroupNonUniformRotateKHR -stage fragment -entry main -fvk-use-entrypoint-name -depfile "$(GEN_DIR)/plane.frag.d" -Ishaders -o "$@" "$<"
+
 $(GEN_DIR)/bevel.comp.spv: shaders/face_grid.slang
 $(GEN_DIR)/heat.comp.spv: shaders/heat_nbr.slang shaders/face_grid.slang
 $(GEN_DIR)/cube.vert.spv: shaders/camera.slang shaders/material.slang shaders/face_grid.slang
 $(GEN_DIR)/solid.vert.spv: shaders/camera.slang shaders/material.slang
 $(GEN_DIR)/shape.vert.spv: shaders/camera.slang shaders/material.slang
-$(GEN_DIR)/plane.vert.spv: shaders/camera.slang
 $(GEN_DIR)/plot.vert.spv: shaders/camera.slang
 $(GEN_DIR)/gimbal.vert.spv: shaders/camera.slang
 $(GEN_DIR)/mesh.vert.spv: shaders/camera.slang shaders/material.slang
@@ -99,6 +104,7 @@ $(GEN_DIR)/text.frag.spv: examples/demo/text/draw/text.frag.slang
 $(OBJ_DIR)/examples/demo/text/draw/draw.o: $(GEN_DIR)/text.vert.spv $(GEN_DIR)/text.frag.spv
 $(OBJ_DIR)/examples/demo/text/face/face.o: examples/demo/text/face/bundled/InterVariable.ttf
 $(OBJ_DIR)/src/chrome/gpu.o: $(GEN_DIR)/chrome.vert.spv $(GEN_DIR)/chrome.frag.spv
+$(OBJ_DIR)/src/input/page/page.o: $(GEN_DIR)/input.comp.spv
 
 # Compiler & Preprocessor Flags
 CFLAGS ?= $(C23_FLAGS) -D_GNU_SOURCE -Wall -Wextra -Wunused-function -Werror=unused-function -Wmissing-declarations \
@@ -236,7 +242,7 @@ distclean: clean
 test: $(CONFIG_MK)
 	$(CC) $(CFLAGS) -o build/test_handles tests/test_handles.c
 	./build/test_handles
-	$(CC) $(CFLAGS) -o build/test_clock tests/test_clock.c src/frame/loop/clock.c
+	$(CC) $(CFLAGS) -o build/test_clock tests/test_clock.c src/frame/clock/clock.c
 	./build/test_clock
 	$(CC) $(CFLAGS) -o build/test_world tests/test_world.c examples/demo/world/table.c examples/demo/world/spin.c -lm
 	./build/test_world

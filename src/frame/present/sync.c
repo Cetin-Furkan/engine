@@ -182,26 +182,8 @@ int create_acquire_semaphore(VulkanContext *vk, VkSemaphore *out) {
 }
 
 int arm_slot_read(RingContext *ring, uint32_t slot, bool fixed, int raw_fd,
-                         void *buf, uint32_t len, uint64_t user_data) {
-    if (ring == nullptr || !ring->is_initialized || buf == nullptr || len == 0 ||
-        (!fixed && raw_fd < 0)) {
-        return -EINVAL;
-    }
-    struct io_uring_sqe *sqe = ring_sqe(ring);
-    if (sqe == nullptr) {
-        return -ENOSPC;
-    }
-    sqe->opcode = IORING_OP_READ;
-    sqe->flags  = IOSQE_ASYNC;
-    sqe->fd     = fixed ? (int)slot : raw_fd;
-    if (fixed) {
-        sqe->flags |= IOSQE_FIXED_FILE;
-    }
-    sqe->addr      = (uint64_t)(uintptr_t)buf;
-    sqe->len       = len;
-    sqe->off       = 0;
-    sqe->user_data = user_data;
-    return 0;
+                         uint32_t buf_index, uint64_t user_data) {
+    return ring_arm_read_fixed(ring, slot, fixed, raw_fd, buf_index, user_data);
 }
 
 int prep_cancel_fd(RingContext *ring, int fd, uint32_t slot, bool fixed, uint64_t user_data) {
@@ -261,8 +243,7 @@ int attach_release_eventfd(const FrameSlot *frame) {
 
 int arm_release_read(RingContext *ring) {
     return arm_slot_read(ring, ENG_RELEASE_FD_SLOT, frame_state.release_fixed, frame_state.release_fd,
-                         &frame_state.release_counter, (uint32_t)sizeof frame_state.release_counter,
-                         ENG_UD_GPU_RELEASE);
+                         ENG_FBUF_RELEASE, ENG_UD_GPU_RELEASE);
 }
 
 int wait_gpu_release(RingContext *ring, WaylandContext *wl) {
@@ -271,7 +252,7 @@ int wait_gpu_release(RingContext *ring, WaylandContext *wl) {
         struct io_uring_cqe cqe;
         while (ring_peek(ring, &cqe)) {
             if (cqe.user_data == ENG_UD_GPU_RELEASE) {
-                if (cqe.res != (int)sizeof frame_state.release_counter) {
+                if (cqe.res != (int)ENG_FBUF_RELEASE_LEN) {
                     if (cqe.res < 0) {
                         fprintf(stderr, "[Engine Error] io_uring read on GPU release: %s\n",
                                 strerror(-cqe.res));
@@ -334,7 +315,7 @@ int cancel_release_poll(RingContext *ring, WaylandContext *wl, bool *released) {
         while (ring_peek(ring, &cqe)) {
             if (cqe.user_data == ENG_UD_GPU_RELEASE) {
                 saw_read = true;
-                if (cqe.res == (int)sizeof frame_state.release_counter) {
+                if (cqe.res == (int)ENG_FBUF_RELEASE_LEN) {
                     *released = true;
                 }
             } else if (cqe.user_data == k_ud_release_cancel) {

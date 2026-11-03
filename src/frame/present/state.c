@@ -8,6 +8,10 @@ FrameState frame_state = {
         [0] = { .image = { .dmabuf_fd = -1 }, .release_eventfd = -1 },
         [1] = { .image = { .dmabuf_fd = -1 }, .release_eventfd = -1 },
     },
+    .bar_slot = {
+        [0] = { .image = { .dmabuf_fd = -1 }, .release_eventfd = -1 },
+        [1] = { .image = { .dmabuf_fd = -1 }, .release_eventfd = -1 },
+    },
     .resize_fresh = { .image = { .dmabuf_fd = -1 }, .release_eventfd = -1 },
     .stuck_release_fd = -1,
     .release_fd = -1,

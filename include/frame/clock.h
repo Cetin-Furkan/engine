@@ -3,8 +3,8 @@
 
 #include <stdint.h>
 
-// Present pacing and the simulation cursor share this 64-byte cell.
-// Pure logic, no io_uring, no Vulkan: unit-tested.
+// Present pacing, the simulation cursor, and the GPU pass times share
+// this 64-byte cell. Pure logic, no io_uring, no Vulkan: unit-tested.
 //
 // A wl_surface.frame stamp teaches the refresh period and the stall
 // watchdog. It does not advance the simulation. frame_clock_issue does
@@ -36,7 +36,10 @@ typedef struct FrameClock {
     uint32_t accum_ms;     // Fixed-step accumulator (carried remainder).
     uint32_t sim_steps;    // Fixed steps issued since reset.
     uint32_t sim_ms;       // Monotonic simulation cursor. Advances by issued steps only.
-    uint8_t  reserved[27];
+    uint32_t gpu_compute_us; // Hardware compute interval, EMA, microseconds.
+    uint32_t gpu_render_us;  // Hardware color pass interval, EMA, microseconds.
+    uint32_t gpu_total_us;   // Hardware submit interval, EMA, microseconds.
+    uint8_t  reserved[16];
 } FrameClock;
 
 static_assert(sizeof(FrameClock) == 64, "frame clock is one cache line");
@@ -77,5 +80,11 @@ uint32_t frame_clock_sim_stamp(const FrameClock *clock);
 // quanta, ending on the new cursor, and returns the count. A null
 // out_stamps still advances the cursor. Dropped debt is not in the stamps.
 uint32_t frame_clock_issue(FrameClock *clock, uint32_t dt_ms, uint32_t *out_stamps);
+
+// Fold one retired frame's timestamp-query intervals into the EMA.
+// The first sample is stored as-is. Later samples keep seven eighths
+// of the previous value.
+void frame_clock_note_gpu(FrameClock *clock, uint32_t compute_us,
+                          uint32_t render_us, uint32_t total_us);
 
 #endif /* ENGINE_FRAME_CLOCK_H */

@@ -3,10 +3,13 @@
 #include "frame/camera.h"
 #include "frame/grid.h"
 #include "frame/pass.h"
+#include "render/cube_int.h"
 #include "vulkan/bda.h"
 #include "vulkan/pipe.h"
+#include <math.h>
 #include <stddef.h>
 #include <stdio.h>
+#include <string.h>
 
 alignas(uint32_t) static const unsigned char k_vert_spv[] = {
 #embed "cube.vert.spv"
@@ -21,26 +24,38 @@ alignas(uint32_t) static const unsigned char k_heat_spv[] = {
 #embed "heat.comp.spv"
 };
 
-// Matches shaders/bevel.comp and shaders/face_grid.inc. k_grid is 16.
+// Matches shaders/bevel.comp and shaders/face_grid.slang. k_grid is 16.
 // The 888 fillet vertices stay. Each face adds a 16 by 16 grid whose
-// corners are those fillet vertices. Indices are still one quad's two triangles.
+// corners are those fillet vertices. The bevel rails share that boundary.
+// Interior bevel samples are appended after the face grid. One dispatch
+// writes both, so the vertex count stays at least the quad count.
 enum {
     k_arc          = 8,
     k_grid         = 16,
     k_fillet_verts = 6 * 4 + 12 * (k_arc + 1) * 2 + 8 * (k_arc + 1) * (k_arc + 1),
     k_face_samples = (k_grid + 1) * (k_grid + 1) - 4,
-    k_verts        = k_fillet_verts + 6 * k_face_samples,
+    k_grid_verts   = k_fillet_verts + 6 * k_face_samples,
+    k_seam_verts   = 12 * (k_grid - 1) * (k_arc - 1),
+    k_verts        = k_grid_verts + k_seam_verts,
     k_face_quads   = 6 * k_grid * k_grid,
-    k_quads        = k_face_quads + 12 * k_arc + 8 * k_arc * k_arc,
+    k_edge_quads   = 12 * k_grid * k_arc,
+    k_corner_quads = 8 * k_arc * k_arc,
+    k_quads        = k_face_quads + k_edge_quads + k_corner_quads,
     k_indices      = k_quads * 6,
     k_local        = 64,
 };
 
 static_assert(k_fillet_verts == 888u, "fillet vertex count");
 static_assert(k_face_samples == 285u, "face sample count");
-static_assert(k_verts == 2598u, "cube vertex count");
-static_assert(k_quads == 2144u, "cube quad count");
-static_assert(k_indices == 12864u, "cube index count");
+static_assert(k_grid_verts == 2598u, "face grid vertex count");
+static_assert((uint32_t)k_grid_verts == (uint32_t)k_pick_grid_verts, "pick grid verts");
+static_assert((uint32_t)k_verts == (uint32_t)k_pick_verts, "pick verts");
+static_assert((uint32_t)k_indices == (uint32_t)k_pick_indices, "pick indices");
+static_assert(k_seam_verts == 1260u, "bevel seam vertex count");
+static_assert(k_verts == 3858u, "cube vertex count");
+static_assert(k_quads == 3584u, "cube quad count");
+static_assert(k_indices == 21504u, "cube index count");
+static_assert(k_verts >= k_quads, "one bake dispatch covers quads");
 static_assert(k_verts < 65536u, "uint16 index");
 static_assert(sizeof k_vert_spv % 4u == 0u, "vert spirv");
 static_assert(sizeof k_frag_spv % 4u == 0u, "frag spirv");
@@ -123,8 +138,9 @@ static_assert(offsetof(HeatPush, poke_z) == 44u, "heat poke z");
 static_assert(offsetof(HeatPush, yaw_deg) == 48u, "heat yaw");
 static_assert(sizeof(HeatPush) == 56u, "heat push");
 
+static VulkanContext   *s_vk = nullptr;
 static VkPipelineLayout s_layout = VK_NULL_HANDLE;
-static VkPipeline       s_pipeline = VK_NULL_HANDLE;
+static VulkanGfxLive    s_gfx;
 static VkPipelineLayout s_compute_layout = VK_NULL_HANDLE;
 static VkPipeline       s_compute = VK_NULL_HANDLE;
 static DaBuffer         s_mesh_buf = {0};
@@ -135,6 +151,26 @@ static VkPipelineLayout s_heat_layout = VK_NULL_HANDLE;
 static VkPipeline       s_heat_pipe = VK_NULL_HANDLE;
 static DaBuffer         s_heat_bufs[k_heat_copies] = {0};
 static VkDeviceAddress  s_heat_addr[k_heat_copies] = {0};
+// One host mirror of every heat copy. The step copies the slot it writes
+// into this buffer in the same command buffer. The CPU reads a copy only
+// after that submit's acquire wait returns.
+static DaBuffer         s_heat_host = {0};
+static VkDevice         s_device = VK_NULL_HANDLE;
+static VkSemaphore      s_acquire = VK_NULL_HANDLE;
+
+// Last two published copies of one slot, plus the disp the CPU already
+// observed. copy is -1 until the first record_ok.
+typedef struct HeatPub {
+    int      copy;
+    uint64_t point;
+    int      prev_copy;
+    uint64_t prev_point;
+    int      cached_copy;
+    uint64_t cached_point;
+} HeatPub;
+
+static HeatPub s_pub[k_heat_slots];
+static float   s_disp_cache[k_heat_slots][k_grid_verts * 3u];
 
 typedef struct HeatLive {
     int      read;
@@ -194,8 +230,82 @@ static void barrier_heat(VkCommandBuffer cmd, VkPipelineStageFlags2 dst_stage) {
     vkCmdPipelineBarrier2(cmd, &dep);
 }
 
-static void barrier_heat_to_vertex(VkCommandBuffer cmd) {
-    barrier_heat(cmd, VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT);
+static void barrier_copy_to_host(VkCommandBuffer cmd) {
+    VkMemoryBarrier2 barrier = {
+        .sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+        .srcStageMask  = VK_PIPELINE_STAGE_2_COPY_BIT,
+        .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+        .dstStageMask  = VK_PIPELINE_STAGE_2_HOST_BIT,
+        .dstAccessMask = VK_ACCESS_2_HOST_READ_BIT,
+    };
+    VkDependencyInfo dep = {
+        .sType              = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+        .memoryBarrierCount = 1,
+        .pMemoryBarriers    = &barrier,
+    };
+    vkCmdPipelineBarrier2(cmd, &dep);
+}
+
+static void copy_heat_slot(VkCommandBuffer cmd, int copy, uint32_t slot) {
+    if (copy < 0 || (uint32_t)copy >= k_heat_copies || slot >= k_heat_slots ||
+        s_heat_host.buffer == VK_NULL_HANDLE || s_heat_bufs[copy].buffer == VK_NULL_HANDLE) {
+        return;
+    }
+    VkBufferCopy region = {
+        .srcOffset = s_heat_bufs[copy].offset + (VkDeviceSize)slot * (VkDeviceSize)k_heat_stride,
+        .dstOffset = s_heat_host.offset +
+                     ((VkDeviceSize)copy * k_heat_slots + slot) * (VkDeviceSize)k_heat_stride,
+        .size = (VkDeviceSize)k_verts * 32u,
+    };
+    vkCmdCopyBuffer(cmd, s_heat_bufs[copy].buffer, s_heat_host.buffer, 1, &region);
+}
+
+// The draw reads this slot, and the click's mirror copies it. The acquire
+// wait is what makes that copy visible. A missing mirror still barriers
+// the vertex read.
+static void publish_heat_slot(VkCommandBuffer cmd, int copy, uint32_t slot) {
+    VkMemoryBarrier2 barrier = {
+        .sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+        .srcStageMask  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        .srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+        .dstStageMask  = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_COPY_BIT,
+        .dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_TRANSFER_READ_BIT,
+    };
+    VkDependencyInfo dep = {
+        .sType              = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+        .memoryBarrierCount = 1,
+        .pMemoryBarriers    = &barrier,
+    };
+    vkCmdPipelineBarrier2(cmd, &dep);
+    copy_heat_slot(cmd, copy, slot);
+    if (s_heat_host.buffer != VK_NULL_HANDLE) {
+        barrier_copy_to_host(cmd);
+    }
+}
+
+static void drop_pair(VulkanContext *vk, DaBuffer *a, DaBuffer *b) {
+    da_buffer_destroy(vk, a);
+    da_buffer_destroy(vk, b);
+}
+
+static bool heat_seed_looks_zero(void) {
+    if (s_heat_host.map == nullptr) {
+        fprintf(stderr, "[Cube Error] Heat mirror is not mapped\n");
+        return false;
+    }
+    const uint8_t *base = (const uint8_t *)s_heat_host.map;
+    const uint32_t ids[4] = { 0u, 10u, 100u, 1000u };
+    for (uint32_t n = 0; n < 4u; ++n) {
+        float d[3];
+        memcpy(d, base + (size_t)ids[n] * 32u, sizeof d);
+        if (!isfinite(d[0]) || !isfinite(d[1]) || !isfinite(d[2]) || fabsf(d[0]) > 1.0e-4f ||
+            fabsf(d[1]) > 1.0e-4f || fabsf(d[2]) > 1.0e-4f) {
+            fprintf(stderr, "[Cube Error] Heat readback disp at %u is %g %g %g\n", ids[n], (double)d[0],
+                    (double)d[1], (double)d[2]);
+            return false;
+        }
+    }
+    return true;
 }
 
 static void barrier_heat_to_compute(VkCommandBuffer cmd) {
@@ -206,13 +316,95 @@ static bool heat_slot_ok(uint32_t slot) {
     return slot < k_heat_slots;
 }
 
+static void pub_clear_slot(uint32_t slot) {
+    s_pub[slot] = (HeatPub){
+        .copy        = -1,
+        .prev_copy   = -1,
+        .cached_copy = -1,
+    };
+    memset(s_disp_cache[slot], 0, sizeof s_disp_cache[slot]);
+}
+
 static void heat_live_clear(void) {
     for (uint32_t i = 0; i < k_heat_slots; ++i) {
         s_live[i] = (HeatLive){0};
         s_live[i].draw = -1;
+        pub_clear_slot(i);
     }
     s_heat_announced = false;
     s_heat_published = 0;
+}
+
+static void pub_note(uint32_t slot, int copy, uint64_t point) {
+    if (!heat_slot_ok(slot) || copy < 0 || point == 0) {
+        return;
+    }
+    HeatPub *p = &s_pub[slot];
+    if (p->point == point && p->copy == copy) {
+        return;
+    }
+    p->prev_copy = p->copy;
+    p->prev_point = p->point;
+    p->copy = copy;
+    p->point = point;
+}
+
+static bool host_sees(uint64_t point) {
+    if (point == 0 || s_device == VK_NULL_HANDLE || s_acquire == VK_NULL_HANDLE ||
+        s_heat_host.map == nullptr) {
+        return false;
+    }
+    VkSemaphoreWaitInfo wait_info = {
+        .sType          = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
+        .semaphoreCount = 1,
+        .pSemaphores    = &s_acquire,
+        .pValues        = &point,
+    };
+    return vkWaitSemaphores(s_device, &wait_info, 0) == VK_SUCCESS;
+}
+
+static void copy_slot_disp(uint32_t slot, int copy, float *xyz) {
+    const uint8_t *base = (const uint8_t *)s_heat_host.map;
+    base += ((size_t)copy * k_heat_slots + slot) * k_heat_stride;
+    for (uint32_t i = 0; i < k_grid_verts; ++i) {
+        memcpy(xyz + (size_t)i * 3u, base + (size_t)i * 32u, sizeof(float) * 3u);
+    }
+}
+
+void cube_heat_shown_disp(uint32_t slot, float *xyz) {
+    if (xyz == nullptr) {
+        return;
+    }
+    if (!heat_slot_ok(slot)) {
+        memset(xyz, 0, sizeof(float) * 3u * k_grid_verts);
+        return;
+    }
+    HeatPub *p = &s_pub[slot];
+    int copy = -1;
+    uint64_t point = 0;
+    if (p->copy >= 0 && host_sees(p->point)) {
+        copy = p->copy;
+        point = p->point;
+    } else if (p->prev_copy >= 0 && host_sees(p->prev_point)) {
+        copy = p->prev_copy;
+        point = p->prev_point;
+    }
+    if (copy >= 0 && (p->cached_point != point || p->cached_copy != copy)) {
+        copy_slot_disp(slot, copy, s_disp_cache[slot]);
+        p->cached_copy = copy;
+        p->cached_point = point;
+    }
+    if (p->cached_copy < 0) {
+        memset(xyz, 0, sizeof(float) * 3u * k_grid_verts);
+        return;
+    }
+    memcpy(xyz, s_disp_cache[slot], sizeof s_disp_cache[slot]);
+}
+
+void cube_bind_acquire(VkSemaphore acquire) {
+    if (acquire != VK_NULL_HANDLE) {
+        s_acquire = acquire;
+    }
 }
 
 static VkDeviceAddress heat_at(int copy, uint32_t slot) {
@@ -302,9 +494,48 @@ static int bake_mesh(VulkanContext *vk) {
     for (uint32_t slot = 0; slot < k_heat_slots; ++slot) {
         dispatch_heat(cmd, 0, 1u, -1, 0, slot, 0u, 0.0f);
     }
+    DaBuffer mesh_host = {0};
+    DaBuffer index_host = {0};
+    if (da_buffer_create(vk, (VkDeviceSize)k_verts * 36u, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true, &mesh_host) != 0 ||
+        da_buffer_create(vk, (VkDeviceSize)k_indices * sizeof(uint16_t), VK_BUFFER_USAGE_TRANSFER_DST_BIT, true,
+                         &index_host) != 0 ||
+        mesh_host.map == nullptr || index_host.map == nullptr) {
+        fprintf(stderr, "[Cube Error] Mesh readback buffer was not mapped\n");
+        drop_pair(vk, &mesh_host, &index_host);
+        vkFreeCommandBuffers(vk->device, pool, 1, &cmd);
+        return -1;
+    }
+    VkMemoryBarrier2 to_copy = {
+        .sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+        .srcStageMask  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        .srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+        .dstStageMask  = VK_PIPELINE_STAGE_2_COPY_BIT,
+        .dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT,
+    };
+    VkDependencyInfo copy_dep = {
+        .sType              = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+        .memoryBarrierCount = 1,
+        .pMemoryBarriers    = &to_copy,
+    };
+    vkCmdPipelineBarrier2(cmd, &copy_dep);
+    VkBufferCopy mesh_region = {
+        .srcOffset = s_mesh_buf.offset,
+        .dstOffset = mesh_host.offset,
+        .size      = (VkDeviceSize)k_verts * 36u,
+    };
+    VkBufferCopy index_region = {
+        .srcOffset = s_index_buf.offset,
+        .dstOffset = index_host.offset,
+        .size      = (VkDeviceSize)k_indices * sizeof(uint16_t),
+    };
+    vkCmdCopyBuffer(cmd, s_mesh_buf.buffer, mesh_host.buffer, 1, &mesh_region);
+    vkCmdCopyBuffer(cmd, s_index_buf.buffer, index_host.buffer, 1, &index_region);
+    copy_heat_slot(cmd, 0, 0u);
+    barrier_copy_to_host(cmd);
     res = vkEndCommandBuffer(cmd);
     if (res != VK_SUCCESS) {
         cube_fail("vkEndCommandBuffer bake", res);
+        drop_pair(vk, &mesh_host, &index_host);
         vkFreeCommandBuffers(vk->device, pool, 1, &cmd);
         return -1;
     }
@@ -320,13 +551,21 @@ static int bake_mesh(VulkanContext *vk) {
     res = vkQueueSubmit2(queue, 1, &submit_info, VK_NULL_HANDLE);
     if (res != VK_SUCCESS) {
         cube_fail("vkQueueSubmit2 bake", res);
+        drop_pair(vk, &mesh_host, &index_host);
         vkFreeCommandBuffers(vk->device, pool, 1, &cmd);
         return -1;
     }
     res = vkQueueWaitIdle(queue);
     vkFreeCommandBuffers(vk->device, pool, 1, &cmd);
+    bool stored = res == VK_SUCCESS && cube_pick_store_rest(mesh_host.map, index_host.map);
+    bool seed_ok = stored && heat_seed_looks_zero();
+    bool pick_ok = seed_ok && cube_surface_self_check();
+    drop_pair(vk, &mesh_host, &index_host);
     if (res != VK_SUCCESS) {
         cube_fail("vkQueueWaitIdle bake", res);
+        return -1;
+    }
+    if (!stored || !seed_ok || !pick_ok) {
         return -1;
     }
     return 0;
@@ -336,7 +575,9 @@ int cube_init(VulkanContext *vk) {
     if (vk == nullptr || vk->device == VK_NULL_HANDLE) {
         return -1;
     }
-    if (s_pipeline != VK_NULL_HANDLE) {
+    s_device = vk->device;
+    s_vk = vk;
+    if (s_layout != VK_NULL_HANDLE) {
         return 0;
     }
     VkFormat depth_format = pass_depth_format();
@@ -347,11 +588,12 @@ int cube_init(VulkanContext *vk) {
     }
 
     if (da_buffer_create(vk, (VkDeviceSize)k_verts * 36u,
-                         VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, false,
+                         VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, false,
                          &s_mesh_buf) != 0 ||
         da_buffer_create(vk, (VkDeviceSize)k_indices * sizeof(uint16_t),
-                         VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, false,
-                         &s_index_buf) != 0) {
+                         VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+                             VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                         false, &s_index_buf) != 0) {
         cube_shutdown(vk);
         return -1;
     }
@@ -361,12 +603,19 @@ int cube_init(VulkanContext *vk) {
     heat_live_clear();
     for (uint32_t i = 0; i < k_heat_copies; ++i) {
         if (da_buffer_create(vk, (VkDeviceSize)k_heat_slots * (VkDeviceSize)k_heat_stride,
-                             VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, false,
+                             VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, false,
                              &s_heat_bufs[i]) != 0) {
             cube_shutdown(vk);
             return -1;
         }
         s_heat_addr[i] = s_heat_bufs[i].address;
+    }
+    if (da_buffer_create(vk, (VkDeviceSize)k_heat_copies * (VkDeviceSize)k_heat_slots * (VkDeviceSize)k_heat_stride,
+                         VK_BUFFER_USAGE_TRANSFER_DST_BIT, true, &s_heat_host) != 0 ||
+        s_heat_host.map == nullptr) {
+        fprintf(stderr, "[Cube Error] Heat mirror was not mapped\n");
+        cube_shutdown(vk);
+        return -1;
     }
 
     VkResult res = VK_SUCCESS;
@@ -387,7 +636,6 @@ int cube_init(VulkanContext *vk) {
         return -1;
     }
 
-    VkFormat color_format = VK_FORMAT_B8G8R8A8_SRGB;
     VulkanGfxPipe gfx = {
         .vert          = k_vert_spv,
         .vert_bytes    = sizeof k_vert_spv,
@@ -402,10 +650,7 @@ int cube_init(VulkanContext *vk) {
         .depth_compare = VK_COMPARE_OP_LESS,
         .blend         = VK_FALSE,
     };
-    if (vulkan_gfx_pipelines(vk, &gfx, &color_format, nullptr, 1, &s_pipeline) != 0) {
-        cube_shutdown(vk);
-        return -1;
-    }
+    vulkan_gfx_arm(&s_gfx, &gfx, VK_FORMAT_B8G8R8A8_SRGB, nullptr);
 
     VkPushConstantRange compute_push = {
         .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
@@ -453,7 +698,7 @@ int cube_init(VulkanContext *vk) {
         cube_shutdown(vk);
         return -1;
     }
-    printf("[Cube] 240px centered, %u verts, 12px GPU fillet, %u by %u face grid, %ux edge samples, directional sun\n",
+    printf("[Cube] 240px centered, %u verts, bevel welded to the %u by %u face, %ux\n",
            k_verts, k_grid, k_grid, sample_count_n(sample_count));
     fflush(stdout);
     return 0;
@@ -464,14 +709,19 @@ static void release_heat_copies(VulkanContext *vk) {
         da_buffer_destroy(vk, &s_heat_bufs[i]);
         s_heat_addr[i] = 0;
     }
+    da_buffer_destroy(vk, &s_heat_host);
+    s_acquire = VK_NULL_HANDLE;
+    s_device = VK_NULL_HANDLE;
+    cube_pick_reset();
     heat_live_clear();
 }
 
 void cube_shutdown(VulkanContext *vk) {
     s_mesh_addr = 0;
     s_index_addr = 0;
+    vulkan_gfx_disarm(vk, &s_gfx);
+    s_vk = nullptr;
     if (vk == nullptr || vk->device == VK_NULL_HANDLE) {
-        s_pipeline = VK_NULL_HANDLE;
         s_layout = VK_NULL_HANDLE;
         s_compute = VK_NULL_HANDLE;
         s_compute_layout = VK_NULL_HANDLE;
@@ -482,12 +732,8 @@ void cube_shutdown(VulkanContext *vk) {
         da_buffer_destroy(vk, &s_index_buf);
         return;
     }
-    if (s_pipeline != VK_NULL_HANDLE) {
-        vkDestroyPipeline(vk->device, s_pipeline, nullptr);
-        s_pipeline = VK_NULL_HANDLE;
-    }
     if (s_compute != VK_NULL_HANDLE) {
-        vkDestroyPipeline(vk->device, s_compute, nullptr);
+        vulkan_pipe_release(vk, s_compute);
         s_compute = VK_NULL_HANDLE;
     }
     if (s_layout != VK_NULL_HANDLE) {
@@ -499,7 +745,7 @@ void cube_shutdown(VulkanContext *vk) {
         s_compute_layout = VK_NULL_HANDLE;
     }
     if (s_heat_pipe != VK_NULL_HANDLE) {
-        vkDestroyPipeline(vk->device, s_heat_pipe, nullptr);
+        vulkan_pipe_release(vk, s_heat_pipe);
         s_heat_pipe = VK_NULL_HANDLE;
     }
     if (s_heat_layout != VK_NULL_HANDLE) {
@@ -514,7 +760,8 @@ void cube_shutdown(VulkanContext *vk) {
 void cube_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height, float yaw_deg,
                float origin_x, float origin_y, float depth_bias, float phase, bool selected,
                uint32_t mat, uint32_t heat_slot) {
-    if (cmd == VK_NULL_HANDLE || s_pipeline == VK_NULL_HANDLE || width == 0 || height == 0 ||
+    VkPipeline pipeline = vulkan_gfx_use(s_vk, &s_gfx);
+    if (cmd == VK_NULL_HANDLE || pipeline == VK_NULL_HANDLE || width == 0 || height == 0 ||
         !heat_slot_ok(heat_slot)) {
         return;
     }
@@ -535,7 +782,7 @@ void cube_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height, float yaw_d
         .grid_n     = grid_n(),
     };
     view_push_fill(&draw_push.view, mat);
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_pipeline);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
     vkCmdBindIndexBuffer2(cmd, s_index_buf.buffer, s_index_buf.offset,
                           (VkDeviceSize)k_indices * sizeof(uint16_t),
                           VK_INDEX_TYPE_UINT16);
@@ -604,7 +851,7 @@ bool cube_heat_record(VkCommandBuffer cmd, uint32_t slot, float yaw_deg, uint32_
     }
     if (h->need_seed) {
         dispatch_heat(cmd, 0, 1u, -1, dst, slot, 0u, yaw_deg);
-        barrier_heat_to_vertex(cmd);
+        publish_heat_slot(cmd, dst, slot);
         h->draw = dst;
         h->need_seed = false;
         return true;
@@ -642,7 +889,7 @@ bool cube_heat_record(VkCommandBuffer cmd, uint32_t slot, float yaw_deg, uint32_
             barrier_heat_to_compute(cmd);
             continue;
         }
-        barrier_heat_to_vertex(cmd);
+        publish_heat_slot(cmd, src, slot);
         break;
     }
     h->draw = src;
@@ -662,11 +909,13 @@ void cube_heat_record_ok(uint32_t slot, uint64_t signal_point) {
     if (h->draw < 0) {
         return;
     }
+    int written = h->draw;
     h->read = h->draw;
     h->draw = -1;
     h->poke_armed = false;
     if (signal_point != 0) {
         s_heat_published = signal_point;
+        pub_note(slot, written, signal_point);
     }
     h->started = true;
     if (s_heat_announced) {
@@ -799,6 +1048,7 @@ void cube_heat_claim(uint32_t slot) {
     *h = (HeatLive){0};
     h->draw = -1;
     h->need_seed = reseed;
+    pub_clear_slot(slot);
 }
 
 void cube_heat_retire(uint32_t slot) {

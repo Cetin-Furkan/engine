@@ -47,7 +47,7 @@ static void check_profiles(void) {
     CHECK(strcmp(model->name, "Blender-3D") == 0);
     CHECK(!model->sealed);
     CHECK(!model->lock_2d_quat);
-    CHECK(model->bind_count == 40u);
+    CHECK(model->bind_count == 41u);
 
     CHECK(strcmp(plot->name, "Matplotlib-2D") == 0);
     CHECK(!plot->sealed);
@@ -107,6 +107,11 @@ static void check_profiles(void) {
     CHECK(policy_lookup(plot, KEY_4, true) == ACT_ZOOM_IN);
     CHECK(policy_lookup(model, KEY_EQUAL, true) == ACT_ZOOM_IN);
     CHECK(policy_lookup(model, KEY_X, false) == ACT_DELETE);
+    CHECK(policy_lookup(model, KEY_Z, false) == ACT_RESTORE);
+    CHECK(policy_lookup(model, KEY_Z, true) == ACT_RESTORE);
+    CHECK(policy_can(model, ACT_RESTORE));
+    CHECK(!policy_can(plot, ACT_RESTORE));
+    CHECK(policy_lookup(plot, KEY_Z, false) == ACT_NONE);
     CHECK(policy_lookup(model, KEY_BACKSPACE, false) == ACT_DELETE);
     CHECK(policy_lookup(model, KEY_DELETE, false) == ACT_DELETE);
     CHECK(policy_lookup(model, KEY_TAB, false) == ACT_SWITCH_MODE);
@@ -133,6 +138,8 @@ static void check_profiles(void) {
     CHECK(policy_route(model, KEY_4, true) == KEY_ROUTE_HOLD);
     CHECK(policy_route(model, KEY_4, false) == KEY_ROUTE_TAP);
     CHECK(policy_route(model, KEY_ESC, false) == KEY_ROUTE_TAP);
+    CHECK(policy_route(model, KEY_Z, false) == KEY_ROUTE_TAP);
+    CHECK(policy_route(plot, KEY_Z, false) == KEY_ROUTE_IGNORE);
     CHECK(policy_route(model, KEY_X, false) == KEY_ROUTE_TAP);
     CHECK(policy_route(model, KEY_KP5, false) == KEY_ROUTE_TAP);
     CHECK(policy_route(model, KEY_KP9, false) == KEY_ROUTE_TAP);
@@ -169,7 +176,7 @@ static void check_mutation(void) {
     CHECK(policy_route(&rebound, KEY_Q, false) == KEY_ROUTE_TAP);
 
     rebound.bind_count = k_max_key_binds;
-    CHECK(!policy_rebind_key(&rebound, KEY_Z, KEY_SHIFT_ANY, ACT_DELETE));
+    CHECK(!policy_rebind_key(&rebound, KEY_Y, KEY_SHIFT_ANY, ACT_DELETE));
     CHECK(policy_rebind_key(&rebound, KEY_E, KEY_SHIFT_ANY, ACT_CANCEL));
     CHECK(policy_lookup(&rebound, KEY_E, false) == ACT_CANCEL);
 

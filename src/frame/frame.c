@@ -14,3 +14,15 @@ int engine_subsystem_run(void) {
 int engine_subsystem_shutdown(void) {
     return frame_stop();
 }
+
+void frame_gpu_timings(uint32_t *compute_us, uint32_t *render_us, uint32_t *total_us) {
+    if (compute_us != nullptr) {
+        *compute_us = frame_state.clock.gpu_compute_us;
+    }
+    if (render_us != nullptr) {
+        *render_us = frame_state.clock.gpu_render_us;
+    }
+    if (total_us != nullptr) {
+        *total_us = frame_state.clock.gpu_total_us;
+    }
+}

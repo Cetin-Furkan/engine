@@ -62,6 +62,10 @@ typedef struct GpuCandidate {
     bool                             supports_shader_int64;
     bool                             supports_storage_buffer_16bit;
     bool                             supports_shader_float16;
+    bool                             supports_shader_expect_assume;
+    bool                             supports_shader_float_controls2;
+    bool                             supports_shader_subgroup_rotate;
+    bool                             supports_shader_subgroup_rotate_clustered;
 
     bool                             has_drm_primary;
     bool                             has_drm_render;
@@ -445,6 +449,11 @@ static VulkanResult evaluate_device(GpuCandidate *candidate) {
     candidate->supports_shader_int64                 = (features2.features.shaderInt64 == VK_TRUE);
     candidate->supports_storage_buffer_16bit         = (feat11.storageBuffer16BitAccess == VK_TRUE);
     candidate->supports_shader_float16               = (feat12.shaderFloat16 == VK_TRUE);
+    candidate->supports_shader_expect_assume         = (feat14.shaderExpectAssume == VK_TRUE);
+    candidate->supports_shader_float_controls2       = (feat14.shaderFloatControls2 == VK_TRUE);
+    candidate->supports_shader_subgroup_rotate       = (feat14.shaderSubgroupRotate == VK_TRUE);
+    candidate->supports_shader_subgroup_rotate_clustered =
+        (feat14.shaderSubgroupRotateClustered == VK_TRUE);
     candidate->features_probed                       = true;
 
     if (!candidate->supports_dyn_render || !candidate->supports_sync2 ||
@@ -611,6 +620,11 @@ static void print_candidate(uint32_t index, const GpuCandidate *candidate) {
     if (!candidate->features_probed) {
         printf("      Features: not probed\n");
     } else {
+        printf("      Shader: ExpectAssume=%s, FloatControls2=%s, SubgroupRotate=%s, RotateClustered=%s\n",
+               candidate->supports_shader_expect_assume ? "yes" : "no",
+               candidate->supports_shader_float_controls2 ? "yes" : "no",
+               candidate->supports_shader_subgroup_rotate ? "yes" : "no",
+               candidate->supports_shader_subgroup_rotate_clustered ? "yes" : "no");
         printf("      Features: DynRender=%s, LocalRead=%s, Sync2=%s, BDA=%s, ScalarLayout=%s, Timeline=%s, Anisotropy=%s, Maint5=%s, Maint6=%s, PushDesc=%s, HostImageCopy=%s, Int16=%s, Int64=%s, Storage16=%s, Float16=%s\n",
                candidate->supports_dyn_render ? "yes" : "no",
                candidate->supports_dynamic_rendering_local_read ? "yes" : "no",
@@ -878,6 +892,11 @@ VulkanResult vulkan_device_create(VulkanContext *ctx) {
     ctx->device_info.supports_shader_int64 = best.supports_shader_int64;
     ctx->device_info.supports_storage_buffer_16bit = best.supports_storage_buffer_16bit;
     ctx->device_info.supports_shader_float16 = best.supports_shader_float16;
+    ctx->device_info.supports_shader_expect_assume = best.supports_shader_expect_assume;
+    ctx->device_info.supports_shader_float_controls2 = best.supports_shader_float_controls2;
+    ctx->device_info.supports_shader_subgroup_rotate = best.supports_shader_subgroup_rotate;
+    ctx->device_info.supports_shader_subgroup_rotate_clustered =
+        best.supports_shader_subgroup_rotate_clustered;
     ctx->device_info.has_drm_primary_node = best.has_drm_primary;
     ctx->device_info.has_drm_render_node = best.has_drm_render;
     ctx->device_info.drm_primary_major = best.drm_primary_major;
@@ -937,11 +956,18 @@ VulkanResult vulkan_device_create(VulkanContext *ctx) {
 
     VkPhysicalDeviceVulkan14Features feat14 = {
         .sType                     = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_4_FEATURES,
-        .maintenance5              = VK_TRUE,
-        .maintenance6              = VK_TRUE,
-        .pushDescriptor            = best.supports_push_descriptors ? VK_TRUE : VK_FALSE,
-        .hostImageCopy             = best.supports_host_image_copy ? VK_TRUE : VK_FALSE,
-        .dynamicRenderingLocalRead = best.supports_dynamic_rendering_local_read ? VK_TRUE : VK_FALSE,
+        .maintenance5                  = VK_TRUE,
+        .maintenance6                  = VK_TRUE,
+        .shaderSubgroupRotate          = best.supports_shader_subgroup_rotate ? VK_TRUE : VK_FALSE,
+        .shaderSubgroupRotateClustered =
+            (best.supports_shader_subgroup_rotate && best.supports_shader_subgroup_rotate_clustered)
+                ? VK_TRUE
+                : VK_FALSE,
+        .shaderFloatControls2          = best.supports_shader_float_controls2 ? VK_TRUE : VK_FALSE,
+        .shaderExpectAssume            = best.supports_shader_expect_assume ? VK_TRUE : VK_FALSE,
+        .pushDescriptor                = best.supports_push_descriptors ? VK_TRUE : VK_FALSE,
+        .hostImageCopy                 = best.supports_host_image_copy ? VK_TRUE : VK_FALSE,
+        .dynamicRenderingLocalRead     = best.supports_dynamic_rendering_local_read ? VK_TRUE : VK_FALSE,
     };
     VkPhysicalDeviceVulkan13Features feat13 = {
         .sType                          = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,

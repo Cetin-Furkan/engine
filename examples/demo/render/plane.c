@@ -17,10 +17,10 @@ alignas(uint32_t) static const unsigned char k_frag_spv[] = {
 static_assert(sizeof k_vert_spv % 4u == 0u, "plane vert spirv");
 static_assert(sizeof k_frag_spv % 4u == 0u, "plane frag spirv");
 
-// One 6-vertex quad on the true z = 0 plane, no vertex buffer. The
-// metric decades are analytic in the fragment shader. The old 3-level
-// clipmap sat at z = -170 behind the meshes; this plane is at the
-// world ground and depth-tests (without writing) against real geometry.
+// One fullscreen triangle, no vertex buffer. The fragment shader paints
+// the metric in screen space, so the sheet stays behind the scene at any
+// zoom and does not stand up when the camera yaws. Decades still come
+// from plane_grid_for. span is not sampled.
 typedef struct PlanePush {
     uint32_t width;
     uint32_t height;
@@ -28,39 +28,30 @@ typedef struct PlanePush {
     float    level_frac;
     float    origin_x;
     float    origin_y;
-    float    span;
-    float    span_mod;
-    float    span_steps;
-    float    pad2;
-    uint32_t pad3;
-    uint32_t pad4;
-    ViewPush view;
+    float    zoom;
+    float    coarse;
 } PlanePush;
 
 static_assert(offsetof(PlanePush, cell_med) == 8u, "plane cell_med");
 static_assert(offsetof(PlanePush, origin_x) == 16u, "plane origin");
-static_assert(offsetof(PlanePush, span) == 24u, "plane span");
-static_assert(offsetof(PlanePush, span_mod) == 28u, "plane span mod");
-static_assert(offsetof(PlanePush, span_steps) == 32u, "plane span steps");
-static_assert(offsetof(PlanePush, view) == 48u, "plane view");
-static_assert(sizeof(PlanePush) == 96u, "plane push");
+static_assert(offsetof(PlanePush, zoom) == 24u, "plane zoom");
+static_assert(offsetof(PlanePush, coarse) == 28u, "plane coarse");
+static_assert(sizeof(PlanePush) == 32u, "plane push");
 
+static VulkanContext   *s_vk = nullptr;
 static VkPipelineLayout s_layout = VK_NULL_HANDLE;
-static VkPipeline       s_pipeline = VK_NULL_HANDLE;
+static VulkanGfxLive    s_gfx;
 
 static void plane_fail(const char *what, VkResult res) {
     fprintf(stderr, "[Plane Error] %s: %s (%d)\n", what, vulkan_vkresult_to_str(res), (int)res);
 }
 
 void plane_shutdown(VulkanContext *vk) {
+    vulkan_gfx_disarm(vk, &s_gfx);
+    s_vk = nullptr;
     if (vk == nullptr || vk->device == VK_NULL_HANDLE) {
         s_layout = VK_NULL_HANDLE;
-        s_pipeline = VK_NULL_HANDLE;
         return;
-    }
-    if (s_pipeline != VK_NULL_HANDLE) {
-        vkDestroyPipeline(vk->device, s_pipeline, nullptr);
-        s_pipeline = VK_NULL_HANDLE;
     }
     if (s_layout != VK_NULL_HANDLE) {
         vkDestroyPipelineLayout(vk->device, s_layout, nullptr);
@@ -72,7 +63,8 @@ int plane_init(VulkanContext *vk) {
     if (vk == nullptr || vk->device == VK_NULL_HANDLE || vk->physical_device == VK_NULL_HANDLE) {
         return -1;
     }
-    if (s_pipeline != VK_NULL_HANDLE) {
+    s_vk = vk;
+    if (s_layout != VK_NULL_HANDLE) {
         return 0;
     }
     VkFormat depth_format = pass_depth_format();
@@ -90,7 +82,7 @@ int plane_init(VulkanContext *vk) {
     }
 
     VkPushConstantRange push = {
-        .stageFlags = VK_SHADER_STAGE_VERTEX_BIT,
+        .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
         .offset     = 0,
         .size       = sizeof(PlanePush),
     };
@@ -107,9 +99,9 @@ int plane_init(VulkanContext *vk) {
         return -1;
     }
 
-    // Tests against meshes but never writes depth, so geometry centered
-    // on z = 0 is never sliced by its own ground.
-    VkFormat color_format = VK_FORMAT_B8G8R8A8_SRGB;
+    // Drawn first, with depth test and depth write off. Later geometry
+    // replaces these pixels. The clear depth is left for the meshes.
+    // The pipeline is created on the first draw of this format.
     VulkanGfxPipe gfx = {
         .vert          = k_vert_spv,
         .vert_bytes    = sizeof k_vert_spv,
@@ -119,29 +111,27 @@ int plane_init(VulkanContext *vk) {
         .depth_format  = depth_format,
         .samples       = samples,
         .cull          = VK_CULL_MODE_NONE,
-        .depth_test    = VK_TRUE,
+        .depth_test    = VK_FALSE,
         .depth_write   = VK_FALSE,
-        .depth_compare = VK_COMPARE_OP_LESS_OR_EQUAL,
+        .depth_compare = VK_COMPARE_OP_ALWAYS,
         .blend         = VK_FALSE,
     };
-    if (vulkan_gfx_pipelines(vk, &gfx, &color_format, nullptr, 1, &s_pipeline) != 0) {
-        plane_shutdown(vk);
-        return -1;
-    }
-    printf("[Plane] Universal 6-vertex metric grid on z = 0 (live 10^k subdivisions).\n");
+    vulkan_gfx_arm(&s_gfx, &gfx, VK_FORMAT_B8G8R8A8_SRGB, nullptr);
+    printf("[Plane] Screen-space metric grid behind the scene (live 10^k subdivisions).\n");
     fflush(stdout);
     return 0;
 }
 
 void plane_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height) {
-    if (cmd == VK_NULL_HANDLE || s_pipeline == VK_NULL_HANDLE || width == 0 || height == 0) {
+    VkPipeline pipeline = vulkan_gfx_use(s_vk, &s_gfx);
+    if (cmd == VK_NULL_HANDLE || pipeline == VK_NULL_HANDLE || width == 0 || height == 0) {
         return;
     }
     ViewPush view;
     view_push_fill(&view, 0u);
     PlaneGrid grid = plane_grid_for(width, height, view.zoom);
 
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_pipeline);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
 
     PlanePush push = {
         .width      = width,
@@ -150,11 +140,9 @@ void plane_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height) {
         .level_frac = grid.level_frac,
         .origin_x   = plane_grid_wrap(view.cam_x, grid.coarse),
         .origin_y   = plane_grid_wrap(view.cam_y, grid.coarse),
-        .span       = grid.span,
-        .span_mod   = grid.span_mod,
-        .span_steps = grid.span_steps,
-        .view       = view,
+        .zoom       = view.zoom,
+        .coarse     = grid.coarse,
     };
-    vulkan_cmd_push(cmd, s_layout, VK_SHADER_STAGE_VERTEX_BIT, sizeof push, &push);
-    vkCmdDraw(cmd, 6u, 1u, 0u, 0u);
+    vulkan_cmd_push(cmd, s_layout, VK_SHADER_STAGE_FRAGMENT_BIT, sizeof push, &push);
+    vkCmdDraw(cmd, 3u, 1u, 0u, 0u);
 }

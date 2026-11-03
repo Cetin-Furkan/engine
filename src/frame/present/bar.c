@@ -124,29 +124,9 @@ static int record_bar(VulkanContext *vk, FrameSlot *frame, uint64_t signal_point
         return -1;
     }
 
-    VkImageMemoryBarrier2 to_color = {
-        .sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
-        .srcStageMask        = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
-        .srcAccessMask       = VK_ACCESS_2_NONE,
-        .dstStageMask        = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-        .dstAccessMask       = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
-        .oldLayout           = VK_IMAGE_LAYOUT_UNDEFINED,
-        .newLayout           = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .image               = frame->image.image,
-        .subresourceRange    = {
-            .aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
-            .levelCount     = 1,
-            .layerCount     = 1,
-        },
-    };
-    VkDependencyInfo dep_in = {
-        .sType                   = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
-        .imageMemoryBarrierCount = 1,
-        .pImageMemoryBarriers    = &to_color,
-    };
-    vkCmdPipelineBarrier2(frame->cmd_buf, &dep_in);
+    VkImageMemoryBarrier2 to_color;
+    frame_fill_discard_color(&to_color, frame->image.image);
+    frame_cmd_barriers(frame->cmd_buf, &to_color, 1);
 
     VkRenderingAttachmentInfo color = {
         .sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
@@ -183,32 +163,9 @@ static int record_bar(VulkanContext *vk, FrameSlot *frame, uint64_t signal_point
                     frame->view_format, VK_FORMAT_UNDEFINED, VK_SAMPLE_COUNT_1_BIT);
     vkCmdEndRendering(frame->cmd_buf);
 
-    uint32_t dst_queue = vk->device_info.supports_queue_family_foreign
-        ? VK_QUEUE_FAMILY_FOREIGN_EXT
-        : VK_QUEUE_FAMILY_EXTERNAL;
-    VkImageMemoryBarrier2 to_general = {
-        .sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
-        .srcStageMask        = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-        .srcAccessMask       = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
-        .dstStageMask        = VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT,
-        .dstAccessMask       = VK_ACCESS_2_NONE,
-        .oldLayout           = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-        .newLayout           = VK_IMAGE_LAYOUT_GENERAL,
-        .srcQueueFamilyIndex = vk->queues.graphics_family_index,
-        .dstQueueFamilyIndex = dst_queue,
-        .image               = frame->image.image,
-        .subresourceRange    = {
-            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-            .levelCount = 1,
-            .layerCount = 1,
-        },
-    };
-    VkDependencyInfo dep_out = {
-        .sType                   = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
-        .imageMemoryBarrierCount = 1,
-        .pImageMemoryBarriers    = &to_general,
-    };
-    vkCmdPipelineBarrier2(frame->cmd_buf, &dep_out);
+    VkImageMemoryBarrier2 to_general;
+    frame_fill_release_foreign(&to_general, vk, frame->image.image);
+    frame_cmd_barriers(frame->cmd_buf, &to_general, 1);
     res = vkEndCommandBuffer(frame->cmd_buf);
     if (res != VK_SUCCESS) {
         fprintf(stderr, "[Chrome Error] Bar command end failed: %s (%d)\n",
@@ -216,17 +173,14 @@ static int record_bar(VulkanContext *vk, FrameSlot *frame, uint64_t signal_point
         return -1;
     }
 
-    uint64_t prev = signal_point - 1u;
-    bool wait_prev = signal_point > 1u;
+    // The bar signals the shared acquire timeline at its own point and does
+    // not wait on the previous point. That wait held the bar draw until the
+    // scene's color pass finished. Both submits go to this one queue, in
+    // order, and the later signal's scope already includes the earlier
+    // commands, so the compositor still observes the points in order.
     VkCommandBufferSubmitInfo cmd_submit = {
         .sType         = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
         .commandBuffer = frame->cmd_buf,
-    };
-    VkSemaphoreSubmitInfo wait_info = {
-        .sType     = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
-        .semaphore = frame_state.acquire,
-        .value     = prev,
-        .stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
     };
     VkSemaphoreSubmitInfo signal_info = {
         .sType     = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
@@ -236,8 +190,8 @@ static int record_bar(VulkanContext *vk, FrameSlot *frame, uint64_t signal_point
     };
     VkSubmitInfo2 submit = {
         .sType                    = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
-        .waitSemaphoreInfoCount   = wait_prev ? 1u : 0u,
-        .pWaitSemaphoreInfos      = wait_prev ? &wait_info : nullptr,
+        .waitSemaphoreInfoCount   = 0u,
+        .pWaitSemaphoreInfos      = nullptr,
         .commandBufferInfoCount   = 1,
         .pCommandBufferInfos      = &cmd_submit,
         .signalSemaphoreInfoCount = 1,
@@ -295,6 +249,9 @@ int bar_record_first(WaylandContext *wl, VulkanContext *vk) {
     }
     uint64_t next = frame_state.sync_point + 1u;
     if (record_bar(vk, bar, next) != 0) {
+        // The point was not signalled. Leave it at 0 so shutdown does not
+        // wait three seconds for a value this submit never published.
+        bar->acquire_point = 0;
         reap_frame_resources(wl, vk, bar);
         return -1;
     }
@@ -333,12 +290,16 @@ int bar_prepare(WaylandContext *wl, VulkanContext *vk, bool force) {
         return -EBUSY;
     }
     FrameSlot *dst = bar_spare();
-    if (dst->release_pending &&
-        !poll_release_semaphore(vk, dst->release_semaphore, dst->release_point)) {
+    // Resetting the command buffer while its submit is pending is invalid.
+    // The release poll only says the compositor dropped the buffer.
+    bool ready = acquire_point_retired(vk, dst->acquire_point) &&
+                 (!dst->release_pending ||
+                  poll_release_semaphore(vk, dst->release_semaphore, dst->release_point));
+    if (!ready) {
         frame_state.bar_dirty = true;
         return -EAGAIN;
     }
-    if (dst->image.image != VK_NULL_HANDLE || dst->wl_buffer_id != 0 || dst->cmd_buf != VK_NULL_HANDLE) {
+    if (slot_has_pixels(dst)) {
         if (retire_pixels(wl, vk, dst) != 0) {
             return -1;
         }
@@ -353,12 +314,13 @@ int bar_prepare(WaylandContext *wl, VulkanContext *vk, bool force) {
     }
     uint64_t next = frame_state.sync_point + 1u;
     if (record_bar(vk, dst, next) != 0) {
-        reap_frame_resources(wl, vk, dst);
+        dst->acquire_point = 0;
+        (void)retire_pixels(wl, vk, dst);
         return -1;
     }
     frame_state.sync_point = next;
     if (import_bar_buffer(wl, dst) != 0) {
-        reap_frame_resources(wl, vk, dst);
+        (void)retire_pixels(wl, vk, dst);
         return -1;
     }
     arm_slot(wl, dst);
@@ -378,7 +340,10 @@ void bar_drop_unsent(WaylandContext *wl, VulkanContext *vk) {
     frame_state.bar_dirty = true;
     FrameSlot *dst = bar_spare();
     dst->release_pending = false;
-    reap_frame_resources(wl, vk, dst);
+    // Drop the unsent image and keep this slot's release timeline. The next
+    // prepare reuses it. Reaping here destroyed that syncobj while the other
+    // bar slot, or an orphan of this one, still named it.
+    (void)retire_pixels(wl, vk, dst);
 }
 
 void bar_install(void) {

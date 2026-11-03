@@ -5,8 +5,9 @@
 #include <stdint.h>
 
 // 8x8 readout drawn into frames that are already being recorded.
-// It does not arm wl_surface.frame. While the window is idle the last
-// numbers stay on the last buffer.
+// Four short lines: frame time, completions, scene counts, modifier
+// and zoom. It does not arm wl_surface.frame. While the window is idle
+// the last numbers stay on the last buffer.
 
 [[nodiscard]] int hud_init(VulkanContext *vk);
 void hud_shutdown(VulkanContext *vk);

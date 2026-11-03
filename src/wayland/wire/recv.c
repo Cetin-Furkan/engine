@@ -283,8 +283,27 @@ void wayland_on_cqe(WaylandContext *w, const struct io_uring_cqe *cqe) {
         return;
     }
     if (cqe->user_data == ENG_UD_SIM_TIMER) {
-        w->noted_sim = true;
-        w->noted_sim_res = cqe->res;
+        // Recycle the provided buffer here. A blocking wait can see several
+        // ticks before the idle loop applies the note, and each tick owns a
+        // distinct buffer.
+        uint64_t n = 0;
+        bool have = ring_take_sim_count(w->ring, cqe, &n);
+        if (!w->noted_sim) {
+            w->noted_sim = true;
+            w->noted_sim_res = cqe->res;
+            w->noted_sim_alive = (cqe->flags & IORING_CQE_F_MORE) != 0;
+            w->noted_sim_exp = have ? n : 0;
+        } else {
+            if (have) {
+                w->noted_sim_exp += n;
+            }
+            if (cqe->res < 0) {
+                w->noted_sim_res = cqe->res;
+            }
+            if ((cqe->flags & IORING_CQE_F_MORE) == 0) {
+                w->noted_sim_alive = false;
+            }
+        }
         return;
     }
     if (cqe->user_data == ENG_UD_WL_SEND) {
@@ -326,19 +345,6 @@ void wayland_on_cqe(WaylandContext *w, const struct io_uring_cqe *cqe) {
 
     if (cqe->res < 0) {
         w->recv_armed = false;
-        // recvmsg cannot split its header across an incremental tail. This kernel
-        // returns EFAULT instead of selecting the next buffer. The bytes stay in
-        // the socket. Drop incremental mode and arm a fresh multishot.
-        bool inc_reject = w->ring->pbuf_inc &&
-                          ((cqe->res == -EINVAL && w->recv_cqes == 1) || cqe->res == -EFAULT);
-        if (inc_reject) {
-            fprintf(stderr, "[Wayland] Incremental buffers rejected recvmsg (%s). Falling back.\n",
-                    strerror(-cqe->res));
-            if (ring_pbuf_drop_inc(w->ring) == 0) {
-                wl_arm_recv(w);
-                return;
-            }
-        }
         if (cqe->res == -ENOBUFS) {
             (void)wayland_ensure_recv(w);
             return;
@@ -352,10 +358,9 @@ void wayland_on_cqe(WaylandContext *w, const struct io_uring_cqe *cqe) {
     }
 
     uint16_t bid = (uint16_t)(cqe->flags >> IORING_CQE_BUFFER_SHIFT);
-    bool more = w->ring->pbuf_inc && (cqe->flags & IORING_CQE_F_BUF_MORE) != 0;
     uint8_t *buf = ring_pbuf_chunk(w->ring, bid, (uint32_t)cqe->res);
     if (buf == nullptr) {
-        ring_pbuf_finish(w->ring, bid, (uint32_t)cqe->res, more);
+        ring_pbuf_finish(w->ring, bid);
         wl_fail(w, "recvmsg buffer ID out of range");
         return;
     }
@@ -363,7 +368,7 @@ void wayland_on_cqe(WaylandContext *w, const struct io_uring_cqe *cqe) {
     const struct io_uring_recvmsg_out *out = (const struct io_uring_recvmsg_out *)buf;
     uint32_t hdr = (uint32_t)sizeof(*out) + w->control_reserve;
     if ((uint32_t)cqe->res < hdr || (out->flags & (MSG_CTRUNC | MSG_TRUNC)) != 0) {
-        ring_pbuf_finish(w->ring, bid, (uint32_t)cqe->res, more);
+        ring_pbuf_finish(w->ring, bid);
         wl_fail(w, "recvmsg truncated");
         return;
     }
@@ -373,7 +378,7 @@ void wayland_on_cqe(WaylandContext *w, const struct io_uring_cqe *cqe) {
         park_fds(w, buf + sizeof(*out), out->controllen);
     }
     if (w->failed) {
-        ring_pbuf_finish(w->ring, bid, (uint32_t)cqe->res, more);
+        ring_pbuf_finish(w->ring, bid);
         return;
     }
     const unsigned char *payload = buf + hdr;
@@ -424,7 +429,7 @@ void wayland_on_cqe(WaylandContext *w, const struct io_uring_cqe *cqe) {
             }
         }
     }
-    ring_pbuf_finish(w->ring, bid, (uint32_t)cqe->res, more);
+    ring_pbuf_finish(w->ring, bid);
 
     if (!w->failed) {
         (void)wayland_ensure_recv(w);

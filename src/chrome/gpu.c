@@ -44,10 +44,10 @@ static_assert(offsetof(ChromeGpuPush, ctl) == 40u, "chrome control offset");
 static_assert(sizeof(ChromeGpuPush) == 232u, "chrome push size");
 
 static VkPipelineLayout     s_layout = VK_NULL_HANDLE;
-static VkPipeline           s_srgb = VK_NULL_HANDLE;
-static VkPipeline           s_unorm = VK_NULL_HANDLE;
-static VkPipeline           s_scene_srgb = VK_NULL_HANDLE;
-static VkPipeline           s_scene_unorm = VK_NULL_HANDLE;
+static VulkanGfxLive        s_overlay_srgb;
+static VulkanGfxLive        s_overlay_unorm;
+static VulkanGfxLive        s_scene_srgb;
+static VulkanGfxLive        s_scene_unorm;
 static VkFormat             s_scene_depth = VK_FORMAT_UNDEFINED;
 static VkSampleCountFlagBits s_scene_samples = VK_SAMPLE_COUNT_1_BIT;
 static uint32_t             s_logged_w = 0;
@@ -61,9 +61,8 @@ static uint32_t pack_rgb(uint8_t r, uint8_t g, uint8_t b, uint32_t flag) {
     return (uint32_t)r | ((uint32_t)g << 8) | ((uint32_t)b << 16) | (flag << 24);
 }
 
-static int make_pair(VulkanContext *vk, VkSampleCountFlagBits samples, VkFormat depth,
-                     VkPipeline *srgb, VkPipeline *unorm) {
-    VkFormat formats[2] = { VK_FORMAT_B8G8R8A8_SRGB, VK_FORMAT_B8G8R8A8_UNORM };
+static void arm_pair(VkSampleCountFlagBits samples, VkFormat depth,
+                     VulkanGfxLive *srgb, VulkanGfxLive *unorm) {
     VulkanGfxPipe info = {
         .vert          = k_vert_spv,
         .vert_bytes    = sizeof k_vert_spv,
@@ -78,29 +77,13 @@ static int make_pair(VulkanContext *vk, VkSampleCountFlagBits samples, VkFormat 
         .depth_compare = VK_COMPARE_OP_LESS,
         .blend         = VK_FALSE,
     };
-    VkPipeline out[2] = {0};
-    if (vulkan_gfx_pipelines(vk, &info, formats, nullptr, 2, out) != 0) {
-        return -1;
-    }
-    *srgb = out[0];
-    *unorm = out[1];
-    return 0;
+    vulkan_gfx_arm(srgb, &info, VK_FORMAT_B8G8R8A8_SRGB, nullptr);
+    vulkan_gfx_arm(unorm, &info, VK_FORMAT_B8G8R8A8_UNORM, nullptr);
 }
 
-static void destroy_scene(VkDevice device) {
-    if (device == VK_NULL_HANDLE) {
-        s_scene_srgb = VK_NULL_HANDLE;
-        s_scene_unorm = VK_NULL_HANDLE;
-        return;
-    }
-    if (s_scene_srgb != VK_NULL_HANDLE) {
-        vkDestroyPipeline(device, s_scene_srgb, nullptr);
-        s_scene_srgb = VK_NULL_HANDLE;
-    }
-    if (s_scene_unorm != VK_NULL_HANDLE) {
-        vkDestroyPipeline(device, s_scene_unorm, nullptr);
-        s_scene_unorm = VK_NULL_HANDLE;
-    }
+static void disarm_scene(VulkanContext *vk) {
+    vulkan_gfx_disarm(vk, &s_scene_srgb);
+    vulkan_gfx_disarm(vk, &s_scene_unorm);
 }
 
 int chrome_gpu_init(VulkanContext *vk) {
@@ -136,10 +119,7 @@ int chrome_gpu_init(VulkanContext *vk) {
         return -1;
     }
 
-    if (make_pair(vk, VK_SAMPLE_COUNT_1_BIT, VK_FORMAT_UNDEFINED, &s_srgb, &s_unorm) != 0) {
-        chrome_gpu_shutdown(vk);
-        return -1;
-    }
+    arm_pair(VK_SAMPLE_COUNT_1_BIT, VK_FORMAT_UNDEFINED, &s_overlay_srgb, &s_overlay_unorm);
     printf("[Chrome] Bar, close, and X are drawn by a fragment shader\n");
     fflush(stdout);
     return 0;
@@ -148,27 +128,13 @@ int chrome_gpu_init(VulkanContext *vk) {
 void chrome_gpu_shutdown(VulkanContext *vk) {
     s_scene_depth = VK_FORMAT_UNDEFINED;
     s_scene_samples = VK_SAMPLE_COUNT_1_BIT;
-    if (vk == nullptr || vk->device == VK_NULL_HANDLE) {
-        s_layout = VK_NULL_HANDLE;
-        s_srgb = VK_NULL_HANDLE;
-        s_unorm = VK_NULL_HANDLE;
-        s_scene_srgb = VK_NULL_HANDLE;
-        s_scene_unorm = VK_NULL_HANDLE;
-        return;
-    }
-    destroy_scene(vk->device);
-    if (s_srgb != VK_NULL_HANDLE) {
-        vkDestroyPipeline(vk->device, s_srgb, nullptr);
-        s_srgb = VK_NULL_HANDLE;
-    }
-    if (s_unorm != VK_NULL_HANDLE) {
-        vkDestroyPipeline(vk->device, s_unorm, nullptr);
-        s_unorm = VK_NULL_HANDLE;
-    }
-    if (s_layout != VK_NULL_HANDLE) {
+    disarm_scene(vk);
+    vulkan_gfx_disarm(vk, &s_overlay_srgb);
+    vulkan_gfx_disarm(vk, &s_overlay_unorm);
+    if (vk != nullptr && vk->device != VK_NULL_HANDLE && s_layout != VK_NULL_HANDLE) {
         vkDestroyPipelineLayout(vk->device, s_layout, nullptr);
-        s_layout = VK_NULL_HANDLE;
     }
+    s_layout = VK_NULL_HANDLE;
 }
 
 int chrome_gpu_bind_pass(VulkanContext *vk, VkFormat depth_format,
@@ -178,33 +144,33 @@ int chrome_gpu_bind_pass(VulkanContext *vk, VkFormat depth_format,
         fprintf(stderr, "[Chrome Error] Scene pipelines need the layout and a depth pass\n");
         return -1;
     }
-    if (s_scene_srgb != VK_NULL_HANDLE && s_scene_unorm != VK_NULL_HANDLE &&
+    if (s_scene_srgb.armed && s_scene_unorm.armed &&
         s_scene_depth == depth_format && s_scene_samples == samples) {
         return 0;
     }
-    destroy_scene(vk->device);
-    if (make_pair(vk, samples, depth_format, &s_scene_srgb, &s_scene_unorm) != 0) {
-        s_scene_depth = VK_FORMAT_UNDEFINED;
-        return -1;
-    }
+    disarm_scene(vk);
+    arm_pair(samples, depth_format, &s_scene_srgb, &s_scene_unorm);
     s_scene_depth = depth_format;
     s_scene_samples = samples;
     return 0;
 }
 
-static VkPipeline pick_pipeline(VkFormat format, VkFormat depth_format,
+static VkPipeline pick_pipeline(VulkanContext *vk, VkFormat format, VkFormat depth_format,
                                 VkSampleCountFlagBits samples) {
     bool scene = depth_format != VK_FORMAT_UNDEFINED;
     if (scene && (depth_format != s_scene_depth || samples != s_scene_samples)) {
         return VK_NULL_HANDLE;
     }
+    VulkanGfxLive *live = nullptr;
     if (format == VK_FORMAT_B8G8R8A8_SRGB) {
-        return scene ? s_scene_srgb : s_srgb;
+        live = scene ? &s_scene_srgb : &s_overlay_srgb;
+    } else if (format == VK_FORMAT_B8G8R8A8_UNORM) {
+        live = scene ? &s_scene_unorm : &s_overlay_unorm;
     }
-    if (format == VK_FORMAT_B8G8R8A8_UNORM) {
-        return scene ? s_scene_unorm : s_unorm;
+    if (live == nullptr) {
+        return VK_NULL_HANDLE;
     }
-    return VK_NULL_HANDLE;
+    return vulkan_gfx_use(vk, live);
 }
 
 void chrome_gpu_draw(VulkanContext *vk, VkCommandBuffer cmd,
@@ -216,7 +182,7 @@ void chrome_gpu_draw(VulkanContext *vk, VkCommandBuffer cmd,
         fb_w == 0 || fb_h == 0) {
         return;
     }
-    VkPipeline pipeline = pick_pipeline(format, depth_format, samples);
+    VkPipeline pipeline = pick_pipeline(vk, format, depth_format, samples);
     if (pipeline == VK_NULL_HANDLE || s_layout == VK_NULL_HANDLE) {
         return;
     }

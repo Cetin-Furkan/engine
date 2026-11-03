@@ -64,6 +64,7 @@ static const uint32_t k_action_perm[ACT_COUNT] = {
     // Select, not draw: the key has to be able to turn the tool back on.
     [ACT_TOGGLE_DRAW]   = PERM_OBJ_SELECT,
     [ACT_TOGGLE_GIMBAL] = PERM_CAM_SNAP,
+    [ACT_RESTORE]       = PERM_OBJ_SPAWN,
 };
 
 static const KeyBind k_blender_binds[] = {
@@ -107,6 +108,7 @@ static const KeyBind k_blender_binds[] = {
     { .evdev_key = KEY_KP5,       .need_shift = KEY_SHIFT_ANY,  .action = ACT_VIEW_FRONT },
     { .evdev_key = KEY_KP9,       .need_shift = KEY_SHIFT_ANY,  .action = ACT_TOGGLE_DRAW },
     { .evdev_key = KEY_KP7,       .need_shift = KEY_SHIFT_ANY,  .action = ACT_TOGGLE_GIMBAL },
+    { .evdev_key = KEY_Z,         .need_shift = KEY_SHIFT_ANY,  .action = ACT_RESTORE },
 };
 
 static const KeyBind k_plot_binds[] = {
@@ -126,7 +128,7 @@ static const KeyBind k_plot_binds[] = {
     { .evdev_key = KEY_TAB,     .need_shift = KEY_SHIFT_ANY,  .action = ACT_SWITCH_MODE },
 };
 
-static_assert(sizeof k_blender_binds / sizeof k_blender_binds[0] == 40,
+static_assert(sizeof k_blender_binds / sizeof k_blender_binds[0] == 41,
               "3D workspace bind count");
 static_assert(sizeof k_plot_binds / sizeof k_plot_binds[0] == 14,
               "plot workspace bind count");

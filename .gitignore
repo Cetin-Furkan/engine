@@ -22,6 +22,10 @@ build/
 *~
 .DS_Store
 
+# Engine-written placement. opening.world stays the boot document.
+examples/demo/world/live.world
+examples/demo/world/live.world.tmp
+
 # Logs & debugging
 *.log
 vgcore.*

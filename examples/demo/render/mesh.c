@@ -64,8 +64,9 @@ typedef struct MeshSlice {
     uint64_t point;
 } MeshSlice;
 
+static VulkanContext   *s_vk = nullptr;
 static VkPipelineLayout s_layout = VK_NULL_HANDLE;
-static VkPipeline       s_pipeline = VK_NULL_HANDLE;
+static VulkanGfxLive    s_gfx;
 static DaBuffer         s_geom;
 static VkDevice         s_device = VK_NULL_HANDLE;
 static VkDeviceAddress  s_base = 0;
@@ -102,7 +103,21 @@ static VkDeviceAddress mesh_slice_addr(uint32_t index) {
 
 static int create_buffer(VulkanContext *vk) {
     VkDeviceSize bytes = (VkDeviceSize)k_slice_count * k_slice_corners * sizeof(ObjCorner);
-    if (da_buffer_create(vk, bytes, VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, true, &s_geom) != 0) {
+    if (s_geom.buffer != VK_NULL_HANDLE) {
+        if (s_geom.bytes >= bytes && s_geom.map != nullptr) {
+            return 0;
+        }
+        for (uint32_t i = 0; i < k_slice_count; ++i) {
+            if (s_slice[i].point != 0u) {
+                fprintf(stderr, "[Mesh Error] Mesh buffer is still on the GPU\n");
+                return -1;
+            }
+        }
+        if (da_buffer_replace(vk, &s_geom, bytes,
+                              VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, true) != 0) {
+            return -1;
+        }
+    } else if (da_buffer_create(vk, bytes, VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, true, &s_geom) != 0) {
         return -1;
     }
     if (s_geom.map == nullptr || s_geom.address == 0) {
@@ -271,15 +286,13 @@ void mesh_shutdown(VulkanContext *vk) {
     s_armed_point = 0;
     s_armed_published = false;
     memset(s_slice, 0, sizeof s_slice);
+    vulkan_gfx_disarm(vk, &s_gfx);
+    s_vk = nullptr;
     if (vk != nullptr && vk->device != VK_NULL_HANDLE) {
-        if (s_pipeline != VK_NULL_HANDLE) {
-            vkDestroyPipeline(vk->device, s_pipeline, nullptr);
-        }
         if (s_layout != VK_NULL_HANDLE) {
             vkDestroyPipelineLayout(vk->device, s_layout, nullptr);
         }
     }
-    s_pipeline = VK_NULL_HANDLE;
     s_layout = VK_NULL_HANDLE;
     da_buffer_destroy(vk, &s_geom);
 }
@@ -288,7 +301,8 @@ int mesh_init(VulkanContext *vk, RingCqeFn on_cqe, void *on_user) {
     if (vk == nullptr || vk->device == VK_NULL_HANDLE || vk->physical_device == VK_NULL_HANDLE) {
         return -1;
     }
-    if (s_pipeline != VK_NULL_HANDLE) {
+    s_vk = vk;
+    if (s_layout != VK_NULL_HANDLE) {
         return 0;
     }
     if (!plot_file_mesh_check()) {
@@ -328,7 +342,6 @@ int mesh_init(VulkanContext *vk, RingCqeFn on_cqe, void *on_user) {
         mesh_shutdown(vk);
         return -1;
     }
-    VkFormat color_format = VK_FORMAT_B8G8R8A8_SRGB;
     VulkanGfxPipe gfx = {
         .vert          = k_vert_spv,
         .vert_bytes    = sizeof k_vert_spv,
@@ -343,10 +356,7 @@ int mesh_init(VulkanContext *vk, RingCqeFn on_cqe, void *on_user) {
         .depth_compare = VK_COMPARE_OP_LESS,
         .blend         = VK_FALSE,
     };
-    if (vulkan_gfx_pipelines(vk, &gfx, &color_format, nullptr, 1, &s_pipeline) != 0) {
-        mesh_shutdown(vk);
-        return -1;
-    }
+    vulkan_gfx_arm(&s_gfx, &gfx, VK_FORMAT_B8G8R8A8_SRGB, nullptr);
     (void)load_file(on_cqe, on_user, nullptr);
     s_gen = 0;
     s_shown_gen = 0;
@@ -441,7 +451,11 @@ void mesh_begin(VkSemaphore acquire, uint64_t signal_point) {
     }
     ObjCorner *dst = s_map + (size_t)slot * k_slice_corners;
     if (s_count > 0u) {
-        memcpy(dst, s_held, (size_t)s_count * sizeof(ObjCorner));
+        VkDeviceSize off = (VkDeviceSize)slot * k_slice_corners * sizeof(ObjCorner);
+        if (da_buffer_write(&s_geom, off, s_held, (VkDeviceSize)s_count * sizeof(ObjCorner)) != 0) {
+            fprintf(stderr, "[Mesh Error] Mesh write missed the buffer\n");
+            return;
+        }
     }
     if (s_count < k_slice_corners) {
         memset(dst + s_count, 0, (size_t)(k_slice_corners - s_count) * sizeof(ObjCorner));
@@ -482,7 +496,8 @@ void mesh_release(uint64_t signal_point) {
 
 void mesh_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height,
                float yaw_deg, bool selected) {
-    if (cmd == VK_NULL_HANDLE || s_pipeline == VK_NULL_HANDLE || s_gpu_count < 3u ||
+    VkPipeline pipeline = vulkan_gfx_use(s_vk, &s_gfx);
+    if (cmd == VK_NULL_HANDLE || pipeline == VK_NULL_HANDLE || s_gpu_count < 3u ||
         s_draw_addr == 0 || width == 0u || height == 0u) {
         return;
     }
@@ -498,7 +513,7 @@ void mesh_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height,
         .pad        = 0,
     };
     view_push_fill(&draw_push.view, k_mat_mesh);
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_pipeline);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
     vulkan_cmd_push(cmd, s_layout, VK_SHADER_STAGE_VERTEX_BIT, sizeof draw_push, &draw_push);
     vkCmdDraw(cmd, s_gpu_count, 1, 0, 0);
 }

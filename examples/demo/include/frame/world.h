@@ -25,8 +25,15 @@
 
 void world_reset(void);
 
-// Place what world/opening.world names. Call after the mesh pipeline exists.
+// Place what examples/demo/world/live.world names when that file exists,
+// otherwise opening.world. Call after mesh_init. The graphics pipelines
+// are created on the first draw, so this does not wait for one.
 [[nodiscard]] int world_load(void);
+
+// Write the live placement next to opening.world. The boot file is not
+// replaced. Click-built faces and the heat field are not stored.
+// A finite spin saved mid-turn reloads as a new turn from the saved yaw.
+[[nodiscard]] int world_save(void);
 
 // One click, in pixels from the window center (+X right, +Y up), on the
 // picture currently shown. Dispatch is through WorldOps: the closest
@@ -63,7 +70,13 @@ bool world_cancel(void);
 
 // Remove the selected object. With no selection, remove the last loose
 // corner. With neither, remove the first placed cube. True when the picture changed.
+// A removed cube, solid, or mesh is remembered. Z puts it back.
 bool world_delete(void);
+
+// Z. Put back the last removed cube, solid, or mesh, at the place and yaw
+// it had. The heat dent is not kept. Faces are not remembered.
+// True when an object was placed.
+bool world_restore(void);
 
 // One more five-second revolution for the selected OBJ mesh, solid, or face.
 // The cube yaw stays. True when a spin was armed.

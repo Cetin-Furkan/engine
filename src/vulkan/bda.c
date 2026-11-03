@@ -555,6 +555,33 @@ void da_buffer_destroy(VulkanContext *vk, DaBuffer *buf) {
     *buf = (DaBuffer){0};
 }
 
+int da_buffer_write(DaBuffer *buf, VkDeviceSize offset, const void *src, VkDeviceSize bytes) {
+    if (buf == nullptr || buf->map == nullptr || (src == nullptr && bytes != 0u)) {
+        return -1;
+    }
+    if (offset > buf->bytes || bytes > buf->bytes - offset) {
+        return -1;
+    }
+    if (bytes != 0u) {
+        memcpy((uint8_t *)buf->map + offset, src, (size_t)bytes);
+    }
+    return 0;
+}
+
+int da_buffer_replace(VulkanContext *vk, DaBuffer *buf, VkDeviceSize size,
+                      VkBufferUsageFlags usage, bool host) {
+    if (buf == nullptr || size == 0u) {
+        return -1;
+    }
+    DaBuffer next = {0};
+    if (da_buffer_create(vk, size, usage, host, &next) != 0) {
+        return -1;
+    }
+    da_buffer_destroy(vk, buf);
+    *buf = next;
+    return 0;
+}
+
 int bda_arena_init(VulkanContext *vk, BdaArena *arena, uint32_t capacity, bool host) {
     if (vk == nullptr || vk->device == VK_NULL_HANDLE || arena == nullptr || capacity == 0u) {
         return -1;

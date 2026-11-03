@@ -129,19 +129,51 @@ uint32_t face_chain_count(void);
 const WorldOps *face_ops(void);
 
 bool cube_kind_spawn(Coord at);
+bool cube_kind_spawn_pose(Coord at, int32_t yaw_milli, bool spinning, bool infinite, bool glow);
 const WorldOps *cube_ops(void);
 
 void solid_kind_reset(void);
 bool solid_kind_raise(uint32_t kind);
+int solid_kind_index(const char *name);
+const char *solid_kind_name(uint32_t kind);
+bool solid_kind_place(uint32_t kind, Coord at, int32_t yaw_milli, bool spinning, bool infinite, bool glow);
+const WorldOps *solid_ops(void);
 bool solid_kind_toggle_smooth(void);
+bool solid_kind_smooth(void);
+void solid_kind_set_smooth(bool curved);
 bool solid_kind_smooth_dirty(void);
 void solid_kind_commit_smooth(void);
 
 void mesh_kind_reset(void);
 void mesh_kind_set_wanted(bool wanted);
+void mesh_kind_abandon(void);
 bool mesh_kind_wanted(void);
 bool mesh_kind_raise(void);
+bool mesh_kind_pose(int32_t yaw_milli, bool spinning, bool infinite, bool glow);
+const WorldOps *mesh_ops(void);
 bool mesh_kind_apply(bool has, bool bytes);
+
+// A removed cube, solid, or mesh. Newest is the last entry. Faces are not stored.
+enum : int {
+    k_removed_cube  = 0,
+    k_removed_solid = 1,
+    k_removed_mesh  = 2,
+};
+
+typedef struct WorldRemoved {
+    int     kind;
+    int     solid;
+    Coord   at;
+    int32_t yaw_milli;
+    bool    spinning;
+    bool    infinite;
+    bool    glow;
+} WorldRemoved;
+
+void world_removed_clear(void);
+void world_removed_push(const WorldRemoved *item);
+uint32_t world_removed_count(void);
+const WorldRemoved *world_removed_at(uint32_t index);
 
 void overlay_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height);
 bool overlay_busy(void);

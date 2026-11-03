@@ -133,6 +133,7 @@ static int demo_init(VulkanContext *vk, RingCqeFn forward_cqe, void *forward_use
 }
 
 static void demo_shutdown(VulkanContext *vk) {
+    (void)world_save();
     grid_shutdown(vk);
     text_shutdown(vk);
     hud_shutdown(vk);
@@ -160,6 +161,7 @@ static void demo_claim_frame(VkSemaphore acquire, uint64_t signal_point) {
     // This slot's previous acquire has already retired. Rewind only its
     // half of the transient bump. The other slot may still be reading.
     bda_transient_begin_frame(signal_point);
+    cube_bind_acquire(acquire);
     shape_begin(acquire, signal_point);
     text_begin(acquire, signal_point);
     plot_begin(acquire, signal_point);
@@ -252,6 +254,8 @@ static bool demo_key(uint32_t key, EngineKeyContext *ctx) {
         return world_cancel();
     case ACT_DELETE:
         return world_delete();
+    case ACT_RESTORE:
+        return world_restore();
     case ACT_CLOSE_FACE:
         return world_close_face();
     case ACT_RESPIN:
@@ -351,6 +355,7 @@ static const EngineApp s_app = {
             "selected while other meshes are up. Its colors sweep on that clock, then hold. "
             "Keys 1-6 raise a tetrahedron, octahedron, icosahedron, cylinder, cone, and torus. "
             "S smooths edges. G opens or closes glow. Esc clears. Backspace, Delete, or X removes. "
+            "Z puts the last removed cube, solid, or mesh back. "
             "M cycles the math plot. L reloads the CSV chart and the OBJ mesh. "
             "Numpad 8, 2, 4, 6, and 5 set top, bottom, left, right, and front. "
             "Numpad 5 again sets the back. Home or numpad 1 restores the opening camera, "
@@ -359,7 +364,8 @@ static const EngineApp s_app = {
             "Arrows move on the screen axes. Q and E "
             "yaw, C and V pitch. Minus zooms out. Plus is numpad plus, shift+4, or equals. "
             "Tab switches the flat plot workspace and the 3D workspace. "
-            "Hold T and click twice to place a text box, then type. Escape leaves it.",
+            "Hold T and click twice to place a text box, then type. Escape leaves it. "
+            "Edits are written to examples/demo/world/live.world. Faces and heat stay unsaved.",
     .init              = demo_init,
     .shutdown          = demo_shutdown,
     .load              = world_load,

@@ -3,12 +3,12 @@
 
 #include "vulkan/types.h"
 
-// Universal metric ground: one 6-vertex quad on the true z = 0 plane,
-// no vertex buffer. The span is computed from the viewport diagonal and
-// zoom (frame/grid_math.h), and the fragment shader draws three nested
-// base-10 decades analytically with screen-pixel line widths. The plane
-// depth-tests but never writes depth, so geometry centered on z = 0 is
-// not sliced by its own ground.
+// Universal metric backdrop: one fullscreen triangle, no vertex buffer.
+// The fragment shader draws three nested base-10 decades in screen space
+// (frame/grid_math.h chooses the decade). The sheet ignores yaw and pitch,
+// fills the view at every zoom the camera allows, and neither tests nor
+// writes depth. Scene draws after it and covers it. The z = 0 hit plane
+// stays in world/coord.h.
 
 [[nodiscard]] int plane_init(VulkanContext *vk);
 void plane_shutdown(VulkanContext *vk);

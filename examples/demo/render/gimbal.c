@@ -42,8 +42,9 @@ enum : uint32_t {
 
 static_assert(k_gimbal_verts == 1344u, "gimbal vertex count matches gimbal.vert");
 
+static VulkanContext   *s_vk = nullptr;
 static VkPipelineLayout s_layout = VK_NULL_HANDLE;
-static VkPipeline       s_pipeline = VK_NULL_HANDLE;
+static VulkanGfxLive    s_gfx;
 static bool             s_logged = false;
 static bool             s_want = true;
 static bool             s_drawn = true;
@@ -53,14 +54,11 @@ static void gimbal_fail(const char *what, VkResult res) {
 }
 
 void gimbal_shutdown(VulkanContext *vk) {
+    vulkan_gfx_disarm(vk, &s_gfx);
+    s_vk = nullptr;
     if (vk == nullptr || vk->device == VK_NULL_HANDLE) {
         s_layout = VK_NULL_HANDLE;
-        s_pipeline = VK_NULL_HANDLE;
         return;
-    }
-    if (s_pipeline != VK_NULL_HANDLE) {
-        vkDestroyPipeline(vk->device, s_pipeline, nullptr);
-        s_pipeline = VK_NULL_HANDLE;
     }
     if (s_layout != VK_NULL_HANDLE) {
         vkDestroyPipelineLayout(vk->device, s_layout, nullptr);
@@ -72,7 +70,8 @@ int gimbal_init(VulkanContext *vk) {
     if (vk == nullptr || vk->device == VK_NULL_HANDLE || vk->physical_device == VK_NULL_HANDLE) {
         return -1;
     }
-    if (s_pipeline != VK_NULL_HANDLE) {
+    s_vk = vk;
+    if (s_layout != VK_NULL_HANDLE) {
         return 0;
     }
     VkFormat depth_format = pass_depth_format();
@@ -97,7 +96,6 @@ int gimbal_init(VulkanContext *vk) {
         gimbal_shutdown(vk);
         return -1;
     }
-    VkFormat color_format = VK_FORMAT_B8G8R8A8_SRGB;
     VulkanGfxPipe gfx = {
         .vert          = k_vert_spv,
         .vert_bytes    = sizeof k_vert_spv,
@@ -112,10 +110,7 @@ int gimbal_init(VulkanContext *vk) {
         .depth_compare = VK_COMPARE_OP_LESS,
         .blend         = VK_FALSE,
     };
-    if (vulkan_gfx_pipelines(vk, &gfx, &color_format, nullptr, 1, &s_pipeline) != 0) {
-        gimbal_shutdown(vk);
-        return -1;
-    }
+    vulkan_gfx_arm(&s_gfx, &gfx, VK_FORMAT_B8G8R8A8_SRGB, nullptr);
     if (!s_logged) {
         printf("[Gimbal] View ball in the corner. Numpad 7 shows or hides it.\n");
         fflush(stdout);
@@ -182,7 +177,8 @@ void gimbal_commit(void) {
 }
 
 void gimbal_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height) {
-    if (!s_want || cmd == VK_NULL_HANDLE || s_pipeline == VK_NULL_HANDLE || width == 0 || height == 0) {
+    VkPipeline pipeline = vulkan_gfx_use(s_vk, &s_gfx);
+    if (!s_want || cmd == VK_NULL_HANDLE || pipeline == VK_NULL_HANDLE || width == 0 || height == 0) {
         return;
     }
     ViewPush view;
@@ -196,7 +192,7 @@ void gimbal_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height) {
         .fb_h = (float)height,
         .ord  = gimbal_order(view.qx, view.qy, view.qz, view.qw),
     };
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_pipeline);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
     vulkan_cmd_push(cmd, s_layout, VK_SHADER_STAGE_VERTEX_BIT, sizeof push, &push);
     vkCmdDraw(cmd, k_gimbal_verts, 1, 0, 0);
 }

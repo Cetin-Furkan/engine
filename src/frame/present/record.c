@@ -1,4 +1,5 @@
 #include "frame/frame_int.h"
+#include "input/page.h"
 
 // One command buffer: world, clear, HUD, then the acquire signal.
 // The bar is a separate surface and is not recorded here.
@@ -51,7 +52,9 @@ int record_and_submit_clear(VulkanContext *vk, FrameSlot *frame, VkSemaphore acq
                 vulkan_vkresult_to_str(res), (int)res);
         return -1;
     }
+    gpu_timer_begin_frame(frame->cmd_buf, frame);
     engine_app()->record_compute(frame->cmd_buf, heat_dt, draw_live);
+    gpu_timer_mark_compute_end(frame->cmd_buf, frame);
     engine_app()->claim_frame(acquire, signal_point);
 
     // The image is cleared. oldLayout UNDEFINED discards the previous
@@ -61,57 +64,14 @@ int record_and_submit_clear(VulkanContext *vk, FrameSlot *frame, VkSemaphore acq
     const bool depth_pass = srgb_view && frame->targets.depth_image != VK_NULL_HANDLE;
     VkImageMemoryBarrier2 barriers[3] = {0};
     uint32_t nbar = 0;
-    barriers[nbar++] = (VkImageMemoryBarrier2){
-        .sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
-        .srcStageMask        = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
-        .srcAccessMask       = VK_ACCESS_2_NONE,
-        .dstStageMask        = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-        .dstAccessMask       = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
-        .oldLayout           = VK_IMAGE_LAYOUT_UNDEFINED,
-        .newLayout           = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .image               = frame->image.image,
-        .subresourceRange    = {
-            .aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
-            .baseMipLevel   = 0,
-            .levelCount     = 1,
-            .baseArrayLayer = 0,
-            .layerCount     = 1,
-        },
-    };
+    frame_fill_discard_color(&barriers[nbar++], frame->image.image);
     if (frame->targets.coverage_image != VK_NULL_HANDLE) {
-        barriers[nbar] = barriers[0];
-        barriers[nbar].image = frame->targets.coverage_image;
-        nbar++;
+        frame_fill_discard_color(&barriers[nbar++], frame->targets.coverage_image);
     }
     if (depth_pass) {
-        barriers[nbar++] = (VkImageMemoryBarrier2){
-            .sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
-            .srcStageMask        = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
-            .srcAccessMask       = VK_ACCESS_2_NONE,
-            .dstStageMask        = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT,
-            .dstAccessMask       = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
-            .oldLayout           = VK_IMAGE_LAYOUT_UNDEFINED,
-            .newLayout           = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
-            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .image               = frame->targets.depth_image,
-            .subresourceRange    = {
-                .aspectMask     = VK_IMAGE_ASPECT_DEPTH_BIT,
-                .baseMipLevel   = 0,
-                .levelCount     = 1,
-                .baseArrayLayer = 0,
-                .layerCount     = 1,
-            },
-        };
+        frame_fill_discard_depth(&barriers[nbar++], frame->targets.depth_image);
     }
-    VkDependencyInfo dep_to_attachment = {
-        .sType                   = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
-        .imageMemoryBarrierCount = nbar,
-        .pImageMemoryBarriers    = barriers,
-    };
-    vkCmdPipelineBarrier2(frame->cmd_buf, &dep_to_attachment);
+    frame_cmd_barriers(frame->cmd_buf, barriers, nbar);
     if (depth_pass) {
         engine_app()->prepare_draw(frame->cmd_buf, frame->targets.depth_image);
     }
@@ -162,6 +122,7 @@ int record_and_submit_clear(VulkanContext *vk, FrameSlot *frame, VkSemaphore acq
         color_attachment.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
     }
 
+    gpu_timer_mark_render_begin(frame->cmd_buf, frame);
     vkCmdBeginRendering(frame->cmd_buf, &rendering_info);
     VkViewport viewport = {
         .width    = (float)frame->image.width,
@@ -195,44 +156,18 @@ int record_and_submit_clear(VulkanContext *vk, FrameSlot *frame, VkSemaphore acq
                                    frame->image.drm_format_modifier);
     }
     vkCmdEndRendering(frame->cmd_buf);
+    // The load runs with this buffer. A sample written after submit is
+    // still the one the dispatch observes if it has not reached the read.
+    input_page_record(frame->cmd_buf);
 
-    VkImageSubresourceRange color_range = {
-        .aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
-        .baseMipLevel   = 0,
-        .levelCount     = 1,
-        .baseArrayLayer = 0,
-        .layerCount     = 1,
-    };
-
-    uint32_t dst_queue = vk->device_info.supports_queue_family_foreign
-        ? VK_QUEUE_FAMILY_FOREIGN_EXT
-        : VK_QUEUE_FAMILY_EXTERNAL;
-
-    VkImageMemoryBarrier2 to_general = {
-        .sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
-        .pNext               = nullptr,
-        .srcStageMask        = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-        .srcAccessMask       = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
-        .dstStageMask        = VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT,
-        .dstAccessMask       = VK_ACCESS_2_NONE,
-        .oldLayout           = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-        .newLayout           = VK_IMAGE_LAYOUT_GENERAL,
-        .srcQueueFamilyIndex = vk->queues.graphics_family_index,
-        .dstQueueFamilyIndex = dst_queue,
-        .image               = frame->image.image,
-        .subresourceRange    = color_range,
-    };
-    VkDependencyInfo dep_to_general = {
-        .sType                   = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
-        .pNext                   = nullptr,
-        .dependencyFlags         = 0,
-        .imageMemoryBarrierCount = 1,
-        .pImageMemoryBarriers    = &to_general,
-    };
-    vkCmdPipelineBarrier2(frame->cmd_buf, &dep_to_general);
+    VkImageMemoryBarrier2 to_general;
+    frame_fill_release_foreign(&to_general, vk, frame->image.image);
+    frame_cmd_barriers(frame->cmd_buf, &to_general, 1);
+    gpu_timer_end_frame(frame->cmd_buf, frame);
 
     res = vkEndCommandBuffer(frame->cmd_buf);
     if (res != VK_SUCCESS) {
+        frame->ts_armed = false;
         engine_app()->release_frame(signal_point);
         engine_app()->record_abort();
         fprintf(stderr, "[Engine Error] vkEndCommandBuffer failed: %s (%d)\n",
@@ -284,6 +219,7 @@ int record_and_submit_clear(VulkanContext *vk, FrameSlot *frame, VkSemaphore acq
 
     res = vkQueueSubmit2(vk->queues.graphics_queue, 1, &submit_info, VK_NULL_HANDLE);
     if (res != VK_SUCCESS) {
+        frame->ts_armed = false;
         engine_app()->release_frame(signal_point);
         engine_app()->record_abort();
         fprintf(stderr, "[Engine Error] vkQueueSubmit2 failed: %s (%d)\n",

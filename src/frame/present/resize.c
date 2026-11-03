@@ -27,8 +27,11 @@ bool consume_noted_signal(WaylandContext *wl, int *signo) {
         return false;
     }
     wl->noted_signal = false;
-    if (wl->noted_signal_res == (int)sizeof frame_state.siginfo && signo != nullptr) {
-        *signo = (int)frame_state.siginfo.ssi_signo;
+    if (signo != nullptr) {
+        int got = frame_signal_number(wl->noted_signal_res);
+        if (got != 0) {
+            *signo = got;
+        }
     }
     wl->noted_signal_res = 0;
     return true;
@@ -82,6 +85,9 @@ static int install_resize(WaylandContext *wl, VulkanContext *vk) {
     snprintf(tranche, sizeof tranche, "%s", frame_state.resize_tranche);
     blank_frame(&frame_state.resize_fresh);
     frame_state.resize_pending = false;
+    // This completion installed the resize, not a turn swap. Leaving the
+    // flag set would swap the new front away on the next idle send.
+    frame_state.turn_swap_pending = false;
 
     if (retire_pixels(wl, vk, shown()) != 0) {
         fprintf(stderr,

@@ -24,6 +24,15 @@ Spin spin_start(int32_t rest_milli) {
     return s;
 }
 
+Spin spin_pose(int32_t yaw_milli, bool spinning, bool infinite, bool glow) {
+    Spin s = spin_start(yaw_milli);
+    s.spinning = spinning;
+    s.infinite = infinite;
+    s.glow = glow;
+    s.shown_glow = glow;
+    return s;
+}
+
 bool spin_advance(Spin *s, uint32_t time_ms, bool log_start) {
     if (s == nullptr || !s->spinning) {
         return false;

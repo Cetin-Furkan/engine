@@ -120,3 +120,19 @@ uint32_t frame_clock_fixed_steps(FrameClock *clock, uint32_t dt_ms,
     clock->sim_steps += steps;
     return steps;
 }
+
+void frame_clock_note_gpu(FrameClock *clock, uint32_t compute_us,
+                          uint32_t render_us, uint32_t total_us) {
+    if (clock == nullptr) {
+        return;
+    }
+    if (clock->gpu_total_us == 0) {
+        clock->gpu_compute_us = compute_us;
+        clock->gpu_render_us  = render_us;
+        clock->gpu_total_us   = total_us;
+        return;
+    }
+    clock->gpu_compute_us = (clock->gpu_compute_us * 7u + compute_us) >> 3;
+    clock->gpu_render_us  = (clock->gpu_render_us * 7u + render_us) >> 3;
+    clock->gpu_total_us   = (clock->gpu_total_us * 7u + total_us) >> 3;
+}

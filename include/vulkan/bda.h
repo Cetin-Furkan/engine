@@ -94,10 +94,19 @@ void bda_transient_reset(void);
 // does not fit the half comes from the staging pool and does not wrap.
 void bda_transient_begin_frame(uint64_t signal_point);
 
-// Compatible wrappers
+// Compatible wrappers.
+// A fixed buffer is created before the first frame and is not replaced:
+// the cube rest mesh, the index buffer, and the heat copies. A dynamic
+// buffer is host-mapped and rewritten after boot with da_buffer_write.
+// da_buffer_replace builds a new buffer of a different size. The caller
+// has to have retired every acquire that still reads the old one.
 [[nodiscard]] int da_buffer_create(VulkanContext *vk, VkDeviceSize size,
                                    VkBufferUsageFlags usage, bool host, DaBuffer *out);
 void da_buffer_destroy(VulkanContext *vk, DaBuffer *buf);
+[[nodiscard]] int da_buffer_write(DaBuffer *buf, VkDeviceSize offset,
+                                  const void *src, VkDeviceSize bytes);
+[[nodiscard]] int da_buffer_replace(VulkanContext *vk, DaBuffer *buf, VkDeviceSize size,
+                                    VkBufferUsageFlags usage, bool host);
 
 [[nodiscard]] int bda_arena_init(VulkanContext *vk, BdaArena *arena, uint32_t capacity, bool host);
 void bda_arena_destroy(VulkanContext *vk, BdaArena *arena);

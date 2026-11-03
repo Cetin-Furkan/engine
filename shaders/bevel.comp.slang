@@ -1,12 +1,12 @@
 #include "face_grid.slang"
 #include "camera.slang"
 
-static const uint k_arc = 8u;
 static const float k_half_pi = 1.5707963;
 static const uint k_face_verts = 24u;
 static const uint k_edge_verts = 216u;
 static const uint k_face_quads = 6u * k_grid * k_grid;
-static const uint k_quads = k_face_quads + 12u * k_arc + 8u * k_arc * k_arc;
+static const uint k_edge_quads = 12u * k_grid * k_arc;
+static const uint k_quads = k_face_quads + k_edge_quads + 8u * k_arc * k_arc;
 
 struct Push {
     uint64_t verts;
@@ -39,31 +39,6 @@ float3 color_of(float3 n) {
     return float3(0.35, 0.38, 0.62);
 }
 
-void edge_basis(uint e, out float3 n0, out float3 n1, out float3 d) {
-    uint pair = e / 4u;
-    uint bits = e % 4u;
-    float a = (bits & 1u) == 0u ? 1.0 : -1.0;
-    float bsgn = (bits & 2u) == 0u ? 1.0 : -1.0;
-    if (pair == 0u)      { n0 = float3(a, 0, 0); n1 = float3(0, bsgn, 0); }
-    else if (pair == 1u) { n0 = float3(0, a, 0); n1 = float3(0, 0, bsgn); }
-    else                 { n0 = float3(0, 0, a); n1 = float3(bsgn, 0, 0); }
-    d = cross(n0, n1);
-}
-
-void corner_basis(uint c, out float3 n0, out float3 n1, out float3 n2) {
-    float sx = (c & 1u) == 0u ? 1.0 : -1.0;
-    float sy = (c & 2u) == 0u ? 1.0 : -1.0;
-    float sz = (c & 4u) == 0u ? 1.0 : -1.0;
-    n0 = float3(sx, 0.0, 0.0);
-    n1 = float3(0.0, sy, 0.0);
-    n2 = float3(0.0, 0.0, sz);
-    if (dot(n0, cross(n1, n2)) < 0.0) {
-        float3 swap_n = n1;
-        n1 = n2;
-        n2 = swap_n;
-    }
-}
-
 float3 corner_dir(float3 n0, float3 n1, float3 n2, float a, float b) {
     return normalize(cos(a) * cos(b) * n0 + sin(a) * cos(b) * n1 + sin(b) * n2);
 }
@@ -75,7 +50,29 @@ float3 corner_color(float3 dir, float3 n0, float3 n1, float3 n2, float3 c0, floa
     return (w0 * c0 + w1 * c1 + w2 * c2) / (w0 + w1 + w2);
 }
 
+void write_seam(uint id) {
+    uint e;
+    uint len;
+    uint arc;
+    seam_decode(id, e, len, arc);
+    float3 n0;
+    float3 n1;
+    float3 d;
+    edge_basis(e, n0, n1, d);
+    float m = 1.0 - k_radius;
+    float u = float(arc) / float(k_arc);
+    float ang = u * k_half_pi;
+    float3 nrm = cos(ang) * n0 + sin(ang) * n1;
+    float s = lerp(-m, m, float(len) / float(k_grid));
+    float3 p = (n0 + n1) * m + d * s + k_radius * nrm;
+    store_vert(id, p, nrm, lerp(color_of(n0), color_of(n1), u));
+}
+
 void write_vert(uint id) {
+    if (id >= k_grid_verts) {
+        write_seam(id);
+        return;
+    }
     if (id >= k_fillet_verts) {
         uint face;
         uint i;
@@ -149,20 +146,21 @@ void write_quad(uint q) {
                    grid_vertex(face, i, j + 1u));
         return;
     }
-    uint edge_quads = 12u * k_arc;
-    if (q < k_face_quads + edge_quads) {
+    if (q < k_face_quads + k_edge_quads) {
         uint local = q - k_face_quads;
-        uint e = local / k_arc;
-        uint i = local % k_arc;
-        uint base = k_face_verts + e * 18u;
-        uint p00 = base + i;
-        uint p10 = base + i + 1u;
-        uint p01 = base + 9u + i;
-        uint p11 = base + 9u + i + 1u;
-        store_quad(q, p00, p10, p11, p01);
+        uint per = k_grid * k_arc;
+        uint e = local / per;
+        uint rem = local - e * per;
+        uint len = rem / k_arc;
+        uint arc = rem - len * k_arc;
+        store_quad(q,
+                   edge_vert(e, len, arc),
+                   edge_vert(e, len, arc + 1u),
+                   edge_vert(e, len + 1u, arc + 1u),
+                   edge_vert(e, len + 1u, arc));
         return;
     }
-    uint local = q - (k_face_quads + edge_quads);
+    uint local = q - (k_face_quads + k_edge_quads);
     uint c = local / 64u;
     uint rem = local % 64u;
     uint iv = rem / k_arc;
@@ -179,7 +177,7 @@ void write_quad(uint q) {
 [numthreads(64, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
     uint i = id.x;
-    if (i < k_grid_verts) {
+    if (i < k_mesh_verts) {
         write_vert(i);
     }
     if (i < k_quads) {

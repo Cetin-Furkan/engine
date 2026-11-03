@@ -1,10 +1,13 @@
 #include "frame/frame_int.h"
 
 // Chrome file watch. A reload hands stolen completions back to the idle loop.
-
-alignas(struct inotify_event) static uint8_t s_inotify_buf[4096];
+// The inotify bytes land in the ring's registered buffer.
 
 static void absorb_inotify(int32_t res);
+
+static uint8_t *inotify_bytes(void) {
+    return ring_fixed_ptr(ring_get_context(), ENG_FBUF_INOTIFY);
+}
 
 void ensure_inotify_watch(void) {
     if (frame_state.inotify_fd < 0 || frame_state.inotify_wd >= 0) {
@@ -26,14 +29,14 @@ void ensure_inotify_watch(void) {
 }
 
 static void absorb_inotify(int32_t res) {
-    if (res <= 0) {
+    if (res <= 0 || inotify_bytes() == nullptr) {
         return;
     }
     bool dropped = false;
     int off = 0;
     while (off + (int)sizeof(struct inotify_event) <= res) {
         const struct inotify_event *ev =
-            (const struct inotify_event *)(s_inotify_buf + off);
+            (const struct inotify_event *)(inotify_bytes() + off);
         uint32_t step = (uint32_t)sizeof(*ev) + ev->len;
         if (off + (int)step > res) {
             break;
@@ -70,7 +73,7 @@ void note_inotify_cqe(RingContext *ring, int32_t res, bool *armed) {
         return;
     }
     if (arm_slot_read(ring, ENG_INOTIFY_FD_SLOT, frame_state.inotify_fixed, frame_state.inotify_fd,
-                      s_inotify_buf, (uint32_t)sizeof s_inotify_buf, ENG_UD_INOTIFY) == 0 &&
+                      ENG_FBUF_INOTIFY, ENG_UD_INOTIFY) == 0 &&
         armed != nullptr) {
         *armed = true;
     }
@@ -106,7 +109,7 @@ void start_inotify(RingContext *ring, bool *armed) {
         frame_state.inotify_fixed = true;
     }
     if (arm_slot_read(ring, ENG_INOTIFY_FD_SLOT, frame_state.inotify_fixed, frame_state.inotify_fd,
-                      s_inotify_buf, (uint32_t)sizeof s_inotify_buf, ENG_UD_INOTIFY) != 0) {
+                      ENG_FBUF_INOTIFY, ENG_UD_INOTIFY) != 0) {
         fprintf(stderr, "[Chrome] inotify read was not armed\n");
         if (frame_state.inotify_fixed) {
             (void)ring_update_file(ring, ENG_INOTIFY_FD_SLOT, -1);
@@ -142,8 +145,11 @@ void engine_reload_cqe(const struct io_uring_cqe *cqe, void *user) {
         if (frame_state.relay->signal_armed != nullptr) {
             *frame_state.relay->signal_armed = false;
         }
-        if (cqe->res == (int)sizeof frame_state.siginfo && frame_state.relay->signo != nullptr) {
-            *frame_state.relay->signo = (int)frame_state.siginfo.ssi_signo;
+        if (frame_state.relay->signo != nullptr) {
+            int signo = frame_signal_number(cqe->res);
+            if (signo != 0) {
+                *frame_state.relay->signo = signo;
+            }
         }
         if (frame_state.relay->got_signal != nullptr) {
             *frame_state.relay->got_signal = true;

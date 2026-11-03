@@ -1,10 +1,24 @@
-float axis_phase(float wrapped_cam, float c, float coarse, float span_steps, float span_mod) {
-    float turns = c * span_steps;
-    float frac_turns = turns - floor(turns);
-    float phase = frac_turns * coarse + c * span_mod;
-    float m = wrapped_cam + phase;
-    float p = max(coarse, 1.0e-6);
-    m = m - p * floor(m / p);
+// Screen-space metric backdrop. A pixel's world xy is the wrapped camera
+// plus the same view delta view_ndc would undo, then reduced into one
+// coarse cell. Line width is one world unit per pixel (fw = 1/zoom), so
+// the decades stay a few pixels wide from the near zoom to the far zoom.
+// The sheet ignores the camera quaternion.
+
+struct ScreenPush {
+    uint width;
+    uint height;
+    float cell_med;
+    float level_frac;
+    float origin_x;
+    float origin_y;
+    float zoom;
+    float coarse;
+};
+[[vk::push_constant]] ScreenPush pc;
+
+float wrap_period(float x, float period) {
+    float p = max(period, 1.0e-6);
+    float m = x - p * floor(x / p);
     if (m < 0.0) {
         m += p;
     }
@@ -32,35 +46,32 @@ float metric_grid(float2 world, float2 fw, float step_size, float half_width_px)
     return max(line.x, line.y);
 }
 
-struct PSInput {
-    [[vk::location(0)]] float2 v_c : TEXCOORD0;
-    [[vk::location(1)]] nointerpolation float v_cell_med : TEXCOORD1;
-    [[vk::location(2)]] nointerpolation float v_frac : TEXCOORD2;
-    [[vk::location(3)]] nointerpolation float2 v_cam_mod : TEXCOORD3;
-    [[vk::location(4)]] nointerpolation float v_span_steps : TEXCOORD4;
-    [[vk::location(5)]] nointerpolation float v_span_mod : TEXCOORD5;
-    [[vk::location(6)]] nointerpolation float2 v_fw : TEXCOORD6;
-};
-
 [shader("fragment")]
-float4 main(PSInput pin) : SV_Target0 {
-    float d_fine   = pin.v_cell_med * 0.1;
-    float d_med    = pin.v_cell_med;
-    float d_coarse = max(pin.v_cell_med * 10.0, 1.0e-6);
-    float2 world = float2(axis_phase(pin.v_cam_mod.x, pin.v_c.x, d_coarse, pin.v_span_steps, pin.v_span_mod),
-                         axis_phase(pin.v_cam_mod.y, pin.v_c.y, d_coarse, pin.v_span_steps, pin.v_span_mod));
-    float2 fw = max(pin.v_fw, float2(1.0e-7));
+float4 main(float4 frag : SV_Position) : SV_Target0 {
+    float w = max(float(pc.width), 1.0);
+    float h = max(float(pc.height), 1.0);
+    // WaveRotate of a uniform is the same value on every lane. The rotate
+    // is the subgroup op this fragment stage actually executes.
+    float zoom = max(WaveRotate(pc.zoom, 1u), 1.0e-8);
+    float2 ndc = float2(frag.x / w * 2.0 - 1.0, frag.y / h * 2.0 - 1.0);
+    float2 delta = float2(ndc.x * (w * 0.5) / zoom, -ndc.y * (h * 0.5) / zoom);
+    float coarse = max(pc.coarse, 1.0e-6);
+    float2 world = float2(wrap_period(pc.origin_x + delta.x, coarse),
+                         wrap_period(pc.origin_y + delta.y, coarse));
+    float2 fw = float2(1.0 / zoom);
 
-    float fade_fine = 1.0 - smoothstep(0.0, 0.90, pin.v_frac);
-    float fade_med  = lerp(0.80, 0.32, pin.v_frac);
+    float d_fine   = pc.cell_med * 0.1;
+    float d_med    = pc.cell_med;
+    float d_coarse = coarse;
+    float fade_fine = 1.0 - smoothstep(0.0, 0.90, pc.level_frac);
+    float fade_med  = lerp(0.80, 0.32, pc.level_frac);
 
     float g_fine   = metric_grid(world, fw, d_fine,   0.65) * fade_fine * 0.40;
     float g_med    = metric_grid(world, fw, d_med,    0.85) * fade_med;
     float g_coarse = metric_grid(world, fw, d_coarse, 1.25) * 0.95;
 
-    float w = max(max(g_fine, g_med), g_coarse);
-
+    float weight = max(max(g_fine, g_med), g_coarse);
     float3 base_col = float3(0.055, 0.16, 0.34);
     float3 line_col = float3(0.62, 0.82, 0.96);
-    return float4(lerp(base_col, line_col, clamp(w, 0.0, 1.0)), 1.0);
+    return float4(lerp(base_col, line_col, clamp(weight, 0.0, 1.0)), 1.0);
 }

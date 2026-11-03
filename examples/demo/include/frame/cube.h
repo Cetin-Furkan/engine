@@ -1,6 +1,7 @@
 #ifndef ENGINE_FRAME_CUBE_H
 #define ENGINE_FRAME_CUBE_H
 
+#include "frame/camera.h"
 #include "vulkan/types.h"
 
 // One posed cube in the presented buffer.
@@ -13,8 +14,10 @@
 // That dispatch does not read the color attachment.
 // A second dispatch steps one scalar temperature per vertex on a live frame.
 // The draw mixes that temperature into the baked color.
-// Each face is a 16 by 16 grid so a click lands on a sample. The fillet
-// edges and corners stay on the original 888 vertices.
+// Each face is a 16 by 16 grid. The bevel rails share that face's boundary.
+// Interior bevel samples are appended after the 2598 face-grid vertices and
+// follow those rails when drawn. A click walks those triangles on the CPU.
+// It uses the displacement of the last heat step whose acquire has retired.
 // Depth and MSAA targets live in frame/pass.h. This file is the fillet.
 // The mesh is one buffer. Temperatures are one field per slot, so a click
 // paints the fillet that was hit. The 128^3 tint stays one mesh-local sample.
@@ -57,6 +60,23 @@ void cube_heat_record_ok(uint32_t slot, uint64_t signal_point);
 void cube_heat_record_abort(uint32_t slot);
 uint64_t cube_heat_published(void);
 bool cube_heat_step_open(void);
+
+// claim_frame passes the acquire timeline. The surface pick waits it with
+// a zero timeout before it reads a heat copy. A null semaphore leaves the
+// pick on the rest pose until the first retired step.
+void cube_bind_acquire(VkSemaphore acquire);
+
+// Ray against the posed fillet. yaw_deg is degrees about Y, the same value
+// cube_draw takes. origin_x and origin_y are the draw's pixel offset. The
+// draw does not add a z offset. hx, hy, hz are the world point on the
+// displaced surface. False when the ray misses, or the bake has not stored
+// the mesh yet.
+bool cube_surface_hit(uint32_t heat_slot, float yaw_deg, float origin_x, float origin_y,
+                      const CameraRay *ray, float *t_hit, float *hx, float *hy, float *hz);
+bool cube_surface_ready(void);
+// True when the mesh is not stored yet, or the rest pose hits a ray through
+// the interior and misses a ray at x = 360. Logs and returns false on a miss.
+bool cube_surface_self_check(void);
 bool cube_heat_slot_open(uint32_t slot);
 
 // A click inside this fillet. The next live frame plants a hot spot on its

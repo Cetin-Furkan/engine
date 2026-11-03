@@ -120,6 +120,8 @@ typedef struct WaylandContext {
     int      noted_inotify_res;
     bool     noted_sim;
     int      noted_sim_res;
+    bool     noted_sim_alive;
+    uint64_t noted_sim_exp;
     bool     noted_send;
     int      noted_send_res;
     // True from the moment an ENG_UD_WL_SEND SQE is queued until its CQE is seen.

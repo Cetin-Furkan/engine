@@ -8,10 +8,10 @@
 // cell_med is the 10^k decade nearest the "medium" target: the decade
 // whose cell is about 45% of the smaller screen dimension. level_frac
 // is the fractional position inside that decade (0 = just subdivided).
-// span is the world-space half-extent of the single ground quad: the
-// visible orthographic region on z = 0 lies within the viewport
-// half-diagonal (in world units) plus the 2048 depth range the view
-// projection maps into [0, 1], so this span covers it at any angle.
+// The backdrop shader uses cell_med, coarse, and plane_grid_wrap. It
+// does not place a quad. span, span_steps, and span_mod remain so the
+// phase rebuild stays tested: they describe the old ground-quad extent,
+// half the viewport diagonal over zoom plus the 4096 depth range.
 
 typedef struct PlaneGrid {
     float cell_med;

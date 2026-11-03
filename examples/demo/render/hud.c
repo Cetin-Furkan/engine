@@ -1,9 +1,11 @@
 #include "frame/hud.h"
+#include "frame/camera.h"
 #include "frame/pass.h"
 #include "frame/world.h"
 #include "ring/ring.h"
 #include "vulkan/bda.h"
 #include "vulkan/pipe.h"
+#include <math.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <string.h>
@@ -41,17 +43,37 @@ static_assert(sizeof(HudPush) == 16u, "hud push");
 
 static VulkanContext *s_vk = nullptr;
 
-enum { k_text_cap = 80 };
+enum { k_hud_lines = 4, k_line_cap = 48 };
 
-static VkPipelineLayout      s_layout = VK_NULL_HANDLE;
-static VkPipeline            s_srgb = VK_NULL_HANDLE;
-static VkPipeline            s_unorm = VK_NULL_HANDLE;
-static VkPipeline            s_scene_srgb = VK_NULL_HANDLE;
-static VkPipeline            s_scene_unorm = VK_NULL_HANDLE;
+static const uint32_t k_flag_srgb = 1u;
+static const uint32_t k_flag_unorm = 0u;
+static const VkSpecializationMapEntry k_hud_entry = {
+    .constantID = 0,
+    .offset     = 0,
+    .size       = sizeof(uint32_t),
+};
+static const VkSpecializationInfo k_spec_srgb = {
+    .mapEntryCount = 1,
+    .pMapEntries   = &k_hud_entry,
+    .dataSize      = sizeof k_flag_srgb,
+    .pData         = &k_flag_srgb,
+};
+static const VkSpecializationInfo k_spec_unorm = {
+    .mapEntryCount = 1,
+    .pMapEntries   = &k_hud_entry,
+    .dataSize      = sizeof k_flag_unorm,
+    .pData         = &k_flag_unorm,
+};
+
+static VkPipelineLayout s_layout = VK_NULL_HANDLE;
+static VulkanGfxLive    s_overlay_srgb;
+static VulkanGfxLive    s_overlay_unorm;
+static VulkanGfxLive    s_scene_srgb;
+static VulkanGfxLive    s_scene_unorm;
 static VkFormat              s_scene_depth = VK_FORMAT_UNDEFINED;
 static VkSampleCountFlagBits s_scene_samples = VK_SAMPLE_COUNT_1_BIT;
-static char             s_text[k_text_cap + 1];
-static uint32_t         s_nchars = 0;
+static char             s_line[k_hud_lines][k_line_cap + 1];
+static uint32_t         s_line_n[k_hud_lines];
 static uint32_t         s_cqe_count = 0;
 static uint32_t         s_cqe_rate = 0;
 static uint64_t         s_cqe_t0 = 0;
@@ -73,30 +95,8 @@ static void hud_fail(const char *what, VkResult res) {
     fprintf(stderr, "[Hud Error] %s: %s (%d)\n", what, vulkan_vkresult_to_str(res), (int)res);
 }
 
-static int make_pair(VulkanContext *vk, VkSampleCountFlagBits samples, VkFormat depth,
-                     VkPipeline *srgb, VkPipeline *unorm) {
-    uint32_t flag[2] = { 1u, 0u };
-    VkSpecializationMapEntry entry = {
-        .constantID = 0,
-        .offset     = 0,
-        .size       = sizeof(uint32_t),
-    };
-    VkSpecializationInfo spec[2] = {
-        {
-            .mapEntryCount = 1,
-            .pMapEntries   = &entry,
-            .dataSize      = sizeof(uint32_t),
-            .pData         = &flag[0],
-        },
-        {
-            .mapEntryCount = 1,
-            .pMapEntries   = &entry,
-            .dataSize      = sizeof(uint32_t),
-            .pData         = &flag[1],
-        },
-    };
-    const VkSpecializationInfo *specs[2] = { &spec[0], &spec[1] };
-    VkFormat formats[2] = { VK_FORMAT_B8G8R8A8_SRGB, VK_FORMAT_B8G8R8A8_UNORM };
+static void arm_pair(VkSampleCountFlagBits samples, VkFormat depth,
+                     VulkanGfxLive *srgb, VulkanGfxLive *unorm) {
     VulkanGfxPipe info = {
         .vert          = k_vert_spv,
         .vert_bytes    = sizeof k_vert_spv,
@@ -111,46 +111,21 @@ static int make_pair(VulkanContext *vk, VkSampleCountFlagBits samples, VkFormat 
         .depth_compare = VK_COMPARE_OP_LESS,
         .blend         = VK_FALSE,
     };
-    VkPipeline out[2] = {0};
-    if (vulkan_gfx_pipelines(vk, &info, formats, specs, 2, out) != 0) {
-        return -1;
-    }
-    *srgb = out[0];
-    *unorm = out[1];
-    return 0;
+    vulkan_gfx_arm(srgb, &info, VK_FORMAT_B8G8R8A8_SRGB, &k_spec_srgb);
+    vulkan_gfx_arm(unorm, &info, VK_FORMAT_B8G8R8A8_UNORM, &k_spec_unorm);
 }
 
 void hud_shutdown(VulkanContext *vk) {
     s_scene_depth = VK_FORMAT_UNDEFINED;
     s_scene_samples = VK_SAMPLE_COUNT_1_BIT;
-    if (vk == nullptr || vk->device == VK_NULL_HANDLE) {
-        s_layout = VK_NULL_HANDLE;
-        s_srgb = VK_NULL_HANDLE;
-        s_unorm = VK_NULL_HANDLE;
-        s_scene_srgb = VK_NULL_HANDLE;
-        s_scene_unorm = VK_NULL_HANDLE;
-        return;
-    }
-    if (s_scene_srgb != VK_NULL_HANDLE) {
-        vkDestroyPipeline(vk->device, s_scene_srgb, nullptr);
-        s_scene_srgb = VK_NULL_HANDLE;
-    }
-    if (s_scene_unorm != VK_NULL_HANDLE) {
-        vkDestroyPipeline(vk->device, s_scene_unorm, nullptr);
-        s_scene_unorm = VK_NULL_HANDLE;
-    }
-    if (s_srgb != VK_NULL_HANDLE) {
-        vkDestroyPipeline(vk->device, s_srgb, nullptr);
-        s_srgb = VK_NULL_HANDLE;
-    }
-    if (s_unorm != VK_NULL_HANDLE) {
-        vkDestroyPipeline(vk->device, s_unorm, nullptr);
-        s_unorm = VK_NULL_HANDLE;
-    }
-    if (s_layout != VK_NULL_HANDLE) {
+    vulkan_gfx_disarm(vk, &s_scene_srgb);
+    vulkan_gfx_disarm(vk, &s_scene_unorm);
+    vulkan_gfx_disarm(vk, &s_overlay_srgb);
+    vulkan_gfx_disarm(vk, &s_overlay_unorm);
+    if (vk != nullptr && vk->device != VK_NULL_HANDLE && s_layout != VK_NULL_HANDLE) {
         vkDestroyPipelineLayout(vk->device, s_layout, nullptr);
-        s_layout = VK_NULL_HANDLE;
     }
+    s_layout = VK_NULL_HANDLE;
     s_vk = nullptr;
 }
 
@@ -186,17 +161,10 @@ int hud_init(VulkanContext *vk) {
         hud_shutdown(vk);
         return -1;
     }
-    if (make_pair(vk, VK_SAMPLE_COUNT_1_BIT, VK_FORMAT_UNDEFINED, &s_srgb, &s_unorm) != 0 ||
-        make_pair(vk, pass_raster_samples(), pass_depth_format(), &s_scene_srgb, &s_scene_unorm) != 0) {
-        hud_shutdown(vk);
-        return -1;
-    }
+    arm_pair(VK_SAMPLE_COUNT_1_BIT, VK_FORMAT_UNDEFINED, &s_overlay_srgb, &s_overlay_unorm);
+    arm_pair(pass_raster_samples(), pass_depth_format(), &s_scene_srgb, &s_scene_unorm);
     s_scene_depth = pass_depth_format();
     s_scene_samples = pass_raster_samples();
-    if (s_srgb == VK_NULL_HANDLE || s_unorm == VK_NULL_HANDLE) {
-        hud_shutdown(vk);
-        return -1;
-    }
     printf("[Hud] 8x8 readout on presented frames\n");
     fflush(stdout);
     return 0;
@@ -312,27 +280,47 @@ void hud_prepare(uint32_t frame_ms, bool have_stamp, uint64_t modifier) {
     } else if (us >= 1000u) {
         fps = 1000000u / us;
     }
-    const char *kind = "mod";
+    char kind[32];
     if (modifier == 0) {
-        kind = "linear";
+        snprintf(kind, sizeof kind, "linear");
     } else if (modifier == k_intel_y_tile) {
-        kind = "ytile";
+        snprintf(kind, sizeof kind, "ytile");
+    } else {
+        snprintf(kind, sizeof kind, "mod 0x%llx", (unsigned long long)modifier);
+    }
+    char zoom_text[16];
+    float zoom = camera_zoom_shown();
+    if (!isfinite(zoom) || zoom <= 0.0f) {
+        snprintf(zoom_text, sizeof zoom_text, "0");
+    } else if (zoom >= 100.0f) {
+        snprintf(zoom_text, sizeof zoom_text, "%.0f", (double)zoom);
+    } else if (zoom >= 10.0f) {
+        snprintf(zoom_text, sizeof zoom_text, "%.1f", (double)zoom);
+    } else if (zoom >= 0.01f) {
+        snprintf(zoom_text, sizeof zoom_text, "%.2f", (double)zoom);
+    } else {
+        snprintf(zoom_text, sizeof zoom_text, "%.4f", (double)zoom);
     }
     uint32_t objects = 0;
     uint32_t verts = 0;
     world_stats(&objects, &verts);
-    int n = snprintf(s_text, sizeof s_text, "%uus %ufps miss %u %s 0x%llx %ucq/s obj %u v %u",
-                     us, fps, s_turn_missed, kind, (unsigned long long)modifier,
-                     cqe_rate(), objects, verts);
-    if (n < 0) {
-        s_nchars = 0;
-        s_text[0] = '\0';
-        return;
-    }
-    s_nchars = (uint32_t)n;
-    if (s_nchars > k_text_cap) {
-        s_nchars = k_text_cap;
-        s_text[k_text_cap] = '\0';
+    int wrote[k_hud_lines];
+    wrote[0] = snprintf(s_line[0], sizeof s_line[0], "%u fps  %u us", fps, us);
+    wrote[1] = snprintf(s_line[1], sizeof s_line[1], "miss %u  %u cq/s", s_turn_missed, cqe_rate());
+    wrote[2] = snprintf(s_line[2], sizeof s_line[2], "obj %u  vert %u", objects, verts);
+    wrote[3] = snprintf(s_line[3], sizeof s_line[3], "%s  zoom %s", kind, zoom_text);
+    for (uint32_t row = 0; row < k_hud_lines; ++row) {
+        if (wrote[row] < 0) {
+            s_line[row][0] = '\0';
+            s_line_n[row] = 0;
+            continue;
+        }
+        uint32_t n = (uint32_t)wrote[row];
+        if (n > k_line_cap) {
+            n = k_line_cap;
+            s_line[row][k_line_cap] = '\0';
+        }
+        s_line_n[row] = n;
     }
 }
 
@@ -342,35 +330,46 @@ static VkPipeline pick_pipeline(VkFormat format, VkFormat depth_format,
     if (scene && (depth_format != s_scene_depth || samples != s_scene_samples)) {
         return VK_NULL_HANDLE;
     }
+    VulkanGfxLive *live = nullptr;
     if (format == VK_FORMAT_B8G8R8A8_SRGB) {
-        return scene ? s_scene_srgb : s_srgb;
+        live = scene ? &s_scene_srgb : &s_overlay_srgb;
+    } else if (format == VK_FORMAT_B8G8R8A8_UNORM) {
+        live = scene ? &s_scene_unorm : &s_overlay_unorm;
     }
-    if (format == VK_FORMAT_B8G8R8A8_UNORM) {
-        return scene ? s_scene_unorm : s_unorm;
+    if (live == nullptr) {
+        return VK_NULL_HANDLE;
     }
-    return VK_NULL_HANDLE;
+    return vulkan_gfx_use(s_vk, live);
 }
 
 void hud_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height, VkFormat format,
               VkFormat depth_format, VkSampleCountFlagBits samples) {
     if (cmd == VK_NULL_HANDLE || s_vk == nullptr || s_layout == VK_NULL_HANDLE ||
-        s_nchars == 0 || width < 80u || height < 48u) {
+        width < 80u || height < 64u) {
         return;
     }
     VkPipeline pipeline = pick_pipeline(format, depth_format, samples);
     if (pipeline == VK_NULL_HANDLE) return;
 
-    uint32_t n = s_nchars;
+    uint32_t longest = 0;
+    for (uint32_t row = 0; row < k_hud_lines; ++row) {
+        if (s_line_n[row] > longest) {
+            longest = s_line_n[row];
+        }
+    }
     uint32_t max_chars = (width - 20u - 4u) / 8u;
-    if (n > max_chars) n = max_chars;
-    if (n == 0) return;
+    if (longest > max_chars) {
+        longest = max_chars;
+    }
+    if (longest == 0) return;
 
-    BdaSlice slice = bda_alloc_transient(s_vk, (VkDeviceSize)(n + 1u) * sizeof(HudInstance), 16u);
+    uint32_t cap = 1u + k_hud_lines * k_line_cap;
+    BdaSlice slice = bda_alloc_transient(s_vk, (VkDeviceSize)cap * sizeof(HudInstance), 16u);
     if (slice.cpu == nullptr || slice.gpu == 0) return;
 
     HudInstance *inst = (HudInstance *)slice.cpu;
-    uint32_t plate_w = n * 8u + 4u;
-    uint32_t plate_h = 12u;
+    uint32_t plate_w = longest * 8u + 4u;
+    uint32_t plate_h = k_hud_lines * 8u + 4u;
     uint32_t plate_x = 10u;
     uint32_t plate_y = height - 10u - plate_h;
 
@@ -379,25 +378,34 @@ void hud_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height, VkFormat for
         .x = plate_x, .y = plate_y, .w = plate_w, .h = plate_h, .solid = 1u,
     };
 
-    for (uint32_t i = 0; i < n; ++i) {
-        unsigned char ch = (unsigned char)s_text[i];
-        if (ch < 32u || ch > 126u) continue;
-        const uint8_t *rows = k_font[ch - 32u];
-        if ((rows[0] | rows[1] | rows[2] | rows[3] | rows[4] | rows[5] | rows[6] | rows[7]) == 0) {
-            continue;
+    for (uint32_t row = 0; row < k_hud_lines; ++row) {
+        uint32_t n = s_line_n[row];
+        if (n > max_chars) {
+            n = max_chars;
         }
-        inst[count++] = (HudInstance){
-            .x     = plate_x + 2u + i * 8u,
-            .y     = plate_y + 2u,
-            .w     = 8u,
-            .h     = 8u,
-            .rows0 = (uint32_t)rows[0] | ((uint32_t)rows[1] << 8u) |
-                     ((uint32_t)rows[2] << 16u) | ((uint32_t)rows[3] << 24u),
-            .rows1 = (uint32_t)rows[4] | ((uint32_t)rows[5] << 8u) |
-                     ((uint32_t)rows[6] << 16u) | ((uint32_t)rows[7] << 24u),
-            .rgb   = 0x00f4f1eau,
-            .solid = 0u,
-        };
+        for (uint32_t i = 0; i < n; ++i) {
+            unsigned char ch = (unsigned char)s_line[row][i];
+            if (ch < 32u || ch > 126u) continue;
+            const uint8_t *rows = k_font[ch - 32u];
+            if ((rows[0] | rows[1] | rows[2] | rows[3] | rows[4] | rows[5] | rows[6] | rows[7]) == 0) {
+                continue;
+            }
+            if (count >= cap) {
+                break;
+            }
+            inst[count++] = (HudInstance){
+                .x     = plate_x + 2u + i * 8u,
+                .y     = plate_y + 2u + row * 8u,
+                .w     = 8u,
+                .h     = 8u,
+                .rows0 = (uint32_t)rows[0] | ((uint32_t)rows[1] << 8u) |
+                         ((uint32_t)rows[2] << 16u) | ((uint32_t)rows[3] << 24u),
+                .rows1 = (uint32_t)rows[4] | ((uint32_t)rows[5] << 8u) |
+                         ((uint32_t)rows[6] << 16u) | ((uint32_t)rows[7] << 24u),
+                .rgb   = 0x00f4f1eau,
+                .solid = 0u,
+            };
+        }
     }
 
     HudPush push = { .instances = slice.gpu, .fb_w = width, .fb_h = height };

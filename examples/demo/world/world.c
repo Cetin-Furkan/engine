@@ -3,12 +3,76 @@
 #include "frame/policy.h"
 #include "frame/text.h"
 #include <stdio.h>
+#include <string.h>
 
 // Starts the world and calls the layers under src/world. Object kinds live
 // in kind/. Faces live in face/. The file reader is load.c. This file does
 // not contain a cube, a face list, or a key's geometry.
 
+enum : uint32_t { k_removed_cap = 24 };
+
+static WorldRemoved s_removed[k_removed_cap];
+static uint32_t     s_removed_n = 0;
+
+void world_removed_clear(void) {
+    s_removed_n = 0;
+}
+
+void world_removed_push(const WorldRemoved *item) {
+    if (item == nullptr) {
+        return;
+    }
+    if (s_removed_n == k_removed_cap) {
+        memmove(s_removed, s_removed + 1, (k_removed_cap - 1u) * sizeof s_removed[0]);
+        s_removed_n = k_removed_cap - 1u;
+    }
+    s_removed[s_removed_n++] = *item;
+}
+
+uint32_t world_removed_count(void) {
+    return s_removed_n;
+}
+
+const WorldRemoved *world_removed_at(uint32_t index) {
+    if (index >= s_removed_n) {
+        return nullptr;
+    }
+    return &s_removed[index];
+}
+
+static bool snap_removed(const WorldObj *o, WorldRemoved *out) {
+    if (o == nullptr || o->ops == nullptr || out == nullptr) {
+        return false;
+    }
+    WorldRemoved g = {0};
+    g.at = o->at;
+    if (o->spin != nullptr) {
+        g.yaw_milli = o->spin->live_milli;
+        g.spinning = o->spin->spinning;
+        g.infinite = o->spin->infinite;
+        g.glow = o->spin->glow;
+    }
+    if (o->ops == cube_ops()) {
+        g.kind = k_removed_cube;
+    } else if (o->ops == solid_ops()) {
+        const char *name = o->ops->name != nullptr ? o->ops->name(o) : nullptr;
+        int kind = solid_kind_index(name);
+        if (kind < 0) {
+            return false;
+        }
+        g.kind = k_removed_solid;
+        g.solid = kind;
+    } else if (o->ops == mesh_ops()) {
+        g.kind = k_removed_mesh;
+    } else {
+        return false;
+    }
+    *out = g;
+    return true;
+}
+
 void world_reset(void) {
+    world_removed_clear();
     table_reset();
     ground_reset();
     face_reset();
@@ -57,13 +121,24 @@ void world_simulation_commit(uint32_t time_ms, uint32_t heat_dt) {
     table_simulate_commit(time_ms, heat_dt);
 }
 
+static void world_store(void) {
+    (void)world_save();
+}
+
 void world_adopt_mesh(void) {
     mesh_kind_set_wanted(true);
     mesh_kind_raise();
+    world_store();
 }
 
 bool world_apply_mesh(bool has, bool bytes) {
-    return mesh_kind_apply(has, bytes);
+    bool was = table_find(mesh_ops()) != nullptr;
+    bool changed = mesh_kind_apply(has, bytes);
+    bool now = table_find(mesh_ops()) != nullptr;
+    if (was != now) {
+        world_store();
+    }
+    return changed;
 }
 
 bool world_click(float screen_x, float screen_y) {
@@ -117,10 +192,28 @@ bool world_cancel(void) {
     return true;
 }
 
+static bool delete_obj(WorldObj *o) {
+    if (o == nullptr || o->ops == nullptr || o->ops->remove == nullptr) {
+        return false;
+    }
+    WorldRemoved snap = {0};
+    bool keep = snap_removed(o, &snap);
+    if (!o->ops->remove(o)) {
+        return false;
+    }
+    if (keep) {
+        if (snap.kind == k_removed_mesh) {
+            mesh_kind_abandon();
+        }
+        world_removed_push(&snap);
+    }
+    table_clear_selection();
+    world_store();
+    return true;
+}
+
 bool world_delete(void) {
-    WorldObj *o = table_selected();
-    if (o != nullptr && o->ops != nullptr && o->ops->remove != nullptr && o->ops->remove(o)) {
-        table_clear_selection();
+    if (delete_obj(table_selected())) {
         return true;
     }
     if (face_pop_corner()) {
@@ -128,12 +221,50 @@ bool world_delete(void) {
     }
     // Nothing selected and no open corner: the first placed cube is the
     // fallback, the same object R and G reach when the selection is empty.
-    o = table_fallback();
-    if (o != nullptr && o->ops != nullptr && o->ops->remove != nullptr && o->ops->remove(o)) {
-        table_clear_selection();
-        return true;
+    return delete_obj(table_fallback());
+}
+
+bool world_restore(void) {
+    if (s_removed_n == 0u) {
+        printf("[Engine] Nothing removed to put back.\n");
+        fflush(stdout);
+        return false;
     }
-    return false;
+    WorldRemoved g = s_removed[--s_removed_n];
+    int before = table_count();
+    bool ok = false;
+    if (g.kind == k_removed_cube) {
+        ok = cube_kind_spawn_pose(g.at, g.yaw_milli, g.spinning, g.infinite, g.glow);
+    } else if (g.kind == k_removed_solid) {
+        ok = solid_kind_place((uint32_t)g.solid, g.at, g.yaw_milli, g.spinning, g.infinite, g.glow);
+    } else if (g.kind == k_removed_mesh) {
+        ok = mesh_kind_pose(g.yaw_milli, g.spinning, g.infinite, g.glow);
+    }
+    if (!ok || table_count() == before) {
+        if (ok && g.kind == k_removed_mesh) {
+            mesh_kind_abandon();
+        }
+        s_removed[s_removed_n++] = g;
+        printf("[Engine] That object did not fit back.\n");
+        fflush(stdout);
+        return false;
+    }
+    table_select_quiet(table_count() - 1);
+    const char *name = "Object";
+    if (g.kind == k_removed_cube) {
+        name = "Cube";
+    } else if (g.kind == k_removed_solid) {
+        const char *solid = solid_kind_name((uint32_t)g.solid);
+        if (solid != nullptr) {
+            name = solid;
+        }
+    } else if (g.kind == k_removed_mesh) {
+        name = "Mesh";
+    }
+    printf("[Engine] %s back.\n", name);
+    fflush(stdout);
+    world_store();
+    return true;
 }
 
 bool world_respin_selected(void) {
@@ -141,39 +272,65 @@ bool world_respin_selected(void) {
     if (o == nullptr || o->ops == nullptr || o->ops->respin == nullptr) {
         return false;
     }
-    return o->ops->respin(o);
+    bool changed = o->ops->respin(o);
+    if (changed) {
+        world_store();
+    }
+    return changed;
 }
 
 bool world_raise_solid(uint32_t kind) {
-    return solid_kind_raise(kind);
+    bool changed = solid_kind_raise(kind);
+    if (changed) {
+        world_store();
+    }
+    return changed;
 }
 
 bool world_toggle_spin(void) {
     WorldObj *o = table_selected();
     if (o != nullptr && o->ops != nullptr && o->ops->toggle_spin != nullptr) {
-        return o->ops->toggle_spin(o);
+        bool changed = o->ops->toggle_spin(o);
+        if (changed) {
+            world_store();
+        }
+        return changed;
     }
     o = table_fallback();
     if (o == nullptr || o->ops == nullptr || o->ops->toggle_spin == nullptr) {
         return false;
     }
-    return o->ops->toggle_spin(o);
+    bool changed = o->ops->toggle_spin(o);
+    if (changed) {
+        world_store();
+    }
+    return changed;
 }
 
 bool world_toggle_glow(void) {
     WorldObj *o = table_selected();
     if (o != nullptr && o->ops != nullptr && o->ops->toggle_glow != nullptr) {
-        return o->ops->toggle_glow(o);
+        bool changed = o->ops->toggle_glow(o);
+        if (changed) {
+            world_store();
+        }
+        return changed;
     }
     o = table_fallback();
     if (o == nullptr || o->ops == nullptr || o->ops->toggle_glow == nullptr) {
         return false;
     }
-    return o->ops->toggle_glow(o);
+    bool changed = o->ops->toggle_glow(o);
+    if (changed) {
+        world_store();
+    }
+    return changed;
 }
 
 bool world_toggle_smooth(void) {
-    return solid_kind_toggle_smooth();
+    bool changed = solid_kind_toggle_smooth();
+    world_store();
+    return changed;
 }
 
 bool world_busy(void) {

@@ -78,6 +78,7 @@ typedef enum EngineAction : uint8_t {
     ACT_VIEW_FRONT,
     ACT_TOGGLE_DRAW,
     ACT_TOGGLE_GIMBAL,
+    ACT_RESTORE,
     ACT_COUNT
 } EngineAction;
 

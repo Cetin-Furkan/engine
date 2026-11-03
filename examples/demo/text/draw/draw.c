@@ -48,11 +48,32 @@ typedef struct TextSlice {
     uint64_t point;
 } TextSlice;
 
+static const uint32_t k_flag_srgb = 1u;
+static const uint32_t k_flag_unorm = 0u;
+static const VkSpecializationMapEntry k_text_entry = {
+    .constantID = 0,
+    .offset     = 0,
+    .size       = sizeof(uint32_t),
+};
+static const VkSpecializationInfo k_spec_srgb = {
+    .mapEntryCount = 1,
+    .pMapEntries   = &k_text_entry,
+    .dataSize      = sizeof k_flag_srgb,
+    .pData         = &k_flag_srgb,
+};
+static const VkSpecializationInfo k_spec_unorm = {
+    .mapEntryCount = 1,
+    .pMapEntries   = &k_text_entry,
+    .dataSize      = sizeof k_flag_unorm,
+    .pData         = &k_flag_unorm,
+};
+
+static VulkanContext        *s_vk = nullptr;
 static VkPipelineLayout      s_layout = VK_NULL_HANDLE;
-static VkPipeline            s_srgb = VK_NULL_HANDLE;
-static VkPipeline            s_unorm = VK_NULL_HANDLE;
-static VkPipeline            s_scene_srgb = VK_NULL_HANDLE;
-static VkPipeline            s_scene_unorm = VK_NULL_HANDLE;
+static VulkanGfxLive         s_overlay_srgb;
+static VulkanGfxLive         s_overlay_unorm;
+static VulkanGfxLive         s_scene_srgb;
+static VulkanGfxLive         s_scene_unorm;
 static VkFormat              s_scene_depth = VK_FORMAT_UNDEFINED;
 static VkSampleCountFlagBits s_scene_samples = VK_SAMPLE_COUNT_1_BIT;
 static DaBuffer              s_geom;
@@ -67,30 +88,8 @@ static void text_fail(const char *what, VkResult res) {
     fprintf(stderr, "[Text Error] %s: %s (%d)\n", what, vulkan_vkresult_to_str(res), (int)res);
 }
 
-static int make_pair(VulkanContext *vk, VkSampleCountFlagBits samples, VkFormat depth,
-                     VkPipeline *srgb, VkPipeline *unorm) {
-    uint32_t flag[2] = { 1u, 0u };
-    VkSpecializationMapEntry entry = {
-        .constantID = 0,
-        .offset     = 0,
-        .size       = sizeof(uint32_t),
-    };
-    VkSpecializationInfo spec[2] = {
-        {
-            .mapEntryCount = 1,
-            .pMapEntries   = &entry,
-            .dataSize      = sizeof(uint32_t),
-            .pData         = &flag[0],
-        },
-        {
-            .mapEntryCount = 1,
-            .pMapEntries   = &entry,
-            .dataSize      = sizeof(uint32_t),
-            .pData         = &flag[1],
-        },
-    };
-    const VkSpecializationInfo *specs[2] = { &spec[0], &spec[1] };
-    VkFormat formats[2] = { VK_FORMAT_B8G8R8A8_SRGB, VK_FORMAT_B8G8R8A8_UNORM };
+static void arm_pair(VkSampleCountFlagBits samples, VkFormat depth,
+                     VulkanGfxLive *srgb, VulkanGfxLive *unorm) {
     VulkanGfxPipe info = {
         .vert          = k_vert_spv,
         .vert_bytes    = sizeof k_vert_spv,
@@ -105,20 +104,8 @@ static int make_pair(VulkanContext *vk, VkSampleCountFlagBits samples, VkFormat 
         .depth_compare = VK_COMPARE_OP_LESS,
         .blend         = VK_TRUE,
     };
-    VkPipeline out[2] = {0};
-    if (vulkan_gfx_pipelines(vk, &info, formats, specs, 2, out) != 0) {
-        return -1;
-    }
-    *srgb = out[0];
-    *unorm = out[1];
-    return 0;
-}
-
-static void destroy_pipe(VkDevice device, VkPipeline *pipe) {
-    if (device != VK_NULL_HANDLE && *pipe != VK_NULL_HANDLE) {
-        vkDestroyPipeline(device, *pipe, nullptr);
-    }
-    *pipe = VK_NULL_HANDLE;
+    vulkan_gfx_arm(srgb, &info, VK_FORMAT_B8G8R8A8_SRGB, &k_spec_srgb);
+    vulkan_gfx_arm(unorm, &info, VK_FORMAT_B8G8R8A8_UNORM, &k_spec_unorm);
 }
 
 static void gpu_shutdown(VulkanContext *vk) {
@@ -130,10 +117,11 @@ static void gpu_shutdown(VulkanContext *vk) {
     if (vk != nullptr && vk->device != VK_NULL_HANDLE) {
         device = vk->device;
     }
-    destroy_pipe(device, &s_scene_srgb);
-    destroy_pipe(device, &s_scene_unorm);
-    destroy_pipe(device, &s_srgb);
-    destroy_pipe(device, &s_unorm);
+    vulkan_gfx_disarm(vk, &s_scene_srgb);
+    vulkan_gfx_disarm(vk, &s_scene_unorm);
+    vulkan_gfx_disarm(vk, &s_overlay_srgb);
+    vulkan_gfx_disarm(vk, &s_overlay_unorm);
+    s_vk = nullptr;
     if (device != VK_NULL_HANDLE && s_layout != VK_NULL_HANDLE) {
         vkDestroyPipelineLayout(device, s_layout, nullptr);
     }
@@ -170,6 +158,7 @@ int text_init(VulkanContext *vk) {
     if (vk == nullptr || vk->device == VK_NULL_HANDLE || vk->physical_device == VK_NULL_HANDLE) {
         return -1;
     }
+    s_vk = vk;
     if (s_layout != VK_NULL_HANDLE) {
         return 0;
     }
@@ -209,11 +198,8 @@ int text_init(VulkanContext *vk) {
         text_shutdown(vk);
         return -1;
     }
-    if (make_pair(vk, VK_SAMPLE_COUNT_1_BIT, VK_FORMAT_UNDEFINED, &s_srgb, &s_unorm) != 0 ||
-        make_pair(vk, pass_raster_samples(), pass_depth_format(), &s_scene_srgb, &s_scene_unorm) != 0) {
-        text_shutdown(vk);
-        return -1;
-    }
+    arm_pair(VK_SAMPLE_COUNT_1_BIT, VK_FORMAT_UNDEFINED, &s_overlay_srgb, &s_overlay_unorm);
+    arm_pair(pass_raster_samples(), pass_depth_format(), &s_scene_srgb, &s_scene_unorm);
     s_scene_depth = pass_depth_format();
     s_scene_samples = pass_raster_samples();
     text_place_boot();
@@ -279,13 +265,16 @@ static VkPipeline pick_pipeline(VkFormat format, VkFormat depth_format,
     if (scene && (depth_format != s_scene_depth || samples != s_scene_samples)) {
         return VK_NULL_HANDLE;
     }
+    VulkanGfxLive *live = nullptr;
     if (format == VK_FORMAT_B8G8R8A8_SRGB) {
-        return scene ? s_scene_srgb : s_srgb;
+        live = scene ? &s_scene_srgb : &s_overlay_srgb;
+    } else if (format == VK_FORMAT_B8G8R8A8_UNORM) {
+        live = scene ? &s_scene_unorm : &s_overlay_unorm;
     }
-    if (format == VK_FORMAT_B8G8R8A8_UNORM) {
-        return scene ? s_scene_unorm : s_unorm;
+    if (live == nullptr) {
+        return VK_NULL_HANDLE;
     }
-    return VK_NULL_HANDLE;
+    return vulkan_gfx_use(s_vk, live);
 }
 
 void text_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height, VkFormat format,

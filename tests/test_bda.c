@@ -324,7 +324,27 @@ static void test_bda_usage_and_transient(void) {
     s_bda_sys = (BdaSystem){0};
 }
 
+static void test_da_buffer_write_bounds(void) {
+    uint8_t storage[32];
+    memset(storage, 0xab, sizeof storage);
+    DaBuffer buf = {
+        .map = storage,
+        .bytes = sizeof storage,
+    };
+    uint8_t four[4] = { 1, 2, 3, 4 };
+    CHECK(da_buffer_write(&buf, 0, four, 4) == 0);
+    CHECK(storage[0] == 1 && storage[1] == 2 && storage[2] == 3 && storage[3] == 4);
+    CHECK(da_buffer_write(&buf, 30, four, 4) != 0);
+    CHECK(storage[30] == 0xab && storage[31] == 0xab);
+    CHECK(da_buffer_write(nullptr, 0, four, 4) != 0);
+    CHECK(da_buffer_write(&buf, 32, nullptr, 0) == 0);
+    CHECK(da_buffer_write(&buf, 33, nullptr, 0) != 0);
+    DaBuffer unmapped = { .bytes = 4 };
+    CHECK(da_buffer_write(&unmapped, 0, four, 4) != 0);
+}
+
 int main(void) {
+    test_da_buffer_write_bounds();
     test_bda_alloc_and_free();
     test_bda_two_way_coalescing();
     test_bda_padding_preservation();

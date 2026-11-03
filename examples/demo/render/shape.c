@@ -72,8 +72,9 @@ typedef struct ShapeSlice {
     uint32_t used;
 } ShapeSlice;
 
+static VulkanContext   *s_vk = nullptr;
 static VkPipelineLayout s_layout = VK_NULL_HANDLE;
-static VkPipeline       s_pipeline = VK_NULL_HANDLE;
+static VulkanGfxLive    s_gfx;
 static DaBuffer         s_geom;
 static VkDevice         s_device = VK_NULL_HANDLE;
 static VkDeviceAddress  s_addr = 0;
@@ -99,18 +100,15 @@ static void shape_geom_reset(void) {
 
 void shape_shutdown(VulkanContext *vk) {
     shape_geom_reset();
+    vulkan_gfx_disarm(vk, &s_gfx);
+    s_vk = nullptr;
     if (vk != nullptr && vk->device != VK_NULL_HANDLE) {
-        if (s_pipeline != VK_NULL_HANDLE) {
-            vkDestroyPipeline(vk->device, s_pipeline, nullptr);
-            s_pipeline = VK_NULL_HANDLE;
-        }
         if (s_layout != VK_NULL_HANDLE) {
             vkDestroyPipelineLayout(vk->device, s_layout, nullptr);
             s_layout = VK_NULL_HANDLE;
         }
     } else {
         s_layout = VK_NULL_HANDLE;
-        s_pipeline = VK_NULL_HANDLE;
     }
     da_buffer_destroy(vk, &s_geom);
 }
@@ -158,7 +156,8 @@ int shape_init(VulkanContext *vk) {
     if (vk == nullptr || vk->device == VK_NULL_HANDLE || vk->physical_device == VK_NULL_HANDLE) {
         return -1;
     }
-    if (s_pipeline != VK_NULL_HANDLE) {
+    s_vk = vk;
+    if (s_layout != VK_NULL_HANDLE) {
         return 0;
     }
     VkFormat depth_format = pass_depth_format();
@@ -194,7 +193,6 @@ int shape_init(VulkanContext *vk) {
         return -1;
     }
 
-    VkFormat color_format = VK_FORMAT_B8G8R8A8_SRGB;
     VulkanGfxPipe gfx = {
         .vert          = k_vert_spv,
         .vert_bytes    = sizeof k_vert_spv,
@@ -209,10 +207,7 @@ int shape_init(VulkanContext *vk) {
         .depth_compare = VK_COMPARE_OP_LESS,
         .blend         = VK_FALSE,
     };
-    if (vulkan_gfx_pipelines(vk, &gfx, &color_format, nullptr, 1, &s_pipeline) != 0) {
-        shape_shutdown(vk);
-        return -1;
-    }
+    vulkan_gfx_arm(&s_gfx, &gfx, VK_FORMAT_B8G8R8A8_SRGB, nullptr);
     if (shape_geom_init(vk) != 0) {
         shape_shutdown(vk);
         return -1;
@@ -288,7 +283,8 @@ void shape_draw_polygon(VkCommandBuffer cmd, uint32_t width, uint32_t height,
                         float fill_r, float fill_g, float fill_b,
                         float edge_r, float edge_g, float edge_b,
                         float stroke_half, float mark_half, uint32_t mat_index) {
-    if (cmd == VK_NULL_HANDLE || s_pipeline == VK_NULL_HANDLE || s_layout == VK_NULL_HANDLE ||
+    VkPipeline pipeline = vulkan_gfx_use(s_vk, &s_gfx);
+    if (cmd == VK_NULL_HANDLE || pipeline == VK_NULL_HANDLE || s_layout == VK_NULL_HANDLE ||
         s_active < 0 || x == nullptr || y == nullptr || width == 0u || height == 0u ||
         n == 0u || n > k_poly_points || tri_n > k_poly_tris) {
         return;
@@ -313,7 +309,7 @@ void shape_draw_polygon(VkCommandBuffer cmd, uint32_t width, uint32_t height,
         indices_addr = geom_addr(ix);
     }
 
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_pipeline);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
 
     ShapePush push = {
         .points    = geom_addr(pts),

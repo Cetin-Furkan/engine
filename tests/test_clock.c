@@ -94,6 +94,14 @@ int main(void) {
     CHECK(!frame_clock_stalled(&pacing, 50));
     CHECK(frame_clock_stalled(&pacing, 500));
 
+    // The first GPU sample is stored. The next keeps seven eighths.
+    frame_clock_note_gpu(&clock, 80u, 800u, 1000u);
+    CHECK(clock.gpu_compute_us == 80u && clock.gpu_render_us == 800u && clock.gpu_total_us == 1000u);
+    frame_clock_note_gpu(&clock, 80u, 800u, 1000u);
+    CHECK(clock.gpu_total_us == 1000u);
+    frame_clock_note_gpu(&clock, 160u, 800u, 1000u);
+    CHECK(clock.gpu_compute_us == ((80u * 7u + 160u) >> 3));
+
     // Reset returns to baseline behaviour.
     frame_clock_reset(&clock);
     FrameStep again = frame_clock_step(&clock, 42);

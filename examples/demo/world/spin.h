@@ -22,6 +22,10 @@ typedef struct Spin {
 void spin_clear(void);
 Spin spin_start(int32_t rest_milli);
 
+// rest, live, and shown yaw are yaw_milli. spinning, infinite, and glow
+// replace the spin_start defaults. shown_glow matches glow.
+Spin spin_pose(int32_t yaw_milli, bool spinning, bool infinite, bool glow);
+
 // True when the live angle moved. The first stamp only stores the clock.
 bool spin_advance(Spin *s, uint32_t time_ms, bool log_start);
 void spin_commit(Spin *s);

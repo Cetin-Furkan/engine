@@ -31,6 +31,9 @@ bool upper_half(uint id) {
 }
 
 bool seeded(uint id) {
+    if (id >= k_grid_verts) {
+        return false;
+    }
     if (id < k_fillet_verts) {
         return upper_half(id);
     }
@@ -53,10 +56,21 @@ float3 placed_3d(float3 in_pos, float yaw_deg) {
 [numthreads(64, 1, 1)]
 void main(uint3 group_id : SV_DispatchThreadID) {
     uint id = group_id.x;
-    if (id >= k_grid_verts) {
+    if (id >= k_mesh_verts) {
         return;
     }
     SoftVertexState* out_field = (SoftVertexState*)pc.dst;
+    // Seam samples are drawn as a lerp of the two face rails. They are not
+    // a second membrane, and grid_decode does not describe them.
+    if (id >= k_grid_verts) {
+        SoftVertexState seam;
+        seam.disp = float3(0.0);
+        seam.temp = 0.0;
+        seam.vel  = float3(0.0);
+        seam.pad  = 0.0;
+        out_field[id] = seam;
+        return;
+    }
     if (pc.seed != 0u) {
         SoftVertexState init_s;
         init_s.disp = float3(0.0);

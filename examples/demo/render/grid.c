@@ -112,7 +112,7 @@ static int submit_idle(VulkanContext *vk, VkCommandBuffer cmd) {
 void grid_shutdown(VulkanContext *vk) {
     if (vk != nullptr && vk->device != VK_NULL_HANDLE) {
         if (s_pipe != VK_NULL_HANDLE) {
-            vkDestroyPipeline(vk->device, s_pipe, nullptr);
+            vulkan_pipe_release(vk, s_pipe);
         }
         if (s_layout != VK_NULL_HANDLE) {
             vkDestroyPipelineLayout(vk->device, s_layout, nullptr);

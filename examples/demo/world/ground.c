@@ -1,10 +1,10 @@
 #include "world/world_int.h"
 #include "frame/plane.h"
 
-// The ground is the universal z = 0 metric grid: coordinate space
-// itself, not an object a file opts into. It is on from reset; the
-// world file may still name it (ground_set) with no effect change.
-// Its lines are computed from the camera each draw. No mesh is built.
+// The ground draw is the screen-space metric grid behind the scene.
+// It is on from reset. The world file may still name it (ground_set).
+// That name also sets the hit plane in coord.h. The lines are computed
+// from the camera each draw. No mesh is built.
 
 static bool s_on = true;
 

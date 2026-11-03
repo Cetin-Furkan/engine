@@ -88,8 +88,9 @@ typedef struct PlotSlice {
     bool     math_ready;
 } PlotSlice;
 
+static VulkanContext   *s_vk = nullptr;
 static VkPipelineLayout s_layout = VK_NULL_HANDLE;
-static VkPipeline       s_pipeline = VK_NULL_HANDLE;
+static VulkanGfxLive    s_gfx;
 static VkPipelineLayout s_bake_layout = VK_NULL_HANDLE;
 static VkPipeline       s_bake = VK_NULL_HANDLE;
 static DaBuffer         s_geom;
@@ -178,21 +179,19 @@ void plot_shutdown(VulkanContext *vk) {
     memset(s_slice, 0, sizeof s_slice);
     if (vk != nullptr && vk->device != VK_NULL_HANDLE) {
         if (s_bake != VK_NULL_HANDLE) {
-            vkDestroyPipeline(vk->device, s_bake, nullptr);
+            vulkan_pipe_release(vk, s_bake);
         }
         if (s_bake_layout != VK_NULL_HANDLE) {
             vkDestroyPipelineLayout(vk->device, s_bake_layout, nullptr);
-        }
-        if (s_pipeline != VK_NULL_HANDLE) {
-            vkDestroyPipeline(vk->device, s_pipeline, nullptr);
         }
         if (s_layout != VK_NULL_HANDLE) {
             vkDestroyPipelineLayout(vk->device, s_layout, nullptr);
         }
     }
+    vulkan_gfx_disarm(vk, &s_gfx);
+    s_vk = nullptr;
     s_bake = VK_NULL_HANDLE;
     s_bake_layout = VK_NULL_HANDLE;
-    s_pipeline = VK_NULL_HANDLE;
     s_layout = VK_NULL_HANDLE;
     da_buffer_destroy(vk, &s_geom);
 }
@@ -345,7 +344,10 @@ static int retired_math(VkSemaphore acquire) {
 static void copy_file_into(PlotSample *dst) {
     PlotSample *file = dst + k_math_points;
     if (s_file_n > 0u) {
-        memcpy(file, s_file_cpu, (size_t)s_file_n * sizeof(PlotSample));
+        VkDeviceSize off = (VkDeviceSize)((uint8_t *)file - (uint8_t *)s_geom.map);
+        if (da_buffer_write(&s_geom, off, s_file_cpu, (VkDeviceSize)s_file_n * sizeof(PlotSample)) != 0) {
+            fprintf(stderr, "[Plot Error] Plot file write missed the buffer\n");
+        }
     }
     if (s_file_n < k_file_points) {
         memset(file + s_file_n, 0, (size_t)(k_file_points - s_file_n) * sizeof(PlotSample));
@@ -393,9 +395,13 @@ void plot_begin(VkSemaphore acquire, uint64_t signal_point) {
     }
     PlotSample *dst = slice_cpu((uint32_t)slot);
     if (need_math) {
-        memcpy(dst, s_math_stage, sizeof s_math_stage);
-        s_slice[slot].math_ready = true;
-        s_slice[slot].mode = s_mode;
+        VkDeviceSize off = (VkDeviceSize)((uint8_t *)dst - (uint8_t *)s_geom.map);
+        if (da_buffer_write(&s_geom, off, s_math_stage, sizeof s_math_stage) != 0) {
+            fprintf(stderr, "[Plot Error] Plot math write missed the buffer\n");
+        } else {
+            s_slice[slot].math_ready = true;
+            s_slice[slot].mode = s_mode;
+        }
     }
     copy_file_into(dst);
     s_armed = slot;
@@ -495,11 +501,12 @@ static void draw_range(VkCommandBuffer cmd, uint32_t width, uint32_t height,
 }
 
 void plot_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height) {
-    if (cmd == VK_NULL_HANDLE || width == 0 || height == 0 || s_pipeline == VK_NULL_HANDLE ||
+    VkPipeline pipeline = vulkan_gfx_use(s_vk, &s_gfx);
+    if (cmd == VK_NULL_HANDLE || width == 0 || height == 0 || pipeline == VK_NULL_HANDLE ||
         s_draw_addr == 0) {
         return;
     }
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_pipeline);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
     bool math_ok = s_mode != k_mode_off && s_draw_slice >= 0 &&
                    s_slice[s_draw_slice].math_ready && s_slice[s_draw_slice].mode == s_mode;
     if (math_ok) {
@@ -645,7 +652,8 @@ int plot_init(VulkanContext *vk, RingCqeFn on_cqe, void *on_user) {
     if (vk == nullptr || vk->device == VK_NULL_HANDLE || vk->physical_device == VK_NULL_HANDLE) {
         return -1;
     }
-    if (s_pipeline != VK_NULL_HANDLE) {
+    s_vk = vk;
+    if (s_layout != VK_NULL_HANDLE) {
         return 0;
     }
     VkFormat depth_format = pass_depth_format();
@@ -703,7 +711,6 @@ int plot_init(VulkanContext *vk, RingCqeFn on_cqe, void *on_user) {
         plot_shutdown(vk);
         return -1;
     }
-    VkFormat color_format = VK_FORMAT_B8G8R8A8_SRGB;
     VulkanGfxPipe gfx = {
         .vert          = k_vert_spv,
         .vert_bytes    = sizeof k_vert_spv,
@@ -718,10 +725,7 @@ int plot_init(VulkanContext *vk, RingCqeFn on_cqe, void *on_user) {
         .depth_compare = VK_COMPARE_OP_LESS,
         .blend         = VK_FALSE,
     };
-    if (vulkan_gfx_pipelines(vk, &gfx, &color_format, nullptr, 1, &s_pipeline) != 0) {
-        plot_shutdown(vk);
-        return -1;
-    }
+    vulkan_gfx_arm(&s_gfx, &gfx, VK_FORMAT_B8G8R8A8_SRGB, nullptr);
     VkCommandPool pool = vk->compute_cmd_pool != VK_NULL_HANDLE ? vk->compute_cmd_pool : vk->cmd_pool;
     if (pool == VK_NULL_HANDLE || s_queue == VK_NULL_HANDLE) {
         fprintf(stderr, "[Plot Error] Math bake needs compute queue and command pool\n");

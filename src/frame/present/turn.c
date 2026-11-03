@@ -1,11 +1,9 @@
-#include "frame/frame_int.h"
-#include <poll.h>
-#include <sys/timerfd.h>
+#include "frame/internal.h"
 
-// The 8 ms timer advances the simulation. A compositor stamp paces the next
-// present. The first picture after idle is committed with its frame callback.
-// A frameless callback is not a present: after a resize Mutter can sit on it,
-// and the dent stays on screen until that callback arrives.
+// A compositor stamp paces the next present. The first picture after idle
+// is committed with its frame callback. A frameless callback is not a
+// present: after a resize Mutter can sit on it, and the dent stays on
+// screen until that callback arrives. The 8 ms timer lives in sim.c.
 
 static int queue_frame_only(WaylandContext *wl, bool *queued);
 
@@ -33,9 +31,14 @@ static int queue_frame_only(WaylandContext *wl, bool *queued) {
 }
 
 static bool spare_ready(VulkanContext *vk) {
-    return acquire_point_retired(vk, spare()->acquire_point) &&
-        (!spare()->release_pending ||
-         poll_release_semaphore(vk, spare()->release_semaphore, spare()->release_point));
+    if (!acquire_point_retired(vk, spare()->acquire_point)) {
+        return false;
+    }
+    // The acquire signal is ALL_COMMANDS, after the timestamp writes.
+    // Read them before this slot is recorded again.
+    gpu_timer_harvest(vk, spare());
+    return !spare()->release_pending ||
+           poll_release_semaphore(vk, spare()->release_semaphore, spare()->release_point);
 }
 
 static bool present_chain_wanted(void) {
@@ -56,146 +59,6 @@ bool turn_wants_step(const WaylandContext *wl) {
         return true;
     }
     return frame_state.scene_dirty && wl->frame_cb_id == 0;
-}
-
-static uint32_t sim_wall_ms(void) {
-    uint64_t now = ring_mono_ns();
-    if (frame_state.mono0_ns == 0) {
-        frame_state.mono0_ns = now;
-    }
-    uint64_t ms = (now - frame_state.mono0_ns) / 1000000ull;
-    if (ms > 0xffffffffull) {
-        ms = 0xffffffffull;
-    }
-    return (uint32_t)ms;
-}
-
-static void note_sim_idle(void) {
-    if (frame_sim_wanted() || frame_state.sim_hot || frame_state.scene_dirty) {
-        return;
-    }
-    if (!frame_state.loop_was_busy) {
-        return;
-    }
-    frame_state.loop_was_busy = false;
-    uint32_t frames = 0;
-    uint32_t missed = 0;
-    bool spun = engine_app()->consume_spin();
-    engine_app()->turn_report(&frames, &missed);
-    if (spun) {
-        printf("[Engine] Loop idle. %u frames, %u missed, %u stalls.\n",
-               frames, missed, frame_state.clock.stalls);
-        fflush(stdout);
-        engine_app()->simulation_hold();
-    }
-}
-
-void frame_note_picture(void) {
-    frame_state.scene_dirty = true;
-    // The click plants the poke before it returns. The present that follows
-    // consumes that poke, and without this latch the same turn disarms the
-    // 8 ms timer. The dent is then one frozen picture.
-    if (engine_app()->record_poke_pending()) {
-        frame_state.sim_hot = true;
-    }
-}
-
-bool frame_sim_wanted(void) {
-    return engine_app()->busy() || engine_app()->record_poke_pending();
-}
-
-void sim_timer_set(RingContext *ring, bool want) {
-    (void)ring;
-    if (frame_state.sim_fd < 0 || want == frame_state.sim_timer_on) {
-        return;
-    }
-    struct itimerspec spec = {0};
-    if (want) {
-        spec.it_interval.tv_nsec = (long)FRAME_SIM_STEP_MS * 1000000L;
-        spec.it_value.tv_nsec = (long)FRAME_SIM_STEP_MS * 1000000L;
-    }
-    if (timerfd_settime(frame_state.sim_fd, 0, &spec, nullptr) != 0) {
-        fprintf(stderr, "[Engine Error] sim timerfd: %s\n", strerror(errno));
-        return;
-    }
-    frame_state.sim_timer_on = want;
-}
-
-int frame_arm_sim_poll(RingContext *ring) {
-    if (ring == nullptr || frame_state.sim_fd < 0) {
-        return -EINVAL;
-    }
-    if (frame_state.sim_poll_armed) {
-        return 0;
-    }
-    int rc = frame_state.sim_fixed
-        ? ring_arm_poll_fixed(ring, ENG_SIM_FD_SLOT, POLLIN, ENG_UD_SIM_TIMER)
-        : ring_arm_poll(ring, frame_state.sim_fd, POLLIN, ENG_UD_SIM_TIMER);
-    if (rc == 0) {
-        frame_state.sim_poll_armed = true;
-    }
-    return rc;
-}
-
-bool frame_note_sim_cqe(RingContext *ring, const struct io_uring_cqe *cqe, bool rearm) {
-    if (cqe == nullptr || cqe->user_data != ENG_UD_SIM_TIMER) {
-        return false;
-    }
-    frame_state.sim_poll_armed = false;
-    if (cqe->res >= 0 && (cqe->res & POLLIN) != 0 && frame_state.sim_fd >= 0) {
-        uint64_t expirations = 0;
-        ssize_t n = -1;
-        do {
-            n = read(frame_state.sim_fd, &expirations, sizeof expirations);
-        } while (n < 0 && errno == EINTR);
-        if (n == (ssize_t)sizeof expirations && expirations > 0) {
-            sim_on_timer(expirations);
-        }
-    }
-    if (rearm && cqe->res >= 0) {
-        (void)frame_arm_sim_poll(ring);
-    }
-    return true;
-}
-
-void sim_on_timer(uint64_t expirations) {
-    if (!frame_state.sim_latched) {
-        FrameStep first = { .first = true, .paint = true };
-        if (engine_app()->advance(frame_clock_sim_stamp(&frame_state.clock), &first)) {
-            frame_state.scene_dirty = true;
-        }
-        frame_state.sim_latched = true;
-    }
-    if (expirations == 0) {
-        expirations = 1;
-    }
-    if (expirations > FRAME_SIM_MAX_STEPS) {
-        expirations = FRAME_SIM_MAX_STEPS;
-    }
-    uint32_t dt = (uint32_t)expirations * FRAME_SIM_STEP_MS;
-    uint32_t stamps[FRAME_SIM_MAX_STEPS];
-    uint32_t steps = frame_clock_issue(&frame_state.clock, dt, stamps);
-    FrameStep step = {
-        .dt_ms     = dt,
-        .paint     = steps > 0,
-        .sim_dt_ms = steps * FRAME_SIM_STEP_MS,
-    };
-    bool pulse = false;
-    if (steps > 0) {
-        uint32_t heat = 0;
-        pulse = engine_app()->simulation(sim_wall_ms(), &step, &heat);
-        frame_state.pending_heat = heat;
-        for (uint32_t i = 0; i < steps; ++i) {
-            if (engine_app()->advance(stamps[i], &step)) {
-                frame_state.scene_dirty = true;
-            }
-        }
-    }
-    if (pulse) {
-        frame_state.scene_dirty = true;
-    }
-    frame_state.sim_hot = pulse;
-    note_sim_idle();
 }
 
 int frame_watchdog(WaylandContext *wl, VulkanContext *vk, bool *queued) {
@@ -258,15 +121,20 @@ static int present_spare(WaylandContext *wl, VulkanContext *vk, bool *queued) {
         rel += 1u;
     }
     uint32_t heat_dt = frame_state.pending_heat;
+    uint32_t sim_stamp = frame_state.pending_sim_stamp != 0
+        ? frame_state.pending_sim_stamp
+        : sim_wall_ms();
     frame_state.pending_heat = 0;
+    frame_state.pending_sim_stamp = 0;
     uint64_t next = frame_state.sync_point + 1u;
     if (record_and_submit_clear(vk, spare(), frame_state.acquire, next, true, heat_dt) != 0) {
         spare()->acquire_point = 0;
         frame_state.scene_dirty = true;
         frame_state.pending_heat = heat_dt;
+        frame_state.pending_sim_stamp = sim_stamp;
         return -1;
     }
-    engine_app()->simulation_commit(sim_wall_ms(), heat_dt);
+    engine_app()->simulation_commit(sim_stamp, heat_dt);
     frame_state.sync_point = next;
     bool again = present_chain_wanted();
     int q = wayland_queue_turn_commit(

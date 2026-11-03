@@ -10,6 +10,11 @@ typedef struct MeshData {
 
 static MeshData s_mesh;
 static bool     s_wanted = false;
+static bool     s_have_pose = false;
+static int32_t  s_pose_yaw = 0;
+static bool     s_pose_spin = false;
+static bool     s_pose_inf = false;
+static bool     s_pose_glow = false;
 static const WorldOps s_ops;
 
 static bool mesh_hit(const WorldObj *o, const CameraRay *ray, float *t, Coord *at) {
@@ -100,6 +105,14 @@ static bool mesh_remove(WorldObj *o) {
     return true;
 }
 
+void mesh_kind_abandon(void) {
+    if (s_mesh.up) {
+        return;
+    }
+    s_wanted = false;
+    s_have_pose = false;
+}
+
 static const char *mesh_name(const WorldObj *o) {
     (void)o;
     return "Mesh";
@@ -127,6 +140,11 @@ static const WorldOps s_ops = {
 void mesh_kind_reset(void) {
     s_mesh = (MeshData){0};
     s_wanted = false;
+    s_have_pose = false;
+    s_pose_yaw = 0;
+    s_pose_spin = false;
+    s_pose_inf = false;
+    s_pose_glow = false;
     material_set(k_mat_mesh, false);
 }
 
@@ -148,9 +166,10 @@ bool mesh_kind_raise(void) {
     if (!mesh_sphere(&cx, &cy, &radius)) {
         return false;
     }
+    bool posed = s_have_pose;
     s_mesh = (MeshData){0};
     s_mesh.up = true;
-    s_mesh.spin = spin_start(0);
+    s_mesh.spin = posed ? spin_pose(s_pose_yaw, s_pose_spin, s_pose_inf, s_pose_glow) : spin_start(0);
     Coord at = { cx, cy, 0.0f };
     int index = table_add(&s_ops, &s_mesh, at, &s_mesh.spin);
     if (index < 0) {
@@ -159,10 +178,41 @@ bool mesh_kind_raise(void) {
         return false;
     }
     table_select_quiet(index);
-    table_mark_spun();
-    printf("[Engine] Mesh up. One revolution, then it holds.\n");
+    s_have_pose = false;
+    if (s_mesh.spin.spinning) {
+        table_mark_spun();
+        if (s_mesh.spin.infinite) {
+            printf("[Engine] Mesh spins.\n");
+        } else {
+            printf("[Engine] Mesh up. One revolution, then it holds.\n");
+        }
+    } else {
+        printf("[Engine] Mesh up. It holds.\n");
+    }
     fflush(stdout);
     return true;
+}
+
+bool mesh_kind_pose(int32_t yaw_milli, bool spinning, bool infinite, bool glow) {
+    if (s_wanted || s_mesh.up) {
+        return false;
+    }
+    s_wanted = true;
+    s_have_pose = true;
+    s_pose_yaw = yaw_milli;
+    s_pose_spin = spinning;
+    s_pose_inf = infinite;
+    s_pose_glow = glow;
+    if (mesh_has_triangles() && !mesh_kind_raise()) {
+        s_wanted = false;
+        s_have_pose = false;
+        return false;
+    }
+    return true;
+}
+
+const WorldOps *mesh_ops(void) {
+    return &s_ops;
 }
 
 bool mesh_kind_apply(bool has, bool bytes) {

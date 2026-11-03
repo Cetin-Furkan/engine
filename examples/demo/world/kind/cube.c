@@ -147,6 +147,25 @@ static bool cube_hit(const WorldObj *o, const CameraRay *ray, float *t, Coord *a
     if (c == nullptr) {
         return false;
     }
+    // The draw adds origin x and y only. The slab remains until the bake
+    // has stored the mesh the vertex shader poses.
+    if (cube_surface_ready()) {
+        float yaw_deg = (float)c->spin.shown_milli / 1000.0f;
+        float ht = 0.0f;
+        float hx = 0.0f;
+        float hy = 0.0f;
+        float hz = 0.0f;
+        if (!cube_surface_hit(c->heat, yaw_deg, o->at.x, o->at.y, ray, &ht, &hx, &hy, &hz)) {
+            return false;
+        }
+        if (t != nullptr) {
+            *t = ht;
+        }
+        if (at != nullptr) {
+            *at = (Coord){ hx, hy, hz };
+        }
+        return true;
+    }
     float yaw = rad_of(c->spin.shown_milli);
     return slab_hit(ray, o->at, yaw, k_cube_half, t, at);
 }
@@ -297,7 +316,7 @@ static void cube_kind_reset(void) {
     s_pick_logged = false;
 }
 
-bool cube_kind_spawn(Coord at) {
+bool cube_kind_spawn_pose(Coord at, int32_t yaw_milli, bool spinning, bool infinite, bool glow) {
     int slot = -1;
     for (uint32_t i = 0; i < k_cube_cap; ++i) {
         if (!s_pool[i].used) {
@@ -315,7 +334,7 @@ bool cube_kind_spawn(Coord at) {
     c->mat = mat_of((uint32_t)slot);
     c->heat = (uint32_t)slot;
     cube_heat_claim(c->heat);
-    c->spin = spin_start(k_yaw_start_milli);
+    c->spin = spin_pose(yaw_milli, spinning, infinite, glow);
     int index = table_add(&s_ops, c, at, &c->spin);
     if (index < 0) {
         cube_heat_retire(c->heat);
@@ -323,8 +342,14 @@ bool cube_kind_spawn(Coord at) {
         fprintf(stderr, "[World] No room for the cube.\n");
         return false;
     }
-    table_mark_spun();
+    if (spinning) {
+        table_mark_spun();
+    }
     return true;
+}
+
+bool cube_kind_spawn(Coord at) {
+    return cube_kind_spawn_pose(at, k_yaw_start_milli, true, false, false);
 }
 
 static void cube_kind_self_check(void) {
@@ -342,7 +367,8 @@ static void cube_kind_self_check(void) {
     bool hit = slab_hit(&mid, origin, yaw, k_cube_half, &t_mid, nullptr);
     bool miss = slab_hit(&far, origin, yaw, k_cube_half, &t_far, nullptr);
     bool plane = fabsf(mid.plane_x) < 1.0e-3f && fabsf(mid.plane_y) < 1.0e-3f;
-    if (!hit || miss || !plane) {
+    bool mesh = cube_surface_self_check();
+    if (!hit || miss || !plane || !mesh) {
         fprintf(stderr, "[World Error] Pick self-check failed\n");
         s_pick_logged = true;
     }

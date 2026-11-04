@@ -172,7 +172,12 @@ WorkspacePolicy *policy_active(void);
 WorkspaceMode policy_mode(void);
 
 // Cycles 3D, then 2D, then Hybrid. A switch drops rebinds on the
-// previous copy. False when sealed.
+// previous copy. False when sealed or PERM_MODE_SWITCH is revoked.
 bool policy_switch(void);
+
+// Applies a world preset's starting mode, permission grants/revocations,
+// and optional seal onto the live policy without mutating compiled profiles.
+void policy_apply_world(WorkspaceMode mode, uint32_t grant_perms,
+                        uint32_t revoke_perms, bool seal);
 
 #endif /* ENGINE_FRAME_POLICY_H */

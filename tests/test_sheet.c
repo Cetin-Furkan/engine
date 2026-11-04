@@ -191,6 +191,32 @@ static void test_shove_and_delete(void) {
     CHECK(!sheet_has_selection());
 }
 
+static void test_gravity_and_elastic_presets(void) {
+    for (uint32_t w = 1u; w <= 6u; ++w) {
+        char path[64];
+        snprintf(path, sizeof path, "examples/demo/world/sheet%u.world", w);
+        CHECK(sheet_load_path(path) == 0);
+        for (int step = 0; step < 30; ++step) {
+            (void)sheet_integrate(0.008f);
+        }
+    }
+    // Verify elastic vs inelastic polygon rebound under gravity against a fixed bumper
+    const char *drop =
+        "gravity 0 -700\n"
+        "bounds 500 300\n"
+        "rigid 0 -220 400 20 0 0.90 1\n"
+        "dyn -120 0 0 4 0.92\n"
+        "30 0\n0 30\n-30 0\n0 -30\n"
+        "dyn 120 0 0 4 0.05\n"
+        "30 0\n0 30\n-30 0\n0 -30\n";
+    CHECK(sheet_load_memory(drop, strlen(drop)) == 0);
+    CHECK(sheet_rigid_count() == 1u);
+    CHECK(sheet_dyn_count() == 2u);
+    for (int i = 0; i < 85; ++i) {
+        (void)sheet_integrate(0.008f);
+    }
+}
+
 int main(void) {
     sheet_hold_save(true);
     test_document();
@@ -200,6 +226,7 @@ int main(void) {
     test_soft_returns();
     test_roundtrip();
     test_shove_and_delete();
+    test_gravity_and_elastic_presets();
     if (s_failures != 0) {
         fprintf(stderr, "%d check(s) failed\n", s_failures);
         return 1;

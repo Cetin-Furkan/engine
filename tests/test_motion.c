@@ -131,6 +131,54 @@ static void test_pitched_faces_meet(void) {
     CHECK(!shove[0].awake && !shove[1].awake);
 }
 
+static void test_elastic_bounce_and_solids(void) {
+    // Compare inelastic vs elastic non-cube solid dropped from z = 500
+    MotionBody dull = {
+        .z = 500.0f,
+        .restitution = 0.10f,
+        .radius = 120.0f,
+        .spherical = true,
+        .awake = true,
+    };
+    MotionBody bouncy = {
+        .z = 500.0f,
+        .restitution = 0.88f,
+        .radius = 120.0f,
+        .spherical = true,
+        .awake = true,
+    };
+    float dull_rebound_vz = 0.0f;
+    float bouncy_rebound_vz = 0.0f;
+    float bouncy_max_impact = 0.0f;
+    for (int i = 0; i < 120; ++i) {
+        motion_substep(&dull, 1, 0.008f, 0.0f, k_fillet_half);
+        motion_substep(&bouncy, 1, 0.008f, 0.0f, k_fillet_half);
+        if (dull.vz > dull_rebound_vz) {
+            dull_rebound_vz = dull.vz;
+        }
+        if (bouncy.vz > bouncy_rebound_vz) {
+            bouncy_rebound_vz = bouncy.vz;
+        }
+        if (bouncy.impact > bouncy_max_impact) {
+            bouncy_max_impact = bouncy.impact;
+        }
+    }
+    CHECK(bouncy_rebound_vz > 450.0f);
+    CHECK(bouncy_rebound_vz > dull_rebound_vz * 3.0f);
+    CHECK(bouncy_max_impact > 100.0f);
+
+    // Spherical solid colliding with a cube transfers momentum and separates
+    float lift = motion_rest_lift(0.0f, k_fillet_half);
+    MotionBody mix[2] = {
+        { .x = 0.0f, .z = 120.0f, .vx = 700.0f, .restitution = 0.85f, .radius = 120.0f, .spherical = true, .awake = true },
+        { .x = 220.0f, .z = lift, .restitution = 0.85f },
+    };
+    for (int i = 0; i < 40; ++i) {
+        motion_substep(mix, 2, 0.008f, 0.0f, k_fillet_half);
+    }
+    CHECK(mix[1].x > 250.0f);
+}
+
 int main(void) {
     test_lift_clears_the_pitch();
     test_pose_matches_the_draw();
@@ -138,6 +186,7 @@ int main(void) {
     test_shove_rests_on_the_ground();
     test_cubes_separate();
     test_pitched_faces_meet();
+    test_elastic_bounce_and_solids();
     if (s_failures != 0) {
         fprintf(stderr, "test_motion: %d failed\n", s_failures);
         return 1;

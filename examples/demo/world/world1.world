@@ -1,0 +1,10 @@
+# World 1: 3D-Only Click-to-Draw Studio (Points -> Lines -> Faces)
+# Capability mask: MODE_3D, PERM_DRAW granted at boot, PERM_MODE_SWITCH revoked.
+# Click the ground to place points; click the first point again or press F to close into a face.
+ground z
+smooth 0
+solid Tetrahedron -520 260 0 yaw 25000 spin 1 inf 0 glow 1 bounce 0.45
+solid Octahedron 520 260 0 yaw 45000 spin 1 inf 0 glow 1 bounce 0.68
+solid Cone -520 -260 0 yaw 15000 spin 1 inf 0 glow 1 bounce 0.56
+solid Torus 520 -260 0 yaw 65000 spin 1 inf 0 glow 1 bounce 0.82
+cube 0 340 0 yaw 38000 spin 1 inf 0 glow 0 bounce 0.50

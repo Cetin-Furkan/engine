@@ -82,6 +82,10 @@ typedef struct EngineApp {
     // Short line printed once the window is up (controls, keys). May be null.
     const char *help;
 
+    // Command-line hook run before subsystems boot. Returns 0 to continue,
+    // >0 to exit 0 after printing help/listing, or <0 on invalid flags.
+    int (*configure)(int argc, char **argv);
+
     // GPU pipelines and program state. init is called after Vulkan and
     // chrome exist; load places the opening scene. shutdown runs before
     // chrome/Vulkan teardown, in reverse order of init.

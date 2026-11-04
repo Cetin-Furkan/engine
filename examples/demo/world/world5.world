@@ -1,0 +1,9 @@
+# World 5: Hybrid (3D + 2D) Click-to-Draw, Gravity & Multi-Elasticity
+# Capability mask: MODE_HYBRID, PERM_DRAW granted at boot, PERM_MODE_SWITCH open (Tab cycles modes).
+ground z
+smooth 1
+solid Icosahedron -420 120 580 yaw 22000 spin 1 inf 1 glow 1 bounce 0.90
+solid Torus 420 120 520 yaw 48000 spin 1 inf 1 glow 1 bounce 0.84
+solid Octahedron -420 -160 440 yaw 15000 spin 1 inf 0 glow 0 bounce 0.66
+solid Cone 420 -160 380 yaw 35000 spin 1 inf 0 glow 0 bounce 0.52
+cube 0 40 620 yaw 38000 spin 1 inf 0 glow 1 bounce 0.82

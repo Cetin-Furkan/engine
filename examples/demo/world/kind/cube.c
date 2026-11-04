@@ -27,6 +27,7 @@ typedef struct CubeData {
     float    vx;
     float    vy;
     float    vz;
+    float    restitution;
     bool     awake;
 } CubeData;
 
@@ -51,7 +52,6 @@ static void cube_simulate_hold(WorldObj *o);
 static void cube_simulate_commit(WorldObj *o, uint32_t stamp, uint32_t heat_dt);
 static bool cube_busy(const WorldObj *o);
 static void cube_shove(WorldObj *o, Coord hit);
-static void cube_step_motion(uint32_t time_ms, uint32_t sim_dt_ms);
 
 static float rad_of(int32_t milli) {
     return fillet_rad((float)milli / 1000.0f);
@@ -319,15 +319,20 @@ const WorldOps *cube_ops(void) {
     return &s_ops;
 }
 
+static uint32_t s_motion_stamp = 0;
+static bool     s_motion_have  = false;
+
 static void cube_kind_reset(void) {
     for (uint32_t i = 0; i < k_cube_cap; ++i) {
         material_set(mat_of(i), false);
         s_pool[i] = (CubeData){0};
     }
     s_pick_logged = false;
+    s_motion_have = false;
+    s_motion_stamp = 0;
 }
 
-bool cube_kind_spawn_pose(Coord at, int32_t yaw_milli, bool spinning, bool infinite, bool glow) {
+bool cube_kind_spawn_elastic(Coord at, int32_t yaw_milli, bool spinning, bool infinite, bool glow, float restitution) {
     int slot = -1;
     for (uint32_t i = 0; i < k_cube_cap; ++i) {
         if (!s_pool[i].used) {
@@ -344,6 +349,13 @@ bool cube_kind_spawn_pose(Coord at, int32_t yaw_milli, bool spinning, bool infin
     c->used = true;
     c->mat = mat_of((uint32_t)slot);
     c->heat = (uint32_t)slot;
+    float e = restitution > 0.0f ? restitution : 0.0f;
+    if (e > 0.95f) {
+        e = 0.95f;
+    }
+    c->restitution = e;
+    float rest = motion_rest_lift(rad_of(yaw_milli), k_fillet_half);
+    c->awake = (at.z > rest + 1.0f);
     cube_heat_claim(c->heat);
     c->spin = spin_pose(yaw_milli, spinning, infinite, glow);
     int index = table_add(&s_ops, c, at, &c->spin);
@@ -359,8 +371,20 @@ bool cube_kind_spawn_pose(Coord at, int32_t yaw_milli, bool spinning, bool infin
     return true;
 }
 
+bool cube_kind_spawn_pose(Coord at, int32_t yaw_milli, bool spinning, bool infinite, bool glow) {
+    return cube_kind_spawn_elastic(at, yaw_milli, spinning, infinite, glow, 0.0f);
+}
+
 bool cube_kind_spawn(Coord at) {
-    return cube_kind_spawn_pose(at, k_yaw_start_milli, true, false, false);
+    return cube_kind_spawn_elastic(at, k_yaw_start_milli, true, false, false, 0.0f);
+}
+
+float cube_kind_restitution(const WorldObj *o) {
+    if (o == nullptr || o->ops != &s_ops || o->data == nullptr) {
+        return 0.0f;
+    }
+    const CubeData *c = o->data;
+    return c->restitution;
 }
 
 static void cube_kind_self_check(void) {
@@ -461,26 +485,27 @@ static void cube_shove(WorldObj *o, Coord hit) {
     }
     c->vx += dx / len * 640.0f;
     c->vy += dy / len * 640.0f;
+    if (c->restitution > 0.0f) {
+        c->vz += 480.0f * c->restitution;
+    }
     c->awake = true;
     s_motion_drew = true;
     printf("[Cube] Shoved.\n");
     fflush(stdout);
 }
 
-static uint32_t s_motion_stamp = 0;
-static bool     s_motion_have  = false;
-
-static void cube_step_motion(uint32_t time_ms, uint32_t sim_dt_ms) {
+void world_step_motion(uint32_t time_ms, uint32_t sim_dt_ms) {
     if (sim_dt_ms == 0u || (s_motion_have && s_motion_stamp == time_ms)) {
         return;
     }
     s_motion_have = true;
     s_motion_stamp = time_ms;
-    MotionBody bodies[k_cube_cap];
-    WorldObj *objs[k_cube_cap];
-    uint32_t n = 0;
+    enum { k_body_cap = k_cube_cap + 6u };
+    MotionBody bodies[k_body_cap];
+    WorldObj *objs[k_body_cap];
+    uint32_t cube_n = 0;
     int count = table_count();
-    for (int i = 0; i < count && n < k_cube_cap; ++i) {
+    for (int i = 0; i < count && cube_n < k_cube_cap; ++i) {
         WorldObj *o = table_at(i);
         if (o == nullptr || !o->alive || o->ops != &s_ops) {
             continue;
@@ -489,19 +514,22 @@ static void cube_step_motion(uint32_t time_ms, uint32_t sim_dt_ms) {
         if (c == nullptr) {
             continue;
         }
-        bodies[n] = (MotionBody){
-            .x     = o->at.x,
-            .y     = o->at.y,
-            .z     = o->at.z,
-            .vx    = c->vx,
-            .vy    = c->vy,
-            .vz    = c->vz,
-            .yaw   = rad_of(c->spin.live_milli),
-            .awake = c->awake,
+        bodies[cube_n] = (MotionBody){
+            .x           = o->at.x,
+            .y           = o->at.y,
+            .z           = o->at.z,
+            .vx          = c->vx,
+            .vy          = c->vy,
+            .vz          = c->vz,
+            .yaw         = rad_of(c->spin.live_milli),
+            .restitution = c->restitution,
+            .awake       = c->awake,
         };
-        objs[n] = o;
-        n++;
+        objs[cube_n] = o;
+        cube_n++;
     }
+    uint32_t solid_n = solid_kind_gather_motion(bodies + cube_n, objs + cube_n, 6u);
+    uint32_t n = cube_n + solid_n;
     bool any_before = false;
     for (uint32_t i = 0; i < n; ++i) {
         if (bodies[i].awake) {
@@ -516,7 +544,7 @@ static void cube_step_motion(uint32_t time_ms, uint32_t sim_dt_ms) {
     }
     bool any_after = false;
     bool moved = false;
-    for (uint32_t i = 0; i < n; ++i) {
+    for (uint32_t i = 0; i < cube_n; ++i) {
         WorldObj *o = objs[i];
         CubeData *c = o->data;
         if (fabsf(o->at.x - bodies[i].x) > 1.0e-3f || fabsf(o->at.y - bodies[i].y) > 1.0e-3f ||
@@ -533,6 +561,10 @@ static void cube_step_motion(uint32_t time_ms, uint32_t sim_dt_ms) {
         if (c->awake) {
             any_after = true;
         }
+    }
+    if (solid_kind_apply_motion(bodies + cube_n, objs + cube_n, solid_n,
+                                (float)sim_dt_ms / 1000.0f, &any_after)) {
+        moved = true;
     }
     if (moved) {
         s_motion_drew = true;
@@ -552,7 +584,7 @@ static bool cube_simulate(WorldObj *o, uint32_t time_ms, uint32_t sim_dt_ms, uin
         }
         return false;
     }
-    cube_step_motion(time_ms, sim_dt_ms);
+    world_step_motion(time_ms, sim_dt_ms);
     bool ended = false;
     bool pulse = cube_heat_wants_frame(c->heat, time_ms, &ended);
     if (ended) {

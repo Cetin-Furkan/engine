@@ -97,6 +97,9 @@ static int install_resize(WaylandContext *wl, VulkanContext *vk) {
 
     shown()->image           = fresh.image;
     shown()->image_view      = fresh.image_view;
+    shown()->prime_image     = fresh.prime_image;
+    shown()->prime_memory    = fresh.prime_memory;
+    shown()->prime_view      = fresh.prime_view;
     shown()->view_format     = fresh.view_format;
     shown()->targets         = fresh.targets;
     shown()->cmd_buf         = fresh.cmd_buf;
@@ -163,9 +166,12 @@ int finish_idle_send(WaylandContext *wl, VulkanContext *vk,
 static int queue_replacement(WaylandContext *wl, VulkanContext *vk, uint32_t width,
                              uint32_t height, bool with_configure, uint32_t serial,
                              bool same_repaint) {
-    if (frame_state.resize_pending || width == 0 || height == 0 || frame_state.acquire == VK_NULL_HANDLE ||
+    if (frame_state.resize_pending || width == 0 || height == 0 ||
+        frame_state.acquire == VK_NULL_HANDLE ||
+        frame_state.acquire_sync == VK_NULL_HANDLE ||
+        frame_state.acquire_handle == 0 ||
         shown()->release_timeline_id == 0 ||
-        shown()->release_semaphore == VK_NULL_HANDLE) {
+        shown()->release_handle == 0) {
         return -EINVAL;
     }
     if (make_orphan_room(wl, vk) != 0) {
@@ -191,12 +197,10 @@ static int queue_replacement(WaylandContext *wl, VulkanContext *vk, uint32_t wid
 
     uint64_t next_point = frame_state.sync_point + 1u;
     if (record_and_submit_clear(vk, &fresh, frame_state.acquire, next_point, false, 0u) != 0) {
-        fresh.acquire_point = 0;
         reap_frame_resources(wl, vk, &fresh);
         frame_apply_layout(wl, old_w, old_h, nullptr, nullptr);
         return -1;
     }
-    frame_state.sync_point = next_point;
 
     int prepared = bar_prepare(wl, vk, true);
     if (prepared < 0 && prepared != -EAGAIN) {

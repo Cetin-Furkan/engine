@@ -36,7 +36,7 @@ int frame_stop(void) {
         fprintf(stderr, "[Engine Error] GPU release read could not be removed\n");
         release_rc = 1;
     } else if (shown()->release_pending) {
-        bool released_now = poll_release_semaphore(vk, shown()->release_semaphore, shown()->release_point);
+        bool released_now = poll_release_handle(shown()->release_handle, shown()->release_point);
         bool armed = false;
         if (!released_now &&
             ensure_release_fd(ring) == 0 &&
@@ -60,7 +60,7 @@ int frame_stop(void) {
                     frame_state.stuck_release_fd = frame_state.release_fd;
                     frame_state.release_fd = -1;
                     frame_state.release_fixed = false;
-                } else if (late || poll_release_semaphore(vk, shown()->release_semaphore, shown()->release_point)) {
+                } else if (late || poll_release_handle(shown()->release_handle, shown()->release_point)) {
                     printf("[Engine] GPU release point signalled (io_uring fixed read)\n");
                     release_rc = 0;
                 }
@@ -73,7 +73,7 @@ int frame_stop(void) {
     sweep_ready_orphans(wl, vk, true);
 
     bool release_held = shown()->release_pending &&
-        !poll_release_semaphore(vk, shown()->release_semaphore, shown()->release_point);
+        !poll_release_handle(shown()->release_handle, shown()->release_point);
     bool acquire_held = false;
     if (vk != nullptr && vk->device != VK_NULL_HANDLE &&
         !wait_acquire_point(vk, shown()->acquire_point)) {
@@ -96,6 +96,9 @@ int frame_stop(void) {
     if (!release_held) {
         drm_syncobj_destroy(frame_state.drm_fd, &shown()->release_handle);
     }
+    if (!acquire_held) {
+        drm_syncobj_destroy(frame_state.drm_fd, &frame_state.acquire_handle);
+    }
     if (frame_state.drm_fd >= 0) {
         close(frame_state.drm_fd);
         frame_state.drm_fd = -1;
@@ -110,9 +113,9 @@ int frame_stop(void) {
         gpu_timer_shutdown(vk);
         input_gpu_shutdown(vk);
         bool destroy_shown = !release_held && !acquire_held;
-        if (destroy_shown && shown()->release_semaphore != VK_NULL_HANDLE) {
-            vkDestroySemaphore(vk->device, shown()->release_semaphore, nullptr);
-            shown()->release_semaphore = VK_NULL_HANDLE;
+        if (!acquire_held && frame_state.acquire_sync != VK_NULL_HANDLE) {
+            vkDestroySemaphore(vk->device, frame_state.acquire_sync, nullptr);
+            frame_state.acquire_sync = VK_NULL_HANDLE;
         }
         if (!acquire_held && frame_state.acquire != VK_NULL_HANDLE) {
             vkDestroySemaphore(vk->device, frame_state.acquire, nullptr);

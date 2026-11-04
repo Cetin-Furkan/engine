@@ -36,10 +36,6 @@ static void destroy_wl_buffer_now(WaylandContext *wl, uint32_t buffer_id) {
 }
 
 static bool same_release(const FrameSlot *a, const FrameSlot *b) {
-    if (a->release_semaphore != VK_NULL_HANDLE &&
-        a->release_semaphore == b->release_semaphore) {
-        return true;
-    }
     if (a->release_timeline_id != 0 && a->release_timeline_id == b->release_timeline_id) {
         return true;
     }
@@ -87,11 +83,10 @@ void reap_frame_resources(WaylandContext *wl, VulkanContext *vk, FrameSlot *fram
         destroy_wl_buffer_now(wl, frame->wl_buffer_id);
         frame->wl_buffer_id = 0;
     }
-    // Several copies poll one semaphore: the slot, and each resized image
-    // still on screen. The last copy destroys the Wayland timeline, the DRM
-    // syncobj, and the Vulkan semaphore.
-    bool last_release = (frame->release_semaphore != VK_NULL_HANDLE ||
-                         frame->release_timeline_id != 0 ||
+    // Several copies poll one timeline: the slot, and each resized image
+    // still on screen. The last copy destroys the Wayland timeline and the
+    // DRM syncobj.
+    bool last_release = (frame->release_timeline_id != 0 ||
                          frame->release_handle != 0) &&
                         !release_held_elsewhere(frame);
     if (last_release) {
@@ -103,14 +98,9 @@ void reap_frame_resources(WaylandContext *wl, VulkanContext *vk, FrameSlot *fram
             }
         }
         drm_syncobj_destroy(frame_state.drm_fd, &frame->release_handle);
-        if (vk != nullptr && vk->device != VK_NULL_HANDLE &&
-            frame->release_semaphore != VK_NULL_HANDLE) {
-            vkDestroySemaphore(vk->device, frame->release_semaphore, nullptr);
-        }
     }
     frame->release_timeline_id = 0;
     frame->release_handle = 0;
-    frame->release_semaphore = VK_NULL_HANDLE;
     destroy_frame_gpu(vk, frame);
     frame->release_point = 0;
     frame->release_pending = false;
@@ -160,10 +150,10 @@ void sweep_ready_orphans(WaylandContext *wl, VulkanContext *vk, bool force_all) 
         if (orb == nullptr) {
             continue;
         }
-        bool ready = poll_release_semaphore(vk, orb->release_semaphore, orb->release_point);
+        bool ready = poll_release_handle(orb->release_handle, orb->release_point);
         if (!ready && force_all) {
-            (void)wait_own_release(vk, orb, 3000000000ull);
-            ready = poll_release_semaphore(vk, orb->release_semaphore, orb->release_point);
+            (void)wait_own_release(orb, 3000000000ull);
+            ready = poll_release_handle(orb->release_handle, orb->release_point);
             if (!ready) {
                 fprintf(stderr,
                         "[Engine Error] Release point %llu was not signalled before shutdown\n",
@@ -199,8 +189,8 @@ int make_orphan_room(WaylandContext *wl, VulkanContext *vk) {
             oldest = &frame_state.orphans[i];
         }
     }
-    (void)wait_own_release(vk, oldest, 500000000ull);
-    if (!poll_release_semaphore(vk, oldest->release_semaphore, oldest->release_point)) {
+    (void)wait_own_release(oldest, 500000000ull);
+    if (!poll_release_handle(oldest->release_handle, oldest->release_point)) {
         return -1;
     }
     reap_orphan_slot(wl, vk, oldest_idx);
@@ -219,7 +209,6 @@ static int stash_orphan(WaylandContext *wl, VulkanContext *vk, FrameSlot *frame)
         return -1;
     }
     frame->release_handle = 0;
-    frame->release_semaphore = VK_NULL_HANDLE;
     frame->release_timeline_id = 0;
     frame->release_point = 0;
     frame->release_eventfd = -1;
@@ -230,7 +219,7 @@ static int stash_orphan(WaylandContext *wl, VulkanContext *vk, FrameSlot *frame)
 
 // Drop the images and the wl_buffer. The release syncobj stays on the slot.
 // A buffer the compositor still holds is orphaned at the old point and polls
-// the same semaphore. It must not destroy that semaphore. A pending release
+// the same syncobj. It must not destroy that syncobj. A pending release
 // moves this slot's point forward by one.
 int retire_pixels(WaylandContext *wl, VulkanContext *vk, FrameSlot *frame) {
     if (frame == nullptr) {
@@ -247,7 +236,7 @@ int retire_pixels(WaylandContext *wl, VulkanContext *vk, FrameSlot *frame) {
     }
 
     bool held = pending &&
-                !poll_release_semaphore(vk, frame->release_semaphore, old_point);
+                !poll_release_handle(frame->release_handle, old_point);
     if (held && make_orphan_room(wl, vk) != 0) {
         return -1;
     }
@@ -264,7 +253,6 @@ int retire_pixels(WaylandContext *wl, VulkanContext *vk, FrameSlot *frame) {
 
     if (!held) {
         pixels.release_handle = 0;
-        pixels.release_semaphore = VK_NULL_HANDLE;
         pixels.release_timeline_id = 0;
         pixels.release_point = 0;
         reap_frame_resources(wl, vk, &pixels);
@@ -283,7 +271,7 @@ void retire_spare(WaylandContext *wl, VulkanContext *vk) {
         return;
     }
     bool held = spare()->release_pending &&
-                !poll_release_semaphore(vk, spare()->release_semaphore, spare()->release_point);
+                !poll_release_handle(spare()->release_handle, spare()->release_point);
     if (held) {
         if (stash_orphan(wl, vk, spare()) != 0) {
             fprintf(stderr,

@@ -1,0 +1,15 @@
+# World 2: 3D-Only Gravity & Elastic Non-Cube Solids (Squash-and-Stretch)
+# Capability mask: MODE_3D, PERM_MODE_SWITCH revoked.
+# Elevated non-cube solids and cubes drop under gravity with distinct restitution (0.08..0.90)
+# and volume-preserving squash-and-stretch deformation on impact. Click any solid/cube to launch it.
+ground z
+smooth 1
+solid Icosahedron -460 150 640 yaw 18000 spin 1 inf 1 glow 1 bounce 0.90
+solid Torus -160 190 560 yaw 42000 spin 1 inf 1 glow 1 bounce 0.84
+solid Octahedron 160 190 500 yaw 30000 spin 1 inf 1 glow 0 bounce 0.68
+solid Cone 460 150 440 yaw 12000 spin 1 inf 0 glow 0 bounce 0.56
+solid Tetrahedron -310 -190 400 yaw 55000 spin 1 inf 0 glow 0 bounce 0.38
+solid Cylinder 310 -190 360 yaw 20000 spin 1 inf 0 glow 0 bounce 0.20
+cube 0 -180 600 yaw 38000 spin 1 inf 0 glow 1 bounce 0.85
+cube -620 -60 480 yaw 14000 spin 1 inf 0 glow 0 bounce 0.48
+cube 620 -60 380 yaw 62000 spin 1 inf 0 glow 0 bounce 0.08

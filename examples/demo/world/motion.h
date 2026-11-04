@@ -16,6 +16,10 @@ typedef struct MotionBody {
     float vy;
     float vz;
     float yaw;
+    float restitution;
+    float radius;
+    float impact;
+    bool  spherical;
     bool  awake;
 } MotionBody;
 

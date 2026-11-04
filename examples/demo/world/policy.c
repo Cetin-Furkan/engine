@@ -382,7 +382,7 @@ bool policy_switch(void) {
     if (!s_booted) {
         policy_boot();
     }
-    if (s_live.sealed) {
+    if (s_live.sealed || (s_live.active_perms & PERM_MODE_SWITCH) == 0u) {
         return false;
     }
     s_which = (s_which + 1u) % 3u;
@@ -395,4 +395,40 @@ bool policy_switch(void) {
     }
     log_mode();
     return true;
+}
+
+void policy_apply_world(WorkspaceMode mode, uint32_t grant_perms,
+                        uint32_t revoke_perms, bool seal) {
+    fill_profiles();
+    if (mode == MODE_2D) {
+        s_live = s_flat;
+        s_which = MODE_2D;
+    } else if (mode == MODE_HYBRID) {
+        s_live = s_hybrid;
+        s_which = MODE_HYBRID;
+    } else {
+        s_live = s_blender;
+        s_which = MODE_3D;
+    }
+    s_live.active_perms = (s_live.active_perms | grant_perms) & ~revoke_perms;
+    if (mode == MODE_2D && (grant_perms & PERM_DRAW) != 0u) {
+        s_live.active_perms |= PERM_OBJ_SPIN | PERM_OBJ_MATERIAL;
+        (void)policy_rebind_key(&s_live, KEY_F,   KEY_SHIFT_ANY, ACT_CLOSE_FACE);
+        (void)policy_rebind_key(&s_live, KEY_KP9, KEY_SHIFT_ANY, ACT_TOGGLE_DRAW);
+        (void)policy_rebind_key(&s_live, KEY_R,   KEY_SHIFT_ANY, ACT_TOGGLE_SPIN);
+        (void)policy_rebind_key(&s_live, KEY_G,   KEY_SHIFT_ANY, ACT_TOGGLE_GLOW);
+        (void)policy_rebind_key(&s_live, KEY_F5,  KEY_SHIFT_ANY, ACT_RESPIN);
+    }
+    s_live.sealed = seal;
+    s_booted = true;
+    const char *mode_str = (s_which == MODE_2D) ? "2D" : (s_which == MODE_HYBRID ? "Hybrid" : "3D");
+    const bool can_switch = !s_live.sealed && (s_live.active_perms & PERM_MODE_SWITCH) != 0u;
+    const bool can_draw = (s_live.active_perms & PERM_DRAW) != 0u;
+    printf("[Policy] World preset applied: mode=%s (%s), click-draw=%s, mask=0x%04x, sealed=%s\n",
+           mode_str,
+           can_switch ? "3D/2D/Hybrid switchable via Tab" : (s_which == MODE_2D ? "2D-ONLY locked" : "3D-ONLY locked"),
+           can_draw ? "ON (click places points/lines, F closes face)" : "off (Numpad 9 toggles)",
+           s_live.active_perms,
+           s_live.sealed ? "yes" : "no");
+    fflush(stdout);
 }

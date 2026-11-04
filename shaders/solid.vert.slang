@@ -10,8 +10,8 @@ struct ScreenPush {
     float origin_y;
     float depth_bias;
     float selected;
-    uint pad;
-    uint tail0;
+    float origin_z;
+    float squash;
     uint tail1;
     ViewPush view;
 };
@@ -38,14 +38,21 @@ VSOutput main(uint vert_id : SV_VulkanVertexID) {
     float3 posed_pos = rotate_pose(in_pos, ax, ay);
     float3 posed_nrm = rotate_pose(in_nrm, ax, ay);
 
+    float sz = clamp(1.0 + screen.squash, 0.45, 1.85);
+    float sxy = rsqrt(sz);
     float3 p = posed_pos * (k_edge_px * 0.5);
+    p.x *= sxy;
+    p.y *= sxy;
+    p.z *= sz;
     p.x += screen.origin_x;
     p.y += screen.origin_y;
+    p.z += screen.origin_z;
 
+    float3 scaled_nrm = normalize(float3(posed_nrm.x / sxy, posed_nrm.y / sxy, posed_nrm.z / sz));
     float3 view = view_of(p, screen.view.q, screen.view.cam);
     VSOutput out;
     out.sv_pos = view_ndc(view, screen.view.zoom, screen.width, screen.height, screen.depth_bias);
-    out.v_nrm = view_rotate(screen.view.q, posed_nrm);
+    out.v_nrm = view_rotate(screen.view.q, scaled_nrm);
     out.v_albedo = lerp(in_albedo, float3(1.0), clamp(screen.selected, 0.0, 1.0) * 0.42);
     out.v_emit = material_emit(screen.view.materials, screen.view.mat_index);
     return out;

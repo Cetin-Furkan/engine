@@ -95,7 +95,6 @@ static int make_bar_view(VulkanContext *vk, FrameSlot *frame) {
 }
 
 static int record_bar(VulkanContext *vk, FrameSlot *frame, uint64_t signal_point) {
-    frame->acquire_point = signal_point;
     if (make_bar_view(vk, frame) != 0) {
         return -1;
     }
@@ -189,11 +188,19 @@ static int record_bar(VulkanContext *vk, FrameSlot *frame, uint64_t signal_point
         .sType         = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
         .commandBuffer = frame->cmd_buf,
     };
-    VkSemaphoreSubmitInfo signal_info = {
-        .sType     = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
-        .semaphore = frame_state.acquire,
-        .value     = signal_point,
-        .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+    VkSemaphoreSubmitInfo signal_infos[2] = {
+        {
+            .sType     = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+            .semaphore = frame_state.acquire,
+            .value     = signal_point,
+            .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+        },
+        {
+            .sType     = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+            .semaphore = frame_state.acquire_sync,
+            .value     = 0,
+            .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+        },
     };
     VkSubmitInfo2 submit = {
         .sType                    = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
@@ -201,8 +208,8 @@ static int record_bar(VulkanContext *vk, FrameSlot *frame, uint64_t signal_point
         .pWaitSemaphoreInfos      = nullptr,
         .commandBufferInfoCount   = 1,
         .pCommandBufferInfos      = &cmd_submit,
-        .signalSemaphoreInfoCount = 1,
-        .pSignalSemaphoreInfos    = &signal_info,
+        .signalSemaphoreInfoCount = 2,
+        .pSignalSemaphoreInfos    = signal_infos,
     };
     res = vkQueueSubmit2(vk->queues.graphics_queue, 1, &submit, VK_NULL_HANDLE);
     if (res != VK_SUCCESS) {
@@ -210,7 +217,13 @@ static int record_bar(VulkanContext *vk, FrameSlot *frame, uint64_t signal_point
                 vulkan_vkresult_to_str(res), (int)res);
         return -1;
     }
+    frame->acquire_point = signal_point;
+    frame_state.sync_point = signal_point;
     frame->foreign_owned = true;
+    if (publish_acquire_point(vk, signal_point) < 0) {
+        (void)wait_acquire_point(vk, signal_point);
+        return -1;
+    }
     return 0;
 }
 
@@ -246,7 +259,7 @@ int bar_record_first(WaylandContext *wl, VulkanContext *vk) {
         return 0;
     }
     FrameSlot *bar = bar_shown();
-    if (create_release_timeline(vk, wl, bar) != 0) {
+    if (create_release_timeline(wl, bar) != 0) {
         return -1;
     }
     const char *tranche = "general";
@@ -256,13 +269,9 @@ int bar_record_first(WaylandContext *wl, VulkanContext *vk) {
     }
     uint64_t next = frame_state.sync_point + 1u;
     if (record_bar(vk, bar, next) != 0) {
-        // The point was not signalled. Leave it at 0 so shutdown does not
-        // wait three seconds for a value this submit never published.
-        bar->acquire_point = 0;
         reap_frame_resources(wl, vk, bar);
         return -1;
     }
-    frame_state.sync_point = next;
     if (import_bar_buffer(wl, bar) != 0) {
         reap_frame_resources(wl, vk, bar);
         return -1;
@@ -301,7 +310,7 @@ int bar_prepare(WaylandContext *wl, VulkanContext *vk, bool force) {
     // The release poll only says the compositor dropped the buffer.
     bool ready = acquire_point_retired(vk, dst->acquire_point) &&
                  (!dst->release_pending ||
-                  poll_release_semaphore(vk, dst->release_semaphore, dst->release_point));
+                  poll_release_handle(dst->release_handle, dst->release_point));
     if (!ready) {
         frame_state.bar_dirty = true;
         return -EAGAIN;
@@ -311,7 +320,7 @@ int bar_prepare(WaylandContext *wl, VulkanContext *vk, bool force) {
             return -1;
         }
     }
-    if (dst->release_semaphore == VK_NULL_HANDLE && create_release_timeline(vk, wl, dst) != 0) {
+    if (dst->release_handle == 0 && create_release_timeline(wl, dst) != 0) {
         return -1;
     }
     const char *tranche = "general";
@@ -321,11 +330,9 @@ int bar_prepare(WaylandContext *wl, VulkanContext *vk, bool force) {
     }
     uint64_t next = frame_state.sync_point + 1u;
     if (record_bar(vk, dst, next) != 0) {
-        dst->acquire_point = 0;
         (void)retire_pixels(wl, vk, dst);
         return -1;
     }
-    frame_state.sync_point = next;
     if (import_bar_buffer(wl, dst) != 0) {
         (void)retire_pixels(wl, vk, dst);
         return -1;
@@ -368,7 +375,7 @@ void bar_shutdown(WaylandContext *wl, VulkanContext *vk) {
     for (int i = 0; i < 2; ++i) {
         FrameSlot *slot = &frame_state.bar_slot[i];
         bool held = slot->release_pending &&
-                    !poll_release_semaphore(vk, slot->release_semaphore, slot->release_point);
+                    !poll_release_handle(slot->release_handle, slot->release_point);
         if (held) {
             fprintf(stderr, "[Chrome] Bar image left alive. Release point %llu is still pending.\n",
                     (unsigned long long)slot->release_point);

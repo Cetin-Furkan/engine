@@ -33,8 +33,8 @@ typedef struct SolidPush {
     float    origin_y;
     float    depth_bias;
     float    selected;
-    uint32_t pad;
-    uint32_t tail0;
+    float    origin_z;
+    float    squash;
     uint32_t tail1;
     ViewPush view;
 } SolidPush;
@@ -48,6 +48,8 @@ static_assert(offsetof(SolidPush, origin_x) == 20u, "solid origin x");
 static_assert(offsetof(SolidPush, origin_y) == 24u, "solid origin y");
 static_assert(offsetof(SolidPush, depth_bias) == 28u, "solid depth");
 static_assert(offsetof(SolidPush, selected) == 32u, "solid selected");
+static_assert(offsetof(SolidPush, origin_z) == 36u, "solid origin z");
+static_assert(offsetof(SolidPush, squash) == 40u, "solid squash");
 static_assert(offsetof(SolidPush, view) == 48u, "solid view");
 static_assert(sizeof(SolidPush) == 96u, "solid push");
 static_assert(sizeof(BakePush) == 8u, "solid bake push");
@@ -275,7 +277,8 @@ int solid_init(VulkanContext *vk) {
 
 void solid_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height,
                 uint32_t kind, bool curved, float yaw_deg,
-                float origin_x, float origin_y, bool selected) {
+                float origin_x, float origin_y, float origin_z,
+                float squash, bool selected) {
     VkPipeline pipeline = vulkan_gfx_use(s_vk, &s_gfx);
     if (cmd == VK_NULL_HANDLE || pipeline == VK_NULL_HANDLE || width == 0 || height == 0 ||
         kind >= 6u) {
@@ -291,7 +294,8 @@ void solid_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height,
         .origin_y   = origin_y,
         .depth_bias = 0.0f,
         .selected   = selected ? 1.0f : 0.0f,
-        .pad        = 0,
+        .origin_z   = origin_z,
+        .squash     = squash,
     };
     view_push_fill(&draw_push.view, k_mat_solid0 + kind);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);

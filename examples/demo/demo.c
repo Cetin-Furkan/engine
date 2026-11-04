@@ -21,6 +21,7 @@
 #include "world/world_int.h"
 #include <linux/input-event-codes.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 // The hosted program. Boot draws the metric grid and no objects.
@@ -119,8 +120,106 @@ static void demo_destroy_targets(VulkanContext *vk, EngineTargets *targets) {
 
 // ------------------------------------------------------------------- hooks
 
+static void print_worlds_usage(const char *prog) {
+    printf("Usage: %s [--world=<0..6> | -w <0..6>] [--list-worlds] [--help]\n\n"
+           "Selectable Worlds & Capability Masks:\n"
+           "  --world=0  Default Sandbox (3D / 2D / Hybrid switchable via Tab)\n"
+           "  --world=1  [3D-Only | PERM_DRAW=on  | Tab=locked] Click-to-Draw Studio (Points -> Lines -> Faces)\n"
+           "  --world=2  [3D-Only | Gravity+Bounce| Tab=locked] Non-Cube Solids Squash-and-Stretch Drop\n"
+           "  --world=3  [2D-Only | Gravity+Soft  | Tab=locked] Deformable Soft Patches & Elastic Polygons\n"
+           "  --world=4  [2D-Only | PERM_DRAW=on  | Tab=locked] 2D Click-to-Draw Polygon Workshop & Sheet\n"
+           "  --world=5  [Hybrid  | 3D+2D+Draw    | Tab=open  ] Combined 3D+2D Gravity, Soft Bodies & Draw\n"
+           "  --world=6  [3D+2D   | Multi-Bounce  | Tab=open  ] Restitution Staircase (0.08..0.94) & Bumper Lab\n",
+           prog != nullptr ? prog : "engine");
+    fflush(stdout);
+}
+
+static bool parse_world_arg(const char *arg, uint32_t *out_id) {
+    if (arg == nullptr || arg[0] == '\0' || out_id == nullptr) {
+        return false;
+    }
+    if (strcmp(arg, "default") == 0) {
+        *out_id = 0u;
+        return true;
+    }
+    if (strcmp(arg, "draw3d") == 0) {
+        *out_id = 1u;
+        return true;
+    }
+    if (strcmp(arg, "gravity3d") == 0 || strcmp(arg, "solids") == 0) {
+        *out_id = 2u;
+        return true;
+    }
+    if (strcmp(arg, "soft2d") == 0 || strcmp(arg, "2d") == 0) {
+        *out_id = 3u;
+        return true;
+    }
+    if (strcmp(arg, "draw2d") == 0) {
+        *out_id = 4u;
+        return true;
+    }
+    if (strcmp(arg, "hybrid") == 0) {
+        *out_id = 5u;
+        return true;
+    }
+    if (strcmp(arg, "bounce") == 0 || strcmp(arg, "elastic") == 0) {
+        *out_id = 6u;
+        return true;
+    }
+    char *end = nullptr;
+    unsigned long v = strtoul(arg, &end, 10);
+    if (end == arg || *end != '\0' || v > (unsigned long)k_world_preset_max) {
+        return false;
+    }
+    *out_id = (uint32_t)v;
+    return true;
+}
+
+static int demo_configure(int argc, char **argv) {
+    uint32_t chosen = 0u;
+    for (int i = 1; i < argc; ++i) {
+        const char *a = argv[i];
+        if (a == nullptr) {
+            continue;
+        }
+        if (strcmp(a, "--help") == 0 || strcmp(a, "-h") == 0 || strcmp(a, "--list-worlds") == 0) {
+            print_worlds_usage(argv[0]);
+            return 1;
+        }
+        const char *val = nullptr;
+        if (strncmp(a, "--world=", 8) == 0) {
+            val = a + 8;
+        } else if (strncmp(a, "-w=", 3) == 0) {
+            val = a + 3;
+        } else if (strcmp(a, "--world") == 0 || strcmp(a, "-w") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "[Engine] Missing world number after '%s' (expected 0..%u)\n",
+                        a, k_world_preset_max);
+                print_worlds_usage(argv[0]);
+                return -1;
+            }
+            val = argv[++i];
+        } else if (strncmp(a, "-w", 2) == 0 && a[2] != '\0') {
+            val = a + 2;
+        } else {
+            fprintf(stderr, "[Engine] Unknown option '%s'\n", a);
+            print_worlds_usage(argv[0]);
+            return -1;
+        }
+        if (!parse_world_arg(val, &chosen)) {
+            fprintf(stderr, "[Engine] Invalid world '%s' (expected 0..%u)\n",
+                    val, k_world_preset_max);
+            print_worlds_usage(argv[0]);
+            return -1;
+        }
+    }
+    world_select(chosen);
+    return 0;
+}
+
 static int demo_init(VulkanContext *vk, RingCqeFn forward_cqe, void *forward_user) {
     policy_boot();
+    world_apply_policy();
     if (pass_init(vk) != 0 ||
         chrome_gpu_bind_pass(vk, pass_depth_format(), pass_raster_samples()) != 0 ||
         cube_init(vk) != 0 || solid_init(vk) != 0 || shape_init(vk) != 0 ||
@@ -377,6 +476,7 @@ static const EngineApp s_app = {
             "or the lattice. Hybrid draws the 3D scene and that sheet. "
             "Hold T and click twice to place a text box, then type. Escape leaves it. "
             "Edits are written to examples/demo/world/live.world. Faces and heat stay unsaved.",
+    .configure         = demo_configure,
     .init              = demo_init,
     .shutdown          = demo_shutdown,
     .load              = world_load,

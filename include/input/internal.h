@@ -5,7 +5,6 @@
 // in pointer.h. The device page is internal until the frame records it.
 
 #include "input/pointer.h"
-#include <stdbool.h>
 #include <stdint.h>
 
 struct xkb_context;

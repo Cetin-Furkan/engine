@@ -38,7 +38,7 @@ static bool spare_ready(VulkanContext *vk) {
     // Read them before this slot is recorded again.
     gpu_timer_harvest(vk, spare());
     return !spare()->release_pending ||
-           poll_release_semaphore(vk, spare()->release_semaphore, spare()->release_point);
+           poll_release_handle(spare()->release_handle, spare()->release_point);
 }
 
 static bool present_chain_wanted(void) {
@@ -128,14 +128,12 @@ static int present_spare(WaylandContext *wl, VulkanContext *vk, bool *queued) {
     frame_state.pending_sim_stamp = 0;
     uint64_t next = frame_state.sync_point + 1u;
     if (record_and_submit_clear(vk, spare(), frame_state.acquire, next, true, heat_dt) != 0) {
-        spare()->acquire_point = 0;
         frame_state.scene_dirty = true;
         frame_state.pending_heat = heat_dt;
         frame_state.pending_sim_stamp = sim_stamp;
         return -1;
     }
     engine_app()->simulation_commit(sim_stamp, heat_dt);
-    frame_state.sync_point = next;
     bool again = present_chain_wanted();
     int q = wayland_queue_turn_commit(
         wl,

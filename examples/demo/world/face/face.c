@@ -241,6 +241,14 @@ void face_self_check(void) {
 }
 
 bool face_spawn(Coord at) {
+    if (s_build_n >= 3u) {
+        float near = coord_near();
+        float dx = at.x - s_build[0].x;
+        float dy = at.y - s_build[0].y;
+        if (dx * dx + dy * dy < near * near) {
+            return face_close();
+        }
+    }
     if (near_build(at.x, at.y)) {
         return false;
     }

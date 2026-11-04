@@ -8,7 +8,6 @@
 // Zero draws the field as it stands.
 int record_and_submit_clear(VulkanContext *vk, FrameSlot *frame, VkSemaphore acquire,
                                    uint64_t signal_point, bool draw_live, uint32_t heat_dt) {
-    frame->acquire_point = signal_point;
     if (ensure_frame_targets(vk, frame) != 0) {
         return -1;
     }
@@ -196,13 +195,23 @@ int record_and_submit_clear(VulkanContext *vk, FrameSlot *frame, VkSemaphore acq
                                                 : VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT,
         .deviceIndex = 0,
     };
-    VkSemaphoreSubmitInfo signal_info = {
-        .sType       = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
-        .pNext       = nullptr,
-        .semaphore   = acquire,
-        .value       = signal_point,
-        .stageMask   = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
-        .deviceIndex = 0,
+    VkSemaphoreSubmitInfo signal_infos[2] = {
+        {
+            .sType       = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+            .pNext       = nullptr,
+            .semaphore   = acquire,
+            .value       = signal_point,
+            .stageMask   = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+            .deviceIndex = 0,
+        },
+        {
+            .sType       = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+            .pNext       = nullptr,
+            .semaphore   = frame_state.acquire_sync,
+            .value       = 0,
+            .stageMask   = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+            .deviceIndex = 0,
+        },
     };
     VkSubmitInfo2 submit_info = {
         .sType                    = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
@@ -212,8 +221,8 @@ int record_and_submit_clear(VulkanContext *vk, FrameSlot *frame, VkSemaphore acq
         .pWaitSemaphoreInfos      = wait_heat ? &wait_info : nullptr,
         .commandBufferInfoCount   = 1,
         .pCommandBufferInfos      = &cmd_submit,
-        .signalSemaphoreInfoCount = 1,
-        .pSignalSemaphoreInfos    = &signal_info,
+        .signalSemaphoreInfoCount = 2,
+        .pSignalSemaphoreInfos    = signal_infos,
     };
 
     res = vkQueueSubmit2(vk->queues.graphics_queue, 1, &submit_info, VK_NULL_HANDLE);
@@ -225,7 +234,13 @@ int record_and_submit_clear(VulkanContext *vk, FrameSlot *frame, VkSemaphore acq
                 vulkan_vkresult_to_str(res), (int)res);
         return -1;
     }
+    frame->acquire_point = signal_point;
+    frame_state.sync_point = signal_point;
     frame->foreign_owned = true;
     engine_app()->record_ok(signal_point);
+    if (publish_acquire_point(vk, signal_point) < 0) {
+        (void)wait_acquire_point(vk, signal_point);
+        return -1;
+    }
     return 0;
 }

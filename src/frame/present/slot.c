@@ -224,7 +224,7 @@ void destroy_frame_gpu(VulkanContext *vk, FrameSlot *frame) {
 }
 
 
-int create_release_timeline(VulkanContext *vk, WaylandContext *wl, FrameSlot *frame) {
+int create_release_timeline(WaylandContext *wl, FrameSlot *frame) {
     struct drm_syncobj_create release_create = {0};
     if (frame_state.drm_fd < 0 || frame == nullptr) {
         return -EINVAL;
@@ -239,11 +239,6 @@ int create_release_timeline(VulkanContext *vk, WaylandContext *wl, FrameSlot *fr
         drm_syncobj_destroy(frame_state.drm_fd, &frame->release_handle);
         return -1;
     }
-    if (import_release_semaphore_fd(vk, release_fd, &frame->release_semaphore) < 0) {
-        close(release_fd);
-        drm_syncobj_destroy(frame_state.drm_fd, &frame->release_handle);
-        return -1;
-    }
     uint32_t timeline_id = 0;
     int imported = wayland_import_syncobj_timeline(wl, release_fd, &timeline_id);
     close(release_fd);
@@ -252,10 +247,6 @@ int create_release_timeline(VulkanContext *vk, WaylandContext *wl, FrameSlot *fr
             if (wayland_put_raw(wl, timeline_id, 0u, nullptr, 0u)) {
                 (void)wayland_send_batch(wl);
             }
-        }
-        if (frame->release_semaphore != VK_NULL_HANDLE) {
-            vkDestroySemaphore(vk->device, frame->release_semaphore, nullptr);
-            frame->release_semaphore = VK_NULL_HANDLE;
         }
         drm_syncobj_destroy(frame_state.drm_fd, &frame->release_handle);
         return -1;
@@ -429,6 +420,15 @@ int alloc_content_image(
                                    wl->all_modifiers, wl->all_modifier_count,
                                    false, false, out) == 0) {
         *tranche_kind = "general";
+    } else if (wl->prime_modifier_count > 0) {
+        if (alloc_modifier_list(vk, width, height, VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                                wl->prime_modifiers, wl->prime_modifier_count,
+                                true, true, out) == 0 ||
+            alloc_modifier_list(vk, width, height, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+                                wl->prime_modifiers, wl->prime_modifier_count,
+                                false, true, out) == 0) {
+            *tranche_kind = "cross-device";
+        }
     }
 
     if (out->image == VK_NULL_HANDLE || !out->has_drm_format_modifier) {
@@ -521,7 +521,7 @@ int alloc_spare(WaylandContext *wl, VulkanContext *vk) {
         return -1;
     }
     (void)tranche_kind;
-    if (!keep_timeline && create_release_timeline(vk, wl, spare()) != 0) {
+    if (!keep_timeline && create_release_timeline(wl, spare()) != 0) {
         spare()->acquire_point = 0;
         destroy_frame_gpu(vk, spare());
         blank_frame(spare());
@@ -546,7 +546,6 @@ int alloc_spare(WaylandContext *wl, VulkanContext *vk) {
             FrameSlot junk = *spare();
             junk.release_eventfd = -1;
             junk.release_handle = 0;
-            junk.release_semaphore = VK_NULL_HANDLE;
             junk.release_timeline_id = 0;
             junk.release_point = 0;
             clear_pixels(spare());

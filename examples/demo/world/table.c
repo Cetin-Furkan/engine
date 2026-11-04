@@ -190,6 +190,20 @@ void table_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height, bool live)
     }
 }
 
+void table_draw_ops(VkCommandBuffer cmd, uint32_t width, uint32_t height, bool live, const WorldOps *ops) {
+    if (ops == nullptr) {
+        return;
+    }
+    for (int i = 0; i < s_n; ++i) {
+        WorldObj *o = &s_obj[i];
+        bool up = live ? o->alive : o->shown_alive;
+        if (!up || o->ops != ops || o->ops->draw == nullptr) {
+            continue;
+        }
+        o->ops->draw(o, cmd, width, height, live);
+    }
+}
+
 bool table_advance(uint32_t time_ms) {
     bool changed = s_selected != s_shown_selected;
     for (int i = 0; i < s_n; ++i) {
@@ -198,6 +212,29 @@ bool table_advance(uint32_t time_ms) {
             changed = true;
         }
         if (!o->alive || o->ops == nullptr || o->ops->advance == nullptr) {
+            continue;
+        }
+        if (o->ops->advance(o, time_ms)) {
+            changed = true;
+        }
+    }
+    return changed;
+}
+
+bool table_advance_ops(uint32_t time_ms, const WorldOps *ops) {
+    if (ops == nullptr) {
+        return false;
+    }
+    bool changed = s_selected != s_shown_selected;
+    for (int i = 0; i < s_n; ++i) {
+        WorldObj *o = &s_obj[i];
+        if (o->ops != ops) {
+            continue;
+        }
+        if (o->alive != o->shown_alive) {
+            changed = true;
+        }
+        if (!o->alive || o->ops->advance == nullptr) {
             continue;
         }
         if (o->ops->advance(o, time_ms)) {
@@ -250,6 +287,34 @@ bool table_busy(void) {
             return true;
         }
         if (o->ops != nullptr && o->ops->busy != nullptr && o->ops->busy(o)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool table_busy_ops(const WorldOps *ops) {
+    if (ops == nullptr) {
+        return false;
+    }
+    if (s_selected != s_shown_selected) {
+        return true;
+    }
+    for (int i = 0; i < s_n; ++i) {
+        WorldObj *o = &s_obj[i];
+        if (o->ops != ops) {
+            continue;
+        }
+        if (o->alive != o->shown_alive) {
+            return true;
+        }
+        if (!o->alive) {
+            continue;
+        }
+        if (o->spin != nullptr && spin_busy(o->spin)) {
+            return true;
+        }
+        if (o->ops->busy != nullptr && o->ops->busy(o)) {
             return true;
         }
     }

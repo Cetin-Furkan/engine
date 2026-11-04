@@ -14,7 +14,8 @@ void solid_shutdown(VulkanContext *vk);
 
 void solid_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height,
                 uint32_t kind, bool curved, float yaw_deg,
-                float origin_x, float origin_y, bool selected);
+                float origin_x, float origin_y, float origin_z,
+                float squash, bool selected);
 
 uint32_t solid_vertex_count(void);
 // Vertices one raised solid of this kind draws (faceted or rounded cage).

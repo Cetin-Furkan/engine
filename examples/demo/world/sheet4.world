@@ -1,0 +1,24 @@
+# Sheet 4: 2D-Only Click-to-Draw Polygon Workshop & Elastic Sheet
+# Open center canvas for click-to-draw points -> lines -> faces, framed by soft bodies and polygons.
+bounds 600 320
+rigid -460 0 28 150 0 0.88 1
+rigid 460 0 28 150 0 0.88 1
+soft -280 -190 5 4 32 26 1.2 0.80
+soft 280 -190 5 4 32 130 2.4 0.88
+dyn -280 190 0 6 0.90
+44 0
+22 38
+-22 38
+-44 0
+-22 -38
+22 -38
+dyn 0 220 0 5 0.65
+42 0
+13 40
+-34 25
+-34 -25
+13 -40
+dyn 280 190 0 3 0.25
+46 -30
+0 48
+-46 -30

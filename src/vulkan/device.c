@@ -563,28 +563,26 @@ static VulkanResult evaluate_device(GpuCandidate *candidate) {
         return VULKAN_SUCCESS;
     }
 
-    // Probe timeline semaphore export AND import with VkSemaphoreTypeCreateInfo in pNext.
-    VkSemaphoreTypeCreateInfo timeline_type_info = {
+    // Explicit sync exports a Linux sync_file fd from a binary VkSemaphore on
+    // each present submit and imports that fence into the DRM acquire timeline.
+    VkSemaphoreTypeCreateInfo binary_type_info = {
         .sType         = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
         .pNext         = nullptr,
-        .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE,
+        .semaphoreType = VK_SEMAPHORE_TYPE_BINARY,
         .initialValue  = 0,
     };
     VkPhysicalDeviceExternalSemaphoreInfo ext_info = {
         .sType      = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_SEMAPHORE_INFO,
-        .pNext      = &timeline_type_info,
-        .handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT,
+        .pNext      = &binary_type_info,
+        .handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
     };
     VkExternalSemaphoreProperties ext_props = {
         .sType = VK_STRUCTURE_TYPE_EXTERNAL_SEMAPHORE_PROPERTIES,
         .pNext = nullptr,
     };
     vkGetPhysicalDeviceExternalSemaphoreProperties(candidate->device, &ext_info, &ext_props);
-    const VkExternalSemaphoreFeatureFlags req_sem_flags =
-        VK_EXTERNAL_SEMAPHORE_FEATURE_EXPORTABLE_BIT |
-        VK_EXTERNAL_SEMAPHORE_FEATURE_IMPORTABLE_BIT;
-    if ((ext_props.externalSemaphoreFeatures & req_sem_flags) != req_sem_flags) {
-        disqualify(candidate, "Timeline semaphore opaque-fd export/import is not supported");
+    if ((ext_props.externalSemaphoreFeatures & VK_EXTERNAL_SEMAPHORE_FEATURE_EXPORTABLE_BIT) == 0) {
+        disqualify(candidate, "Binary semaphore sync-fd export is not supported");
         return VULKAN_SUCCESS;
     }
 

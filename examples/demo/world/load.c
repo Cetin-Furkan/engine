@@ -28,6 +28,60 @@ static const char *k_path_legacy = "world/opening.world";
 static const char *k_live = "examples/demo/world/live.world";
 static const char *k_live_legacy = "world/live.world";
 
+static const char *k_preset_worlds[k_world_preset_max] = {
+    // World 1: 3D-Only Click-to-Draw Studio (open central court framed by glowing pillars)
+    "ground z\n"
+    "smooth 0\n"
+    "solid Tetrahedron -520 260 0 yaw 25000 spin 1 inf 0 glow 1 bounce 0.45\n"
+    "solid Octahedron 520 260 0 yaw 45000 spin 1 inf 0 glow 1 bounce 0.68\n"
+    "solid Cone -520 -260 0 yaw 15000 spin 1 inf 0 glow 1 bounce 0.56\n"
+    "solid Torus 520 -260 0 yaw 65000 spin 1 inf 0 glow 1 bounce 0.82\n"
+    "cube 0 340 0 yaw 38000 spin 1 inf 0 glow 0 bounce 0.50\n",
+
+    // World 2: 3D-Only Gravity Drop & Elastic Non-Cube Solids (elevated drop with varied bounce)
+    "ground z\n"
+    "smooth 1\n"
+    "solid Icosahedron -460 150 640 yaw 18000 spin 1 inf 1 glow 1 bounce 0.90\n"
+    "solid Torus -160 190 560 yaw 42000 spin 1 inf 1 glow 1 bounce 0.84\n"
+    "solid Octahedron 160 190 500 yaw 30000 spin 1 inf 1 glow 0 bounce 0.68\n"
+    "solid Cone 460 150 440 yaw 12000 spin 1 inf 0 glow 0 bounce 0.56\n"
+    "solid Tetrahedron -310 -190 400 yaw 55000 spin 1 inf 0 glow 0 bounce 0.38\n"
+    "solid Cylinder 310 -190 360 yaw 20000 spin 1 inf 0 glow 0 bounce 0.20\n"
+    "cube 0 -180 600 yaw 38000 spin 1 inf 0 glow 1 bounce 0.85\n"
+    "cube -620 -60 480 yaw 14000 spin 1 inf 0 glow 0 bounce 0.48\n"
+    "cube 620 -60 380 yaw 62000 spin 1 inf 0 glow 0 bounce 0.08\n",
+
+    // World 3: 2D-Only Gravity & Soft Bodies (3D scene stays dormant in 2D-only mode)
+    "ground z\n"
+    "cube 0 0 0\n",
+
+    // World 4: 2D-Only Click-to-Draw Polygon Workshop (3D scene stays dormant in 2D-only mode)
+    "ground z\n"
+    "cube 0 0 0\n",
+
+    // World 5: Hybrid (3D + 2D) Click-to-Draw + Gravity & Multi-Elasticity
+    "ground z\n"
+    "smooth 1\n"
+    "solid Icosahedron -420 120 580 yaw 22000 spin 1 inf 1 glow 1 bounce 0.90\n"
+    "solid Torus 420 120 520 yaw 48000 spin 1 inf 1 glow 1 bounce 0.84\n"
+    "solid Octahedron -420 -160 440 yaw 15000 spin 1 inf 0 glow 0 bounce 0.66\n"
+    "solid Cone 420 -160 380 yaw 35000 spin 1 inf 0 glow 0 bounce 0.52\n"
+    "cube 0 40 620 yaw 38000 spin 1 inf 0 glow 1 bounce 0.82\n",
+
+    // World 6: 3D + 2D Switchable Restitution Staircase & Collision Arena
+    "ground z\n"
+    "smooth 1\n"
+    "solid Cylinder -550 140 520 yaw 0 spin 1 inf 0 glow 0 bounce 0.14\n"
+    "solid Tetrahedron -330 140 520 yaw 15000 spin 1 inf 0 glow 0 bounce 0.32\n"
+    "solid Cone -110 140 520 yaw 30000 spin 1 inf 0 glow 0 bounce 0.50\n"
+    "solid Octahedron 110 140 520 yaw 45000 spin 1 inf 1 glow 0 bounce 0.68\n"
+    "solid Torus 330 140 520 yaw 60000 spin 1 inf 1 glow 1 bounce 0.82\n"
+    "solid Icosahedron 550 140 520 yaw 75000 spin 1 inf 1 glow 1 bounce 0.92\n"
+    "cube -380 -210 520 yaw 38000 spin 1 inf 0 glow 0 bounce 0.20\n"
+    "cube 0 -210 520 yaw 38000 spin 1 inf 0 glow 0 bounce 0.58\n"
+    "cube 380 -210 520 yaw 38000 spin 1 inf 0 glow 1 bounce 0.88\n",
+};
+
 static bool s_file_ground_seen = false;
 static bool s_smooth_seen = false;
 static bool s_loading = false;
@@ -86,15 +140,39 @@ static int place_cube(const char *line, int number) {
     int spinning = 0;
     int infinite = 0;
     int glow = 0;
+    float bounce = 0.0f;
     char tail = 0;
+    int posed_b = sscanf(line, "cube %f %f %f yaw %d spin %d inf %d glow %d bounce %f %c",
+                         &x, &y, &z, &yaw, &spinning, &infinite, &glow, &bounce, &tail);
     int posed = sscanf(line, "cube %f %f %f yaw %d spin %d inf %d glow %d %c",
                        &x, &y, &z, &yaw, &spinning, &infinite, &glow, &tail);
-    if (posed > 3) {
+    int short_b = sscanf(line, "cube %f %f %f bounce %f %c", &x, &y, &z, &bounce, &tail);
+    bool have_pose = false;
+    if (posed_b == 8) {
+        if (!flag_bit(spinning) || !flag_bit(infinite) || !flag_bit(glow) || !isfinite(bounce)) {
+            fprintf(stderr, "[World] %s:%d cube pose flags must be 0 or 1 and bounce finite\n",
+                    source_name(), number);
+            return -1;
+        }
+        have_pose = true;
+    } else if (posed > 3) {
         if (posed != 7 || !flag_bit(spinning) || !flag_bit(infinite) || !flag_bit(glow)) {
             fprintf(stderr, "[World] %s:%d cube pose needs yaw spin inf glow, each flag 0 or 1\n",
                     source_name(), number);
             return -1;
         }
+        bounce = 0.0f;
+        have_pose = true;
+    } else if (short_b == 4) {
+        if (!isfinite(bounce)) {
+            fprintf(stderr, "[World] %s:%d cube bounce is not finite\n", source_name(), number);
+            return -1;
+        }
+        yaw = 38000;
+        spinning = 1;
+        infinite = 0;
+        glow = 0;
+        have_pose = true;
     } else if (sscanf(line, "cube %f %f %f %c", &x, &y, &z, &tail) != 3) {
         fprintf(stderr, "[World] %s:%d cube needs x y z\n", source_name(), number);
         return -1;
@@ -104,8 +182,9 @@ static int place_cube(const char *line, int number) {
         return -1;
     }
     bool ok = false;
-    if (posed == 7) {
-        ok = cube_kind_spawn_pose((Coord){ x, y, z }, (int32_t)yaw, spinning != 0, infinite != 0, glow != 0);
+    if (have_pose) {
+        ok = cube_kind_spawn_elastic((Coord){ x, y, z }, (int32_t)yaw,
+                                     spinning != 0, infinite != 0, glow != 0, bounce);
     } else {
         ok = cube_kind_spawn((Coord){ x, y, z });
     }
@@ -124,11 +203,15 @@ static int place_solid(const char *line, int number) {
     int spinning = 0;
     int infinite = 0;
     int glow = 0;
+    float bounce = -1.0f;
     char tail = 0;
-    int got = sscanf(line, "solid %31s %f %f %f yaw %d spin %d inf %d glow %d %c",
-                     name, &x, &y, &z, &yaw, &spinning, &infinite, &glow, &tail);
-    if (got != 8 || !flag_bit(spinning) || !flag_bit(infinite) || !flag_bit(glow)) {
-        fprintf(stderr, "[World] %s:%d solid needs Name x y z yaw spin inf glow\n",
+    int got_b = sscanf(line, "solid %31s %f %f %f yaw %d spin %d inf %d glow %d bounce %f %c",
+                       name, &x, &y, &z, &yaw, &spinning, &infinite, &glow, &bounce, &tail);
+    int got = (got_b == 9) ? 9 : sscanf(line, "solid %31s %f %f %f yaw %d spin %d inf %d glow %d %c",
+                                        name, &x, &y, &z, &yaw, &spinning, &infinite, &glow, &tail);
+    if ((got != 8 && got != 9) || !flag_bit(spinning) || !flag_bit(infinite) || !flag_bit(glow) ||
+        (got == 9 && !isfinite(bounce))) {
+        fprintf(stderr, "[World] %s:%d solid needs Name x y z yaw spin inf glow [bounce]\n",
                 source_name(), number);
         return -1;
     }
@@ -137,8 +220,9 @@ static int place_solid(const char *line, int number) {
         fprintf(stderr, "[World] %s:%d solid %s is not a kind\n", source_name(), number, name);
         return -1;
     }
-    if (!solid_kind_place((uint32_t)kind, (Coord){ x, y, z }, (int32_t)yaw,
-                          spinning != 0, infinite != 0, glow != 0)) {
+    if (!solid_kind_place_elastic((uint32_t)kind, (Coord){ x, y, z }, (int32_t)yaw,
+                                  spinning != 0, infinite != 0, glow != 0,
+                                  got == 9 ? bounce : -1.0f)) {
         return -1;
     }
     return 0;
@@ -363,6 +447,28 @@ static int read_named(const char *rel_path, char *buf, size_t cap, size_t *out_l
 }
 
 static int open_document(char *buf, size_t cap, size_t *len) {
+    uint32_t wid = world_selected_id();
+    if (wid >= 1u && wid <= k_world_preset_max) {
+        char rel[64];
+        char rel_legacy[64];
+        snprintf(rel, sizeof rel, "examples/demo/world/world%u.world", wid);
+        snprintf(rel_legacy, sizeof rel_legacy, "world/world%u.world", wid);
+        if (read_named(rel, buf, cap, len) == 0) {
+            return 0;
+        }
+        if (read_named(rel_legacy, buf, cap, len) == 0) {
+            return 0;
+        }
+        const char *preset = k_preset_worlds[wid - 1u];
+        size_t plen = strlen(preset);
+        if (plen + 1u >= cap) {
+            return -1;
+        }
+        memcpy(buf, preset, plen + 1u);
+        *len = plen;
+        snprintf(s_source, sizeof s_source, "builtin:world%u.world", wid);
+        return 0;
+    }
     int live = read_named(k_live, buf, cap, len);
     if (live <= 0) {
         return live;
@@ -451,6 +557,11 @@ int world_load(void) {
             rc = parse_document(buf, len);
             if (rc == 0) {
                 table_publish();
+                if (world_selected_id() >= 1u) {
+                    printf("[World] Loaded World %u (%s) from %s\n",
+                           world_selected_id(), world_selected_title(), source_name());
+                    fflush(stdout);
+                }
             }
         }
     }
@@ -530,7 +641,7 @@ static bool live_path(char *out, size_t cap) {
 }
 
 int world_save(void) {
-    if (s_loading || !s_loaded) {
+    if (s_loading || !s_loaded || world_selected_id() != 0u) {
         return 0;
     }
     char body[16384];

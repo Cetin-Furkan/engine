@@ -4,8 +4,6 @@
 
 static constexpr float k_gravity     = 3200.0f;
 static constexpr float k_damp        = 1.8f;
-// Inelastic. A rebound would leave the faces apart after they had already met.
-static constexpr float k_bounce      = 0.0f;
 static constexpr float k_sleep_speed = 12.0f;
 static constexpr float k_slop        = 0.5f;
 static constexpr int   k_passes      = 4;
@@ -26,15 +24,34 @@ float motion_rest_lift(float yaw, float half) {
     return e[2];
 }
 
+static float body_rest_lift(const MotionBody *b, float half) {
+    if (b->spherical) {
+        return b->radius > 0.0f ? b->radius : half;
+    }
+    return motion_rest_lift(b->yaw, half);
+}
+
 static void clamp_ground(MotionBody *b, float ground, float half) {
     if (!b->awake) {
         return;
     }
-    float rest = ground + motion_rest_lift(b->yaw, half);
+    float rest = ground + body_rest_lift(b, half);
     if (b->z < rest) {
         b->z = rest;
         if (b->vz < 0.0f) {
-            b->vz = 0.0f;
+            float down = -b->vz;
+            if (down > b->impact) {
+                b->impact = down;
+            }
+            float e = b->restitution;
+            if (e > 0.95f) {
+                e = 0.95f;
+            }
+            if (e > 0.0f && down > k_sleep_speed * 2.5f) {
+                b->vz = down * e;
+            } else {
+                b->vz = 0.0f;
+            }
         }
     }
 }
@@ -112,10 +129,41 @@ static bool obb_hit(const MotionBody *a, const MotionBody *b, float half, float 
     return true;
 }
 
+static bool body_hit(const MotionBody *a, const MotionBody *b, float half, float *pen, float n[3]) {
+    if (!a->spherical && !b->spherical) {
+        return obb_hit(a, b, half, pen, n);
+    }
+    float ra = a->spherical ? (a->radius > 0.0f ? a->radius : half) : half;
+    float rb = b->spherical ? (b->radius > 0.0f ? b->radius : half) : half;
+    float dx = b->x - a->x;
+    float dy = b->y - a->y;
+    float dz = b->z - a->z;
+    float dist2 = dx * dx + dy * dy + dz * dz;
+    float reach = ra + rb;
+    float limit = reach - k_slop;
+    if (!(limit > 0.0f) || !(dist2 < limit * limit)) {
+        return false;
+    }
+    float dist = sqrtf(dist2);
+    if (dist < 1.0e-4f) {
+        n[0] = 1.0f;
+        n[1] = 0.0f;
+        n[2] = 0.0f;
+        *pen = reach;
+        return true;
+    }
+    float inv = 1.0f / dist;
+    n[0] = dx * inv;
+    n[1] = dy * inv;
+    n[2] = dz * inv;
+    *pen = reach - dist;
+    return true;
+}
+
 static bool separated(const MotionBody *a, const MotionBody *b, float half) {
     float pen = 0.0f;
     float n[3] = { 0.0f, 0.0f, 0.0f };
-    return !obb_hit(a, b, half, &pen, n);
+    return !body_hit(a, b, half, &pen, n);
 }
 
 static void trade(MotionBody *a, MotionBody *b, float nx, float ny, float nz) {
@@ -123,7 +171,20 @@ static void trade(MotionBody *a, MotionBody *b, float nx, float ny, float nz) {
     if (!(vrel < 0.0f)) {
         return;
     }
-    float j = -(1.0f + k_bounce) * vrel * 0.5f;
+    float hit_speed = -vrel;
+    if (hit_speed > a->impact) {
+        a->impact = hit_speed;
+    }
+    if (hit_speed > b->impact) {
+        b->impact = hit_speed;
+    }
+    float e = 0.5f * (a->restitution + b->restitution);
+    if (e < 0.0f) {
+        e = 0.0f;
+    } else if (e > 0.95f) {
+        e = 0.95f;
+    }
+    float j = -(1.0f + e) * vrel * 0.5f;
     a->vx -= nx * j;
     a->vy -= ny * j;
     a->vz -= nz * j;
@@ -138,7 +199,7 @@ static void collide_pair(MotionBody *a, MotionBody *b, float ground, float half)
     }
     float pen = 0.0f;
     float n[3] = { 0.0f, 0.0f, 0.0f };
-    if (!obb_hit(a, b, half, &pen, n)) {
+    if (!body_hit(a, b, half, &pen, n)) {
         return;
     }
     // A still cube stands up when something hits it. Separate after that,
@@ -147,7 +208,7 @@ static void collide_pair(MotionBody *a, MotionBody *b, float ground, float half)
     b->awake = true;
     clamp_ground(a, ground, half);
     clamp_ground(b, ground, half);
-    if (!obb_hit(a, b, half, &pen, n)) {
+    if (!body_hit(a, b, half, &pen, n)) {
         return;
     }
     float horiz = sqrtf(n[0] * n[0] + n[1] * n[1]);
@@ -192,7 +253,7 @@ static void sleep_one(MotionBody *bodies, uint32_t count, uint32_t index, float 
         return;
     }
     float speed = sqrtf(b->vx * b->vx + b->vy * b->vy + b->vz * b->vz);
-    float rest = ground + motion_rest_lift(b->yaw, half);
+    float rest = ground + body_rest_lift(b, half);
     if (speed > k_sleep_speed || fabsf(b->z - rest) > k_slop) {
         return;
     }

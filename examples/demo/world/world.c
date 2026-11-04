@@ -15,6 +15,80 @@ enum : uint32_t { k_removed_cap = 24 };
 
 static WorldRemoved s_removed[k_removed_cap];
 static uint32_t     s_removed_n = 0;
+static uint32_t     s_world_id  = 0;
+
+void world_select(uint32_t world_id) {
+    if (world_id > k_world_preset_max) {
+        world_id = 0u;
+    }
+    s_world_id = world_id;
+    sheet_select_world(s_world_id);
+}
+
+uint32_t world_selected_id(void) {
+    return s_world_id;
+}
+
+const char *world_selected_title(void) {
+    switch (s_world_id) {
+    case 1u:
+        return "3D-Only Click-to-Draw Studio (Points -> Lines -> Faces)";
+    case 2u:
+        return "3D-Only Gravity & Elastic Non-Cube Solids (Squash-and-Stretch)";
+    case 3u:
+        return "2D-Only Gravity, Deformable Soft Bodies & Elastic Polygons";
+    case 4u:
+        return "2D-Only Click-to-Draw Polygon Workshop & Elastic Sheet";
+    case 5u:
+        return "Hybrid 3D+2D Click-to-Draw, Gravity & Multi-Elasticity";
+    case 6u:
+        return "3D+2D Switchable Restitution Staircase & Bumper Lab";
+    default:
+        return "Default Sandbox (Switchable 3D / 2D / Hybrid)";
+    }
+}
+
+void world_apply_policy(void) {
+    switch (s_world_id) {
+    case 1u:
+        // World 1: 3D-only, click-to-draw (PERM_DRAW) enabled at boot, mode switching locked.
+        policy_apply_world(MODE_3D, PERM_DRAW, PERM_MODE_SWITCH, false);
+        break;
+    case 2u:
+        // World 2: 3D-only gravity & elastic non-cube solids, mode switching locked.
+        policy_apply_world(MODE_3D, PERM_NONE, PERM_MODE_SWITCH, false);
+        break;
+    case 3u:
+        // World 3: 2D-only gravity & deformable soft patches, mode switching locked.
+        policy_apply_world(MODE_2D, PERM_NONE, PERM_MODE_SWITCH, false);
+        (void)camera_snap_front();
+        camera_commit();
+        break;
+    case 4u:
+        // World 4: 2D-only with click-to-draw (PERM_DRAW) enabled at boot, mode switching locked.
+        policy_apply_world(MODE_2D, PERM_DRAW, PERM_MODE_SWITCH, false);
+        (void)camera_snap_front();
+        camera_commit();
+        break;
+    case 5u:
+        // World 5: Hybrid 3D+2D with click-to-draw enabled at boot, Tab mode switch allowed.
+        policy_apply_world(MODE_HYBRID, PERM_DRAW, PERM_NONE, false);
+        break;
+    case 6u:
+        // World 6: 3D+2D switchable restitution staircase & bumper lab, Tab mode switch allowed.
+        policy_apply_world(MODE_3D, PERM_NONE, PERM_NONE, false);
+        break;
+    default:
+        policy_boot();
+        break;
+    }
+    const WorkspacePolicy *pol = policy_active();
+    printf("[World] Active #%u: %s | Mode=%s (Tab switch=%s, click-draw=%s)\n",
+           s_world_id, world_selected_title(), pol->name,
+           policy_allows(PERM_MODE_SWITCH) ? "on" : "locked",
+           policy_allows(PERM_DRAW) ? "on" : "off");
+    fflush(stdout);
+}
 
 void world_removed_clear(void) {
     s_removed_n = 0;
@@ -56,6 +130,7 @@ static bool snap_removed(const WorldObj *o, WorldRemoved *out) {
     }
     if (o->ops == cube_ops()) {
         g.kind = k_removed_cube;
+        g.restitution = cube_kind_restitution(o);
     } else if (o->ops == solid_ops()) {
         const char *name = o->ops->name != nullptr ? o->ops->name(o) : nullptr;
         int kind = solid_kind_index(name);
@@ -64,6 +139,7 @@ static bool snap_removed(const WorldObj *o, WorldRemoved *out) {
         }
         g.kind = k_removed_solid;
         g.solid = kind;
+        g.restitution = solid_kind_restitution(o);
     } else if (o->ops == mesh_ops()) {
         g.kind = k_removed_mesh;
     } else {
@@ -177,24 +253,40 @@ bool world_click(float screen_x, float screen_y) {
             return true;
         }
     }
-    if (mode == MODE_2D) {
-        return false;
-    }
-    Coord hit = {0};
-    int index = table_pick(&ray, &hit, nullptr);
-    if (index >= 0) {
-        // A rejected select must not fall through into a face spawn.
-        if (!policy_allows(PERM_OBJ_SELECT)) {
-            return false;
+    if (mode != MODE_2D) {
+        Coord hit = {0};
+        int index = table_pick(&ray, &hit, nullptr);
+        if (index >= 0) {
+            // A rejected select must not fall through into a face spawn.
+            if (!policy_allows(PERM_OBJ_SELECT)) {
+                return false;
+            }
+            sheet_clear();
+            bool changed = table_select(index);
+            WorldObj *o = table_at(index);
+            if (o != nullptr && o->ops != nullptr && o->ops->on_click != nullptr &&
+                o->ops->on_click(o, hit)) {
+                changed = true;
+            }
+            return changed;
         }
-        sheet_clear();
-        bool changed = table_select(index);
-        WorldObj *o = table_at(index);
-        if (o != nullptr && o->ops != nullptr && o->ops->on_click != nullptr &&
-            o->ops->on_click(o, hit)) {
-            changed = true;
+    } else if (face_chain_count() == 0u) {
+        Coord hit = {0};
+        int index = table_pick(&ray, &hit, nullptr);
+        if (index >= 0) {
+            WorldObj *o = table_at(index);
+            if (o != nullptr && o->ops == face_ops()) {
+                if (!policy_allows(PERM_OBJ_SELECT)) {
+                    return false;
+                }
+                sheet_clear();
+                bool changed = table_select(index);
+                if (o->ops->on_click != nullptr && o->ops->on_click(o, hit)) {
+                    changed = true;
+                }
+                return changed;
+            }
         }
-        return changed;
     }
     Coord ground = {0};
     if (!coord_ground_hit(&ray, &ground, nullptr)) {
@@ -212,14 +304,6 @@ bool world_close_face(void) {
 
 bool world_cancel(void) {
     bool sheet = policy_mode() != MODE_3D && sheet_cancel();
-    if (policy_mode() == MODE_2D) {
-        if (!sheet) {
-            return false;
-        }
-        printf("[Sheet] Selection cleared.\n");
-        fflush(stdout);
-        return true;
-    }
     bool corners = face_chain_count() > 0u;
     bool selected = table_selected() != nullptr;
     face_cancel_chain();
@@ -268,7 +352,11 @@ bool world_delete(void) {
         return sheet_delete();
     }
     if (policy_mode() == MODE_2D) {
-        return false;
+        WorldObj *sel = table_selected();
+        if (sel != nullptr && sel->ops == face_ops() && delete_obj(sel)) {
+            return true;
+        }
+        return face_pop_corner();
     }
     if (delete_obj(table_selected())) {
         return true;
@@ -291,9 +379,9 @@ bool world_restore(void) {
     int before = table_count();
     bool ok = false;
     if (g.kind == k_removed_cube) {
-        ok = cube_kind_spawn_pose(g.at, g.yaw_milli, g.spinning, g.infinite, g.glow);
+        ok = cube_kind_spawn_elastic(g.at, g.yaw_milli, g.spinning, g.infinite, g.glow, g.restitution);
     } else if (g.kind == k_removed_solid) {
-        ok = solid_kind_place((uint32_t)g.solid, g.at, g.yaw_milli, g.spinning, g.infinite, g.glow);
+        ok = solid_kind_place_elastic((uint32_t)g.solid, g.at, g.yaw_milli, g.spinning, g.infinite, g.glow, g.restitution);
     } else if (g.kind == k_removed_mesh) {
         ok = mesh_kind_pose(g.yaw_milli, g.spinning, g.infinite, g.glow);
     }
@@ -393,7 +481,7 @@ bool world_toggle_smooth(void) {
 bool world_busy(void) {
     bool busy = camera_busy() || text_busy();
     if (policy_mode() == MODE_2D) {
-        busy = busy || plot_wants_frame() || sheet_busy();
+        busy = busy || plot_wants_frame() || sheet_busy() || face_chain_busy() || table_busy_ops(face_ops());
     } else {
         busy = busy || overlay_busy() || face_chain_busy() || solid_kind_smooth_dirty() || table_busy();
         if (policy_mode() == MODE_HYBRID) {
@@ -406,7 +494,7 @@ bool world_busy(void) {
 bool world_advance(uint32_t time_ms) {
     bool changed = text_busy();
     if (policy_mode() == MODE_2D) {
-        if (plot_wants_frame()) {
+        if (plot_wants_frame() || face_chain_busy() || table_advance_ops(time_ms, face_ops())) {
             changed = true;
         }
     } else if (table_advance(time_ms) || face_chain_busy() || solid_kind_smooth_dirty() || overlay_busy()) {
@@ -448,6 +536,9 @@ void world_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height, bool live)
     ground_draw(cmd, width, height);
     if (policy_mode() != MODE_2D) {
         table_draw(cmd, width, height, live);
+        face_draw_chain(cmd, width, height, live);
+    } else {
+        table_draw_ops(cmd, width, height, live, face_ops());
         face_draw_chain(cmd, width, height, live);
     }
     if (policy_mode() != MODE_3D) {

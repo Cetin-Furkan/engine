@@ -1,5 +1,6 @@
 #include <signal.h>
 #include <stdio.h>
+#include "engine/app.h"
 #include "system/system.h"
 #include "ring/ring.h"
 #include "wayland/wayland.h"
@@ -24,7 +25,18 @@ static void format_stage(int rc, char *buf, size_t buf_size) {
     }
 }
 
-int main(void) {
+int main(int argc, char **argv) {
+    const EngineApp *app = engine_app();
+    if (app != nullptr && app->configure != nullptr) {
+        int cfg_rc = app->configure(argc, argv);
+        if (cfg_rc > 0) {
+            return 0;
+        }
+        if (cfg_rc < 0) {
+            return 1;
+        }
+    }
+
     // Block before any subsystem starts a thread. Later threads inherit the
     // mask, so SIGINT, SIGTERM, and SIGHUP stay pending for the signalfd
     // instead of killing a driver thread.

@@ -11,6 +11,7 @@
 // 3D does not draw or step the sheet. 2D does not step the fillets or the lattice.
 
 void sheet_reset(void);
+void sheet_select_world(uint32_t world_id);
 
 // 0 loaded, 1 absent, -1 present but refused. A refused load keeps the
 // sheet already in memory.

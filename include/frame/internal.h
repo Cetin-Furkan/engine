@@ -66,7 +66,6 @@ enum : uint32_t {
 typedef struct FrameSlot {
     uint64_t              acquire_point;
     uint64_t              release_point;
-    VkSemaphore           release_semaphore;
     uint32_t              wl_buffer_id;
     uint32_t              release_timeline_id;
     // Bumped every time the slot is blanked or reaped. A SlotRef taken before
@@ -134,7 +133,9 @@ typedef struct FrameState {
     uint32_t resize_old_h;
     uint64_t resize_release;
     int      drm_fd;
+    uint32_t acquire_handle;
     VkSemaphore acquire;
+    VkSemaphore acquire_sync;
     VkQueryPool ts_pool;
     float    ts_period_ns;
     bool     sim_fixed;
@@ -233,16 +234,16 @@ void gpu_timer_harvest(VulkanContext *vk, FrameSlot *frame);
 
 bool wait_acquire_point(VulkanContext *vk, uint64_t point);
 bool acquire_point_retired(VulkanContext *vk, uint64_t point);
-bool poll_release_semaphore(VulkanContext *vk, VkSemaphore semaphore, uint64_t point);
+bool poll_release_handle(uint32_t handle, uint64_t point);
 int ensure_frame_targets(VulkanContext *vk, FrameSlot *frame);
 int record_and_submit_clear(VulkanContext *vk, FrameSlot *frame, VkSemaphore acquire,
                                    uint64_t signal_point, bool draw_live, uint32_t heat_dt);
-int export_semaphore_fd(VulkanContext *vk, VkSemaphore semaphore);
-int import_release_semaphore_fd(VulkanContext *vk, int syncobj_fd, VkSemaphore *out);
-int drm_syncobj_from_fd(int drm_fd, int syncobj_fd, uint32_t *out_handle);
+int open_drm_render_node(const VulkanContext *vk);
 int drm_syncobj_to_fd(int drm_fd, uint32_t handle);
 void drm_syncobj_destroy(int drm_fd, uint32_t *handle);
-int create_acquire_semaphore(VulkanContext *vk, VkSemaphore *out);
+int create_acquire_semaphore(VulkanContext *vk, VkSemaphore *out_timeline, VkSemaphore *out_sync);
+int create_acquire_timeline(WaylandContext *wl);
+int publish_acquire_point(VulkanContext *vk, uint64_t point);
 int arm_slot_read(RingContext *ring, uint32_t slot, bool fixed, int raw_fd,
                          uint32_t buf_index, uint64_t user_data);
 int prep_cancel_fd(RingContext *ring, int fd, uint32_t slot, bool fixed, uint64_t user_data);
@@ -250,8 +251,8 @@ int ensure_release_fd(RingContext *ring);
 int attach_release_eventfd(const FrameSlot *frame);
 int arm_release_read(RingContext *ring);
 int wait_gpu_release(RingContext *ring, WaylandContext *wl);
-int create_release_timeline(VulkanContext *vk, WaylandContext *wl, FrameSlot *frame);
-VkResult wait_own_release(VulkanContext *vk, FrameSlot *frame, uint64_t timeout_ns);
+int create_release_timeline(WaylandContext *wl, FrameSlot *frame);
+int wait_own_release(const FrameSlot *frame, uint64_t timeout_ns);
 void clear_pixels(FrameSlot *frame);
 bool slot_has_pixels(const FrameSlot *frame);
 [[nodiscard]] int ensure_prime_color(VulkanContext *vk, FrameSlot *frame);

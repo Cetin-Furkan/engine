@@ -1,0 +1,14 @@
+# World 6: 3D + 2D Switchable Restitution Staircase & Bumper Lab
+# Capability mask: MODE_3D at boot, PERM_MODE_SWITCH open (Tab switches 3D / 2D / Hybrid).
+# Side-by-side restitution comparison from heavy inelastic (0.14) to super-elastic (0.92).
+ground z
+smooth 1
+solid Cylinder -550 140 520 yaw 0 spin 1 inf 0 glow 0 bounce 0.14
+solid Tetrahedron -330 140 520 yaw 15000 spin 1 inf 0 glow 0 bounce 0.32
+solid Cone -110 140 520 yaw 30000 spin 1 inf 0 glow 0 bounce 0.50
+solid Octahedron 110 140 520 yaw 45000 spin 1 inf 1 glow 0 bounce 0.68
+solid Torus 330 140 520 yaw 60000 spin 1 inf 1 glow 1 bounce 0.82
+solid Icosahedron 550 140 520 yaw 75000 spin 1 inf 1 glow 1 bounce 0.92
+cube -380 -210 520 yaw 38000 spin 1 inf 0 glow 0 bounce 0.20
+cube 0 -210 520 yaw 38000 spin 1 inf 0 glow 0 bounce 0.58
+cube 380 -210 520 yaw 38000 spin 1 inf 0 glow 1 bounce 0.88

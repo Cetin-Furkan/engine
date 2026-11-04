@@ -25,6 +25,13 @@
 // Each cube's colors crawl one hue turn per revolution on those same stamps,
 // then hold. The sweep does not arm a frame by itself.
 
+enum : uint32_t { k_world_preset_max = 6u };
+
+void world_select(uint32_t world_id);
+uint32_t world_selected_id(void);
+const char *world_selected_title(void);
+void world_apply_policy(void);
+
 void world_reset(void);
 
 // Place what examples/demo/world/live.world names when that file exists,

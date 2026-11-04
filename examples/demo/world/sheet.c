@@ -16,12 +16,13 @@
 
 enum : uint32_t {
     k_rigid_cap = 16u,
-    k_soft_cap  = 2u,
-    k_dyn_cap   = 8u,
+    k_soft_cap  = 4u,
+    k_dyn_cap   = 12u,
     k_soft_side = 8u,
     k_soft_pts  = 64u,
     k_dyn_verts = 12u,
     k_passes    = 4u,
+    k_poly_cap  = k_rigid_cap + k_dyn_cap,
 };
 
 static const float k_deg       = 0.017453292519943295f;
@@ -54,6 +55,8 @@ static const char *k_seed =
 typedef struct Rigid {
     float x, y, hx, hy, yaw;
     float vx, vy;
+    float bounce;
+    bool  fixed;
     bool  alive;
     bool  awake;
 } Rigid;
@@ -66,6 +69,9 @@ typedef struct Soft {
     float    rx[k_soft_pts];
     float    ry[k_soft_pts];
     float    ox, oy, spacing;
+    float    spring;
+    float    damp;
+    float    bounce;
     uint32_t cols, rows;
     bool     alive;
     bool     awake;
@@ -76,6 +82,7 @@ typedef struct Dyn {
     float    ly[k_dyn_verts];
     float    x, y, yaw;
     float    vx, vy;
+    float    bounce;
     uint32_t n;
     bool     alive;
     bool     awake;
@@ -85,6 +92,10 @@ typedef struct Sheet {
     Rigid rigid[k_rigid_cap];
     Soft  soft[k_soft_cap];
     Dyn   dyn[k_dyn_cap];
+    float gx, gy;
+    float bound_x, bound_y;
+    bool  has_gravity;
+    bool  has_bounds;
 } Sheet;
 
 typedef struct Poly {
@@ -95,13 +106,16 @@ typedef struct Poly {
     float   *cy;
     float   *vx;
     float   *vy;
+    float    bounce;
+    bool     fixed;
     bool    *awake;
 } Poly;
 
 enum : int { k_sel_none = 0, k_sel_rigid = 1, k_sel_soft = 2, k_sel_dyn = 3 };
 
-static Sheet   s_sheet;
-static bool    s_hold_save = false;
+static Sheet    s_sheet;
+static uint32_t s_world_id = 0;
+static bool     s_hold_save = false;
 static bool    s_ready = false;
 static bool    s_moved = false;
 static bool    s_drew  = false;
@@ -202,7 +216,18 @@ static uint32_t count_alive_dyn(const Sheet *s) {
     return n;
 }
 
-static int add_rigid(Sheet *s, float x, float y, float hx, float hy, float yaw_deg) {
+static float clamp_bounce(float b) {
+    if (!isfinite(b) || b < 0.0f) {
+        return 0.0f;
+    }
+    if (b > 0.95f) {
+        return 0.95f;
+    }
+    return b;
+}
+
+static int add_rigid(Sheet *s, float x, float y, float hx, float hy, float yaw_deg,
+                     float bounce, bool fixed) {
     if (!finite2(x, y) || !isfinite(hx) || !isfinite(hy) || !isfinite(yaw_deg) ||
         hx < 1.0f || hy < 1.0f || hx > 4000.0f || hy > 4000.0f) {
         return -1;
@@ -212,17 +237,27 @@ static int add_rigid(Sheet *s, float x, float y, float hx, float hy, float yaw_d
             continue;
         }
         s->rigid[i] = (Rigid){
-            .x = x, .y = y, .hx = hx, .hy = hy, .yaw = yaw_deg * k_deg,
-            .alive = true,
+            .x      = x,
+            .y      = y,
+            .hx     = hx,
+            .hy     = hy,
+            .yaw    = yaw_deg * k_deg,
+            .bounce = clamp_bounce(bounce),
+            .fixed  = fixed,
+            .alive  = true,
+            .awake  = s->has_gravity && !fixed,
         };
         return 0;
     }
     return -1;
 }
 
-static int add_soft(Sheet *s, float x, float y, uint32_t cols, uint32_t rows, float spacing) {
+static int add_soft(Sheet *s, float x, float y, uint32_t cols, uint32_t rows, float spacing,
+                    float spring, float damp, float bounce) {
     if (!finite2(x, y) || !isfinite(spacing) || cols < 2u || rows < 2u ||
-        cols > k_soft_side || rows > k_soft_side || spacing < 4.0f || spacing > 400.0f) {
+        cols > k_soft_side || rows > k_soft_side || spacing < 4.0f || spacing > 400.0f ||
+        !isfinite(spring) || !isfinite(damp) || spring < 2.0f || spring > 600.0f ||
+        damp < 0.1f || damp > 20.0f) {
         return -1;
     }
     for (uint32_t i = 0; i < k_soft_cap; ++i) {
@@ -236,7 +271,11 @@ static int add_soft(Sheet *s, float x, float y, uint32_t cols, uint32_t rows, fl
         p->cols = cols;
         p->rows = rows;
         p->spacing = spacing;
+        p->spring = spring;
+        p->damp = damp;
+        p->bounce = clamp_bounce(bounce);
         p->alive = true;
+        p->awake = s->has_gravity;
         for (uint32_t r = 0; r < rows; ++r) {
             for (uint32_t c = 0; c < cols; ++c) {
                 uint32_t k = r * cols + c;
@@ -278,7 +317,7 @@ static bool poly_convex(const float *x, const float *y, uint32_t n) {
 }
 
 static int add_dyn(Sheet *s, float x, float y, float yaw_deg, uint32_t n,
-                   const float *lx, const float *ly) {
+                   const float *lx, const float *ly, float bounce) {
     if (!finite2(x, y) || !isfinite(yaw_deg) || n < 3u || n > k_dyn_verts) {
         return -1;
     }
@@ -309,8 +348,10 @@ static int add_dyn(Sheet *s, float x, float y, float yaw_deg, uint32_t n,
         d->x = x;
         d->y = y;
         d->yaw = yaw_deg * k_deg;
+        d->bounce = clamp_bounce(bounce);
         d->n = n;
         d->alive = true;
+        d->awake = s->has_gravity;
         memcpy(d->lx, tx, (size_t)n * sizeof(float));
         memcpy(d->ly, ty, (size_t)n * sizeof(float));
         return 0;
@@ -328,6 +369,7 @@ static int parse_sheet(Sheet *dst, const char *text, size_t len, const char *nam
     float dx = 0.0f;
     float dy = 0.0f;
     float dyaw = 0.0f;
+    float dbounce = 0.0f;
     int number = 0;
     const char *cursor = text;
     const char *end = text + len;
@@ -361,37 +403,74 @@ static int parse_sheet(Sheet *dst, const char *text, size_t len, const char *nam
                 have++;
                 left--;
                 if (left == 0u) {
-                    if (add_dyn(dst, dx, dy, dyaw, have, lx, ly) != 0) {
+                    if (add_dyn(dst, dx, dy, dyaw, have, lx, ly, dbounce) != 0) {
                         fprintf(stderr, "[Sheet] %s:%d shape was refused\n", name, number);
                         return -1;
                     }
                     pending = false;
                 }
-            } else if (strncmp(p, "rigid", 5) == 0) {
-                float x = 0, y = 0, hx = 0, hy = 0, yaw = 0;
+            } else if (strncmp(p, "gravity", 7) == 0) {
+                float gx = 0.0f;
+                float gy = 0.0f;
                 char tail = 0;
-                if (sscanf(p, "rigid %f %f %f %f %f %c", &x, &y, &hx, &hy, &yaw, &tail) != 5 ||
-                    add_rigid(dst, x, y, hx, hy, yaw) != 0) {
-                    fprintf(stderr, "[Sheet] %s:%d rigid needs x y hx hy yaw\n", name, number);
+                if (sscanf(p, "gravity %f %f %c", &gx, &gy, &tail) != 2 || !finite2(gx, gy) ||
+                    fabsf(gx) > 5000.0f || fabsf(gy) > 5000.0f) {
+                    fprintf(stderr, "[Sheet] %s:%d gravity needs gx gy\n", name, number);
+                    return -1;
+                }
+                dst->gx = gx;
+                dst->gy = gy;
+                dst->has_gravity = (fabsf(gx) > 1.0e-3f || fabsf(gy) > 1.0e-3f);
+            } else if (strncmp(p, "bounds", 6) == 0) {
+                float bx = 0.0f;
+                float by = 0.0f;
+                char tail = 0;
+                if (sscanf(p, "bounds %f %f %c", &bx, &by, &tail) != 2 || !finite2(bx, by) ||
+                    bx < 80.0f || by < 80.0f || bx > 4000.0f || by > 4000.0f) {
+                    fprintf(stderr, "[Sheet] %s:%d bounds needs hx hy\n", name, number);
+                    return -1;
+                }
+                dst->bound_x = bx;
+                dst->bound_y = by;
+                dst->has_bounds = true;
+            } else if (strncmp(p, "rigid", 5) == 0) {
+                float x = 0, y = 0, hx = 0, hy = 0, yaw = 0, bounce = 0;
+                int fixed = 0;
+                char tail = 0;
+                int got = sscanf(p, "rigid %f %f %f %f %f %f %d %c",
+                                 &x, &y, &hx, &hy, &yaw, &bounce, &fixed, &tail);
+                if ((got != 5 && got != 6 && got != 7) ||
+                    (got == 7 && fixed != 0 && fixed != 1) ||
+                    add_rigid(dst, x, y, hx, hy, yaw, got >= 6 ? bounce : 0.0f,
+                              got == 7 && fixed != 0) != 0) {
+                    fprintf(stderr, "[Sheet] %s:%d rigid needs x y hx hy yaw [bounce [fixed]]\n", name, number);
                     return -1;
                 }
             } else if (strncmp(p, "soft", 4) == 0) {
                 float x = 0, y = 0, spacing = 0;
+                float spring = k_spring, damp = k_soft_damp, bounce = 0.45f;
                 unsigned cols = 0, rows = 0;
                 char tail = 0;
-                if (sscanf(p, "soft %f %f %u %u %f %c", &x, &y, &cols, &rows, &spacing, &tail) != 5 ||
-                    add_soft(dst, x, y, cols, rows, spacing) != 0) {
-                    fprintf(stderr, "[Sheet] %s:%d soft needs x y cols rows spacing\n", name, number);
+                int got = sscanf(p, "soft %f %f %u %u %f %f %f %f %c",
+                                 &x, &y, &cols, &rows, &spacing, &spring, &damp, &bounce, &tail);
+                if ((got != 5 && got != 7 && got != 8) ||
+                    add_soft(dst, x, y, cols, rows, spacing,
+                             got >= 7 ? spring : k_spring,
+                             got >= 7 ? damp : k_soft_damp,
+                             got == 8 ? bounce : 0.45f) != 0) {
+                    fprintf(stderr, "[Sheet] %s:%d soft needs x y cols rows spacing [spring damp [bounce]]\n", name, number);
                     return -1;
                 }
             } else if (strncmp(p, "dyn", 3) == 0) {
                 unsigned n = 0;
+                float bounce = 0.0f;
                 char tail = 0;
-                if (sscanf(p, "dyn %f %f %f %u %c", &dx, &dy, &dyaw, &n, &tail) != 4 ||
-                    n < 3u || n > k_dyn_verts) {
-                    fprintf(stderr, "[Sheet] %s:%d dyn needs x y yaw n\n", name, number);
+                int got = sscanf(p, "dyn %f %f %f %u %f %c", &dx, &dy, &dyaw, &n, &bounce, &tail);
+                if ((got != 4 && got != 5) || n < 3u || n > k_dyn_verts) {
+                    fprintf(stderr, "[Sheet] %s:%d dyn needs x y yaw n [bounce]\n", name, number);
                     return -1;
                 }
+                dbounce = (got == 5) ? bounce : 0.0f;
                 pending = true;
                 left = n;
                 have = 0;
@@ -623,8 +702,100 @@ int sheet_save_path(const char *path) {
     return write_all(path, body, used);
 }
 
+static const char *k_preset_sheets[6] = {
+    // World 1 (3D only; minimal sheet if inspected)
+    "rigid -220 80 90 50 0\n"
+    "rigid 220 80 90 50 18\n"
+    "soft 0 -180 6 4 36\n",
+    // World 2 (3D only; minimal sheet if inspected)
+    "rigid -220 80 90 50 0\n"
+    "soft 0 -180 6 4 36\n",
+    // World 3: 2D Only - Gravity + 3 Soft Bodies (Jelly, Medium, Stiff) + 5 Elastic Polygons
+    "gravity 0 -680\n"
+    "bounds 580 310\n"
+    "rigid -330 -120 110 18 -16 0.75 1\n"
+    "rigid 330 -120 110 18 16 0.75 1\n"
+    "rigid 0 -285 520 16 0 0.82 1\n"
+    "soft -340 150 5 4 32 22 1.0 0.78\n"
+    "soft 0 180 6 4 32 58 1.8 0.65\n"
+    "soft 340 150 5 4 32 145 2.7 0.90\n"
+    "dyn -180 250 12 6 0.92\n"
+    "42 0\n21 36\n-21 36\n-42 0\n-21 -36\n21 -36\n"
+    "dyn 180 250 -15 5 0.82\n"
+    "44 0\n14 42\n-36 26\n-36 -26\n14 -42\n"
+    "dyn -80 90 8 4 0.58\n"
+    "46 0\n0 38\n-46 0\n0 -38\n"
+    "dyn 90 90 -10 3 0.28\n"
+    "44 -28\n0 46\n-44 -28\n",
+    // World 4: 2D Only - Click-to-Draw Polygon Workshop + Elastic Soft/Polygon Ring
+    "bounds 600 320\n"
+    "rigid -460 0 28 150 0 0.88 1\n"
+    "rigid 460 0 28 150 0 0.88 1\n"
+    "soft -280 -190 5 4 32 26 1.2 0.80\n"
+    "soft 280 -190 5 4 32 130 2.4 0.88\n"
+    "dyn -280 190 0 6 0.90\n"
+    "44 0\n22 38\n-22 38\n-44 0\n-22 -38\n22 -38\n"
+    "dyn 0 220 0 5 0.65\n"
+    "42 0\n13 40\n-34 25\n-34 -25\n13 -40\n"
+    "dyn 280 190 0 3 0.25\n"
+    "46 -30\n0 48\n-46 -30\n",
+    // World 5: Hybrid (3D + 2D) - Click-to-Draw + Deformable Soft Patches + Elastic Shapes
+    "bounds 600 320\n"
+    "rigid -380 90 80 42 15 0.80 0\n"
+    "rigid 380 90 80 42 -15 0.80 0\n"
+    "soft -220 -200 6 4 34 28 1.2 0.82\n"
+    "soft 220 -200 6 4 34 125 2.4 0.88\n"
+    "dyn -180 240 0 6 0.90\n"
+    "44 0\n22 38\n-22 38\n-44 0\n-22 -38\n22 -38\n"
+    "dyn 180 240 0 5 0.68\n"
+    "44 0\n14 42\n-36 26\n-36 -26\n14 -42\n"
+    "dyn 0 -60 0 4 0.35\n"
+    "48 0\n0 40\n-48 0\n0 -36\n",
+    // World 6: Elastic Collision & Restitution Lab (2D Bumper Arena)
+    "bounds 600 320\n"
+    "rigid 0 -290 540 16 0 0.92 1\n"
+    "rigid 0 290 540 16 0 0.92 1\n"
+    "rigid -560 0 16 260 0 0.92 1\n"
+    "rigid 560 0 16 260 0 0.92 1\n"
+    "soft -330 -120 5 4 32 24 1.1 0.85\n"
+    "soft 0 -120 5 4 32 64 1.8 0.85\n"
+    "soft 330 -120 5 4 32 150 2.6 0.92\n"
+    "dyn -380 140 0 6 0.94\n"
+    "40 0\n20 35\n-20 35\n-40 0\n-20 -35\n20 -35\n"
+    "dyn -190 140 0 6 0.78\n"
+    "40 0\n20 35\n-20 35\n-40 0\n-20 -35\n20 -35\n"
+    "dyn 0 140 0 5 0.58\n"
+    "42 0\n13 40\n-34 25\n-34 -25\n13 -40\n"
+    "dyn 190 140 0 4 0.36\n"
+    "44 0\n0 38\n-44 0\n0 -38\n"
+    "dyn 380 140 0 3 0.15\n"
+    "44 -28\n0 46\n-44 -28\n",
+};
+
+void sheet_select_world(uint32_t world_id) {
+    s_world_id = world_id <= 6u ? world_id : 0u;
+}
+
 int sheet_load(void) {
     char path[1024];
+    if (s_world_id >= 1u && s_world_id <= 6u) {
+        char rel[64];
+        char rel_old[64];
+        snprintf(rel, sizeof rel, "examples/demo/world/sheet%u.world", s_world_id);
+        snprintf(rel_old, sizeof rel_old, "world/sheet%u.world", s_world_id);
+        if (resolve_file(rel, path, sizeof path) || resolve_file(rel_old, path, sizeof path)) {
+            int doc = sheet_load_path(path);
+            if (doc == 0) {
+                return 0;
+            }
+        }
+        const char *preset = k_preset_sheets[s_world_id - 1u];
+        if (sheet_load_memory(preset, strlen(preset)) != 0) {
+            return -1;
+        }
+        note_loaded(rel);
+        return 0;
+    }
     if (sibling("sheet.live", path, sizeof path)) {
         int live = sheet_load_path(path);
         if (live == 0) {
@@ -650,7 +821,7 @@ void sheet_hold_save(bool hold) {
 }
 
 int sheet_save(void) {
-    if (s_hold_save) {
+    if (s_hold_save || s_world_id != 0u) {
         return 0;
     }
     char path[1024];
@@ -662,6 +833,9 @@ int sheet_save(void) {
 }
 
 bool sheet_reload(void) {
+    if (s_world_id >= 1u && s_world_id <= 6u) {
+        return sheet_load() == 0;
+    }
     char path[1024];
     if (!resolve_file(k_doc, path, sizeof path) && !resolve_file(k_doc_old, path, sizeof path)) {
         fprintf(stderr, "[Sheet] sheet.world is not there to read again.\n");
@@ -784,7 +958,7 @@ static bool sat_hit(const Poly *a, const Poly *b, float *nx, float *ny, float *p
 
 static uint32_t gather(Poly *out) {
     uint32_t n = 0;
-    for (uint32_t i = 0; i < k_rigid_cap && n < 24u; ++i) {
+    for (uint32_t i = 0; i < k_rigid_cap && n < k_poly_cap; ++i) {
         Rigid *b = &s_sheet.rigid[i];
         if (!b->alive) {
             continue;
@@ -797,9 +971,11 @@ static uint32_t gather(Poly *out) {
         p->cy = &b->y;
         p->vx = &b->vx;
         p->vy = &b->vy;
+        p->bounce = b->bounce;
+        p->fixed = b->fixed;
         p->awake = &b->awake;
     }
-    for (uint32_t i = 0; i < k_dyn_cap && n < 24u; ++i) {
+    for (uint32_t i = 0; i < k_dyn_cap && n < k_poly_cap; ++i) {
         Dyn *d = &s_sheet.dyn[i];
         if (!d->alive) {
             continue;
@@ -812,16 +988,49 @@ static uint32_t gather(Poly *out) {
         p->cy = &d->y;
         p->vx = &d->vx;
         p->vy = &d->vy;
+        p->bounce = d->bounce;
+        p->fixed = false;
         p->awake = &d->awake;
     }
     return n;
 }
 
 static void separate(Poly *a, Poly *b) {
+    if (a->fixed && b->fixed) {
+        return;
+    }
     float nx = 0.0f;
     float ny = 0.0f;
     float pen = 0.0f;
     if (!sat_hit(a, b, &nx, &ny, &pen)) {
+        return;
+    }
+    float va = *a->vx * nx + *a->vy * ny;
+    float vb = *b->vx * nx + *b->vy * ny;
+    float vrel = vb - va;
+    float e = clamp_bounce(0.5f * (a->bounce + b->bounce));
+    if (a->fixed) {
+        *b->cx += nx * pen;
+        *b->cy += ny * pen;
+        if (vrel < 0.0f) {
+            float imp = -(1.0f + e) * vrel;
+            *b->vx += imp * nx;
+            *b->vy += imp * ny;
+        }
+        *b->awake = true;
+        mark_moved();
+        return;
+    }
+    if (b->fixed) {
+        *a->cx -= nx * pen;
+        *a->cy -= ny * pen;
+        if (vrel < 0.0f) {
+            float imp = -(1.0f + e) * vrel;
+            *a->vx -= imp * nx;
+            *a->vy -= imp * ny;
+        }
+        *a->awake = true;
+        mark_moved();
         return;
     }
     float half = pen * 0.5f;
@@ -829,14 +1038,12 @@ static void separate(Poly *a, Poly *b) {
     *a->cy -= ny * half;
     *b->cx += nx * half;
     *b->cy += ny * half;
-    float va = *a->vx * nx + *a->vy * ny;
-    float vb = *b->vx * nx + *b->vy * ny;
-    if (vb - va < 0.0f) {
-        float avg = 0.5f * (va + vb);
-        *a->vx += (avg - va) * nx;
-        *a->vy += (avg - va) * ny;
-        *b->vx += (avg - vb) * nx;
-        *b->vy += (avg - vb) * ny;
+    if (vrel < 0.0f) {
+        float j = -(1.0f + e) * vrel * 0.5f;
+        *a->vx -= j * nx;
+        *a->vy -= j * ny;
+        *b->vx += j * nx;
+        *b->vy += j * ny;
     }
     *a->awake = true;
     *b->awake = true;
@@ -862,7 +1069,8 @@ static void spring_pair(Soft *p, uint32_t a, uint32_t b, float rest, float *fx, 
     float ux = dx / len;
     float uy = dy / len;
     float vrel = (p->vx[b] - p->vx[a]) * ux + (p->vy[b] - p->vy[a]) * uy;
-    float f = k_spring * (len - rest) + k_rel * vrel;
+    float k = p->spring > 0.0f ? p->spring : k_spring;
+    float f = k * (len - rest) + k_rel * vrel;
     fx[a] += f * ux;
     fy[a] += f * uy;
     fx[b] -= f * ux;
@@ -918,7 +1126,7 @@ static float soft_strain(const Soft *p) {
 
 static void push_soft_out(Soft *p) {
     uint32_t n = p->cols * p->rows;
-    Poly solids[24];
+    Poly solids[k_poly_cap];
     uint32_t sn = gather(solids);
     for (uint32_t k = 0; k < n; ++k) {
         for (uint32_t s = 0; s < sn; ++s) {
@@ -952,8 +1160,9 @@ static void push_soft_out(Soft *p) {
                 p->y[k] += ny * (best + k_slop);
                 float vn = p->vx[k] * nx + p->vy[k] * ny;
                 if (vn < 0.0f) {
-                    p->vx[k] -= vn * nx;
-                    p->vy[k] -= vn * ny;
+                    float reb = (-vn > k_sleep * 2.5f) ? clamp_bounce(0.5f * (p->bounce + poly->bounce)) : 0.0f;
+                    p->vx[k] -= (1.0f + reb) * vn * nx;
+                    p->vy[k] -= (1.0f + reb) * vn * ny;
                 }
                 p->awake = true;
                 mark_moved();
@@ -962,14 +1171,112 @@ static void push_soft_out(Soft *p) {
     }
 }
 
+static void clamp_bounds(void) {
+    if (!s_sheet.has_bounds) {
+        return;
+    }
+    float bx = s_sheet.bound_x;
+    float by = s_sheet.bound_y;
+    for (uint32_t i = 0; i < k_rigid_cap; ++i) {
+        Rigid *b = &s_sheet.rigid[i];
+        if (!b->alive || !b->awake || b->fixed) {
+            continue;
+        }
+        float vx[4];
+        float vy[4];
+        box_verts(b, vx, vy);
+        float rx = 0.0f, ry = 0.0f;
+        for (uint32_t v = 0; v < 4u; ++v) {
+            if (fabsf(vx[v] - b->x) > rx) rx = fabsf(vx[v] - b->x);
+            if (fabsf(vy[v] - b->y) > ry) ry = fabsf(vy[v] - b->y);
+        }
+        float e = b->bounce;
+        if (b->x - rx < -bx) {
+            b->x = -bx + rx;
+            if (b->vx < 0.0f) b->vx = (-b->vx > k_sleep * 2.5f) ? -b->vx * e : 0.0f;
+        } else if (b->x + rx > bx) {
+            b->x = bx - rx;
+            if (b->vx > 0.0f) b->vx = (b->vx > k_sleep * 2.5f) ? -b->vx * e : 0.0f;
+        }
+        if (b->y - ry < -by) {
+            b->y = -by + ry;
+            if (b->vy < 0.0f) b->vy = (-b->vy > k_sleep * 2.5f) ? -b->vy * e : 0.0f;
+        } else if (b->y + ry > by) {
+            b->y = by - ry;
+            if (b->vy > 0.0f) b->vy = (b->vy > k_sleep * 2.5f) ? -b->vy * e : 0.0f;
+        }
+    }
+    for (uint32_t i = 0; i < k_dyn_cap; ++i) {
+        Dyn *d = &s_sheet.dyn[i];
+        if (!d->alive || !d->awake) {
+            continue;
+        }
+        float vx[k_dyn_verts];
+        float vy[k_dyn_verts];
+        dyn_verts(d, vx, vy);
+        float min_x = vx[0], max_x = vx[0], min_y = vy[0], max_y = vy[0];
+        for (uint32_t v = 1; v < d->n; ++v) {
+            if (vx[v] < min_x) min_x = vx[v];
+            if (vx[v] > max_x) max_x = vx[v];
+            if (vy[v] < min_y) min_y = vy[v];
+            if (vy[v] > max_y) max_y = vy[v];
+        }
+        float e = d->bounce;
+        if (min_x < -bx) {
+            d->x += (-bx - min_x);
+            if (d->vx < 0.0f) d->vx = (-d->vx > k_sleep * 2.5f) ? -d->vx * e : 0.0f;
+        } else if (max_x > bx) {
+            d->x -= (max_x - bx);
+            if (d->vx > 0.0f) d->vx = (d->vx > k_sleep * 2.5f) ? -d->vx * e : 0.0f;
+        }
+        if (min_y < -by) {
+            d->y += (-by - min_y);
+            if (d->vy < 0.0f) d->vy = (-d->vy > k_sleep * 2.5f) ? -d->vy * e : 0.0f;
+        } else if (max_y > by) {
+            d->y -= (max_y - by);
+            if (d->vy > 0.0f) d->vy = (d->vy > k_sleep * 2.5f) ? -d->vy * e : 0.0f;
+        }
+    }
+    for (uint32_t i = 0; i < k_soft_cap; ++i) {
+        Soft *p = &s_sheet.soft[i];
+        if (!p->alive || !p->awake) {
+            continue;
+        }
+        uint32_t count = p->cols * p->rows;
+        float e = p->bounce;
+        for (uint32_t k = 0; k < count; ++k) {
+            if (p->x[k] < -bx) {
+                p->x[k] = -bx;
+                if (p->vx[k] < 0.0f) p->vx[k] = (-p->vx[k] > k_sleep * 2.5f) ? -p->vx[k] * e : 0.0f;
+            } else if (p->x[k] > bx) {
+                p->x[k] = bx;
+                if (p->vx[k] > 0.0f) p->vx[k] = (p->vx[k] > k_sleep * 2.5f) ? -p->vx[k] * e : 0.0f;
+            }
+            if (p->y[k] < -by) {
+                p->y[k] = -by;
+                if (p->vy[k] < 0.0f) p->vy[k] = (-p->vy[k] > k_sleep * 2.5f) ? -p->vy[k] * e : 0.0f;
+            } else if (p->y[k] > by) {
+                p->y[k] = by;
+                if (p->vy[k] > 0.0f) p->vy[k] = (p->vy[k] > k_sleep * 2.5f) ? -p->vy[k] * e : 0.0f;
+            }
+        }
+    }
+}
+
 static bool any_hot(void) {
-    Poly solids[24];
+    Poly solids[k_poly_cap];
     uint32_t n = gather(solids);
     for (uint32_t i = 0; i < n; ++i) {
+        if (solids[i].fixed) {
+            continue;
+        }
         if (hypotf(*solids[i].vx, *solids[i].vy) >= k_sleep) {
             return true;
         }
         for (uint32_t j = i + 1u; j < n; ++j) {
+            if (solids[i].fixed && solids[j].fixed) {
+                continue;
+            }
             float nx, ny, pen;
             if (sat_hit(&solids[i], &solids[j], &nx, &ny, &pen)) {
                 return true;
@@ -987,7 +1294,7 @@ static bool any_hot(void) {
                 return true;
             }
         }
-        if (soft_strain(p) > k_strain) {
+        if (!s_sheet.has_gravity && soft_strain(p) > k_strain) {
             return true;
         }
     }
@@ -1024,14 +1331,15 @@ bool sheet_integrate(float dt) {
         return sheet_busy();
     }
     float damp = expf(-k_damp * dt);
-    float sd = expf(-k_soft_damp * dt);
+    float gx = s_sheet.has_gravity ? s_sheet.gx : 0.0f;
+    float gy = s_sheet.has_gravity ? s_sheet.gy : 0.0f;
     for (uint32_t i = 0; i < k_rigid_cap; ++i) {
         Rigid *b = &s_sheet.rigid[i];
-        if (!b->alive || !b->awake) {
+        if (!b->alive || !b->awake || b->fixed) {
             continue;
         }
-        b->vx *= damp;
-        b->vy *= damp;
+        b->vx = (b->vx + gx * dt) * damp;
+        b->vy = (b->vy + gy * dt) * damp;
         cap_speed(&b->vx, &b->vy);
         b->x += b->vx * dt;
         b->y += b->vy * dt;
@@ -1042,8 +1350,8 @@ bool sheet_integrate(float dt) {
         if (!d->alive || !d->awake) {
             continue;
         }
-        d->vx *= damp;
-        d->vy *= damp;
+        d->vx = (d->vx + gx * dt) * damp;
+        d->vy = (d->vy + gy * dt) * damp;
         cap_speed(&d->vx, &d->vy);
         d->x += d->vx * dt;
         d->y += d->vy * dt;
@@ -1054,6 +1362,7 @@ bool sheet_integrate(float dt) {
         if (!p->alive || !p->awake) {
             continue;
         }
+        float sd = expf(-(p->damp > 0.0f ? p->damp : k_soft_damp) * dt);
         float fx[k_soft_pts];
         float fy[k_soft_pts];
         uint32_t count = p->cols * p->rows;
@@ -1078,8 +1387,8 @@ bool sheet_integrate(float dt) {
             }
         }
         for (uint32_t k = 0; k < count; ++k) {
-            p->vx[k] = (p->vx[k] + fx[k] * dt) * sd;
-            p->vy[k] = (p->vy[k] + fy[k] * dt) * sd;
+            p->vx[k] = (p->vx[k] + (fx[k] + gx) * dt) * sd;
+            p->vy[k] = (p->vy[k] + (fy[k] + gy) * dt) * sd;
             cap_speed(&p->vx[k], &p->vy[k]);
             p->x[k] += p->vx[k] * dt;
             p->y[k] += p->vy[k] * dt;
@@ -1092,20 +1401,23 @@ bool sheet_integrate(float dt) {
         }
         mark_moved();
     }
+    clamp_bounds();
     for (uint32_t pass = 0; pass < k_passes; ++pass) {
-        Poly solids[24];
+        Poly solids[k_poly_cap];
         uint32_t n = gather(solids);
         for (uint32_t i = 0; i < n; ++i) {
             for (uint32_t j = i + 1u; j < n; ++j) {
                 separate(&solids[i], &solids[j]);
             }
         }
+        clamp_bounds();
     }
     for (uint32_t i = 0; i < k_soft_cap; ++i) {
         if (s_sheet.soft[i].alive) {
             push_soft_out(&s_sheet.soft[i]);
         }
     }
+    clamp_bounds();
     fall_asleep();
     return sheet_busy();
 }
@@ -1180,6 +1492,9 @@ static void shove_linear(float *vx, float *vy, float cx, float cy, float hx, flo
     }
     *vx += dx / len * k_shove;
     *vy += dy / len * k_shove;
+    if (s_sheet.has_gravity && s_sheet.gy < 0.0f) {
+        *vy += 420.0f;
+    }
 }
 
 static bool click_rigid(float x, float y) {
@@ -1194,8 +1509,10 @@ static bool click_rigid(float x, float y) {
         if (fabsf(lx) <= b->hx && fabsf(ly) <= b->hy) {
             s_sel = k_sel_rigid;
             s_sel_i = i;
-            shove_linear(&b->vx, &b->vy, b->x, b->y, x, y);
-            b->awake = true;
+            if (!b->fixed) {
+                shove_linear(&b->vx, &b->vy, b->x, b->y, x, y);
+                b->awake = true;
+            }
             mark_moved();
             return true;
         }
@@ -1283,6 +1600,14 @@ static bool click_soft(float x, float y) {
         }
         p->vx[k] += dx / len * scale;
         p->vy[k] += dy / len * scale;
+        if (s_sheet.has_gravity && s_sheet.gy < 0.0f) {
+            p->vy[k] += 460.0f;
+        }
+    }
+    if (s_sheet.has_gravity && s_sheet.gy < 0.0f) {
+        for (uint32_t k = 0; k < count; ++k) {
+            p->vy[k] += 220.0f;
+        }
     }
     p->awake = true;
     mark_moved();
@@ -1371,8 +1696,11 @@ void sheet_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height) {
         }
         float x[4] = { b->x - b->hx, b->x + b->hx, b->x + b->hx, b->x - b->hx };
         float y[4] = { b->y - b->hy, b->y - b->hy, b->y + b->hy, b->y + b->hy };
+        float fr = b->fixed ? 0.34f : (0.22f - 0.04f * b->bounce);
+        float fg = b->fixed ? 0.41f : (0.48f + 0.22f * b->bounce);
+        float fb = b->fixed ? 0.52f : (0.78f + 0.12f * b->bounce);
         paint(cmd, width, height, x, y, 4, quad, 2, b->x, b->y, b->yaw,
-              0.22f, 0.48f, 0.78f, selected_rigid(i));
+              fr, fg, fb, selected_rigid(i));
     }
     for (uint32_t i = 0; i < k_soft_cap; ++i) {
         const Soft *p = &s_sheet.soft[i];
@@ -1380,6 +1708,18 @@ void sheet_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height) {
             continue;
         }
         bool hot = selected_soft(i);
+        float fr = 0.30f;
+        float fg = 0.62f;
+        float fb = 0.38f;
+        if (p->spring > 0.0f && p->spring < 35.0f) {
+            fr = 0.86f;
+            fg = 0.52f;
+            fb = 0.26f;
+        } else if (p->spring > 85.0f) {
+            fr = 0.20f;
+            fg = 0.74f;
+            fb = 0.62f;
+        }
         for (uint32_t r = 0; r + 1u < p->rows; ++r) {
             for (uint32_t c = 0; c + 1u < p->cols; ++c) {
                 uint32_t i00 = r * p->cols + c;
@@ -1389,7 +1729,7 @@ void sheet_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height) {
                 float x[4] = { p->x[i00], p->x[i10], p->x[i11], p->x[i01] };
                 float y[4] = { p->y[i00], p->y[i10], p->y[i11], p->y[i01] };
                 paint(cmd, width, height, x, y, 4, quad, 2, 0.0f, 0.0f, 0.0f,
-                      0.30f, 0.62f, 0.38f, hot);
+                      fr, fg, fb, hot);
             }
         }
     }
@@ -1411,8 +1751,12 @@ void sheet_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height) {
             idx[t * 3u + 1u] = (uint16_t)(t + 1u);
             idx[t * 3u + 2u] = (uint16_t)(t + 2u);
         }
+        float e = d->bounce;
+        float fr = 0.62f + 0.30f * e;
+        float fg = 0.36f + 0.10f * e;
+        float fb = 0.68f - 0.14f * e;
         paint(cmd, width, height, x, y, d->n, idx, tri, d->x, d->y, d->yaw,
-              0.62f, 0.36f, 0.68f, selected_dyn(i));
+              fr, fg, fb, selected_dyn(i));
     }
 }
 

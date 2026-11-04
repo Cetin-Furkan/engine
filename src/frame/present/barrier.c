@@ -143,8 +143,7 @@ void frame_cmd_finish_present(VkCommandBuffer cmd, const VulkanContext *vk, cons
                 .layerCount     = 1,
             },
             .dstSubresource = {
-                // A DRM-modifier image is copied by memory plane, not by color aspect.
-                .aspectMask     = VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT,
+                .aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
                 .mipLevel       = 0,
                 .baseArrayLayer = 0,
                 .layerCount     = 1,

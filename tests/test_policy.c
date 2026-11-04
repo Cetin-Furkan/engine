@@ -275,6 +275,36 @@ static void check_live(void) {
     CHECK(strcmp(policy_active()->name, "Hybrid") == 0);
     CHECK(policy_switch());
     CHECK(strcmp(policy_active()->name, "3D") == 0);
+
+    // World masking: 3D-only with click-to-draw enabled and mode switching revoked
+    policy_apply_world(MODE_3D, PERM_DRAW, PERM_MODE_SWITCH, false);
+    CHECK(policy_mode() == MODE_3D);
+    CHECK(policy_allows(PERM_DRAW));
+    CHECK(!policy_allows(PERM_MODE_SWITCH));
+    CHECK(policy_can(policy_active(), ACT_CLOSE_FACE));
+    CHECK(!policy_can(policy_active(), ACT_SWITCH_MODE));
+    CHECK(!policy_switch());
+    CHECK(policy_mode() == MODE_3D);
+
+    // World masking: 2D-only with click-to-draw enabled and mode switching revoked
+    policy_apply_world(MODE_2D, PERM_DRAW, PERM_MODE_SWITCH, false);
+    CHECK(policy_mode() == MODE_2D);
+    CHECK(policy_active()->lock_2d_quat);
+    CHECK(policy_allows(PERM_DRAW));
+    CHECK(!policy_allows(PERM_MODE_SWITCH));
+    CHECK(!policy_allows(PERM_CAM_YAW));
+    CHECK(policy_can(policy_active(), ACT_CLOSE_FACE));
+    CHECK(policy_lookup(policy_active(), KEY_F, false) == ACT_CLOSE_FACE);
+    CHECK(policy_lookup(policy_active(), KEY_KP9, false) == ACT_TOGGLE_DRAW);
+    CHECK(!policy_switch());
+
+    // World masking: Hybrid with both 3D+2D and mode switch open
+    policy_apply_world(MODE_HYBRID, PERM_DRAW, PERM_NONE, false);
+    CHECK(policy_mode() == MODE_HYBRID);
+    CHECK(policy_allows(PERM_DRAW));
+    CHECK(policy_allows(PERM_MODE_SWITCH));
+    CHECK(policy_switch());
+    CHECK(policy_mode() == MODE_3D);
 }
 
 int main(void) {

@@ -30,7 +30,6 @@ int frame_boot(void) {
     }
     if (!vk->device_info.supports_external_syncobj ||
         vk->dispatch.vkGetSemaphoreFdKHR == nullptr ||
-        vk->dispatch.vkImportSemaphoreFdKHR == nullptr ||
         wl->drm_syncobj_id == 0 || !vk->device_info.has_drm_render_node) {
         fprintf(stderr,
                 "[Engine Error] Explicit sync needs a DRM render node, VK_KHR_external_semaphore_fd, and wp_linux_drm_syncobj_manager_v1\n");
@@ -47,7 +46,9 @@ int frame_boot(void) {
 
     frame_state.front = 0;
     frame_state.drm_fd = -1;
+    frame_state.acquire_handle = 0;
     frame_state.acquire = VK_NULL_HANDLE;
+    frame_state.acquire_sync = VK_NULL_HANDLE;
     blank_frame(shown());
     blank_frame(spare());
     frame_state.spare_live = false;
@@ -147,7 +148,9 @@ int frame_boot(void) {
             has_alt ? vk->device_info.drm_primary_minor : 0,
             has_alt);
         if (feedback == 0 &&
-            alloc_content_image(vk, wl, content_w, content_h, &shown()->image, &tranche_kind) == 0) {
+            open_drm_render_node(vk) == 0 &&
+            alloc_content_image(vk, wl, content_w, content_h, &shown()->image, &tranche_kind) == 0 &&
+            create_acquire_semaphore(vk, &frame_state.acquire, &frame_state.acquire_sync) == 0) {
             break;
         }
         // ENOENT is "this GPU was not named by the compositor". An allocation
@@ -159,7 +162,20 @@ int frame_boot(void) {
         }
         if (feedback == 0) {
             fprintf(stderr,
-                    "[Vulkan] This GPU cannot export a buffer the compositor can import.\n");
+                    "[Vulkan] This GPU cannot export a buffer or timeline the compositor can import.\n");
+        }
+        if (frame_state.acquire_sync != VK_NULL_HANDLE) {
+            vkDestroySemaphore(vk->device, frame_state.acquire_sync, nullptr);
+            frame_state.acquire_sync = VK_NULL_HANDLE;
+        }
+        if (frame_state.acquire != VK_NULL_HANDLE) {
+            vkDestroySemaphore(vk->device, frame_state.acquire, nullptr);
+            frame_state.acquire = VK_NULL_HANDLE;
+        }
+        vulkan_destroy_exportable_image(vk, &shown()->image);
+        if (frame_state.drm_fd >= 0) {
+            close(frame_state.drm_fd);
+            frame_state.drm_fd = -1;
         }
         vulkan_command_pool_destroy(vk);
         if (vulkan_device_use_next(vk) != VULKAN_SUCCESS ||
@@ -170,15 +186,14 @@ int frame_boot(void) {
         }
     }
 
-    if (bar_open_surface(wl) != 0) {
+    if (bar_open_surface(wl) != 0 ||
+        create_acquire_timeline(wl) < 0 ||
+        create_release_timeline(wl, shown()) != 0) {
         (void)frame_stop();
         return 1;
     }
+    wl->release_timeline_id = shown()->release_timeline_id;
 
-    if (create_acquire_semaphore(vk, &frame_state.acquire) < 0) {
-        (void)frame_stop();
-        return 1;
-    }
     gpu_timer_init(vk);
     if (input_gpu_init(vk) != 0) {
         (void)frame_stop();
@@ -195,55 +210,6 @@ int frame_boot(void) {
         return 1;
     }
     if (record_and_submit_clear(vk, shown(), frame_state.acquire, 1u, false, 0u) < 0) {
-        (void)frame_stop();
-        return 1;
-    }
-    frame_state.sync_point = 1u;
-
-    char render_path[64];
-    int path_n = snprintf(render_path, sizeof render_path, "/dev/dri/renderD%lld",
-                          (long long)vk->device_info.drm_render_minor);
-    if (path_n < 0 || (size_t)path_n >= sizeof render_path) {
-        fprintf(stderr, "[Engine Error] DRM render node path is too long\n");
-        (void)frame_stop();
-        return 1;
-    }
-    frame_state.drm_fd = open(render_path, O_RDWR | O_CLOEXEC);
-    if (frame_state.drm_fd < 0) {
-        fprintf(stderr, "[Engine Error] open %s: %s\n", render_path, strerror(errno));
-        (void)frame_stop();
-        return 1;
-    }
-
-    int acquire_vk_fd = export_semaphore_fd(vk, frame_state.acquire);
-    if (acquire_vk_fd < 0) {
-        (void)frame_stop();
-        return 1;
-    }
-    uint32_t acquire_handle = 0;
-    int imported = drm_syncobj_from_fd(frame_state.drm_fd, acquire_vk_fd, &acquire_handle);
-    close(acquire_vk_fd);
-    if (imported < 0) {
-        (void)frame_stop();
-        return 1;
-    }
-    int acquire_fd = drm_syncobj_to_fd(frame_state.drm_fd, acquire_handle);
-    drm_syncobj_destroy(frame_state.drm_fd, &acquire_handle);
-    if (acquire_fd < 0) {
-        (void)frame_stop();
-        return 1;
-    }
-
-    if (create_release_timeline(vk, wl, shown()) != 0) {
-        close(acquire_fd);
-        (void)frame_stop();
-        return 1;
-    }
-    wl->release_timeline_id = shown()->release_timeline_id;
-
-    int acquire_import = wayland_import_syncobj_timeline(wl, acquire_fd, &wl->acquire_timeline_id);
-    close(acquire_fd);
-    if (acquire_import < 0 || wayland_bind_explicit_sync(wl) < 0) {
         (void)frame_stop();
         return 1;
     }

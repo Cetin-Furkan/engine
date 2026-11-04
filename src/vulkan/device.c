@@ -1,5 +1,6 @@
 #include "vulkan/device.h"
 #include "vulkan/pipe.h"
+#include "chrome/gpu.h"
 #include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -38,6 +39,7 @@ typedef struct GpuCandidate {
     uint32_t                         compute_queue_count;
     uint32_t                         transfer_queue_count;
     bool                             has_graphics;
+    bool                             graphics_lacks_compute;
     bool                             has_dedicated_compute;
     bool                             has_dedicated_transfer;
 
@@ -66,6 +68,8 @@ typedef struct GpuCandidate {
     bool                             supports_shader_float_controls2;
     bool                             supports_shader_subgroup_rotate;
     bool                             supports_shader_subgroup_rotate_clustered;
+    bool                             supports_shader_demote;
+    bool                             supports_shader_draw_parameters;
 
     bool                             has_drm_primary;
     bool                             has_drm_render;
@@ -234,6 +238,7 @@ static void measure_memory(GpuCandidate *candidate) {
 static VulkanResult discover_queue_families(GpuCandidate *candidate) {
     candidate->queues_probed = true;
     candidate->has_graphics = false;
+    candidate->graphics_lacks_compute = false;
     candidate->has_dedicated_compute = false;
     candidate->has_dedicated_transfer = false;
     candidate->graphics_family = UINT32_MAX;
@@ -255,6 +260,7 @@ static VulkanResult discover_queue_families(GpuCandidate *candidate) {
     }
     vkGetPhysicalDeviceQueueFamilyProperties(candidate->device, &count, families);
 
+    bool saw_graphics = false;
     for (uint32_t i = 0; i < count; ++i) {
         VkQueueFlags flags = families[i].queueFlags;
         uint32_t queue_count = families[i].queueCount;
@@ -262,7 +268,14 @@ static VulkanResult discover_queue_families(GpuCandidate *candidate) {
             continue;
         }
 
-        if (!candidate->has_graphics && (flags & VK_QUEUE_GRAPHICS_BIT) != 0) {
+        const bool graphics = (flags & VK_QUEUE_GRAPHICS_BIT) != 0;
+        const bool compute = (flags & VK_QUEUE_COMPUTE_BIT) != 0;
+        if (graphics) {
+            saw_graphics = true;
+        }
+        // The frame command buffer comes from the graphics family and records
+        // vkCmdDispatch. A compute-only family cannot satisfy that.
+        if (!candidate->has_graphics && graphics && compute) {
             candidate->graphics_family = i;
             candidate->graphics_queue_count = queue_count;
             candidate->has_graphics = true;
@@ -284,20 +297,11 @@ static VulkanResult discover_queue_families(GpuCandidate *candidate) {
         }
     }
 
+    candidate->graphics_lacks_compute = saw_graphics && !candidate->has_graphics;
+
     if (candidate->has_graphics && !candidate->has_dedicated_compute) {
-        uint32_t graphics = candidate->graphics_family;
-        if ((families[graphics].queueFlags & VK_QUEUE_COMPUTE_BIT) != 0) {
-            candidate->compute_family = graphics;
-            candidate->compute_queue_count = families[graphics].queueCount;
-        } else {
-            for (uint32_t i = 0; i < count; ++i) {
-                if ((families[i].queueFlags & VK_QUEUE_COMPUTE_BIT) != 0 && families[i].queueCount > 0) {
-                    candidate->compute_family = i;
-                    candidate->compute_queue_count = families[i].queueCount;
-                    break;
-                }
-            }
-        }
+        candidate->compute_family = candidate->graphics_family;
+        candidate->compute_queue_count = candidate->graphics_queue_count;
     }
 
     // A pure transfer family was already recorded. Otherwise keep transfer off the
@@ -351,6 +355,9 @@ static VulkanResult discover_queue_families(GpuCandidate *candidate) {
 }
 
 static uint32_t score_candidate(const GpuCandidate *candidate) {
+    // Discrete stays ahead of integrated. A muxless laptop still presents:
+    // the frame is copied into a buffer the compositor's GPU can import, and
+    // a present failure opens the next device in this order.
     uint32_t score = 1000;
     switch (candidate->properties.deviceType) {
     case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU:   score += 100000; break;
@@ -395,13 +402,27 @@ static VulkanResult evaluate_device(GpuCandidate *candidate) {
         disqualify(candidate, reason);
         return VULKAN_SUCCESS;
     }
+    if (candidate->properties.limits.maxPushConstantsSize < k_chrome_push_bytes) {
+        char reason[256];
+        snprintf(reason, sizeof reason,
+                 "maxPushConstantsSize %u is below the %u-byte chrome block",
+                 candidate->properties.limits.maxPushConstantsSize,
+                 k_chrome_push_bytes);
+        disqualify(candidate, reason);
+        return VULKAN_SUCCESS;
+    }
 
     VulkanResult queues = discover_queue_families(candidate);
     if (queues != VULKAN_SUCCESS) {
         return queues;
     }
     if (!candidate->has_graphics || candidate->graphics_queue_count < 1) {
-        disqualify(candidate, "No queue family supports VK_QUEUE_GRAPHICS_BIT");
+        if (candidate->graphics_lacks_compute) {
+            disqualify(candidate,
+                       "Graphics queue family has no compute. The frame command buffer records vkCmdDispatch");
+        } else {
+            disqualify(candidate, "No queue family supports graphics and compute together");
+        }
         return VULKAN_SUCCESS;
     }
     if (candidate->compute_family == UINT32_MAX || candidate->compute_queue_count < 1) {
@@ -454,6 +475,8 @@ static VulkanResult evaluate_device(GpuCandidate *candidate) {
     candidate->supports_shader_subgroup_rotate       = (feat14.shaderSubgroupRotate == VK_TRUE);
     candidate->supports_shader_subgroup_rotate_clustered =
         (feat14.shaderSubgroupRotateClustered == VK_TRUE);
+    candidate->supports_shader_demote                = (feat13.shaderDemoteToHelperInvocation == VK_TRUE);
+    candidate->supports_shader_draw_parameters       = (feat11.shaderDrawParameters == VK_TRUE);
     candidate->features_probed                       = true;
 
     if (!candidate->supports_dyn_render || !candidate->supports_sync2 ||
@@ -620,11 +643,13 @@ static void print_candidate(uint32_t index, const GpuCandidate *candidate) {
     if (!candidate->features_probed) {
         printf("      Features: not probed\n");
     } else {
-        printf("      Shader: ExpectAssume=%s, FloatControls2=%s, SubgroupRotate=%s, RotateClustered=%s\n",
+        printf("      Shader: ExpectAssume=%s, FloatControls2=%s, SubgroupRotate=%s, RotateClustered=%s, Demote=%s, DrawParams=%s\n",
                candidate->supports_shader_expect_assume ? "yes" : "no",
                candidate->supports_shader_float_controls2 ? "yes" : "no",
                candidate->supports_shader_subgroup_rotate ? "yes" : "no",
-               candidate->supports_shader_subgroup_rotate_clustered ? "yes" : "no");
+               candidate->supports_shader_subgroup_rotate_clustered ? "yes" : "no",
+               candidate->supports_shader_demote ? "yes" : "no",
+               candidate->supports_shader_draw_parameters ? "yes" : "no");
         printf("      Features: DynRender=%s, LocalRead=%s, Sync2=%s, BDA=%s, ScalarLayout=%s, Timeline=%s, Anisotropy=%s, Maint5=%s, Maint6=%s, PushDesc=%s, HostImageCopy=%s, Int16=%s, Int64=%s, Storage16=%s, Float16=%s\n",
                candidate->supports_dyn_render ? "yes" : "no",
                candidate->supports_dynamic_rendering_local_read ? "yes" : "no",
@@ -724,6 +749,82 @@ static uint32_t family_plan_take(FamilyPlan *plans, uint32_t count, uint32_t fam
     return 0;
 }
 
+enum : uint32_t { k_ranked_cap = 32u };
+
+typedef struct RankedGpu {
+    GpuCandidate candidate;
+    uint32_t     enum_index;
+    const char  *note;
+} RankedGpu;
+
+static RankedGpu g_ranked[k_ranked_cap];
+static uint32_t  g_ranked_count;
+static uint32_t  g_ranked_pos;
+static bool      g_ranked_locked;
+
+static void ranked_reset(void) {
+    g_ranked_count = 0;
+    g_ranked_pos = 0;
+    g_ranked_locked = false;
+}
+
+static void ranked_push(const GpuCandidate *candidate, uint32_t enum_index, const char *note) {
+    if (candidate == nullptr || g_ranked_count >= k_ranked_cap) {
+        return;
+    }
+    for (uint32_t i = 0; i < g_ranked_count; ++i) {
+        if (g_ranked[i].enum_index == enum_index) {
+            return;
+        }
+    }
+    g_ranked[g_ranked_count].candidate = *candidate;
+    g_ranked[g_ranked_count].enum_index = enum_index;
+    g_ranked[g_ranked_count].note = note;
+    g_ranked_count += 1;
+}
+
+static bool ranked_before(const RankedGpu *a, const RankedGpu *b) {
+    if (a->candidate.score != b->candidate.score) {
+        return a->candidate.score > b->candidate.score;
+    }
+    return a->enum_index < b->enum_index;
+}
+
+static void ranked_sort_range(uint32_t begin, uint32_t end) {
+    for (uint32_t i = begin + 1; i < end; ++i) {
+        RankedGpu item = g_ranked[i];
+        uint32_t j = i;
+        while (j > begin && ranked_before(&item, &g_ranked[j - 1])) {
+            g_ranked[j] = g_ranked[j - 1];
+            j -= 1;
+        }
+        g_ranked[j] = item;
+    }
+}
+
+static bool candidate_matches_env(const GpuCandidate *candidate, const char *env_gpu_match) {
+    const char *vendor = get_vendor_name(candidate->properties.vendorID);
+    const char *type = get_device_type_str(candidate->properties.deviceType);
+    const char *name = candidate->properties.deviceName;
+    return ascii_contains_ci(vendor, env_gpu_match) ||
+           ascii_contains_ci(type, env_gpu_match) ||
+           ascii_contains_ci(name, env_gpu_match);
+}
+
+static VulkanResult open_candidate(VulkanContext *ctx, const GpuCandidate *chosen,
+                                 uint32_t enum_index, const char *note);
+
+static const char *queue_place(uint32_t graphics_family, uint32_t graphics_index,
+                               uint32_t family, uint32_t index, bool dedicated) {
+    if (family != graphics_family) {
+        return dedicated ? "dedicated family" : "separate family";
+    }
+    if (index != graphics_index) {
+        return "distinct queue";
+    }
+    return "aliased";
+}
+
 static bool append_extension(const char **names, uint32_t *count, uint32_t capacity, const char *name) {
     for (uint32_t i = 0; i < *count; ++i) {
         if (strcmp(names[i], name) == 0) {
@@ -787,9 +888,7 @@ VulkanResult vulkan_device_create(VulkanContext *ctx) {
 
     const char *env_gpu_index = getenv("ENGINE_GPU_INDEX");
     const char *env_gpu_match = getenv("ENGINE_GPU");
-    int32_t selected_index = -1;
-    uint32_t highest_score = 0;
-    const char *selection_override_note = "";
+    ranked_reset();
 
     if (env_gpu_index != nullptr) {
         uint32_t idx = 0;
@@ -806,58 +905,71 @@ VulkanResult vulkan_device_create(VulkanContext *ctx) {
                     "[Vulkan Warn] ENGINE_GPU_INDEX=%u requested, but device is disqualified (%s). Falling back.\n",
                     idx, candidates[idx].disqualification_reason);
         } else {
-            selected_index = (int32_t)idx;
-            selection_override_note = " [Forced by ENGINE_GPU_INDEX]";
+            ranked_push(&candidates[idx], idx, " [Forced by ENGINE_GPU_INDEX]");
+            g_ranked_locked = true;
         }
     }
 
-    if (selected_index == -1 && env_gpu_match != nullptr) {
+    if (!g_ranked_locked && env_gpu_match != nullptr) {
         for (uint32_t i = 0; i < device_count; ++i) {
             if (candidates[i].is_disqualified) {
                 continue;
             }
-            const char *vendor = get_vendor_name(candidates[i].properties.vendorID);
-            const char *type = get_device_type_str(candidates[i].properties.deviceType);
-            const char *name = candidates[i].properties.deviceName;
-            if (ascii_contains_ci(vendor, env_gpu_match) ||
-                ascii_contains_ci(type, env_gpu_match) ||
-                ascii_contains_ci(name, env_gpu_match)) {
-                if (candidates[i].score > highest_score) {
-                    highest_score = candidates[i].score;
-                    selected_index = (int32_t)i;
-                    selection_override_note = " [Filtered by ENGINE_GPU]";
-                }
+            if (candidate_matches_env(&candidates[i], env_gpu_match)) {
+                ranked_push(&candidates[i], i, " [Filtered by ENGINE_GPU]");
             }
         }
+        ranked_sort_range(0, g_ranked_count);
     }
 
-    if (selected_index == -1) {
+    if (!g_ranked_locked) {
+        uint32_t matched = g_ranked_count;
         for (uint32_t i = 0; i < device_count; ++i) {
-            if (!candidates[i].is_disqualified && candidates[i].score > highest_score) {
-                highest_score = candidates[i].score;
-                selected_index = (int32_t)i;
+            if (!candidates[i].is_disqualified) {
+                ranked_push(&candidates[i], i, "");
             }
         }
+        ranked_sort_range(matched, g_ranked_count);
     }
 
-    if (selected_index == -1) {
+    if (g_ranked_count == 0) {
         fprintf(stderr, "[Vulkan Error] None of the %u available GPUs satisfy engine requirements.\n",
                 device_count);
         free(candidates);
         free(devices);
+        ranked_reset();
         return VULKAN_ERROR_NO_SUITABLE_GPU;
     }
 
-    GpuCandidate best = candidates[selected_index];
-    printf("[Vulkan Device] Selected GPU [%d]: %s (%s, Score: %u)%s\n",
-           selected_index,
-           best.properties.deviceName,
-           get_device_type_str(best.properties.deviceType),
-           best.score,
-           selection_override_note);
     free(candidates);
     free(devices);
 
+    while (g_ranked_pos < g_ranked_count) {
+        uint32_t slot = g_ranked_pos;
+        g_ranked_pos += 1;
+        VulkanResult opened = open_candidate(
+            ctx, &g_ranked[slot].candidate, g_ranked[slot].enum_index, g_ranked[slot].note);
+        if (opened == VULKAN_SUCCESS) {
+            return VULKAN_SUCCESS;
+        }
+        vulkan_device_destroy(ctx);
+        if (g_ranked_locked || g_ranked_pos >= g_ranked_count) {
+            return opened;
+        }
+        fprintf(stderr, "[Vulkan] Logical device was not created. Trying the next GPU.\n");
+    }
+    return VULKAN_ERROR_NO_SUITABLE_GPU;
+}
+
+static VulkanResult open_candidate(VulkanContext *ctx, const GpuCandidate *chosen,
+                                 uint32_t enum_index, const char *note) {
+    GpuCandidate best = *chosen;
+    printf("[Vulkan Device] Selected GPU [%u]: %s (%s, Score: %u)%s\n",
+           enum_index,
+           best.properties.deviceName,
+           get_device_type_str(best.properties.deviceType),
+           best.score,
+           note != nullptr ? note : "");
     ctx->physical_device = best.device;
     ctx->queues.graphics_family_index = best.graphics_family;
     ctx->queues.compute_family_index = best.compute_family;
@@ -897,6 +1009,8 @@ VulkanResult vulkan_device_create(VulkanContext *ctx) {
     ctx->device_info.supports_shader_subgroup_rotate = best.supports_shader_subgroup_rotate;
     ctx->device_info.supports_shader_subgroup_rotate_clustered =
         best.supports_shader_subgroup_rotate_clustered;
+    ctx->device_info.supports_shader_demote = best.supports_shader_demote;
+    ctx->device_info.supports_shader_draw_parameters = best.supports_shader_draw_parameters;
     ctx->device_info.has_drm_primary_node = best.has_drm_primary;
     ctx->device_info.has_drm_render_node = best.has_drm_render;
     ctx->device_info.drm_primary_major = best.drm_primary_major;
@@ -974,7 +1088,7 @@ VulkanResult vulkan_device_create(VulkanContext *ctx) {
         .pNext                          = &feat14,
         .dynamicRendering               = VK_TRUE,
         .synchronization2               = VK_TRUE,
-        .shaderDemoteToHelperInvocation = VK_TRUE,
+        .shaderDemoteToHelperInvocation = best.supports_shader_demote ? VK_TRUE : VK_FALSE,
     };
     VkPhysicalDeviceVulkan12Features feat12 = {
         .sType               = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
@@ -988,7 +1102,7 @@ VulkanResult vulkan_device_create(VulkanContext *ctx) {
         .sType                     = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
         .pNext                     = &feat12,
         .storageBuffer16BitAccess  = VK_TRUE,
-        .shaderDrawParameters      = VK_TRUE,
+        .shaderDrawParameters      = best.supports_shader_draw_parameters ? VK_TRUE : VK_FALSE,
     };
     VkPhysicalDeviceFeatures2 features2 = {
         .sType    = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
@@ -1093,4 +1207,104 @@ void vulkan_device_destroy(VulkanContext *ctx) {
     ctx->dispatch.vkGetImageDrmFormatModifierPropertiesEXT = nullptr;
     ctx->dispatch.vkGetSemaphoreFdKHR = nullptr;
     ctx->dispatch.vkImportSemaphoreFdKHR = nullptr;
+}
+
+void vulkan_device_log(const VulkanContext *ctx) {
+    if (ctx == nullptr || ctx->device == VK_NULL_HANDLE) {
+        return;
+    }
+    char driver_version[64];
+    vulkan_format_driver_version(ctx->device_info.vendor_id, ctx->device_info.driver_version,
+                                 driver_version, sizeof driver_version);
+    printf("[Vulkan] Hardware: %s (Driver v%s, API v%u.%u.%u)\n",
+           ctx->device_info.name,
+           driver_version,
+           VK_API_VERSION_MAJOR(ctx->device_info.api_version),
+           VK_API_VERSION_MINOR(ctx->device_info.api_version),
+           VK_API_VERSION_PATCH(ctx->device_info.api_version));
+
+    printf("[Vulkan] Queues: Graphics=family %u index %u, Compute=family %u index %u (%s), Transfer=family %u index %u (%s)\n",
+           ctx->queues.graphics_family_index,
+           ctx->queues.graphics_queue_index,
+           ctx->queues.compute_family_index,
+           ctx->queues.compute_queue_index,
+           queue_place(ctx->queues.graphics_family_index, ctx->queues.graphics_queue_index,
+                       ctx->queues.compute_family_index, ctx->queues.compute_queue_index,
+                       ctx->queues.has_dedicated_compute),
+           ctx->queues.transfer_family_index,
+           ctx->queues.transfer_queue_index,
+           queue_place(ctx->queues.graphics_family_index, ctx->queues.graphics_queue_index,
+                       ctx->queues.transfer_family_index, ctx->queues.transfer_queue_index,
+                       ctx->queues.has_dedicated_transfer));
+
+    if (ctx->queues.submission_aliased) {
+        fflush(stdout);
+        fprintf(stderr,
+                "[Vulkan Warn] Two roles share one VkQueue. Concurrent submits on those roles must be externally synchronized.\n");
+    }
+
+    printf("[Vulkan] Shader 1.4: ExpectAssume=%s, FloatControls2=%s, SubgroupRotate=%s, RotateClustered=%s, Demote=%s, DrawParams=%s\n",
+           ctx->device_info.supports_shader_expect_assume ? "yes" : "no",
+           ctx->device_info.supports_shader_float_controls2 ? "yes" : "no",
+           ctx->device_info.supports_shader_subgroup_rotate ? "yes" : "no",
+           ctx->device_info.supports_shader_subgroup_rotate_clustered ? "yes" : "no",
+           ctx->device_info.supports_shader_demote ? "yes" : "no",
+           ctx->device_info.supports_shader_draw_parameters ? "yes" : "no");
+    printf("[Vulkan] Capabilities: DMA-BUF=%s, DRM-Modifiers=%s, ForeignQueue=%s, Syncobj=%s, BDA=%s, ScalarLayout=%s, Anisotropy=%s, DynRender=%s, LocalRead=%s, Sync2=%s, Timeline=%s, Maint5=%s, Maint6=%s, PushDesc=%s, HostImageCopy=%s, Int16=%s, Int64=%s, Storage16=%s, Float16=%s\n",
+           ctx->device_info.supports_dma_buf ? "yes" : "no",
+           ctx->device_info.supports_drm_format_modifiers ? "yes" : "no",
+           ctx->device_info.supports_queue_family_foreign ? "yes" : "no",
+           ctx->device_info.supports_external_syncobj ? "yes" : "no",
+           ctx->device_info.supports_buffer_device_address ? "yes" : "no",
+           ctx->device_info.supports_scalar_block_layout ? "yes" : "no",
+           ctx->device_info.supports_sampler_anisotropy ? "yes" : "no",
+           ctx->device_info.supports_dynamic_rendering ? "yes" : "no",
+           ctx->device_info.supports_dynamic_rendering_local_read ? "yes" : "no",
+           ctx->device_info.supports_synchronization2 ? "yes" : "no",
+           ctx->device_info.supports_timeline_semaphore ? "yes" : "no",
+           ctx->device_info.supports_maintenance5 ? "yes" : "no",
+           ctx->device_info.supports_maintenance6 ? "yes" : "no",
+           ctx->device_info.supports_push_descriptors ? "yes" : "no",
+           ctx->device_info.supports_host_image_copy ? "yes" : "no",
+           ctx->device_info.supports_shader_int16 ? "yes" : "no",
+           ctx->device_info.supports_shader_int64 ? "yes" : "no",
+           ctx->device_info.supports_storage_buffer_16bit ? "yes" : "no",
+           ctx->device_info.supports_shader_float16 ? "yes" : "no");
+
+    if (ctx->device_info.has_drm_render_node || ctx->device_info.has_drm_primary_node) {
+        printf("[Vulkan] DRM Device Nodes: Primary=%s (%lld:%lld), Render=%s (%lld:%lld)\n",
+               ctx->device_info.has_drm_primary_node ? "yes" : "no",
+               (long long)ctx->device_info.drm_primary_major,
+               (long long)ctx->device_info.drm_primary_minor,
+               ctx->device_info.has_drm_render_node ? "yes" : "no",
+               (long long)ctx->device_info.drm_render_major,
+               (long long)ctx->device_info.drm_render_minor);
+    }
+}
+
+VulkanResult vulkan_device_use_next(VulkanContext *ctx) {
+    if (ctx == nullptr) {
+        return VULKAN_ERROR_INVALID_ARGUMENT;
+    }
+    if (g_ranked_locked || g_ranked_pos >= g_ranked_count) {
+        return VULKAN_ERROR_NO_SUITABLE_GPU;
+    }
+    vulkan_device_destroy(ctx);
+    while (g_ranked_pos < g_ranked_count) {
+        uint32_t slot = g_ranked_pos;
+        g_ranked_pos += 1;
+        const RankedGpu *ranked = &g_ranked[slot];
+        fprintf(stderr, "[Vulkan] Present path failed. Trying GPU [%u] %s.\n",
+                ranked->enum_index, ranked->candidate.properties.deviceName);
+        VulkanResult opened = open_candidate(ctx, &ranked->candidate, ranked->enum_index, ranked->note);
+        if (opened == VULKAN_SUCCESS) {
+            vulkan_device_log(ctx);
+            return VULKAN_SUCCESS;
+        }
+        vulkan_device_destroy(ctx);
+        if (g_ranked_locked) {
+            return opened;
+        }
+    }
+    return VULKAN_ERROR_NO_SUITABLE_GPU;
 }

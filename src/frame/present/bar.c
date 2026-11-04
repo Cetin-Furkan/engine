@@ -56,6 +56,14 @@ static int make_bar_view(VulkanContext *vk, FrameSlot *frame) {
     if (frame->image_view != VK_NULL_HANDLE) {
         return 0;
     }
+    if (frame->image.prime_copy) {
+        if (ensure_prime_color(vk, frame) != 0) {
+            return -1;
+        }
+        frame->image_view = frame->prime_view;
+        frame->view_format = VK_FORMAT_B8G8R8A8_SRGB;
+        return 0;
+    }
     VkFormat view_format = (frame->image.format == VK_FORMAT_B8G8R8A8_UNORM)
         ? VK_FORMAT_B8G8R8A8_SRGB
         : frame->image.format;
@@ -124,8 +132,9 @@ static int record_bar(VulkanContext *vk, FrameSlot *frame, uint64_t signal_point
         return -1;
     }
 
+    VkImage color_image = frame->prime_image != VK_NULL_HANDLE ? frame->prime_image : frame->image.image;
     VkImageMemoryBarrier2 to_color;
-    frame_fill_discard_color(&to_color, frame->image.image);
+    frame_fill_discard_color(&to_color, color_image);
     frame_cmd_barriers(frame->cmd_buf, &to_color, 1);
 
     VkRenderingAttachmentInfo color = {
@@ -163,9 +172,7 @@ static int record_bar(VulkanContext *vk, FrameSlot *frame, uint64_t signal_point
                     frame->view_format, VK_FORMAT_UNDEFINED, VK_SAMPLE_COUNT_1_BIT);
     vkCmdEndRendering(frame->cmd_buf);
 
-    VkImageMemoryBarrier2 to_general;
-    frame_fill_release_foreign(&to_general, vk, frame->image.image);
-    frame_cmd_barriers(frame->cmd_buf, &to_general, 1);
+    frame_cmd_finish_present(frame->cmd_buf, vk, frame);
     res = vkEndCommandBuffer(frame->cmd_buf);
     if (res != VK_SUCCESS) {
         fprintf(stderr, "[Chrome Error] Bar command end failed: %s (%d)\n",

@@ -118,6 +118,9 @@ int frame_stop(void) {
             vkDestroySemaphore(vk->device, frame_state.acquire, nullptr);
             frame_state.acquire = VK_NULL_HANDLE;
         }
+        if (!acquire_held) {
+            destroy_prime_color(vk, shown());
+        }
         if (destroy_shown) {
             if (shown()->cmd_buf != VK_NULL_HANDLE && vk->cmd_pool != VK_NULL_HANDLE) {
                 vkFreeCommandBuffers(vk->device, vk->cmd_pool, 1, &shown()->cmd_buf);

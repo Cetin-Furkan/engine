@@ -62,9 +62,10 @@ int record_and_submit_clear(VulkanContext *vk, FrameSlot *frame, VkSemaphore acq
     // end of the buffer is the ownership handoff to the compositor, and
     // the release syncobj is what lets this record start.
     const bool depth_pass = srgb_view && frame->targets.depth_image != VK_NULL_HANDLE;
+    VkImage color_image = frame->prime_image != VK_NULL_HANDLE ? frame->prime_image : frame->image.image;
     VkImageMemoryBarrier2 barriers[3] = {0};
     uint32_t nbar = 0;
-    frame_fill_discard_color(&barriers[nbar++], frame->image.image);
+    frame_fill_discard_color(&barriers[nbar++], color_image);
     if (frame->targets.coverage_image != VK_NULL_HANDLE) {
         frame_fill_discard_color(&barriers[nbar++], frame->targets.coverage_image);
     }
@@ -160,9 +161,7 @@ int record_and_submit_clear(VulkanContext *vk, FrameSlot *frame, VkSemaphore acq
     // still the one the dispatch observes if it has not reached the read.
     input_page_record(frame->cmd_buf);
 
-    VkImageMemoryBarrier2 to_general;
-    frame_fill_release_foreign(&to_general, vk, frame->image.image);
-    frame_cmd_barriers(frame->cmd_buf, &to_general, 1);
+    frame_cmd_finish_present(frame->cmd_buf, vk, frame);
     gpu_timer_end_frame(frame->cmd_buf, frame);
 
     res = vkEndCommandBuffer(frame->cmd_buf);

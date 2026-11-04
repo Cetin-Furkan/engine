@@ -1,5 +1,7 @@
 #include "frame/frame_int.h"
 #include "input/page.h"
+#include "vulkan/device.h"
+#include "vulkan/memory.h"
 
 // Device pipelines, the world file, the first present, and the reverse shutdown.
 
@@ -122,37 +124,53 @@ int frame_boot(void) {
     }
     chrome_clamp_size(&width, &height);
 
-    const bool has_render  = vk->device_info.has_drm_render_node;
-    const bool has_primary = vk->device_info.has_drm_primary_node;
-    const int64_t target_major = has_render
-        ? vk->device_info.drm_render_major
-        : vk->device_info.drm_primary_major;
-    const int64_t target_minor = has_render
-        ? vk->device_info.drm_render_minor
-        : vk->device_info.drm_primary_minor;
-    const bool has_alt = has_render && has_primary;
+    uint32_t content_w = 0;
+    uint32_t content_h = 0;
+    frame_apply_layout(wl, width, height, &content_w, &content_h);
 
-    if (wayland_query_surface_dmabuf_feedback(
+    const char *tranche_kind = "general";
+    for (;;) {
+        const bool has_render  = vk->device_info.has_drm_render_node;
+        const bool has_primary = vk->device_info.has_drm_primary_node;
+        const int64_t target_major = has_render
+            ? vk->device_info.drm_render_major
+            : vk->device_info.drm_primary_major;
+        const int64_t target_minor = has_render
+            ? vk->device_info.drm_render_minor
+            : vk->device_info.drm_primary_minor;
+        const bool has_alt = has_render && has_primary;
+        int feedback = wayland_query_surface_dmabuf_feedback(
             wl,
             target_major,
             target_minor,
             has_alt ? vk->device_info.drm_primary_major : 0,
             has_alt ? vk->device_info.drm_primary_minor : 0,
-            has_alt) < 0) {
-        (void)frame_stop();
-        return 1;
+            has_alt);
+        if (feedback == 0 &&
+            alloc_content_image(vk, wl, content_w, content_h, &shown()->image, &tranche_kind) == 0) {
+            break;
+        }
+        // ENOENT is "this GPU was not named by the compositor". An allocation
+        // failure is "it was named, but this device cannot export that buffer".
+        // Another eligible GPU may be the display device itself.
+        if (feedback != 0 && feedback != -ENOENT) {
+            (void)frame_stop();
+            return 1;
+        }
+        if (feedback == 0) {
+            fprintf(stderr,
+                    "[Vulkan] This GPU cannot export a buffer the compositor can import.\n");
+        }
+        vulkan_command_pool_destroy(vk);
+        if (vulkan_device_use_next(vk) != VULKAN_SUCCESS ||
+            vulkan_command_pool_create(vk) != VULKAN_SUCCESS) {
+            fprintf(stderr, "[Vulkan Error] No remaining GPU can present to this compositor.\n");
+            (void)frame_stop();
+            return 1;
+        }
     }
 
-    uint32_t content_w = 0;
-    uint32_t content_h = 0;
-    frame_apply_layout(wl, width, height, &content_w, &content_h);
     if (bar_open_surface(wl) != 0) {
-        (void)frame_stop();
-        return 1;
-    }
-
-    const char *tranche_kind = "general";
-    if (alloc_content_image(vk, wl, content_w, content_h, &shown()->image, &tranche_kind) != 0) {
         (void)frame_stop();
         return 1;
     }

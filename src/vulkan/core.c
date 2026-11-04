@@ -5,17 +5,6 @@
 #include "vulkan/bda.h"
 #include <stdio.h>
 
-static const char *queue_place(uint32_t graphics_family, uint32_t graphics_index,
-                               uint32_t family, uint32_t index, bool dedicated) {
-    if (family != graphics_family) {
-        return dedicated ? "dedicated family" : "separate family";
-    }
-    if (index != graphics_index) {
-        return "distinct queue";
-    }
-    return "aliased";
-}
-
 VulkanResult vulkan_context_init(VulkanContext *ctx) {
     if (ctx == nullptr) {
         return VULKAN_ERROR_INVALID_ARGUMENT;
@@ -53,71 +42,7 @@ VulkanResult vulkan_context_init(VulkanContext *ctx) {
         return res;
     }
 
-    char driver_version[64];
-    vulkan_format_driver_version(ctx->device_info.vendor_id, ctx->device_info.driver_version,
-                                 driver_version, sizeof driver_version);
-    printf("[Vulkan] Hardware: %s (Driver v%s, API v%u.%u.%u)\n",
-           ctx->device_info.name,
-           driver_version,
-           VK_API_VERSION_MAJOR(ctx->device_info.api_version),
-           VK_API_VERSION_MINOR(ctx->device_info.api_version),
-           VK_API_VERSION_PATCH(ctx->device_info.api_version));
-
-    printf("[Vulkan] Queues: Graphics=family %u index %u, Compute=family %u index %u (%s), Transfer=family %u index %u (%s)\n",
-           ctx->queues.graphics_family_index,
-           ctx->queues.graphics_queue_index,
-           ctx->queues.compute_family_index,
-           ctx->queues.compute_queue_index,
-           queue_place(ctx->queues.graphics_family_index, ctx->queues.graphics_queue_index,
-                       ctx->queues.compute_family_index, ctx->queues.compute_queue_index,
-                       ctx->queues.has_dedicated_compute),
-           ctx->queues.transfer_family_index,
-           ctx->queues.transfer_queue_index,
-           queue_place(ctx->queues.graphics_family_index, ctx->queues.graphics_queue_index,
-                       ctx->queues.transfer_family_index, ctx->queues.transfer_queue_index,
-                       ctx->queues.has_dedicated_transfer));
-
-    if (ctx->queues.submission_aliased) {
-        fflush(stdout);
-        fprintf(stderr,
-                "[Vulkan Warn] Two roles share one VkQueue. Concurrent submits on those roles must be externally synchronized.\n");
-    }
-
-    printf("[Vulkan] Shader 1.4: ExpectAssume=%s, FloatControls2=%s, SubgroupRotate=%s, RotateClustered=%s\n",
-           ctx->device_info.supports_shader_expect_assume ? "yes" : "no",
-           ctx->device_info.supports_shader_float_controls2 ? "yes" : "no",
-           ctx->device_info.supports_shader_subgroup_rotate ? "yes" : "no",
-           ctx->device_info.supports_shader_subgroup_rotate_clustered ? "yes" : "no");
-    printf("[Vulkan] Capabilities: DMA-BUF=%s, DRM-Modifiers=%s, ForeignQueue=%s, Syncobj=%s, BDA=%s, ScalarLayout=%s, Anisotropy=%s, DynRender=%s, LocalRead=%s, Sync2=%s, Timeline=%s, Maint5=%s, Maint6=%s, PushDesc=%s, HostImageCopy=%s, Int16=%s, Int64=%s, Storage16=%s, Float16=%s\n",
-           ctx->device_info.supports_dma_buf ? "yes" : "no",
-           ctx->device_info.supports_drm_format_modifiers ? "yes" : "no",
-           ctx->device_info.supports_queue_family_foreign ? "yes" : "no",
-           ctx->device_info.supports_external_syncobj ? "yes" : "no",
-           ctx->device_info.supports_buffer_device_address ? "yes" : "no",
-           ctx->device_info.supports_scalar_block_layout ? "yes" : "no",
-           ctx->device_info.supports_sampler_anisotropy ? "yes" : "no",
-           ctx->device_info.supports_dynamic_rendering ? "yes" : "no",
-           ctx->device_info.supports_dynamic_rendering_local_read ? "yes" : "no",
-           ctx->device_info.supports_synchronization2 ? "yes" : "no",
-           ctx->device_info.supports_timeline_semaphore ? "yes" : "no",
-           ctx->device_info.supports_maintenance5 ? "yes" : "no",
-           ctx->device_info.supports_maintenance6 ? "yes" : "no",
-           ctx->device_info.supports_push_descriptors ? "yes" : "no",
-           ctx->device_info.supports_host_image_copy ? "yes" : "no",
-           ctx->device_info.supports_shader_int16 ? "yes" : "no",
-           ctx->device_info.supports_shader_int64 ? "yes" : "no",
-           ctx->device_info.supports_storage_buffer_16bit ? "yes" : "no",
-           ctx->device_info.supports_shader_float16 ? "yes" : "no");
-
-    if (ctx->device_info.has_drm_render_node || ctx->device_info.has_drm_primary_node) {
-        printf("[Vulkan] DRM Device Nodes: Primary=%s (%lld:%lld), Render=%s (%lld:%lld)\n",
-               ctx->device_info.has_drm_primary_node ? "yes" : "no",
-               (long long)ctx->device_info.drm_primary_major,
-               (long long)ctx->device_info.drm_primary_minor,
-               ctx->device_info.has_drm_render_node ? "yes" : "no",
-               (long long)ctx->device_info.drm_render_major,
-               (long long)ctx->device_info.drm_render_minor);
-    }
+    vulkan_device_log(ctx);
 
     printf("hello init from vulkan (device & command pool active, validation: %s)\n",
            ctx->validation_enabled ? "enabled" : "disabled");

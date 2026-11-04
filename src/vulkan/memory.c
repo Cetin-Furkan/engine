@@ -42,9 +42,24 @@ VulkanResult vulkan_find_memory_type(
             continue;
         }
 
-        // Rank 2: real device-local VRAM. Rank 1: host-visible ReBAR or UMA memory.
+        // Device-local request: invisible VRAM outranks a host-visible mapping of
+        // the same heap. A host-visible request prefers ReBAR (device-local and
+        // host-visible), then cached system memory, then uncached write-combine.
         const bool host_visible = (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0;
-        int rank = (want_device_local && !host_visible) ? 2 : 1;
+        const bool host_cached = (flags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) != 0;
+        const bool device_local = (flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
+        int rank = 1;
+        if (want_device_local) {
+            rank = !host_visible ? 2 : 1;
+        } else if ((required_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0) {
+            if (device_local && host_cached) {
+                rank = 4;
+            } else if (device_local) {
+                rank = 3;
+            } else if (host_cached) {
+                rank = 2;
+            }
+        }
         VkDeviceSize heap_size = mem_props->memoryHeaps[heap_idx].size;
 
         if (best_index < 0 || rank > best_rank || (rank == best_rank && heap_size > best_heap_size)) {
@@ -151,6 +166,54 @@ static void destroy_unexported_image(VkDevice device, VkImage image, VkDeviceMem
 
 static bool format_uses_bgra8_view_list(VkFormat format) {
     return format == VK_FORMAT_B8G8R8A8_UNORM || format == VK_FORMAT_B8G8R8A8_SRGB;
+}
+
+// A buffer the other GPU imports has to live in system RAM. Device-local
+// memory, including a resizeable BAR, is not readable by that GPU's DMA.
+static VulkanResult find_foreign_import_memory(
+    const VulkanContext *ctx,
+    uint32_t             type_filter,
+    uint32_t            *out_type_index
+) {
+    const VkPhysicalDeviceMemoryProperties *mem = &ctx->device_info.memory_properties;
+    int32_t system = -1;
+    int system_rank = -1;
+    int32_t barred = -1;
+    int barred_rank = -1;
+
+    for (uint32_t i = 0; i < mem->memoryTypeCount && i < 32; ++i) {
+        if ((type_filter & (1u << i)) == 0) {
+            continue;
+        }
+        VkMemoryPropertyFlags flags = mem->memoryTypes[i].propertyFlags;
+        if ((flags & (VK_MEMORY_PROPERTY_PROTECTED_BIT | VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT)) != 0) {
+            continue;
+        }
+        if ((flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) == 0) {
+            continue;
+        }
+        const bool local = (flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
+        const int rank = (flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0 ? 2 : 1;
+        if (!local) {
+            if (system < 0 || rank > system_rank) {
+                system = (int32_t)i;
+                system_rank = rank;
+            }
+        } else if (barred < 0 || rank > barred_rank) {
+            barred = (int32_t)i;
+            barred_rank = rank;
+        }
+    }
+
+    if (system >= 0) {
+        *out_type_index = (uint32_t)system;
+        return VULKAN_SUCCESS;
+    }
+    if (barred >= 0) {
+        *out_type_index = (uint32_t)barred;
+        return VULKAN_SUCCESS;
+    }
+    return vulkan_find_memory_type(ctx, type_filter, 0, out_type_index);
 }
 
 static VulkanResult image_is_exportable(
@@ -345,6 +408,7 @@ static VulkanResult create_bound_export_image(
     const uint64_t        *modifiers,
     uint32_t               modifier_count,
     bool                   mutable_bgra8,
+    bool                   foreign_read,
     VulkanExportableImage *out_image
 ) {
     const bool modifier_tiling = tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
@@ -411,10 +475,18 @@ static VulkanResult create_bound_export_image(
     const VkMemoryRequirements *mem_reqs = &mem_reqs2.memoryRequirements;
 
     uint32_t memory_type_index = 0;
-    VulkanResult mem_type_res = vulkan_find_memory_type(
-        ctx, mem_reqs->memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &memory_type_index);
+    VulkanResult mem_type_res;
+    if (foreign_read) {
+        mem_type_res = find_foreign_import_memory(ctx, mem_reqs->memoryTypeBits, &memory_type_index);
+    } else {
+        mem_type_res = vulkan_find_memory_type(
+            ctx, mem_reqs->memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &memory_type_index);
+        if (mem_type_res != VULKAN_SUCCESS) {
+            mem_type_res = vulkan_find_memory_type(ctx, mem_reqs->memoryTypeBits, 0, &memory_type_index);
+        }
+    }
     if (mem_type_res != VULKAN_SUCCESS) {
-        fprintf(stderr, "[Vulkan Error] Could not find device-local memory type for DMA-BUF image\n");
+        fprintf(stderr, "[Vulkan Error] Could not find a memory type for the DMA-BUF image\n");
         vkDestroyImage(ctx->device, image, nullptr);
         return mem_type_res;
     }
@@ -561,6 +633,7 @@ static VulkanResult create_bound_export_image(
     out_image->tiling = tiling;
     out_image->drm_format_modifier = chosen_modifier;
     out_image->has_drm_format_modifier = has_modifier;
+    out_image->mutable_bgra8 = mutable_bgra8;
     out_image->allocation_size = mem_reqs->size;
     out_image->offset = plane_offset;
     out_image->row_pitch = plane_row_pitch;
@@ -575,6 +648,7 @@ VulkanResult vulkan_create_exportable_image_with_modifiers(
     VkImageUsageFlags      usage,
     const uint64_t        *allowed_modifiers,
     uint32_t               allowed_modifier_count,
+    bool                   foreign_read,
     VulkanExportableImage *out_image
 ) {
     if (ctx == nullptr || out_image == nullptr || width == 0 || height == 0 ||
@@ -623,7 +697,7 @@ VulkanResult vulkan_create_exportable_image_with_modifiers(
 
     VulkanResult created = create_bound_export_image(
         ctx, width, height, format, usage, VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
-        modifiers, modifier_count, use_mutable, out_image);
+        modifiers, modifier_count, use_mutable, foreign_read, out_image);
     free(modifiers);
     if (created != VULKAN_SUCCESS) {
         return created;
@@ -666,6 +740,8 @@ void vulkan_destroy_exportable_image(
     image->tiling = VK_IMAGE_TILING_OPTIMAL;
     image->drm_format_modifier = 0;
     image->has_drm_format_modifier = false;
+    image->mutable_bgra8 = false;
+    image->prime_copy = false;
     image->width = 0;
     image->height = 0;
     image->allocation_size = 0;
@@ -692,23 +768,37 @@ VulkanResult vulkan_command_pool_create(VulkanContext *ctx) {
         return mapped == VULKAN_ERROR_UNKNOWN ? VULKAN_ERROR_INITIALIZATION_FAILED : mapped;
     }
 
-    // Dedicated compute command pool
-    pool_info.queueFamilyIndex = ctx->queues.compute_family_index;
-    res = vkCreateCommandPool(ctx->device, &pool_info, nullptr, &ctx->compute_cmd_pool);
-    if (res != VK_SUCCESS) {
-        fprintf(stderr, "[Vulkan Error] vkCreateCommandPool (compute) failed: %s (%d)\n",
-                vulkan_vkresult_to_str(res), (int)res);
-        ctx->compute_cmd_pool = ctx->cmd_pool; // fallback alias
+    // A pool belongs to one family. The graphics pool is a legal alias only
+    // when the role uses that same family.
+    if (ctx->queues.compute_family_index == ctx->queues.graphics_family_index) {
+        ctx->compute_cmd_pool = ctx->cmd_pool;
+    } else {
+        pool_info.queueFamilyIndex = ctx->queues.compute_family_index;
+        res = vkCreateCommandPool(ctx->device, &pool_info, nullptr, &ctx->compute_cmd_pool);
+        if (res != VK_SUCCESS) {
+            fprintf(stderr, "[Vulkan Error] vkCreateCommandPool (compute) failed: %s (%d)\n",
+                    vulkan_vkresult_to_str(res), (int)res);
+            vulkan_command_pool_destroy(ctx);
+            VulkanResult mapped = vulkan_result_from_vkresult(res);
+            return mapped == VULKAN_ERROR_UNKNOWN ? VULKAN_ERROR_INITIALIZATION_FAILED : mapped;
+        }
     }
 
-    // Dedicated transfer command pool
-    pool_info.queueFamilyIndex = ctx->queues.transfer_family_index;
-    pool_info.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT | VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-    res = vkCreateCommandPool(ctx->device, &pool_info, nullptr, &ctx->transfer_cmd_pool);
-    if (res != VK_SUCCESS) {
-        fprintf(stderr, "[Vulkan Error] vkCreateCommandPool (transfer) failed: %s (%d)\n",
-                vulkan_vkresult_to_str(res), (int)res);
-        ctx->transfer_cmd_pool = ctx->cmd_pool; // fallback alias
+    if (ctx->queues.transfer_family_index == ctx->queues.graphics_family_index) {
+        ctx->transfer_cmd_pool = ctx->cmd_pool;
+    } else if (ctx->queues.transfer_family_index == ctx->queues.compute_family_index) {
+        ctx->transfer_cmd_pool = ctx->compute_cmd_pool;
+    } else {
+        pool_info.queueFamilyIndex = ctx->queues.transfer_family_index;
+        pool_info.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT | VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+        res = vkCreateCommandPool(ctx->device, &pool_info, nullptr, &ctx->transfer_cmd_pool);
+        if (res != VK_SUCCESS) {
+            fprintf(stderr, "[Vulkan Error] vkCreateCommandPool (transfer) failed: %s (%d)\n",
+                    vulkan_vkresult_to_str(res), (int)res);
+            vulkan_command_pool_destroy(ctx);
+            VulkanResult mapped = vulkan_result_from_vkresult(res);
+            return mapped == VULKAN_ERROR_UNKNOWN ? VULKAN_ERROR_INITIALIZATION_FAILED : mapped;
+        }
     }
 
     return VULKAN_SUCCESS;
@@ -718,18 +808,22 @@ void vulkan_command_pool_destroy(VulkanContext *ctx) {
     if (ctx == nullptr || ctx->device == VK_NULL_HANDLE) {
         return;
     }
-    if (ctx->transfer_cmd_pool != VK_NULL_HANDLE && ctx->transfer_cmd_pool != ctx->cmd_pool) {
-        vkDestroyCommandPool(ctx->device, ctx->transfer_cmd_pool, nullptr);
-    }
+    // Transfer may alias the compute pool when those roles share a family.
+    // Destroying that handle twice is a driver fault.
+    VkCommandPool transfer = ctx->transfer_cmd_pool;
+    VkCommandPool compute = ctx->compute_cmd_pool;
+    VkCommandPool graphics = ctx->cmd_pool;
     ctx->transfer_cmd_pool = VK_NULL_HANDLE;
-
-    if (ctx->compute_cmd_pool != VK_NULL_HANDLE && ctx->compute_cmd_pool != ctx->cmd_pool) {
-        vkDestroyCommandPool(ctx->device, ctx->compute_cmd_pool, nullptr);
-    }
     ctx->compute_cmd_pool = VK_NULL_HANDLE;
+    ctx->cmd_pool = VK_NULL_HANDLE;
 
-    if (ctx->cmd_pool != VK_NULL_HANDLE) {
-        vkDestroyCommandPool(ctx->device, ctx->cmd_pool, nullptr);
-        ctx->cmd_pool = VK_NULL_HANDLE;
+    if (transfer != VK_NULL_HANDLE && transfer != graphics && transfer != compute) {
+        vkDestroyCommandPool(ctx->device, transfer, nullptr);
+    }
+    if (compute != VK_NULL_HANDLE && compute != graphics) {
+        vkDestroyCommandPool(ctx->device, compute, nullptr);
+    }
+    if (graphics != VK_NULL_HANDLE) {
+        vkDestroyCommandPool(ctx->device, graphics, nullptr);
     }
 }

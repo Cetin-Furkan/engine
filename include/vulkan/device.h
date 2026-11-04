@@ -8,26 +8,22 @@ extern "C" {
 #endif
 
 /**
- * @brief Selects the optimal physical device and creates the Vulkan logical device.
+ * @brief Selects a physical device and creates the Vulkan logical device.
  *
- * Implements:
- * - Scores discrete above integrated above virtual. Rejects CPU / llvmpipe devices.
- * - Requires a Vulkan 1.4 device, a graphics queue, and a compute queue.
- * - Requires dynamic rendering, synchronization2, buffer device address, and timeline semaphores.
- * - Requires VK_KHR_external_memory_fd and VK_EXT_external_memory_dma_buf.
- * - Enables DRM-modifier and syncobj extensions only when that device lists them.
- * - Requires maintenance5, maintenance6, push descriptors, host image copy,
- *   and dynamic rendering local read.
- * - Prefers a pure transfer family, then another non-graphics transfer family,
- *   then the graphics family.
- * - On a shared family, requests one queue per role when queueCount allows it.
- *   Otherwise the roles share one VkQueue and submission_aliased is set.
- * - Loads extension entry points with vkGetDeviceProcAddr and rejects a null vkGetMemoryFdKHR.
- *
- * @param ctx Pointer to the initialized VulkanContext (instance must be created).
- * @return VULKAN_SUCCESS on success, or a descriptive VulkanResult error code.
+ * The frame command buffer is graphics and also records vkCmdDispatch, so the
+ * graphics family must include compute. A dedicated compute family is still
+ * opened for mesh bakes. Discrete GPUs outrank integrated ones. If logical
+ * device creation fails, the next eligible GPU is tried unless ENGINE_GPU_INDEX
+ * locked the choice. Wayland present failure can call vulkan_device_use_next.
  */
 [[nodiscard]] VulkanResult vulkan_device_create(VulkanContext *ctx);
+
+// Destroys the current logical device and opens the next ranked GPU.
+// Command pools must already be destroyed. ENGINE_GPU_INDEX does not fall through.
+[[nodiscard]] VulkanResult vulkan_device_use_next(VulkanContext *ctx);
+
+// Prints the queues, features, and DRM nodes of the device that is open.
+void vulkan_device_log(const VulkanContext *ctx);
 
 /**
  * @brief Safely destroys the Vulkan logical device.

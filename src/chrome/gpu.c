@@ -41,7 +41,7 @@ typedef struct ChromeGpuPush {
 
 static_assert(sizeof(ChromeGpuControl) == 24u, "chrome control push");
 static_assert(offsetof(ChromeGpuPush, ctl) == 40u, "chrome control offset");
-static_assert(sizeof(ChromeGpuPush) == 232u, "chrome push size");
+static_assert(sizeof(ChromeGpuPush) == k_chrome_push_bytes, "chrome push size");
 
 static VkPipelineLayout     s_layout = VK_NULL_HANDLE;
 static VulkanGfxLive        s_overlay_srgb;

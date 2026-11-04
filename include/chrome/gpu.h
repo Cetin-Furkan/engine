@@ -6,6 +6,11 @@
 
 // The bar, its controls, and a close glyph are filled by a fragment shader
 // over each layer rectangle. Hit tests stay on the CPU.
+// ChromeGpuPush is the largest push block the engine records. Device
+// selection rejects a GPU whose maxPushConstantsSize is smaller.
+enum : uint32_t {
+    k_chrome_push_bytes = 232u,
+};
 
 [[nodiscard]] int chrome_gpu_init(VulkanContext *vk);
 void chrome_gpu_shutdown(VulkanContext *vk);

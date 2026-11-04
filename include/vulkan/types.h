@@ -139,6 +139,8 @@ typedef struct VulkanDeviceInfo {
     bool supports_shader_float_controls2;
     bool supports_shader_subgroup_rotate;
     bool supports_shader_subgroup_rotate_clustered;
+    bool supports_shader_demote;
+    bool supports_shader_draw_parameters;
 
     // Linux DRM device node identity (VK_EXT_physical_device_drm) for Wayland matching.
     bool    has_drm_primary_node;

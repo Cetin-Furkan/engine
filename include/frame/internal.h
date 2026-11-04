@@ -84,6 +84,11 @@ typedef struct FrameSlot {
     VkImageView           image_view;
     VkFormat              view_format;
     EngineTargets         targets;
+    // Device-local color target used when image.prime_copy is set. The export
+    // image is then only a transfer destination for the display GPU.
+    VkImage               prime_image;
+    VkDeviceMemory        prime_memory;
+    VkImageView           prime_view;
 } FrameSlot;
 
 typedef EngineRelay RunRelay;
@@ -249,6 +254,8 @@ int create_release_timeline(VulkanContext *vk, WaylandContext *wl, FrameSlot *fr
 VkResult wait_own_release(VulkanContext *vk, FrameSlot *frame, uint64_t timeout_ns);
 void clear_pixels(FrameSlot *frame);
 bool slot_has_pixels(const FrameSlot *frame);
+[[nodiscard]] int ensure_prime_color(VulkanContext *vk, FrameSlot *frame);
+void destroy_prime_color(VulkanContext *vk, FrameSlot *frame);
 void destroy_frame_gpu(VulkanContext *vk, FrameSlot *frame);
 void reap_frame_resources(WaylandContext *wl, VulkanContext *vk, FrameSlot *frame);
 void sweep_ready_orphans(WaylandContext *wl, VulkanContext *vk, bool force_all);
@@ -301,6 +308,9 @@ void frame_fill_discard_color(VkImageMemoryBarrier2 *out, VkImage image);
 void frame_fill_discard_depth(VkImageMemoryBarrier2 *out, VkImage image);
 void frame_fill_release_foreign(VkImageMemoryBarrier2 *out, const VulkanContext *vk, VkImage image);
 void frame_cmd_barriers(VkCommandBuffer cmd, const VkImageMemoryBarrier2 *barriers, uint32_t count);
+// Direct present releases the color attachment. A cross-device present copies
+// the device-local target into the export image, then releases that copy.
+void frame_cmd_finish_present(VkCommandBuffer cmd, const VulkanContext *vk, const FrameSlot *frame);
 
 uint32_t sim_wall_ms(void);
 void note_sim_idle(void);

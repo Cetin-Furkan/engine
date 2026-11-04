@@ -31,7 +31,7 @@ The cube samples a 128³ fp16 lattice. `shaders/grid.comp` steps that field. `sh
 
 ## How it works
 
-**Ring and wire.** `src/ring/` registers the ring with `SINGLE_ISSUER`, `DEFER_TASKRUN`, `NO_MMAP`, and `REGISTERED_FD_ONLY`, plus a registered wait and a provided-buffer ring. Setup also requires `EXT_ARG`, `CQE_SKIP`, `LINKED_FILE`, `REG_REG_RING`, `MIN_TIMEOUT`, and `NO_IOWAIT`. The bring-up log on this machine is SQ 64, CQ 256, 32 buffers of 8192 bytes. `src/wayland/` encodes and parses the wire. It asks the surface for a DMA-BUF tranche and binds `wp_linux_drm_syncobj_v1` acquire and release timelines. The color image is `DRM_FORMAT_ARGB8888`. The modifier is the one the compositor's tranche and the device agree on.
+**Ring and wire.** `src/ring/` registers the ring with `SINGLE_ISSUER`, `DEFER_TASKRUN`, `NO_MMAP`, and `REGISTERED_FD_ONLY`, plus a registered wait and a provided-buffer ring. Setup also requires `EXT_ARG`, `CQE_SKIP`, `LINKED_FILE`, `REG_REG_RING`, `MIN_TIMEOUT`, and `NO_IOWAIT`. The bring-up log on this machine is SQ 64, CQ 256, 32 buffers of 8192 bytes. `src/wayland/` encodes and parses the wire. It asks the surface for a DMA-BUF tranche and binds `wp_linux_drm_syncobj_v1` acquire and release timelines. The color image is `DRM_FORMAT_ARGB8888`. The modifier is the one the compositor's tranche and the device agree on. When the render GPU is not the compositor's main device, the frame is drawn in device-local memory and copied into a buffer that device can import. If that export fails, the next eligible GPU is opened.
 
 **Clock and handles.** `FrameClock` in `include/frame/clock.h` is 64 bytes: the last stamp, a fixed-point refresh period, missed refreshes, stall count, and the fixed-step remainder. The instance in the frame state is `alignas(64)`. A presented slot is named by `(generation << 8) | (index + 1)`. Generation 0 never resolves, and blanking the slot bumps the generation so the old handle fails the match. The world table stores the generation it selected. A render-target entry stores its own, so a copied `EngineTargets` cannot pick up a recycled image.
 
@@ -102,7 +102,7 @@ ENGINE_GPU_INDEX=0 ./build/release/bin/engine
 ENGINE_GPU=Intel ./build/release/bin/engine
 ```
 
-`ENGINE_GPU_INDEX` is the probe index printed at startup. `ENGINE_GPU` is a case-insensitive substring of the vendor, the device type, or the device name. Either one is a filter. It is not a portability test.
+`ENGINE_GPU_INDEX` is the probe index printed at startup, and it locks that device. `ENGINE_GPU` is a case-insensitive substring of the vendor, the device type, or the device name. Matching devices are tried first, and the rest stay as a fallback. It is not a portability test.
 
 ## Layout
 

@@ -18,15 +18,13 @@ static int create_raw_block(VulkanContext *vk, VkDeviceSize size, VkBufferUsageF
     }
     *out = (BdaBlock){0};
 
-    uint32_t queue_families[3];
+    // Frame dispatches use the graphics queue. Mesh bakes use the compute
+    // queue. Nothing submits the transfer queue, so it is not a sharing member.
+    uint32_t queue_families[2];
     uint32_t queue_family_count = 0;
     queue_families[queue_family_count++] = vk->queues.graphics_family_index;
     if (vk->queues.compute_family_index != vk->queues.graphics_family_index) {
         queue_families[queue_family_count++] = vk->queues.compute_family_index;
-    }
-    if (vk->queues.transfer_family_index != vk->queues.graphics_family_index &&
-        vk->queues.transfer_family_index != vk->queues.compute_family_index) {
-        queue_families[queue_family_count++] = vk->queues.transfer_family_index;
     }
 
     VkBufferCreateInfo buffer_info = {
@@ -55,6 +53,16 @@ static int create_raw_block(VulkanContext *vk, VkDeviceSize size, VkBufferUsageF
 
     uint32_t type_index = 0;
     VulkanResult mem_res = vulkan_find_memory_type(vk, reqs.memoryTypeBits, req_flags, &type_index);
+    if (mem_res != VULKAN_SUCCESS && (req_flags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) != 0) {
+        mem_res = vulkan_find_memory_type(
+            vk, reqs.memoryTypeBits, req_flags & ~VK_MEMORY_PROPERTY_HOST_CACHED_BIT, &type_index);
+    }
+    if (mem_res != VULKAN_SUCCESS &&
+        (req_flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0 &&
+        (req_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0) {
+        mem_res = vulkan_find_memory_type(
+            vk, reqs.memoryTypeBits, req_flags & ~VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &type_index);
+    }
     if (mem_res != VULKAN_SUCCESS && (req_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) == 0) {
         mem_res = vulkan_find_memory_type(vk, reqs.memoryTypeBits, 0, &type_index);
     }
@@ -311,15 +319,21 @@ int bda_system_init(VulkanContext *vk) {
                           VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
                           VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |
                           VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-        .mem_flags      = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        .mem_flags      = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                          VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+                          VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
         .is_host_mapped = true,
     };
 
-    // Per-frame 16 MiB transient bump ring
+    // Per-frame 16 MiB transient bump ring. Shaders read it, so a ReBAR
+    // heap wins over a larger uncached system-RAM heap. Cached system RAM
+    // is the fallback when the device has no host-visible device-local type.
     VkBufferUsageFlags transient_usage = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
                                          VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
     (void)create_raw_block(vk, 16u * 1024u * 1024u, transient_usage,
-                           VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                           VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+                               VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                               VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                            true, &s_bda_sys.transient_ring);
 
     s_bda_sys.is_initialized = true;

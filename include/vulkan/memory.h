@@ -21,6 +21,12 @@ typedef struct VulkanExportableImage {
     VkImageTiling     tiling;
     uint64_t          drm_format_modifier;
     bool              has_drm_format_modifier;
+    // The image was created with VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT and the
+    // UNORM/sRGB view list, so a B8G8R8A8_SRGB view of a UNORM image is legal.
+    bool              mutable_bgra8;
+    // The display GPU is not this device. The image is a transfer target.
+    // The frame renders into a device-local image and copies into this one.
+    bool              prime_copy;
     VkDeviceSize      allocation_size;
     VkDeviceSize      offset;
     VkDeviceSize      row_pitch;
@@ -40,7 +46,8 @@ typedef struct VulkanExportableImage {
  *
  * Intersects the physical device's single-plane exportable modifiers for (format, usage)
  * with allowed_modifiers. Rejects optimal tiling (no modifier) and any chosen modifier
- * not present in allowed_modifiers.
+ * not present in allowed_modifiers. foreign_read places the buffer in memory another
+ * GPU can DMA, which is required when the compositor's device is not this one.
  */
 [[nodiscard]] VulkanResult vulkan_create_exportable_image_with_modifiers(
     VulkanContext         *ctx,
@@ -50,6 +57,7 @@ typedef struct VulkanExportableImage {
     VkImageUsageFlags      usage,
     const uint64_t        *allowed_modifiers,
     uint32_t               allowed_modifier_count,
+    bool                   foreign_read,
     VulkanExportableImage *out_image);
 
 /**

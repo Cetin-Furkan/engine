@@ -211,6 +211,18 @@ typedef struct WaylandContext {
     int64_t                  feedback_main_minor;
     bool                     feedback_has_main_dev;
     bool                     feedback_done;
+    // Modifiers the compositor's main device can import when that device is
+    // not the Vulkan render GPU. Merged into all_modifiers for a cross-device
+    // copy. Scanout stays empty: those flags describe the other GPU's tiling.
+    uint64_t                 prime_modifiers[ENG_WL_MAX_MODIFIERS];
+    uint32_t                 prime_modifier_count;
+    bool                     feedback_cross_device;
+    bool                     feedback_round_sealed;
+    uint32_t                 feedback_producer_mods;
+    uint32_t                 feedback_consumer_mods;
+    uint32_t                 feedback_producer_tranches;
+    uint32_t                 feedback_consumer_tranches;
+    uint32_t                 feedback_other_tranches;
 
     // Staging for the tranche currently being parsed
     int64_t  tranche_major;
@@ -289,10 +301,11 @@ void wayland_on_cqe(WaylandContext *w, const struct io_uring_cqe *cqe);
 );
 
 /**
- * @brief Requests zwp_linux_dmabuf_v1.get_surface_feedback for the active wl_surface,
- * matches tranches against the render node and, when has_alt is set,
- * the primary node of the same GPU, and populates w->scanout_modifiers
- * and w->all_modifiers for DRM_FORMAT_ARGB8888.
+ * @brief Requests zwp_linux_dmabuf_v1.get_surface_feedback for the active wl_surface.
+ * Tranches for the render node, and the primary node when has_alt is set, fill
+ * scanout_modifiers and all_modifiers. Tranches for the compositor main device
+ * are kept when that device is different, so a muxless dGPU can export a buffer
+ * the display GPU imports. Only DRM_FORMAT_ARGB8888 is collected.
  */
 [[nodiscard]] int wayland_query_surface_dmabuf_feedback(
     WaylandContext *w,

@@ -29,14 +29,15 @@ void cube_shutdown(VulkanContext *vk);
 
 // yaw_deg is degrees about Y. 38 with a 28 degree pitch is the still pose.
 // origin_x is pixels right of center. origin_y is pixels up from center.
-// depth_bias pulls a later object closer. Object 0 passes 0.
+// origin_z is the center's height off the ground plane. depth_bias pulls a
+// later object closer. Object 0 passes 0 for the bias.
 // phase is turns of hue, one full turn per 5000 ms of frame-clock time.
 // selected lightens the cube the same way a selected solid is lightened.
 // mat is that fillet's look. The first uses slot 0. The rest use 40..62.
 // heat_slot picks that fillet's temperature field. It is the pool index.
 void cube_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height, float yaw_deg,
-               float origin_x, float origin_y, float depth_bias, float phase, bool selected,
-               uint32_t mat, uint32_t heat_slot);
+               float origin_x, float origin_y, float origin_z, float depth_bias, float phase,
+               bool selected, uint32_t mat, uint32_t heat_slot);
 
 // Remember the interval the frame clock issued for this slot. The returned
 // value is what a submit records. Zero is a held slot or an issued interval
@@ -67,12 +68,12 @@ bool cube_heat_step_open(void);
 void cube_bind_acquire(VkSemaphore acquire);
 
 // Ray against the posed fillet. yaw_deg is degrees about Y, the same value
-// cube_draw takes. origin_x and origin_y are the draw's pixel offset. The
-// draw does not add a z offset. hx, hy, hz are the world point on the
-// displaced surface. False when the ray misses, or the bake has not stored
-// the mesh yet.
+// cube_draw takes. origin_x, origin_y, and origin_z are the draw's offset.
+// hx, hy, hz are the world point on the displaced surface. False when the
+// ray misses, or the bake has not stored the mesh yet.
 bool cube_surface_hit(uint32_t heat_slot, float yaw_deg, float origin_x, float origin_y,
-                      const CameraRay *ray, float *t_hit, float *hx, float *hy, float *hz);
+                      float origin_z, const CameraRay *ray, float *t_hit, float *hx, float *hy,
+                      float *hz);
 bool cube_surface_ready(void);
 // True when the mesh is not stored yet, or the rest pose hits a ray through
 // the interior and misses a ray at x = 360. Logs and returns false on a miss.

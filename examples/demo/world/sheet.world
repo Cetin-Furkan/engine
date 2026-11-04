@@ -1,0 +1,14 @@
+# Flat sheet. This file is the document. L reads it again in 2D and Hybrid.
+# The resting pose is sheet.live, beside this file. live.world is not used.
+# rigid x y hx hy yaw_deg
+# soft x y cols rows spacing
+# dyn x y yaw_deg n
+# then n lines of local x y, convex, counter-clockwise
+rigid -220 80 90 50 0
+rigid 220 80 90 50 18
+soft 0 -180 6 4 36
+dyn 0 280 0 4
+48 0
+0 40
+-48 0
+0 -36

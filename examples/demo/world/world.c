@@ -1,6 +1,8 @@
 #include "world/world_int.h"
 #include "frame/camera.h"
+#include "frame/plot.h"
 #include "frame/policy.h"
+#include "frame/sheet.h"
 #include "frame/text.h"
 #include <stdio.h>
 #include <string.h>
@@ -75,6 +77,7 @@ void world_reset(void) {
     world_removed_clear();
     table_reset();
     ground_reset();
+    sheet_reset();
     face_reset();
     table_kinds_reset();
     solid_kind_reset();
@@ -86,6 +89,10 @@ void world_reset(void) {
 }
 
 void world_record(VkCommandBuffer cmd, uint32_t heat_dt, bool live) {
+    // 2D keeps the fillet heat and the 128³ lattice off the queue.
+    if (policy_mode() == MODE_2D) {
+        return;
+    }
     table_record(cmd, heat_dt, live);
 }
 
@@ -106,19 +113,37 @@ bool world_record_step_open(void) {
 }
 
 bool world_record_poke_pending(void) {
+    if (policy_mode() == MODE_2D) {
+        return false;
+    }
     return table_record_poke_pending();
 }
 
 bool world_simulation(uint32_t time_ms, uint32_t sim_dt_ms, uint32_t *heat_dt) {
-    return table_simulate(time_ms, sim_dt_ms, heat_dt);
+    bool pulse = false;
+    if (policy_mode() == MODE_2D) {
+        if (heat_dt != nullptr) {
+            *heat_dt = 0;
+        }
+    } else {
+        pulse = table_simulate(time_ms, sim_dt_ms, heat_dt);
+    }
+    if (policy_mode() != MODE_3D && sheet_simulate(sim_dt_ms)) {
+        pulse = true;
+    }
+    return pulse;
 }
 
 void world_simulation_hold(void) {
-    table_simulate_hold();
+    if (policy_mode() != MODE_2D) {
+        table_simulate_hold();
+    }
 }
 
 void world_simulation_commit(uint32_t time_ms, uint32_t heat_dt) {
-    table_simulate_commit(time_ms, heat_dt);
+    if (policy_mode() != MODE_2D) {
+        table_simulate_commit(time_ms, heat_dt);
+    }
 }
 
 static void world_store(void) {
@@ -142,8 +167,19 @@ bool world_apply_mesh(bool has, bool bytes) {
 }
 
 bool world_click(float screen_x, float screen_y) {
+    WorkspaceMode mode = policy_mode();
     CameraRay ray;
     camera_click_ray(screen_x, screen_y, &ray);
+    if (mode != MODE_3D && policy_allows(PERM_OBJ_SELECT)) {
+        Coord ground = {0};
+        if (coord_ground_hit(&ray, &ground, nullptr) && sheet_click(ground.x, ground.y)) {
+            table_clear_selection();
+            return true;
+        }
+    }
+    if (mode == MODE_2D) {
+        return false;
+    }
     Coord hit = {0};
     int index = table_pick(&ray, &hit, nullptr);
     if (index >= 0) {
@@ -151,6 +187,7 @@ bool world_click(float screen_x, float screen_y) {
         if (!policy_allows(PERM_OBJ_SELECT)) {
             return false;
         }
+        sheet_clear();
         bool changed = table_select(index);
         WorldObj *o = table_at(index);
         if (o != nullptr && o->ops != nullptr && o->ops->on_click != nullptr &&
@@ -174,12 +211,26 @@ bool world_close_face(void) {
 }
 
 bool world_cancel(void) {
+    bool sheet = policy_mode() != MODE_3D && sheet_cancel();
+    if (policy_mode() == MODE_2D) {
+        if (!sheet) {
+            return false;
+        }
+        printf("[Sheet] Selection cleared.\n");
+        fflush(stdout);
+        return true;
+    }
     bool corners = face_chain_count() > 0u;
     bool selected = table_selected() != nullptr;
     face_cancel_chain();
     table_clear_selection();
-    if (!corners && !selected) {
+    if (!corners && !selected && !sheet) {
         return false;
+    }
+    if (sheet && !corners && !selected) {
+        printf("[Sheet] Selection cleared.\n");
+        fflush(stdout);
+        return true;
     }
     if (corners && selected) {
         printf("[Engine] Edit cancelled.\n");
@@ -213,6 +264,12 @@ static bool delete_obj(WorldObj *o) {
 }
 
 bool world_delete(void) {
+    if (policy_mode() != MODE_3D && sheet_has_selection()) {
+        return sheet_delete();
+    }
+    if (policy_mode() == MODE_2D) {
+        return false;
+    }
     if (delete_obj(table_selected())) {
         return true;
     }
@@ -334,13 +391,30 @@ bool world_toggle_smooth(void) {
 }
 
 bool world_busy(void) {
-    return camera_busy() || overlay_busy() || face_chain_busy() ||
-           solid_kind_smooth_dirty() || table_busy() || text_busy();
+    bool busy = camera_busy() || text_busy();
+    if (policy_mode() == MODE_2D) {
+        busy = busy || plot_wants_frame() || sheet_busy();
+    } else {
+        busy = busy || overlay_busy() || face_chain_busy() || solid_kind_smooth_dirty() || table_busy();
+        if (policy_mode() == MODE_HYBRID) {
+            busy = busy || sheet_busy();
+        }
+    }
+    return busy;
 }
 
 bool world_advance(uint32_t time_ms) {
-    bool changed = table_advance(time_ms) || face_chain_busy() || solid_kind_smooth_dirty() ||
-                   overlay_busy() || text_busy();
+    bool changed = text_busy();
+    if (policy_mode() == MODE_2D) {
+        if (plot_wants_frame()) {
+            changed = true;
+        }
+    } else if (table_advance(time_ms) || face_chain_busy() || solid_kind_smooth_dirty() || overlay_busy()) {
+        changed = true;
+    }
+    if (policy_mode() != MODE_3D && sheet_take_changed()) {
+        changed = true;
+    }
     if (camera_advance(time_ms)) {
         changed = true;
     }
@@ -358,6 +432,10 @@ void world_commit(void) {
 }
 
 bool world_consume_spin(void) {
+    // 2D freezes the 3D turn. Do not call it finished, and do not hold the lattice.
+    if (policy_mode() == MODE_2D && (table_busy() || table_record_poke_pending())) {
+        return false;
+    }
     if (world_busy() || !table_spun_pending()) {
         return false;
     }
@@ -368,8 +446,13 @@ bool world_consume_spin(void) {
 void world_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height, bool live) {
     camera_bind(live);
     ground_draw(cmd, width, height);
-    table_draw(cmd, width, height, live);
-    face_draw_chain(cmd, width, height, live);
+    if (policy_mode() != MODE_2D) {
+        table_draw(cmd, width, height, live);
+        face_draw_chain(cmd, width, height, live);
+    }
+    if (policy_mode() != MODE_3D) {
+        sheet_draw(cmd, width, height);
+    }
     overlay_draw(cmd, width, height);
 }
 

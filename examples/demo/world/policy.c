@@ -3,22 +3,27 @@
 #include <stdio.h>
 #include <string.h>
 
-// Two compiled workspaces. The live copy starts as the 3D keymap so
-// Q/E yaw and C/V pitch behave as they did before the gate existed.
-// sealed true on a profile locks that copy for the life of the process:
-// grant, revoke, rebind, and Tab all fail. Both ship unsealed so Tab
-// can move between them.
+// Three compiled workspaces. The live copy starts as 3D so Q/E yaw and
+// C/V pitch behave as they did before the gate existed. Tab cycles
+// 3D, then the flat sheet, then Hybrid. sealed true on a profile locks
+// that copy for the life of the process: grant, revoke, rebind, and
+// Tab all fail. All three ship unsealed.
+//
+// 2D pans, zooms, snaps, selects, and deletes on the sheet. It does
+// not yaw, pitch, spawn a solid, or run the lattice.
 //
 // Shift+4 is plus on a Turkish Q number row. That chord is zoom.
 // 4 with shift up places the cylinder. The two binds share KEY_4 and
 // the exact shift match picks one.
 
 static const bool k_blender_sealed = false;
-static const bool k_plot_sealed    = false;
+static const bool k_flat_sealed    = false;
+static const bool k_hybrid_sealed  = false;
 
-static const uint32_t k_perm_plot =
+static const uint32_t k_perm_flat =
     PERM_CAM_PAN_X | PERM_CAM_PAN_Y | PERM_CAM_ZOOM | PERM_CAM_SNAP |
-    PERM_PLOT_CYCLE | PERM_DATA_RELOAD | PERM_MODE_SWITCH;
+    PERM_OBJ_SELECT | PERM_OBJ_DELETE | PERM_PLOT_CYCLE | PERM_DATA_RELOAD |
+    PERM_MODE_SWITCH;
 
 static const uint32_t k_perm_blender =
     PERM_CAM_PAN_X | PERM_CAM_PAN_Y | PERM_CAM_ZOOM | PERM_CAM_YAW |
@@ -111,34 +116,39 @@ static const KeyBind k_blender_binds[] = {
     { .evdev_key = KEY_Z,         .need_shift = KEY_SHIFT_ANY,  .action = ACT_RESTORE },
 };
 
-static const KeyBind k_plot_binds[] = {
-    { .evdev_key = KEY_LEFT,    .need_shift = KEY_SHIFT_ANY,  .action = ACT_PAN_LEFT },
-    { .evdev_key = KEY_RIGHT,   .need_shift = KEY_SHIFT_ANY,  .action = ACT_PAN_RIGHT },
-    { .evdev_key = KEY_UP,      .need_shift = KEY_SHIFT_ANY,  .action = ACT_PAN_UP },
-    { .evdev_key = KEY_DOWN,    .need_shift = KEY_SHIFT_ANY,  .action = ACT_PAN_DOWN },
-    { .evdev_key = KEY_EQUAL,   .need_shift = KEY_SHIFT_ANY,  .action = ACT_ZOOM_IN },
-    { .evdev_key = KEY_KPPLUS,  .need_shift = KEY_SHIFT_ANY,  .action = ACT_ZOOM_IN },
-    { .evdev_key = KEY_4,       .need_shift = KEY_SHIFT_DOWN, .action = ACT_ZOOM_IN },
-    { .evdev_key = KEY_MINUS,   .need_shift = KEY_SHIFT_ANY,  .action = ACT_ZOOM_OUT },
-    { .evdev_key = KEY_KPMINUS, .need_shift = KEY_SHIFT_ANY,  .action = ACT_ZOOM_OUT },
-    { .evdev_key = KEY_HOME,    .need_shift = KEY_SHIFT_ANY,  .action = ACT_HOME },
-    { .evdev_key = KEY_KP1,     .need_shift = KEY_SHIFT_ANY,  .action = ACT_HOME },
-    { .evdev_key = KEY_M,       .need_shift = KEY_SHIFT_ANY,  .action = ACT_PLOT_CYCLE },
-    { .evdev_key = KEY_L,       .need_shift = KEY_SHIFT_ANY,  .action = ACT_DATA_RELOAD },
-    { .evdev_key = KEY_TAB,     .need_shift = KEY_SHIFT_ANY,  .action = ACT_SWITCH_MODE },
+static const KeyBind k_flat_binds[] = {
+    { .evdev_key = KEY_LEFT,      .need_shift = KEY_SHIFT_ANY,  .action = ACT_PAN_LEFT },
+    { .evdev_key = KEY_RIGHT,     .need_shift = KEY_SHIFT_ANY,  .action = ACT_PAN_RIGHT },
+    { .evdev_key = KEY_UP,        .need_shift = KEY_SHIFT_ANY,  .action = ACT_PAN_UP },
+    { .evdev_key = KEY_DOWN,      .need_shift = KEY_SHIFT_ANY,  .action = ACT_PAN_DOWN },
+    { .evdev_key = KEY_EQUAL,     .need_shift = KEY_SHIFT_ANY,  .action = ACT_ZOOM_IN },
+    { .evdev_key = KEY_KPPLUS,    .need_shift = KEY_SHIFT_ANY,  .action = ACT_ZOOM_IN },
+    { .evdev_key = KEY_4,         .need_shift = KEY_SHIFT_DOWN, .action = ACT_ZOOM_IN },
+    { .evdev_key = KEY_MINUS,     .need_shift = KEY_SHIFT_ANY,  .action = ACT_ZOOM_OUT },
+    { .evdev_key = KEY_KPMINUS,   .need_shift = KEY_SHIFT_ANY,  .action = ACT_ZOOM_OUT },
+    { .evdev_key = KEY_HOME,      .need_shift = KEY_SHIFT_ANY,  .action = ACT_HOME },
+    { .evdev_key = KEY_KP1,       .need_shift = KEY_SHIFT_ANY,  .action = ACT_HOME },
+    { .evdev_key = KEY_ESC,       .need_shift = KEY_SHIFT_ANY,  .action = ACT_CANCEL },
+    { .evdev_key = KEY_BACKSPACE, .need_shift = KEY_SHIFT_ANY,  .action = ACT_DELETE },
+    { .evdev_key = KEY_DELETE,    .need_shift = KEY_SHIFT_ANY,  .action = ACT_DELETE },
+    { .evdev_key = KEY_X,         .need_shift = KEY_SHIFT_ANY,  .action = ACT_DELETE },
+    { .evdev_key = KEY_M,         .need_shift = KEY_SHIFT_ANY,  .action = ACT_PLOT_CYCLE },
+    { .evdev_key = KEY_L,         .need_shift = KEY_SHIFT_ANY,  .action = ACT_DATA_RELOAD },
+    { .evdev_key = KEY_TAB,       .need_shift = KEY_SHIFT_ANY,  .action = ACT_SWITCH_MODE },
 };
 
 static_assert(sizeof k_blender_binds / sizeof k_blender_binds[0] == 41,
               "3D workspace bind count");
-static_assert(sizeof k_plot_binds / sizeof k_plot_binds[0] == 14,
-              "plot workspace bind count");
+static_assert(sizeof k_flat_binds / sizeof k_flat_binds[0] == 18,
+              "2D workspace bind count");
 static_assert(sizeof k_blender_binds / sizeof k_blender_binds[0] <= k_max_key_binds,
               "3D binds fit the table");
-static_assert(sizeof k_plot_binds / sizeof k_plot_binds[0] <= k_max_key_binds,
-              "plot binds fit the table");
+static_assert(sizeof k_flat_binds / sizeof k_flat_binds[0] <= k_max_key_binds,
+              "2D binds fit the table");
 
 static WorkspacePolicy s_blender;
-static WorkspacePolicy s_plot;
+static WorkspacePolicy s_flat;
+static WorkspacePolicy s_hybrid;
 static WorkspacePolicy s_live;
 static bool            s_profiles_ready = false;
 static bool            s_booted = false;
@@ -176,12 +186,15 @@ static void fill_profiles(void) {
     if (s_profiles_ready) {
         return;
     }
-    fill_one(&s_blender, "Blender-3D", k_perm_blender, k_blender_sealed, false,
+    fill_one(&s_blender, "3D", k_perm_blender, k_blender_sealed, false,
              k_blender_binds,
              (uint32_t)(sizeof k_blender_binds / sizeof k_blender_binds[0]));
-    fill_one(&s_plot, "Matplotlib-2D", k_perm_plot, k_plot_sealed, true,
-             k_plot_binds,
-             (uint32_t)(sizeof k_plot_binds / sizeof k_plot_binds[0]));
+    fill_one(&s_flat, "2D", k_perm_flat, k_flat_sealed, true,
+             k_flat_binds,
+             (uint32_t)(sizeof k_flat_binds / sizeof k_flat_binds[0]));
+    fill_one(&s_hybrid, "Hybrid", k_perm_blender, k_hybrid_sealed, false,
+             k_blender_binds,
+             (uint32_t)(sizeof k_blender_binds / sizeof k_blender_binds[0]));
     s_profiles_ready = true;
 }
 
@@ -315,7 +328,23 @@ const WorkspacePolicy *policy_blender(void) {
 
 const WorkspacePolicy *policy_matplotlib(void) {
     fill_profiles();
-    return &s_plot;
+    return &s_flat;
+}
+
+const WorkspacePolicy *policy_hybrid(void) {
+    fill_profiles();
+    return &s_hybrid;
+}
+
+static void log_mode(void) {
+    if (s_which == MODE_2D) {
+        printf("[Policy] 2D. Flat sheet only. The fillets and the lattice stay off.\n");
+    } else if (s_which == MODE_HYBRID) {
+        printf("[Policy] Hybrid. The 3D scene and the flat sheet.\n");
+    } else {
+        printf("[Policy] 3D.\n");
+    }
+    fflush(stdout);
 }
 
 void policy_boot(void) {
@@ -324,10 +353,22 @@ void policy_boot(void) {
     }
     fill_profiles();
     s_live = s_blender;
-    s_which = 0;
+    s_which = MODE_3D;
     s_booted = true;
-    printf("[Policy] %s.\n", s_live.name);
-    fflush(stdout);
+    log_mode();
+}
+
+WorkspaceMode policy_mode(void) {
+    if (!s_booted) {
+        policy_boot();
+    }
+    if (s_which == MODE_2D) {
+        return MODE_2D;
+    }
+    if (s_which == MODE_HYBRID) {
+        return MODE_HYBRID;
+    }
+    return MODE_3D;
 }
 
 WorkspacePolicy *policy_active(void) {
@@ -344,9 +385,14 @@ bool policy_switch(void) {
     if (s_live.sealed) {
         return false;
     }
-    s_which ^= 1u;
-    s_live = (s_which == 0u) ? s_blender : s_plot;
-    printf("[Policy] %s.\n", s_live.name);
-    fflush(stdout);
+    s_which = (s_which + 1u) % 3u;
+    if (s_which == MODE_2D) {
+        s_live = s_flat;
+    } else if (s_which == MODE_HYBRID) {
+        s_live = s_hybrid;
+    } else {
+        s_live = s_blender;
+    }
+    log_mode();
     return true;
 }

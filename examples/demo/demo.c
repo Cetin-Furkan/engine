@@ -13,6 +13,7 @@
 #include "frame/policy.h"
 #include "frame/plot.h"
 #include "frame/shape.h"
+#include "frame/sheet.h"
 #include "frame/solid.h"
 #include "frame/text.h"
 #include "frame/world.h"
@@ -25,9 +26,9 @@
 // The hosted program. Boot draws the metric grid and no objects.
 // opening.world places each cube line on z = 0. Clicks build faces.
 // Keys 1-6 raise solids. M cycles the math plot. L reloads the CSV
-// chart and the OBJ. Tab swaps the flat plot workspace and the 3D
-// workspace. The engine knows none of these names; it only calls
-// the EngineApp hooks below on its io_uring thread.
+// chart and the OBJ, and in 2D or Hybrid the sheet document too.
+// Tab cycles 3D, 2D, and Hybrid. The engine knows none of these names;
+// it only calls the EngineApp hooks below on its io_uring thread.
 
 // ---------------------------------------------------------------- targets
 
@@ -134,6 +135,7 @@ static int demo_init(VulkanContext *vk, RingCqeFn forward_cqe, void *forward_use
 
 static void demo_shutdown(VulkanContext *vk) {
     (void)world_save();
+    (void)sheet_save();
     grid_shutdown(vk);
     text_shutdown(vk);
     hud_shutdown(vk);
@@ -273,9 +275,14 @@ static bool demo_key(uint32_t key, EngineKeyContext *ctx) {
         engine_relay_begin(&relay, ctx->signal_armed, ctx->got_signal,
                            ctx->signo, ctx->inotify_armed);
         bool changed = plot_reload(ctx->reload_cqe, nullptr);
-        bool mesh_has = false;
-        bool mesh_bytes = mesh_reload(ctx->reload_cqe, nullptr, &mesh_has);
-        if (world_apply_mesh(mesh_has, mesh_bytes)) {
+        if (policy_mode() != MODE_2D) {
+            bool mesh_has = false;
+            bool mesh_bytes = mesh_reload(ctx->reload_cqe, nullptr, &mesh_has);
+            if (world_apply_mesh(mesh_has, mesh_bytes)) {
+                changed = true;
+            }
+        }
+        if (policy_mode() != MODE_3D && sheet_reload()) {
             changed = true;
         }
         if (engine_relay_end(&relay, ctx->wl, ctx->vk, ctx->pending_serial,
@@ -351,19 +358,23 @@ static const EngineApp s_app = {
     .help = "One turn, then io_uring idle. Points stay off until numpad 9. "
             "Empty clicks then place points, and F closes them into a face that stays. "
             "R spins until R again. F5 turns the selection again. A click on a mesh "
-            "selects it. A cube click also plants heat for five seconds, and it can be "
-            "selected while other meshes are up. Its colors sweep on that clock, then hold. "
+            "selects it. A cube click plants heat for five seconds and shoves the cube. "
+            "It stops on the ground and against other cubes, and that place is saved. "
+            "It can be selected while other meshes are up. Its colors sweep on that clock, then hold. "
             "Keys 1-6 raise a tetrahedron, octahedron, icosahedron, cylinder, cone, and torus. "
             "S smooths edges. G opens or closes glow. Esc clears. Backspace, Delete, or X removes. "
             "Z puts the last removed cube, solid, or mesh back. "
             "M cycles the math plot. L reloads the CSV chart and the OBJ mesh. "
+            "In 2D and Hybrid, L also reads sheet.world again. "
             "Numpad 8, 2, 4, 6, and 5 set top, bottom, left, right, and front. "
             "Numpad 5 again sets the back. Home or numpad 1 restores the opening camera, "
             "including zoom and position. Numpad 7 shows or hides the view ball. "
             "The wheel and the touchpad zoom. Right-drag orbits. Middle-drag pans. "
             "Arrows move on the screen axes. Q and E "
             "yaw, C and V pitch. Minus zooms out. Plus is numpad plus, shift+4, or equals. "
-            "Tab switches the flat plot workspace and the 3D workspace. "
+            "Tab cycles 3D, 2D, and Hybrid. 2D is a flat sheet of rigid boxes, "
+            "a soft patch, and shapes from sheet.world. It does not step the fillets "
+            "or the lattice. Hybrid draws the 3D scene and that sheet. "
             "Hold T and click twice to place a text box, then type. Escape leaves it. "
             "Edits are written to examples/demo/world/live.world. Faces and heat stay unsaved.",
     .init              = demo_init,

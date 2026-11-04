@@ -55,13 +55,6 @@ int ring_sim_pbuf_register(RingContext *r) {
     return rc;
 }
 
-uint8_t *ring_buf(const RingContext *r, uint16_t bid) {
-    if (r == nullptr || bid >= ENG_PBUF_ENTRIES || r->bufs == nullptr) {
-        return nullptr;
-    }
-    return r->bufs + (size_t)bid * ENG_PBUF_LEN;
-}
-
 void ring_pbuf_recycle(RingContext *r, uint16_t bid) {
     if (r == nullptr || bid >= ENG_PBUF_ENTRIES || r->pbuf == nullptr) {
         return;

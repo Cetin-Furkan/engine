@@ -143,7 +143,7 @@ $(TARGET): $(OBJS)
 		cat $(BUILD_DIR)/link.log >&2; \
 		exit 1; \
 	fi
-	@dead=$$(grep -E "removing unused section '\.text\.[^']*' in file '.*(src/vulkan|src/frame)" $(BUILD_DIR)/link.log || true); \
+	@dead=$$(grep -E "removing unused section '\.text\.[^']*' in file '.*(src/vulkan|src/frame|src/ring|src/wayland|src/input|src/chrome|src/system)" $(BUILD_DIR)/link.log || true); \
 	if [ -n "$$dead" ]; then \
 		echo -e "\033[0;31m[Link Error] Dead/hallucinated functions detected:\033[0m" >&2; \
 		echo "$$dead" >&2; rm -f $@; exit 1; \
@@ -246,8 +246,12 @@ test: $(CONFIG_MK)
 	./build/test_clock
 	$(CC) $(CFLAGS) -o build/test_world tests/test_world.c examples/demo/world/table.c examples/demo/world/spin.c -lm
 	./build/test_world
+	$(CC) $(CFLAGS) -o build/test_motion tests/test_motion.c examples/demo/world/motion.c examples/demo/world/fillet.c -lm
+	./build/test_motion
 	$(CC) $(CFLAGS) -o build/test_policy tests/test_policy.c examples/demo/world/policy.c
 	./build/test_policy
+	$(CC) $(CFLAGS) -o build/test_sheet tests/test_sheet.c examples/demo/world/sheet.c -lm
+	./build/test_sheet
 	$(CC) $(CFLAGS) -o build/test_text tests/test_text.c \
 		examples/demo/text/face/face.c examples/demo/text/shape/shape.c $(TEXT_LIBS) -lm
 	./build/test_text

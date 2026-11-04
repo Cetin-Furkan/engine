@@ -25,6 +25,8 @@ build/
 # Engine-written placement. opening.world stays the boot document.
 examples/demo/world/live.world
 examples/demo/world/live.world.tmp
+examples/demo/world/sheet.live
+examples/demo/world/sheet.live.tmp
 
 # Logs & debugging
 *.log

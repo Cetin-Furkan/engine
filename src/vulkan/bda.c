@@ -97,7 +97,13 @@ static int create_raw_block(VulkanContext *vk, VkDeviceSize size, VkBufferUsageF
         return -1;
     }
 
-    if (host_map) {
+    VkMemoryPropertyFlags got = vk->device_info.memory_properties.memoryTypes[type_index].propertyFlags;
+    bool coherent = (got & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0 &&
+                    (got & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
+    // A caller that asked for a map must get one. A device-local slab that
+    // landed in coherent memory is mapped too, so the CPU can read it after
+    // the acquire wait. A failed optional map leaves the mirror path.
+    if (host_map || coherent) {
         VkMemoryMapInfo map_info = {
             .sType  = VK_STRUCTURE_TYPE_MEMORY_MAP_INFO,
             .memory = out->memory,
@@ -107,12 +113,15 @@ static int create_raw_block(VulkanContext *vk, VkDeviceSize size, VkBufferUsageF
         void *mapped = nullptr;
         res = vkMapMemory2(vk->device, &map_info, &mapped);
         if (res != VK_SUCCESS) {
-            da_fail("vkMapMemory2 (raw slab)", res);
-            vkFreeMemory(vk->device, out->memory, nullptr);
-            vkDestroyBuffer(vk->device, out->buffer, nullptr);
-            return -1;
+            if (host_map) {
+                da_fail("vkMapMemory2 (raw slab)", res);
+                vkFreeMemory(vk->device, out->memory, nullptr);
+                vkDestroyBuffer(vk->device, out->buffer, nullptr);
+                return -1;
+            }
+        } else {
+            out->base_cpu = (uint8_t *)mapped;
         }
-        out->base_cpu = (uint8_t *)mapped;
     }
 
     if ((usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) != 0) {

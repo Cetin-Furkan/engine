@@ -19,6 +19,8 @@
 // Delete removes the selection, or the last loose corner, or the first
 // placed cube when neither is present. F5 runs the selected object through
 // one more revolution. A click on a cube also plants heat.
+// Tab cycles 3D, 2D, and Hybrid. 2D draws the flat sheet and does not
+// step the fillets or the lattice. Hybrid draws the 3D scene and the sheet.
 // The window idles when nothing is turning and no heat pulse is open.
 // Each cube's colors crawl one hue turn per revolution on those same stamps,
 // then hold. The sweep does not arm a frame by itself.

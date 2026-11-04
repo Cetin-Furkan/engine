@@ -1,13 +1,19 @@
 #include "world/world_int.h"
 #include "frame/gimbal.h"
 #include "frame/plot.h"
+#include "frame/policy.h"
 
 void overlay_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height) {
     plot_draw(cmd, width, height);
-    gimbal_draw(cmd, width, height);
+    if (policy_mode() != MODE_2D) {
+        gimbal_draw(cmd, width, height);
+    }
 }
 
 bool overlay_busy(void) {
+    if (policy_mode() == MODE_2D) {
+        return plot_wants_frame();
+    }
     return plot_wants_frame() || gimbal_busy();
 }
 

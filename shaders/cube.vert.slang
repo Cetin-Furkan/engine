@@ -15,7 +15,7 @@ struct DrawPush {
     float selected;
     uint64_t grid;
     uint grid_n;
-    uint grid_pad;
+    float origin_z;
     ViewPush view;
 };
 [[vk::push_constant]] DrawPush screen;
@@ -244,6 +244,7 @@ VSOutput main(uint vert_id : SV_VulkanVertexID) {
     float3 p = posed_pos * (k_edge_px * 0.5);
     p.x += screen.origin_x;
     p.y += screen.origin_y;
+    p.z += screen.origin_z;
 
     float3 view = view_of(p, screen.view.q, screen.view.cam);
     VSOutput out;

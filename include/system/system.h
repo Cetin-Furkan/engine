@@ -20,6 +20,5 @@ typedef struct SystemCapabilities {
 
 [[nodiscard]] int system_init(void);
 void system_shutdown(void);
-[[nodiscard]] const SystemCapabilities *system_get_capabilities(void);
 
 #endif /* ENGINE_SYSTEM_H */

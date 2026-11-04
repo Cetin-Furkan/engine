@@ -5,6 +5,28 @@
 #include <stddef.h>
 #include <stdint.h>
 
+// system_init and ring_context_init both require this set. A kernel that
+// fails the probe never maps the arena.
+static constexpr uint32_t k_ring_setup_mask =
+    IORING_SETUP_SINGLE_ISSUER |
+    IORING_SETUP_DEFER_TASKRUN |
+    IORING_SETUP_TASKRUN_FLAG  |
+    IORING_SETUP_NO_SQARRAY    |
+    IORING_SETUP_CQSIZE        |
+    IORING_SETUP_CLAMP         |
+    IORING_SETUP_SUBMIT_ALL    |
+    IORING_SETUP_NO_MMAP       |
+    IORING_SETUP_REGISTERED_FD_ONLY |
+    IORING_SETUP_R_DISABLED;
+
+static constexpr uint32_t k_ring_required_features =
+    IORING_FEAT_EXT_ARG |
+    IORING_FEAT_CQE_SKIP |
+    IORING_FEAT_LINKED_FILE |
+    IORING_FEAT_REG_REG_RING |
+    IORING_FEAT_MIN_TIMEOUT |
+    IORING_FEAT_NO_IOWAIT;
+
 enum : uint32_t {
     ENG_SQ_ENTRIES       = 64,
     ENG_CQ_ENTRIES       = 256,
@@ -113,7 +135,6 @@ typedef struct RingContext {
     bool                      ring_registered;
     int                       enter_fd;
     bool                      wait_reg_on;
-    bool                      min_timeout_on;
     uint32_t                  cq_overflow_total;
     uint32_t                  sq_dropped_total;
     bool                      overflow_warned;
@@ -141,7 +162,6 @@ void ring_context_shutdown(RingContext *r);
 unsigned ring_submit(RingContext *r);
 [[nodiscard]] int ring_enter(RingContext *r, unsigned submit, unsigned min_complete, int timeout_ms);
 [[nodiscard]] bool ring_peek(RingContext *r, struct io_uring_cqe *out);
-[[nodiscard]] uint8_t *ring_buf(const RingContext *r, uint16_t bid);
 [[nodiscard]] uint8_t *ring_pbuf_chunk(const RingContext *r, uint16_t bid, uint32_t nbytes);
 void ring_pbuf_finish(RingContext *r, uint16_t bid);
 void ring_pbuf_recycle(RingContext *r, uint16_t bid);

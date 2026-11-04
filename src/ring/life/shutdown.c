@@ -2,7 +2,6 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
-#include <unistd.h>
 
 void ring_release_registered_mem(RingContext *r) {
     if (r->fixed_on) {
@@ -49,10 +48,7 @@ void ring_context_shutdown(RingContext *r) {
         r->ring_registered = false;
         r->enter_fd = -1;
     }
-    if (r->fd >= 0) {
-        close(r->fd);
-        r->fd = -1;
-    }
+    // fd stays -1. REGISTERED_FD_ONLY never returns a process fd.
     if (r->arena != nullptr && r->arena_len > 0) {
         munmap(r->arena, r->arena_len);
     }

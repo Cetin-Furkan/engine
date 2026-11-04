@@ -17,17 +17,17 @@ NC='\033[0m'
 echo -e "${BLUE}=== [Engine] System Requirements & Dependency Check ===${NC}"
 FAILURES=0
 
-# 1. Check Linux Kernel >= 7.2
+# 1. Check Linux Kernel >= 7.1. Absolute timeouts need IMMEDIATE_ARG.
 KERNEL_RAW=$(uname -r)
 KERNEL_MAJOR=$(echo "$KERNEL_RAW" | cut -d. -f1 | sed 's/[^0-9].*//')
 KERNEL_MINOR=$(echo "$KERNEL_RAW" | cut -d. -f2 | sed 's/[^0-9].*//')
 KERNEL_MAJOR=${KERNEL_MAJOR:-0}
 KERNEL_MINOR=${KERNEL_MINOR:-0}
 
-if [[ "$KERNEL_MAJOR" -gt 7 ]] || { [[ "$KERNEL_MAJOR" -eq 7 ]] && [[ "$KERNEL_MINOR" -ge 2 ]]; }; then
-    echo -e "  [${GREEN}OK${NC}] Linux Kernel: $KERNEL_RAW (>= 7.2)"
+if [[ "$KERNEL_MAJOR" -gt 7 ]] || { [[ "$KERNEL_MAJOR" -eq 7 ]] && [[ "$KERNEL_MINOR" -ge 1 ]]; }; then
+    echo -e "  [${GREEN}OK${NC}] Linux Kernel: $KERNEL_RAW (>= 7.1)"
 else
-    echo -e "  [${RED}FAIL${NC}] Linux Kernel: $KERNEL_RAW is older than required 7.2"
+    echo -e "  [${RED}FAIL${NC}] Linux Kernel: $KERNEL_RAW is older than required 7.1"
     FAILURES=$((FAILURES + 1))
 fi
 
@@ -184,7 +184,7 @@ cat << INFO_EOF > "$SYSTEM_INFO"
 Engine System Requirements & Environment Snapshot
 Checked at: $(date)
 Status: PASSED
-- Linux Kernel: $KERNEL_RAW (Required: >= 7.2)
+- Linux Kernel: $KERNEL_RAW (Required: >= 7.1)
 - C23 Compiler: $CC ($CC_VER)
 - Vulkan Version: $VULKAN_VER (Required: 1.4)
   - Header Location: $VULKAN_HEADER

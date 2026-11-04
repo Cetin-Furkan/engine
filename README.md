@@ -6,7 +6,7 @@ One C23 process. `src/` is the platform: a hand-written Wayland client, its own 
 
 The client does not use SDL, GLFW, `libwayland`, `liburing`, or `VK_KHR_swapchain`. It writes the Wayland wire protocol on one fixed socket, submits I/O on a ring it set up itself, and hands the compositor a DMA-BUF whose acquire and release points are DRM syncobj timelines.
 
-A `wl_surface.frame` callback stays armed while the window is up. Each stamp steps a fixed 8 ms clock, at most five steps. The engine records a new DMA-BUF when the picture changed, on the first stamp, or while a compute pulse still has work. When the demo goes idle the callback chain stays up, and the GPU is not submitted again until input or the simulation changes the picture. Between those events the thread waits in `io_uring`. The loop leaves on the toplevel close, or on `SIGINT`, `SIGTERM`, or `SIGHUP`. If the compositor stops sending stamps, an absolute timeout re-arms the callback.
+The simulation clock is an 8 ms `timerfd`, at most five steps. A `wl_surface.frame` callback stays armed while the window is up. The engine records a new DMA-BUF when the picture changed, on the first stamp, or while a compute pulse still has work. When the demo goes idle the callback chain stays up, and the GPU is not submitted again until input or the simulation changes the picture. Between those events the thread waits in `io_uring`. The loop leaves on the toplevel close, or on `SIGINT`, `SIGTERM`, or `SIGHUP`. If the compositor stops sending stamps, an absolute timeout re-arms the callback.
 
 ## What the demo does
 
@@ -14,7 +14,7 @@ A `wl_surface.frame` callback stays armed while the window is up. Each stamp ste
 
 Coordinates are world pixels. `+X` is right, `+Y` is up, `+Z` comes out of the ground. The ground is the plane `z = 0`, and it is on from boot. It is not a line in the world file.
 
-`Tab` switches the live workspace between `Blender-3D` and `Matplotlib-2D`. Both profiles ship unsealed, so the switch works. The 3D view stores yaw and pitch as `Ry(yaw) * Rx(-pitch)`. The flat profile locks the identity quaternion and `z = 0`, and it does not grant yaw, pitch, or object spawn.
+`Tab` cycles three workspaces: `3D`, `2D`, then `Hybrid`. All three ship unsealed. `3D` is the fillet scene. It stores yaw and pitch as `Ry(yaw) * Rx(-pitch)`. `2D` locks the identity quaternion and `z = 0`. It draws the sheet in `examples/demo/world/sheet.world` and does not record the fillet heat or the 128³ lattice. `Hybrid` draws the 3D scene and that sheet. The sheet holds rigid boxes, a soft patch, and convex shapes. A click shoves one. Delete removes it. The resting pose is written to `sheet.live` beside the document. `L` in `2D` or `Hybrid` reads `sheet.world` again.
 
 The opening fillets run one revolution on the compositor clock, 5000 ms, then hold. A click on a cube plants heat. That field steps for 5000 ms and then holds. After that the loop prints `Loop idle` and stops recording until something changes.
 
@@ -22,20 +22,20 @@ Keys, on the 3D profile:
 
 - Arrows pan on the screen axes. `Q` and `E` yaw. `C` and `V` pitch. The wheel and the touchpad zoom. `=` , numpad plus, and shift+`4` zoom in. `-` and numpad minus zoom out. Zoom runs from `0.0001` to `10000`. At zoom 1, one world pixel is one screen pixel.
 - Numpad `8`, `2`, `4`, `6`, and `5` snap to top, bottom, left, right, and front. Numpad `5` again, from the front, sets the back. `Home` or numpad `1` restores the opening pose, including position and zoom. Numpad `7` shows or hides the view ball.
-- Numpad `9` grants and revokes `PERM_DRAW`. It is off in both compiled profiles, so boot places no corners. With it on, a click on empty ground places a point. `F` closes that list into a face. A crossing outline is refused. A valid outline is filled by an ear clip. `Esc` clears the selection. Backspace, Delete, or `X` removes the selection.
-- `1` through `6` raise a tetrahedron, an octahedron, an icosahedron, a cylinder, a cone, and a torus. `4` with shift up is the cylinder. `S` toggles faceted and smooth edges. `G` toggles glow. `R` toggles a continuous spin. `F5` runs one revolution again. A click selects. A click on a cube also plants heat.
-- `M` cycles the math curve through sin, sinc, gaussian, and off. `L` reloads `plots/data.csv` and `plots/mesh.obj`.
+- Numpad `9` grants and revokes `PERM_DRAW`. It is off in all three compiled profiles, so boot places no corners. With it on, a click on empty ground places a point. `F` closes that list into a face. A crossing outline is refused. A valid outline is filled by an ear clip. `Esc` clears the selection. Backspace, Delete, or `X` removes the selection. `Z` puts the last removed cube, solid, or mesh back at the place and yaw it had.
+- `1` through `6` raise a tetrahedron, an octahedron, an icosahedron, a cylinder, a cone, and a torus. `4` with shift up is the cylinder. `S` toggles faceted and smooth edges. `G` toggles glow. `R` toggles a continuous spin. `F5` runs one revolution again. A click selects. A click on a cube plants heat and shoves that cube. It slides, stops on the ground and against other cubes, and the resting center is written to `live.world`. A cube that has not been shoved keeps the center it was saved with.
+- `M` cycles the math curve through sin, sinc, gaussian, and off. `L` reloads `plots/data.csv` and `plots/mesh.obj`. In `2D` and `Hybrid`, `L` also reads `sheet.world`. `2D` does not reload the OBJ.
 - Hold `T`, click, click again, then type. `Esc` leaves the box. Glyphs are HarfBuzz outlines, rasterized by FreeType as a signed-distance field into an append-only R8 device-address atlas. The corner mark is the embedded Inter face. A `dynamic.faces` line cannot retarget that face.
 
 The cube samples a 128³ fp16 lattice. `shaders/grid.comp` steps that field. `shaders/heat.comp` steps the per-vertex fillet heat.
 
 ## How it works
 
-**Ring and wire.** `src/ring/ring.c` registers the ring with `SINGLE_ISSUER`, `DEFER_TASKRUN`, and `NO_MMAP`, plus a registered wait and a provided-buffer ring. The bring-up log on this machine is SQ 64, CQ 256, 32 buffers of 8192 bytes. `src/wayland/wayland.c` encodes and parses the wire itself. It asks the surface for a DMA-BUF tranche and binds `wp_linux_drm_syncobj_v1` acquire and release timelines. The color image is `DRM_FORMAT_ARGB8888`. The modifier is the one the compositor's tranche and the device agree on.
+**Ring and wire.** `src/ring/` registers the ring with `SINGLE_ISSUER`, `DEFER_TASKRUN`, `NO_MMAP`, and `REGISTERED_FD_ONLY`, plus a registered wait and a provided-buffer ring. Setup also requires `EXT_ARG`, `CQE_SKIP`, `LINKED_FILE`, `REG_REG_RING`, `MIN_TIMEOUT`, and `NO_IOWAIT`. The bring-up log on this machine is SQ 64, CQ 256, 32 buffers of 8192 bytes. `src/wayland/` encodes and parses the wire. It asks the surface for a DMA-BUF tranche and binds `wp_linux_drm_syncobj_v1` acquire and release timelines. The color image is `DRM_FORMAT_ARGB8888`. The modifier is the one the compositor's tranche and the device agree on.
 
 **Clock and handles.** `FrameClock` in `include/frame/clock.h` is 64 bytes: the last stamp, a fixed-point refresh period, missed refreshes, stall count, and the fixed-step remainder. The instance in the frame state is `alignas(64)`. A presented slot is named by `(generation << 8) | (index + 1)`. Generation 0 never resolves, and blanking the slot bumps the generation so the old handle fails the match. The world table stores the generation it selected. A render-target entry stores its own, so a copied `EngineTargets` cannot pick up a recycled image.
 
-**Device addresses.** Shaders that carry bulk data read it through `GL_EXT_buffer_reference` and push constants. `vulkan_cmd_push` is `vkCmdPushConstants2`. Geometry, heat, materials, plot samples, mesh corners, and text quads each have their own `DaBuffer`. The volume lattice is the one `BdaArena`. Host buffers ask for device-local, host-visible, coherent memory. There is no descriptor set in the tree.
+**Device addresses.** Shaders that carry bulk data read it through `GL_EXT_buffer_reference` and push constants. `vulkan_cmd_push` is `vkCmdPushConstants2`. Geometry, heat, materials, plot samples, mesh corners, and text quads each have their own `DaBuffer`. The volume lattice is the one `BdaArena`. Host buffers ask for device-local, host-visible, coherent memory. A device-local slab that lands in coherent memory is mapped, and the cube click reads that heat in place. A heap that is not coherent keeps a host mirror and a copy. There is no descriptor set in the tree.
 
 Shape, plot, mesh, and text each keep 12 slices, enough for both frame slots and the orphan ring. A slice is claimed only after `vkGetSemaphoreCounterValue` shows its acquire point has retired. A reload writes the new slice and does not call `vkQueueWaitIdle`. The cube mesh bake, the solid bake, the lattice seed, and the plot math bake do wait once, at init, before the first frame.
 
@@ -51,13 +51,13 @@ Depth and coverage images are created transient when the device allows it, and a
 
 `include/engine/app.h` is the seam. `src/` does not name a cube, a face, a plot, a font, or a key action. It calls `engine_app()`.
 
-What is in the tree today is `examples/demo`: the two workspaces, the fillets, the 128³ fp16 lattice, the six solids, ear-clipped faces, the plot, and the SDF text. That program was brought up on Intel Iris Xe (TGL GT2), Mesa 26.2.4, Vulkan 1.4.354, one queue family shared by graphics, compute, and transfer.
+What is in the tree today is `examples/demo`: the `3D`, `2D`, and `Hybrid` workspaces, the fillets, the 128³ fp16 lattice, the six solids, ear-clipped faces, the flat sheet, the plot, and the SDF text. That program was brought up on Intel Iris Xe (TGL GT2), Mesa 26.2.4, Vulkan 1.4.354, one queue family shared by graphics, compute, and transfer.
 
 The same seam is where a different program goes. Replacing `examples/demo` keeps the ring, the wire protocol, and the DMA-BUF present path. Draw and compute are Vulkan 1.4, not a vendor compute API. A plotter, a modeling viewport, a game, or a live compute view is another `EngineApp` on that path. An AMD or NVIDIA driver is that same path when it passes the startup probe. This tree has not been run on those devices. The probe prints the device it accepted and names the feature or extension it refused.
 
 Three places to change the demo without replacing it:
 
-**Policy.** `WorkspacePolicy` in `examples/demo/include/frame/policy.h` is a name, a permission mask, `sealed`, `lock_2d_quat`, and up to 48 key binds. An action runs only when its bit is set. `sealed` makes `policy_grant`, `policy_revoke`, `policy_rebind_key`, and `policy_switch` fail. `lock_2d_quat` holds the identity quaternion and `z = 0`. The compiled profiles live in `examples/demo/world/policy.c`. Shift matches exactly: shift+`4` is zoom, and `4` alone is the cylinder.
+**Policy.** `WorkspacePolicy` in `examples/demo/include/frame/policy.h` is a name, a permission mask, `sealed`, `lock_2d_quat`, and up to 48 key binds. An action runs only when its bit is set. `sealed` makes `policy_grant`, `policy_revoke`, `policy_rebind_key`, and `policy_switch` fail. `lock_2d_quat` holds the identity quaternion and `z = 0`. The compiled profiles live in `examples/demo/world/policy.c`. `Tab` cycles `3D`, `2D`, and `Hybrid`. Shift matches exactly: shift+`4` is zoom, and `4` alone is the cylinder.
 
 **Objects.** A kind is a `WorldOps` table in `examples/demo/world/world_int.h`: `hit`, `on_click`, `draw`, `advance`, `commit`, `record_compute`, `simulate`, and the record outcome calls. Kinds register with `table_kind_listen` from a `[[gnu::constructor]]`. `k_startup_objects[]` places C objects at boot. `opening.world` places `ground`, `cube`, and `mesh` lines. The table holds 48 objects. `alive` is the picture being built. `shown_alive` is the picture on screen.
 
@@ -67,15 +67,15 @@ Three places to change the demo without replacing it:
 
 The language is C23 (`-std=c23`). The code uses `#embed`, `nullptr`, `alignas`, and `static_assert`. The platform does not link `libwayland` or `liburing`, and it does not create a swapchain. The binary does link `libvulkan`, `libm`, FreeType, HarfBuzz, fontconfig, and libxkbcommon.
 
-Hooks run on the one `io_uring` thread and return. A plot reload and a chrome-spec reload go through `ring_read_file_all`. `opening.world` is read with `fopen` at boot. A runtime edit of shape, plot, mesh, or text claims a retired slice. It does not call `vkQueueWaitIdle`. The init bakes do.
+Hooks run on the one `io_uring` thread and return. A plot reload, a chrome-spec reload, and the world file go through `ring_read_file_all`. The world file is `examples/demo/world/live.world` when that file exists, otherwise `opening.world`. A failed ring read uses `open` and `read`. `opening.world` is not overwritten. A runtime edit of shape, plot, mesh, or text claims a retired slice. It does not call `vkQueueWaitIdle`. The init bakes do.
 
 The camera, the spin, the object table, the text runs, and the view ball keep a shown copy of what is already on screen. A resize draws that copy. It does not advance the clock.
 
-The embedded Inter face and a `WorkspacePolicy` with `sealed` set ignore later retargeting. Both shipped profiles are unsealed. These files are meant to be edited: `chrome/window.chrome`, `examples/demo/world/opening.world`, `examples/demo/text/face/dynamic.faces`, `examples/demo/plots/data.csv`, and `examples/demo/plots/mesh.obj`. `ENGINE_CHROME` overrides the chrome spec path.
+The embedded Inter face and a `WorkspacePolicy` with `sealed` set ignore later retargeting. All three shipped profiles are unsealed. These files are meant to be edited: `chrome/window.chrome`, `examples/demo/world/opening.world`, `examples/demo/world/sheet.world`, `examples/demo/text/face/dynamic.faces`, `examples/demo/plots/data.csv`, and `examples/demo/plots/mesh.obj`. `sheet.live` is the resting sheet, the same way `live.world` is the resting scene. `ENGINE_CHROME` overrides the chrome spec path.
 
 ## Build and run
 
-`scripts/check_env.sh` requires Linux 7.2 or newer, a compiler that accepts `-std=c23`, and a Vulkan header that defines `VK_API_VERSION_1_4`. Every `.slang` shader is compiled with `slangc` to SPIR-V 1.6. The link also needs `freetype2`, `harfbuzz`, `fontconfig`, and `xkbcommon`. A Wayland session has to be running. `wayland-protocols` is not used.
+`scripts/check_env.sh` requires Linux 7.1 or newer. This tree was proved on 7.3. Absolute timeouts need `IORING_TIMEOUT_IMMEDIATE_ARG`, which is that 7.1 floor. The script also wants a compiler that accepts `-std=c23`, and a Vulkan header that defines `VK_API_VERSION_1_4`. Every `.slang` shader is compiled with `slangc` to SPIR-V 1.6. The link also needs `freetype2`, `harfbuzz`, `fontconfig`, and `xkbcommon`. A Wayland session has to be running. `wayland-protocols` is not used.
 
 ```bash
 make

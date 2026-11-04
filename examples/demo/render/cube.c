@@ -75,7 +75,7 @@ typedef struct DrawPush {
     float    selected;
     uint64_t grid;
     uint32_t grid_n;
-    uint32_t grid_pad;
+    float    origin_z;
     ViewPush view;
 } DrawPush;
 
@@ -123,6 +123,7 @@ static_assert(offsetof(DrawPush, phase) == 40u, "hue phase");
 static_assert(offsetof(DrawPush, selected) == 44u, "cube selected");
 static_assert(offsetof(DrawPush, grid) == 48u, "grid address");
 static_assert(offsetof(DrawPush, grid_n) == 56u, "grid n");
+static_assert(offsetof(DrawPush, origin_z) == 60u, "origin z");
 static_assert(offsetof(DrawPush, view) == 64u, "cube view");
 static_assert(offsetof(ViewPush, qx) == 16u, "view quat");
 static_assert(sizeof(ViewPush) == 48u, "view push");
@@ -151,9 +152,8 @@ static VkPipelineLayout s_heat_layout = VK_NULL_HANDLE;
 static VkPipeline       s_heat_pipe = VK_NULL_HANDLE;
 static DaBuffer         s_heat_bufs[k_heat_copies] = {0};
 static VkDeviceAddress  s_heat_addr[k_heat_copies] = {0};
-// One host mirror of every heat copy. The step copies the slot it writes
-// into this buffer in the same command buffer. The CPU reads a copy only
-// after that submit's acquire wait returns.
+// Host mirror used only when the device slab is not host-coherent. A mapped
+// device copy is read in place after that submit's acquire wait returns.
 static DaBuffer         s_heat_host = {0};
 static VkDevice         s_device = VK_NULL_HANDLE;
 static VkSemaphore      s_acquire = VK_NULL_HANDLE;
@@ -246,8 +246,31 @@ static void barrier_copy_to_host(VkCommandBuffer cmd) {
     vkCmdPipelineBarrier2(cmd, &dep);
 }
 
+static bool heat_direct(void) {
+    for (uint32_t i = 0; i < k_heat_copies; ++i) {
+        if (s_heat_bufs[i].map == nullptr) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static const uint8_t *heat_slot_bytes(int copy, uint32_t slot) {
+    if (copy < 0 || (uint32_t)copy >= k_heat_copies || slot >= k_heat_slots) {
+        return nullptr;
+    }
+    if (s_heat_bufs[copy].map != nullptr) {
+        return (const uint8_t *)s_heat_bufs[copy].map + (size_t)slot * k_heat_stride;
+    }
+    if (s_heat_host.map == nullptr) {
+        return nullptr;
+    }
+    return (const uint8_t *)s_heat_host.map +
+           ((size_t)copy * k_heat_slots + slot) * k_heat_stride;
+}
+
 static void copy_heat_slot(VkCommandBuffer cmd, int copy, uint32_t slot) {
-    if (copy < 0 || (uint32_t)copy >= k_heat_copies || slot >= k_heat_slots ||
+    if (heat_direct() || copy < 0 || (uint32_t)copy >= k_heat_copies || slot >= k_heat_slots ||
         s_heat_host.buffer == VK_NULL_HANDLE || s_heat_bufs[copy].buffer == VK_NULL_HANDLE) {
         return;
     }
@@ -260,16 +283,25 @@ static void copy_heat_slot(VkCommandBuffer cmd, int copy, uint32_t slot) {
     vkCmdCopyBuffer(cmd, s_heat_bufs[copy].buffer, s_heat_host.buffer, 1, &region);
 }
 
-// The draw reads this slot, and the click's mirror copies it. The acquire
-// wait is what makes that copy visible. A missing mirror still barriers
-// the vertex read.
+// The draw reads this slot. A mapped device copy is visible to the CPU
+// after the acquire wait. Otherwise the same command buffer copies the
+// slot into the host mirror.
 static void publish_heat_slot(VkCommandBuffer cmd, int copy, uint32_t slot) {
+    VkPipelineStageFlags2 dst_stage = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT;
+    VkAccessFlags2 dst_access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+    if (heat_direct()) {
+        dst_stage |= VK_PIPELINE_STAGE_2_HOST_BIT;
+        dst_access |= VK_ACCESS_2_HOST_READ_BIT;
+    } else {
+        dst_stage |= VK_PIPELINE_STAGE_2_COPY_BIT;
+        dst_access |= VK_ACCESS_2_TRANSFER_READ_BIT;
+    }
     VkMemoryBarrier2 barrier = {
         .sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
         .srcStageMask  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
         .srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-        .dstStageMask  = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_COPY_BIT,
-        .dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_TRANSFER_READ_BIT,
+        .dstStageMask  = dst_stage,
+        .dstAccessMask = dst_access,
     };
     VkDependencyInfo dep = {
         .sType              = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
@@ -277,9 +309,11 @@ static void publish_heat_slot(VkCommandBuffer cmd, int copy, uint32_t slot) {
         .pMemoryBarriers    = &barrier,
     };
     vkCmdPipelineBarrier2(cmd, &dep);
-    copy_heat_slot(cmd, copy, slot);
-    if (s_heat_host.buffer != VK_NULL_HANDLE) {
-        barrier_copy_to_host(cmd);
+    if (!heat_direct()) {
+        copy_heat_slot(cmd, copy, slot);
+        if (s_heat_host.buffer != VK_NULL_HANDLE) {
+            barrier_copy_to_host(cmd);
+        }
     }
 }
 
@@ -289,11 +323,11 @@ static void drop_pair(VulkanContext *vk, DaBuffer *a, DaBuffer *b) {
 }
 
 static bool heat_seed_looks_zero(void) {
-    if (s_heat_host.map == nullptr) {
-        fprintf(stderr, "[Cube Error] Heat mirror is not mapped\n");
+    const uint8_t *base = heat_slot_bytes(0, 0u);
+    if (base == nullptr) {
+        fprintf(stderr, "[Cube Error] Heat readback is not mapped\n");
         return false;
     }
-    const uint8_t *base = (const uint8_t *)s_heat_host.map;
     const uint32_t ids[4] = { 0u, 10u, 100u, 1000u };
     for (uint32_t n = 0; n < 4u; ++n) {
         float d[3];
@@ -351,7 +385,7 @@ static void pub_note(uint32_t slot, int copy, uint64_t point) {
 
 static bool host_sees(uint64_t point) {
     if (point == 0 || s_device == VK_NULL_HANDLE || s_acquire == VK_NULL_HANDLE ||
-        s_heat_host.map == nullptr) {
+        (!heat_direct() && s_heat_host.map == nullptr)) {
         return false;
     }
     VkSemaphoreWaitInfo wait_info = {
@@ -364,8 +398,11 @@ static bool host_sees(uint64_t point) {
 }
 
 static void copy_slot_disp(uint32_t slot, int copy, float *xyz) {
-    const uint8_t *base = (const uint8_t *)s_heat_host.map;
-    base += ((size_t)copy * k_heat_slots + slot) * k_heat_stride;
+    const uint8_t *base = heat_slot_bytes(copy, slot);
+    if (base == nullptr) {
+        memset(xyz, 0, sizeof(float) * 3u * k_grid_verts);
+        return;
+    }
     for (uint32_t i = 0; i < k_grid_verts; ++i) {
         memcpy(xyz + (size_t)i * 3u, base + (size_t)i * 32u, sizeof(float) * 3u);
     }
@@ -530,8 +567,24 @@ static int bake_mesh(VulkanContext *vk) {
     };
     vkCmdCopyBuffer(cmd, s_mesh_buf.buffer, mesh_host.buffer, 1, &mesh_region);
     vkCmdCopyBuffer(cmd, s_index_buf.buffer, index_host.buffer, 1, &index_region);
-    copy_heat_slot(cmd, 0, 0u);
-    barrier_copy_to_host(cmd);
+    if (heat_direct()) {
+        VkMemoryBarrier2 host = {
+            .sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+            .srcStageMask  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_COPY_BIT,
+            .srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT,
+            .dstStageMask  = VK_PIPELINE_STAGE_2_HOST_BIT,
+            .dstAccessMask = VK_ACCESS_2_HOST_READ_BIT,
+        };
+        VkDependencyInfo host_dep = {
+            .sType              = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+            .memoryBarrierCount = 1,
+            .pMemoryBarriers    = &host,
+        };
+        vkCmdPipelineBarrier2(cmd, &host_dep);
+    } else {
+        copy_heat_slot(cmd, 0, 0u);
+        barrier_copy_to_host(cmd);
+    }
     res = vkEndCommandBuffer(cmd);
     if (res != VK_SUCCESS) {
         cube_fail("vkEndCommandBuffer bake", res);
@@ -610,12 +663,14 @@ int cube_init(VulkanContext *vk) {
         }
         s_heat_addr[i] = s_heat_bufs[i].address;
     }
-    if (da_buffer_create(vk, (VkDeviceSize)k_heat_copies * (VkDeviceSize)k_heat_slots * (VkDeviceSize)k_heat_stride,
-                         VK_BUFFER_USAGE_TRANSFER_DST_BIT, true, &s_heat_host) != 0 ||
-        s_heat_host.map == nullptr) {
-        fprintf(stderr, "[Cube Error] Heat mirror was not mapped\n");
-        cube_shutdown(vk);
-        return -1;
+    if (!heat_direct()) {
+        if (da_buffer_create(vk, (VkDeviceSize)k_heat_copies * (VkDeviceSize)k_heat_slots * (VkDeviceSize)k_heat_stride,
+                             VK_BUFFER_USAGE_TRANSFER_DST_BIT, true, &s_heat_host) != 0 ||
+            s_heat_host.map == nullptr) {
+            fprintf(stderr, "[Cube Error] Heat mirror was not mapped\n");
+            cube_shutdown(vk);
+            return -1;
+        }
     }
 
     VkResult res = VK_SUCCESS;
@@ -700,6 +755,11 @@ int cube_init(VulkanContext *vk) {
     }
     printf("[Cube] 240px centered, %u verts, bevel welded to the %u by %u face, %ux\n",
            k_verts, k_grid, k_grid, sample_count_n(sample_count));
+    if (heat_direct()) {
+        printf("[Cube] Heat is read from the mapped device slab.\n");
+    } else {
+        printf("[Cube] Heat is copied to a host mirror.\n");
+    }
     fflush(stdout);
     return 0;
 }
@@ -758,8 +818,8 @@ void cube_shutdown(VulkanContext *vk) {
 }
 
 void cube_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height, float yaw_deg,
-               float origin_x, float origin_y, float depth_bias, float phase, bool selected,
-               uint32_t mat, uint32_t heat_slot) {
+               float origin_x, float origin_y, float origin_z, float depth_bias, float phase,
+               bool selected, uint32_t mat, uint32_t heat_slot) {
     VkPipeline pipeline = vulkan_gfx_use(s_vk, &s_gfx);
     if (cmd == VK_NULL_HANDLE || pipeline == VK_NULL_HANDLE || width == 0 || height == 0 ||
         !heat_slot_ok(heat_slot)) {
@@ -780,6 +840,7 @@ void cube_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height, float yaw_d
         .selected   = selected ? 1.0f : 0.0f,
         .grid       = grid_field_addr(),
         .grid_n     = grid_n(),
+        .origin_z   = origin_z,
     };
     view_push_fill(&draw_push.view, mat);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);

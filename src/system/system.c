@@ -1,4 +1,5 @@
 #include "system/system.h"
+#include "ring/ring.h"
 #include "util/fmt.h"
 #include <errno.h>
 #include <linux/io_uring.h>
@@ -8,17 +9,6 @@
 #include <sys/syscall.h>
 #include <sys/utsname.h>
 #include <unistd.h>
-
-static constexpr uint32_t k_required_ring_setup_mask =
-    IORING_SETUP_SINGLE_ISSUER |
-    IORING_SETUP_DEFER_TASKRUN |
-    IORING_SETUP_TASKRUN_FLAG  |
-    IORING_SETUP_NO_SQARRAY    |
-    IORING_SETUP_CQSIZE        |
-    IORING_SETUP_CLAMP         |
-    IORING_SETUP_SUBMIT_ALL    |
-    IORING_SETUP_NO_MMAP       |
-    IORING_SETUP_R_DISABLED;
 
 static SystemCapabilities s_sys_caps = {0};
 
@@ -76,10 +66,10 @@ static int probe_io_uring_kernel(SystemCapabilities *caps) {
         return hdr.result;
     }
 
-    if ((opcodes.ring_setup_flags & k_required_ring_setup_mask) != k_required_ring_setup_mask) {
+    if ((opcodes.ring_setup_flags & k_ring_setup_mask) != k_ring_setup_mask) {
         return -ENOTSUP;
     }
-    if ((opcodes.feature_flags & IORING_FEAT_NODROP) == 0) {
+    if ((opcodes.feature_flags & k_ring_required_features) != k_ring_required_features) {
         return -ENOTSUP;
     }
     // Floor for the modern opcode set this engine uses: multishot recv
@@ -157,8 +147,4 @@ void system_shutdown(void) {
         log_info_raw("[System] Shutdown complete.\n");
         s_sys_caps.is_initialized = false;
     }
-}
-
-const SystemCapabilities *system_get_capabilities(void) {
-    return &s_sys_caps;
 }

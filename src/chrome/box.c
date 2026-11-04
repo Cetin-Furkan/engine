@@ -307,38 +307,3 @@ static bool layout_self_check(void) {
     }
     return true;
 }
-
-bool box_layer_rect(const ChromeSpec *spec, uint32_t layer_index,
-                    uint32_t buf_w, uint32_t buf_h,
-                    uint32_t surf_w, uint32_t surf_h,
-                    BoxRect *out) {
-    if (spec == nullptr || out == nullptr || layer_index >= spec->nlayers) {
-        return false;
-    }
-    BoxNode nodes[BOX_CAP];
-    uint32_t n = box_layout(spec, buf_w, buf_h, surf_w, surf_h, nodes, BOX_CAP, nullptr);
-    const BoxNode *node = find_dock(nodes, n, dock_of_edge(spec->layers[layer_index].edge),
-                                    spec->layers[layer_index].name);
-    if (node == nullptr) {
-        return false;
-    }
-    *out = node->rect;
-    return true;
-}
-
-bool box_control_rect(const ChromeSpec *spec, uint32_t control_index,
-                      uint32_t buf_w, uint32_t buf_h,
-                      uint32_t surf_w, uint32_t surf_h,
-                      BoxRect *out) {
-    if (spec == nullptr || out == nullptr || control_index >= spec->ncontrols) {
-        return false;
-    }
-    BoxNode nodes[BOX_CAP];
-    uint32_t n = box_layout(spec, buf_w, buf_h, surf_w, surf_h, nodes, BOX_CAP, nullptr);
-    const BoxNode *node = find_dock(nodes, n, BOX_DOCK_CONTROL, spec->controls[control_index].name);
-    if (node == nullptr) {
-        return false;
-    }
-    *out = node->rect;
-    return true;
-}

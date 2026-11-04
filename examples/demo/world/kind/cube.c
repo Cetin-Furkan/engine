@@ -1,14 +1,13 @@
 #include "world/world_int.h"
+#include "world/motion.h"
 #include "frame/cube.h"
+#include "frame/fillet.h"
 #include "frame/grid.h"
 #include "frame/material.h"
 #include <math.h>
 #include <stdio.h>
 
 enum : int32_t { k_yaw_start_milli = 38000 };
-
-static const float k_cube_half = 120.0f;
-static const float k_deg       = 0.01745329251f;
 
 // One fillet mesh, many placements. Each opening.world cube line takes a
 // slot, its own spin, its own hue phase, and its own temperature field.
@@ -25,6 +24,10 @@ typedef struct CubeData {
     float    phase_shown;
     uint32_t phase_t0;
     bool     phase_have;
+    float    vx;
+    float    vy;
+    float    vz;
+    bool     awake;
 } CubeData;
 
 static_assert(k_mat_cube_more + k_cube_cap - 2u < k_mat_none, "cube looks fit the table");
@@ -46,37 +49,19 @@ static bool cube_record_poke_pending(const WorldObj *o);
 static bool cube_simulate(WorldObj *o, uint32_t time_ms, uint32_t sim_dt_ms, uint32_t *heat_dt);
 static void cube_simulate_hold(WorldObj *o);
 static void cube_simulate_commit(WorldObj *o, uint32_t stamp, uint32_t heat_dt);
+static bool cube_busy(const WorldObj *o);
+static void cube_shove(WorldObj *o, Coord hit);
+static void cube_step_motion(uint32_t time_ms, uint32_t sim_dt_ms);
 
 static float rad_of(int32_t milli) {
-    return ((float)milli / 1000.0f) * k_deg;
-}
-
-// Local axes of Ry(yaw) * Rx(28°), matching cube.vert.
-static void pose_axes(float yaw_rad, float x[3], float y[3], float z[3]) {
-    const float pitch = 28.0f * k_deg;
-    float cx = cosf(pitch);
-    float sx = sinf(pitch);
-    float cy = cosf(yaw_rad);
-    float sy = sinf(yaw_rad);
-    float rx0[3] = { 1.0f, 0.0f, 0.0f };
-    float rx1[3] = { 0.0f, cx, sx };
-    float rx2[3] = { 0.0f, -sx, cx };
-    x[0] = cy * rx0[0] + sy * rx0[2];
-    x[1] = rx0[1];
-    x[2] = -sy * rx0[0] + cy * rx0[2];
-    y[0] = cy * rx1[0] + sy * rx1[2];
-    y[1] = rx1[1];
-    y[2] = -sy * rx1[0] + cy * rx1[2];
-    z[0] = cy * rx2[0] + sy * rx2[2];
-    z[1] = rx2[1];
-    z[2] = -sy * rx2[0] + cy * rx2[2];
+    return fillet_rad((float)milli / 1000.0f);
 }
 
 static bool slab_hit(const CameraRay *ray, Coord center, float yaw_rad, float half, float *t_hit, Coord *at) {
     float ax[3];
     float ay[3];
     float az[3];
-    pose_axes(yaw_rad, ax, ay, az);
+    fillet_axes(yaw_rad, ax, ay, az);
     const float *axis[3] = { ax, ay, az };
     float delta[3] = { ray->ox - center.x, ray->oy - center.y, ray->oz - center.z };
     float dir[3] = { ray->dx, ray->dy, ray->dz };
@@ -147,15 +132,14 @@ static bool cube_hit(const WorldObj *o, const CameraRay *ray, float *t, Coord *a
     if (c == nullptr) {
         return false;
     }
-    // The draw adds origin x and y only. The slab remains until the bake
-    // has stored the mesh the vertex shader poses.
+    // The slab remains until the bake has stored the mesh the vertex shader poses.
     if (cube_surface_ready()) {
         float yaw_deg = (float)c->spin.shown_milli / 1000.0f;
         float ht = 0.0f;
         float hx = 0.0f;
         float hy = 0.0f;
         float hz = 0.0f;
-        if (!cube_surface_hit(c->heat, yaw_deg, o->at.x, o->at.y, ray, &ht, &hx, &hy, &hz)) {
+        if (!cube_surface_hit(c->heat, yaw_deg, o->at.x, o->at.y, o->at.z, ray, &ht, &hx, &hy, &hz)) {
             return false;
         }
         if (t != nullptr) {
@@ -167,7 +151,7 @@ static bool cube_hit(const WorldObj *o, const CameraRay *ray, float *t, Coord *a
         return true;
     }
     float yaw = rad_of(c->spin.shown_milli);
-    return slab_hit(ray, o->at, yaw, k_cube_half, t, at);
+    return slab_hit(ray, o->at, yaw, k_fillet_half, t, at);
 }
 
 static void advance_phase(CubeData *c, uint32_t time_ms) {
@@ -191,13 +175,20 @@ static void advance_phase(CubeData *c, uint32_t time_ms) {
     }
 }
 
+static bool s_motion_drew = false;
+
 static bool cube_advance(WorldObj *o, uint32_t time_ms) {
     CubeData *c = o->data;
     if (c == nullptr) {
         return false;
     }
     advance_phase(c, time_ms);
-    return spin_advance(&c->spin, time_ms, true);
+    bool spun = spin_advance(&c->spin, time_ms, true);
+    if (s_motion_drew) {
+        s_motion_drew = false;
+        return true;
+    }
+    return spun;
 }
 
 static void cube_commit(WorldObj *o) {
@@ -216,7 +207,7 @@ static void cube_draw_obj(const WorldObj *o, VkCommandBuffer cmd, uint32_t width
     bool glow = live ? c->spin.glow : c->spin.shown_glow;
     material_set(c->mat, glow);
     float phase = live ? c->phase : c->phase_shown;
-    cube_draw(cmd, width, height, spin_deg(&c->spin, live), o->at.x, o->at.y, 0.0f,
+    cube_draw(cmd, width, height, spin_deg(&c->spin, live), o->at.x, o->at.y, o->at.z, 0.0f,
               phase, table_highlight(o, live), c->mat, c->heat);
 }
 
@@ -245,11 +236,27 @@ static bool cube_toggle_glow(WorldObj *o) {
     return true;
 }
 
+static bool cube_respin(WorldObj *o) {
+    CubeData *c = o->data;
+    if (c == nullptr) {
+        return false;
+    }
+    spin_respin(&c->spin);
+    table_mark_spun();
+    printf("[Engine] Cube turns again.\n");
+    fflush(stdout);
+    return true;
+}
+
 static bool cube_remove(WorldObj *o) {
     CubeData *c = o->data;
     o->alive = false;
     if (c != nullptr) {
         c->used = false;
+        c->awake = false;
+        c->vx = 0.0f;
+        c->vy = 0.0f;
+        c->vz = 0.0f;
         c->spin.spinning = false;
         c->spin.infinite = false;
         material_set(c->mat, false);
@@ -273,7 +280,9 @@ static bool cube_on_click(WorldObj *o, Coord hit) {
     if (c == nullptr) {
         return false;
     }
-    return cube_heat_poke(c->heat, hit.x - o->at.x, hit.y - o->at.y, hit.z - o->at.z);
+    bool poked = cube_heat_poke(c->heat, hit.x - o->at.x, hit.y - o->at.y, hit.z - o->at.z);
+    cube_shove(o, hit);
+    return poked || c->awake;
 }
 
 static uint32_t cube_vertices(const WorldObj *o) {
@@ -290,6 +299,7 @@ static const WorldOps s_ops = {
     .commit               = cube_commit,
     .toggle_spin          = cube_toggle_spin,
     .toggle_glow          = cube_toggle_glow,
+    .respin               = cube_respin,
     .remove               = cube_remove,
     .name                 = cube_name,
     .record_compute       = cube_record_compute,
@@ -301,6 +311,7 @@ static const WorldOps s_ops = {
     .simulate             = cube_simulate,
     .simulate_hold        = cube_simulate_hold,
     .simulate_commit      = cube_simulate_commit,
+    .busy                 = cube_busy,
     .fallback             = true,
 };
 
@@ -364,8 +375,8 @@ static void cube_kind_self_check(void) {
     float t_mid = 0.0f;
     float t_far = 0.0f;
     Coord origin = {0};
-    bool hit = slab_hit(&mid, origin, yaw, k_cube_half, &t_mid, nullptr);
-    bool miss = slab_hit(&far, origin, yaw, k_cube_half, &t_far, nullptr);
+    bool hit = slab_hit(&mid, origin, yaw, k_fillet_half, &t_mid, nullptr);
+    bool miss = slab_hit(&far, origin, yaw, k_fillet_half, &t_far, nullptr);
     bool plane = fabsf(mid.plane_x) < 1.0e-3f && fabsf(mid.plane_y) < 1.0e-3f;
     bool mesh = cube_surface_self_check();
     if (!hit || miss || !plane || !mesh) {
@@ -430,6 +441,109 @@ static bool cube_record_poke_pending(const WorldObj *o) {
     return cube_heat_slot_pending(c->heat);
 }
 
+static bool cube_busy(const WorldObj *o) {
+    const CubeData *c = o->data;
+    return c != nullptr && c->awake;
+}
+
+static void cube_shove(WorldObj *o, Coord hit) {
+    CubeData *c = o->data;
+    if (c == nullptr) {
+        return;
+    }
+    float dx = o->at.x - hit.x;
+    float dy = o->at.y - hit.y;
+    float len = sqrtf(dx * dx + dy * dy);
+    if (len < 1.0f) {
+        dx = 1.0f;
+        dy = 0.0f;
+        len = 1.0f;
+    }
+    c->vx += dx / len * 640.0f;
+    c->vy += dy / len * 640.0f;
+    c->awake = true;
+    s_motion_drew = true;
+    printf("[Cube] Shoved.\n");
+    fflush(stdout);
+}
+
+static uint32_t s_motion_stamp = 0;
+static bool     s_motion_have  = false;
+
+static void cube_step_motion(uint32_t time_ms, uint32_t sim_dt_ms) {
+    if (sim_dt_ms == 0u || (s_motion_have && s_motion_stamp == time_ms)) {
+        return;
+    }
+    s_motion_have = true;
+    s_motion_stamp = time_ms;
+    MotionBody bodies[k_cube_cap];
+    WorldObj *objs[k_cube_cap];
+    uint32_t n = 0;
+    int count = table_count();
+    for (int i = 0; i < count && n < k_cube_cap; ++i) {
+        WorldObj *o = table_at(i);
+        if (o == nullptr || !o->alive || o->ops != &s_ops) {
+            continue;
+        }
+        CubeData *c = o->data;
+        if (c == nullptr) {
+            continue;
+        }
+        bodies[n] = (MotionBody){
+            .x     = o->at.x,
+            .y     = o->at.y,
+            .z     = o->at.z,
+            .vx    = c->vx,
+            .vy    = c->vy,
+            .vz    = c->vz,
+            .yaw   = rad_of(c->spin.live_milli),
+            .awake = c->awake,
+        };
+        objs[n] = o;
+        n++;
+    }
+    bool any_before = false;
+    for (uint32_t i = 0; i < n; ++i) {
+        if (bodies[i].awake) {
+            any_before = true;
+        }
+    }
+    uint32_t left = sim_dt_ms;
+    while (left > 0u) {
+        uint32_t step = left > 8u ? 8u : left;
+        motion_substep(bodies, n, (float)step / 1000.0f, 0.0f, k_fillet_half);
+        left -= step;
+    }
+    bool any_after = false;
+    bool moved = false;
+    for (uint32_t i = 0; i < n; ++i) {
+        WorldObj *o = objs[i];
+        CubeData *c = o->data;
+        if (fabsf(o->at.x - bodies[i].x) > 1.0e-3f || fabsf(o->at.y - bodies[i].y) > 1.0e-3f ||
+            fabsf(o->at.z - bodies[i].z) > 1.0e-3f) {
+            moved = true;
+        }
+        o->at.x = bodies[i].x;
+        o->at.y = bodies[i].y;
+        o->at.z = bodies[i].z;
+        c->vx = bodies[i].vx;
+        c->vy = bodies[i].vy;
+        c->vz = bodies[i].vz;
+        c->awake = bodies[i].awake;
+        if (c->awake) {
+            any_after = true;
+        }
+    }
+    if (moved) {
+        s_motion_drew = true;
+    }
+    if (any_before && !any_after) {
+        printf("[Cube] The cubes are resting.\n");
+        fflush(stdout);
+        (void)world_save();
+    }
+}
+
 static bool cube_simulate(WorldObj *o, uint32_t time_ms, uint32_t sim_dt_ms, uint32_t *heat_dt) {
     CubeData *c = o->data;
     if (c == nullptr) {
@@ -438,6 +552,7 @@ static bool cube_simulate(WorldObj *o, uint32_t time_ms, uint32_t sim_dt_ms, uin
         }
         return false;
     }
+    cube_step_motion(time_ms, sim_dt_ms);
     bool ended = false;
     bool pulse = cube_heat_wants_frame(c->heat, time_ms, &ended);
     if (ended) {
@@ -452,7 +567,7 @@ static bool cube_simulate(WorldObj *o, uint32_t time_ms, uint32_t sim_dt_ms, uin
     if (heat_dt != nullptr) {
         *heat_dt = one;
     }
-    return pulse;
+    return pulse || c->awake;
 }
 
 static void cube_simulate_hold(WorldObj *o) {

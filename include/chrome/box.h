@@ -46,14 +46,4 @@ uint32_t box_layout(const ChromeSpec *spec,
                     BoxNode *nodes, uint32_t cap,
                     BoxRect *client);
 
-[[nodiscard]] bool box_layer_rect(const ChromeSpec *spec, uint32_t layer_index,
-                                  uint32_t buf_w, uint32_t buf_h,
-                                  uint32_t surf_w, uint32_t surf_h,
-                                  BoxRect *out);
-
-[[nodiscard]] bool box_control_rect(const ChromeSpec *spec, uint32_t control_index,
-                                    uint32_t buf_w, uint32_t buf_h,
-                                    uint32_t surf_w, uint32_t surf_h,
-                                    BoxRect *out);
-
 #endif /* ENGINE_CHROME_BOX_H */

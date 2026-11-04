@@ -7,26 +7,6 @@
 #include <time.h>
 #include <unistd.h>
 
-static constexpr uint32_t k_ring_setup_mask =
-    IORING_SETUP_SINGLE_ISSUER |
-    IORING_SETUP_DEFER_TASKRUN |
-    IORING_SETUP_TASKRUN_FLAG  |
-    IORING_SETUP_NO_SQARRAY    |
-    IORING_SETUP_CQSIZE        |
-    IORING_SETUP_CLAMP         |
-    IORING_SETUP_SUBMIT_ALL    |
-    IORING_SETUP_NO_MMAP       |
-    IORING_SETUP_REGISTERED_FD_ONLY |
-    IORING_SETUP_R_DISABLED;
-
-static constexpr uint32_t k_required_features =
-    IORING_FEAT_EXT_ARG |
-    IORING_FEAT_CQE_SKIP |
-    IORING_FEAT_LINKED_FILE |
-    IORING_FEAT_REG_REG_RING |
-    IORING_FEAT_MIN_TIMEOUT |
-    IORING_FEAT_NO_IOWAIT;
-
 long ring_sys6(long nr, long a, long b, long c, long d, long e, long f) {
     long rc = syscall(nr, a, b, c, d, e, f);
     return (rc < 0) ? -errno : rc;
@@ -50,7 +30,7 @@ static size_t query_page_size(void) {
 }
 
 static int require_features(uint32_t features) {
-    uint32_t missing = k_required_features & ~features;
+    uint32_t missing = k_ring_required_features & ~features;
     if (missing == 0) {
         return 0;
     }
@@ -209,7 +189,6 @@ int ring_context_init(RingContext *r, const char *name, bool with_pbuf) {
     }
 
     r->wait_flags = IORING_ENTER_NO_IOWAIT;
-    r->min_timeout_on = true;
     r->is_initialized = true;
     printf("[Ring] Initialized '%s' (registered index %d, SQ=%u, CQ=%u, PBUF=%ux%uB, SIM=%ux%uB, FixedBuf=%u, FixedFiles=%u, NO_MMAP+REGISTERED_FD_ONLY+DEFER_TASKRUN)\n",
            r->name,

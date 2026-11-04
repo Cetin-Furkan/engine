@@ -4,7 +4,7 @@
 #include <string.h>
 
 // Capability gate: permissions, shift-exact binds, seal, and the live
-// switch between the flat plot workspace and the 3D workspace.
+// cycle across 3D, 2D, and Hybrid.
 // Links policy.c only. No Vulkan, no pointer, no window.
 
 static int s_failures = 0;
@@ -43,16 +43,25 @@ static bool fake_down(uint16_t key, void *user) {
 static void check_profiles(void) {
     const WorkspacePolicy *model = policy_blender();
     const WorkspacePolicy *plot = policy_matplotlib();
+    const WorkspacePolicy *hybrid = policy_hybrid();
 
-    CHECK(strcmp(model->name, "Blender-3D") == 0);
+    CHECK(strcmp(model->name, "3D") == 0);
     CHECK(!model->sealed);
     CHECK(!model->lock_2d_quat);
     CHECK(model->bind_count == 41u);
 
-    CHECK(strcmp(plot->name, "Matplotlib-2D") == 0);
+    CHECK(strcmp(plot->name, "2D") == 0);
     CHECK(!plot->sealed);
     CHECK(plot->lock_2d_quat);
-    CHECK(plot->bind_count == 14u);
+    CHECK(plot->bind_count == 18u);
+
+    CHECK(strcmp(hybrid->name, "Hybrid") == 0);
+    CHECK(!hybrid->sealed);
+    CHECK(!hybrid->lock_2d_quat);
+    CHECK(hybrid->bind_count == 41u);
+    CHECK(policy_can(hybrid, ACT_YAW_CW));
+    CHECK(policy_can(hybrid, ACT_DELETE));
+    CHECK((hybrid->active_perms & PERM_OBJ_COMPUTE) == PERM_OBJ_COMPUTE);
 
     CHECK(policy_can(model, ACT_YAW_CW));
     CHECK(policy_can(model, ACT_PITCH_UP));
@@ -72,7 +81,8 @@ static void check_profiles(void) {
     CHECK(policy_can(plot, ACT_ZOOM_IN));
     CHECK(policy_can(plot, ACT_SNAP_FRONT));
     CHECK(policy_can(plot, ACT_HOME));
-    CHECK(!policy_can(plot, ACT_TOGGLE_DRAW));
+    CHECK(policy_can(plot, ACT_TOGGLE_DRAW));
+    CHECK((plot->active_perms & PERM_DRAW) == 0u);
     CHECK(policy_can(plot, ACT_PLOT_CYCLE));
     CHECK(policy_can(plot, ACT_DATA_RELOAD));
     CHECK(policy_can(plot, ACT_SWITCH_MODE));
@@ -81,10 +91,10 @@ static void check_profiles(void) {
     CHECK(!policy_can(plot, ACT_PITCH_UP));
     CHECK(!policy_can(plot, ACT_PITCH_DOWN));
     CHECK(!policy_can(plot, ACT_SPAWN_SOLID_1));
-    CHECK(!policy_can(plot, ACT_DELETE));
+    CHECK(policy_can(plot, ACT_DELETE));
     CHECK(!policy_can(plot, ACT_CLOSE_FACE));
     CHECK(!policy_can(plot, ACT_TOGGLE_SPIN));
-    CHECK((plot->active_perms & PERM_OBJ_SELECT) == 0u);
+    CHECK((plot->active_perms & PERM_OBJ_SELECT) == PERM_OBJ_SELECT);
     CHECK((plot->active_perms & PERM_OBJ_COMPUTE) == 0u);
 
     CHECK(policy_can(nullptr, ACT_PAN_LEFT) == false);
@@ -98,7 +108,7 @@ static void check_profiles(void) {
     CHECK(policy_lookup(model, KEY_V, false) == ACT_PITCH_DOWN);
     CHECK(policy_lookup(plot, KEY_Q, false) == ACT_NONE);
     CHECK(policy_lookup(plot, KEY_E, true) == ACT_NONE);
-    CHECK(policy_lookup(plot, KEY_X, false) == ACT_NONE);
+    CHECK(policy_lookup(plot, KEY_X, false) == ACT_DELETE);
     CHECK(policy_lookup(plot, KEY_1, false) == ACT_NONE);
 
     CHECK(policy_lookup(model, KEY_4, false) == ACT_SPAWN_SOLID_4);
@@ -219,7 +229,8 @@ static void check_axis(void) {
 static void check_live(void) {
     policy_boot();
     policy_boot();
-    CHECK(strcmp(policy_active()->name, "Blender-3D") == 0);
+    CHECK(strcmp(policy_active()->name, "3D") == 0);
+    CHECK(policy_mode() == MODE_3D);
     CHECK(policy_allows(PERM_OBJ_SELECT));
     CHECK(policy_allows(PERM_OBJ_SPAWN));
     CHECK(!policy_allows(PERM_NONE));
@@ -227,29 +238,43 @@ static void check_live(void) {
     CHECK(policy_rebind_key(policy_active(), KEY_Q, KEY_SHIFT_ANY, ACT_DELETE));
     CHECK(policy_lookup(policy_active(), KEY_Q, false) == ACT_DELETE);
     CHECK(policy_switch());
-    CHECK(strcmp(policy_active()->name, "Matplotlib-2D") == 0);
+    CHECK(strcmp(policy_active()->name, "2D") == 0);
+    CHECK(policy_mode() == MODE_2D);
     CHECK(policy_active()->lock_2d_quat);
-    CHECK(!policy_allows(PERM_OBJ_SELECT));
+    CHECK(policy_allows(PERM_OBJ_SELECT));
+    CHECK(policy_allows(PERM_OBJ_DELETE));
     CHECK(!policy_allows(PERM_CAM_YAW));
+    CHECK(!policy_allows(PERM_OBJ_COMPUTE));
     CHECK(policy_allows(PERM_CAM_ZOOM));
     CHECK(policy_allows(PERM_MODE_SWITCH));
     CHECK(policy_lookup(policy_active(), KEY_Q, false) == ACT_NONE);
+    CHECK(policy_lookup(policy_active(), KEY_X, false) == ACT_DELETE);
 
     CHECK(policy_switch());
-    CHECK(strcmp(policy_active()->name, "Blender-3D") == 0);
+    CHECK(strcmp(policy_active()->name, "Hybrid") == 0);
+    CHECK(policy_mode() == MODE_HYBRID);
     CHECK(!policy_active()->lock_2d_quat);
     CHECK(policy_lookup(policy_active(), KEY_Q, false) == ACT_YAW_CCW);
     CHECK(policy_allows(PERM_OBJ_SELECT));
+    CHECK(policy_allows(PERM_OBJ_COMPUTE));
+
+    CHECK(policy_switch());
+    CHECK(strcmp(policy_active()->name, "3D") == 0);
+    CHECK(policy_mode() == MODE_3D);
+    CHECK(!policy_active()->lock_2d_quat);
+    CHECK(policy_lookup(policy_active(), KEY_Q, false) == ACT_YAW_CCW);
 
     policy_active()->sealed = true;
     CHECK(!policy_switch());
     CHECK(!policy_grant(policy_active(), PERM_CAM_YAW));
-    CHECK(strcmp(policy_active()->name, "Blender-3D") == 0);
+    CHECK(strcmp(policy_active()->name, "3D") == 0);
     policy_active()->sealed = false;
     CHECK(policy_switch());
-    CHECK(strcmp(policy_active()->name, "Matplotlib-2D") == 0);
+    CHECK(strcmp(policy_active()->name, "2D") == 0);
     CHECK(policy_switch());
-    CHECK(strcmp(policy_active()->name, "Blender-3D") == 0);
+    CHECK(strcmp(policy_active()->name, "Hybrid") == 0);
+    CHECK(policy_switch());
+    CHECK(strcmp(policy_active()->name, "3D") == 0);
 }
 
 int main(void) {

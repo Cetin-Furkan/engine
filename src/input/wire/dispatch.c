@@ -29,7 +29,11 @@ bool pointer_dispatch(
     }
     if (w->pointer_id != 0 && object == w->pointer_id) {
         bool handled = input_on_pointer(w, opcode, payload, len);
-        input_page_publish();
+        // wl_pointer.frame (opcode 5, seat v5) closes the group. A seat
+        // older than 5 has no frame event, so each event is the publish.
+        if (opcode == 5u || w->seat_bound_version < 5u) {
+            input_page_publish();
+        }
         return handled;
     }
     if (w->keyboard_id != 0 && object == w->keyboard_id) {

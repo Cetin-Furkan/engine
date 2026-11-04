@@ -15,6 +15,8 @@
 // sealed rejects grant, revoke, rebind, and a live profile switch.
 // lock_2d_quat is a pose constraint on top of the permission mask:
 // the camera holds the identity quaternion and z = 0.
+// Tab cycles three profiles: 3D, then 2D, then Hybrid. 2D is the flat
+// sheet. Hybrid keeps the 3D scene and also draws that sheet.
 
 enum : uint32_t {
     PERM_NONE         = 0u,
@@ -33,7 +35,7 @@ enum : uint32_t {
     PERM_PLOT_CYCLE   = 1u << 12,
     PERM_DATA_RELOAD  = 1u << 13,
     PERM_MODE_SWITCH  = 1u << 14,
-    // Empty-ground clicks. Off in both compiled profiles, so a boot
+    // Empty-ground clicks. Off in all three compiled profiles, so a boot
     // places no corners. Numpad 9 grants and revokes it on the live copy.
     PERM_DRAW         = 1u << 15,
 };
@@ -146,9 +148,17 @@ int policy_held_axis(const WorkspacePolicy *p, EngineAction positive,
                      EngineAction negative, bool shift,
                      PolicyKeyDown down, void *user);
 
+typedef enum WorkspaceMode : uint8_t {
+    MODE_3D     = 0,
+    MODE_2D     = 1,
+    MODE_HYBRID = 2,
+} WorkspaceMode;
+
 // Compiled profiles. Filling them does not select the live workspace.
+// policy_matplotlib is the 2D profile.
 const WorkspacePolicy *policy_blender(void);
 const WorkspacePolicy *policy_matplotlib(void);
+const WorkspacePolicy *policy_hybrid(void);
 
 // Boot copies the 3D profile into the live workspace and logs once.
 // A second call keeps a live switch and any rebind.
@@ -158,8 +168,11 @@ void policy_boot(void);
 // demo_init still has the 3D keymap.
 WorkspacePolicy *policy_active(void);
 
-// Swaps the live workspace between the 3D profile and the flat plot
-// profile. A switch drops rebinds on the previous copy. False when sealed.
+// Which compiled profile is live. Boots on first use.
+WorkspaceMode policy_mode(void);
+
+// Cycles 3D, then 2D, then Hybrid. A switch drops rebinds on the
+// previous copy. False when sealed.
 bool policy_switch(void);
 
 #endif /* ENGINE_FRAME_POLICY_H */

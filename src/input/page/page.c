@@ -86,6 +86,7 @@ void input_page_publish(void) {
         odd += 1u;
     }
     __atomic_store_n(&page->seq, odd, __ATOMIC_RELAXED);
+    __atomic_thread_fence(__ATOMIC_RELEASE);
     float x = s_ptr.x;
     float y = s_ptr.y;
     float drag_x = s_drag_dx;
@@ -163,7 +164,7 @@ void input_page_record(VkCommandBuffer cmd) {
 
     InputPush push = { .page = s_buf.address };
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_pipe);
-    vkCmdPushConstants(cmd, s_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof push, &push);
+    vulkan_cmd_push(cmd, s_layout, VK_SHADER_STAGE_COMPUTE_BIT, sizeof push, &push);
     vkCmdDispatch(cmd, 1, 1, 1);
 
     VkMemoryBarrier2 shader_to_host = {

@@ -37,8 +37,6 @@ int ring_enter(RingContext *r, unsigned submit, unsigned min_complete, int timeo
     unsigned flags = 0;
     void *arg      = nullptr;
     size_t argz    = 0;
-    struct __kernel_timespec fallback_ts = {0};
-    struct io_uring_getevents_arg fallback_garg = {0};
 
     if (min_complete > 0) {
         flags |= IORING_ENTER_GETEVENTS;
@@ -47,16 +45,18 @@ int ring_enter(RingContext *r, unsigned submit, unsigned min_complete, int timeo
     if ((sq_flags & IORING_SQ_TASKRUN) != 0) {
         flags |= IORING_ENTER_GETEVENTS;
     }
-    if (timeout_ms >= 0 && r->wait_reg_on && r->wait != nullptr) {
+    if (timeout_ms >= 0) {
+        if (!r->wait_reg_on || r->wait == nullptr) {
+            return -EOPNOTSUPP;
+        }
         r->wait[0] = (struct io_uring_reg_wait){
             .ts = {
                 .tv_sec  = timeout_ms / 1000,
                 .tv_nsec = (long)(timeout_ms % 1000) * 1000000L,
             },
-            // With IORING_FEAT_MIN_TIMEOUT the kernel may batch this
-            // wakeup for up to 500us, trading a hair of latency for far
-            // fewer spurious enter returns on short waits.
-            .min_wait_usec = r->min_timeout_on ? 500u : 0u,
+            // IORING_FEAT_MIN_TIMEOUT is required. The kernel may batch this
+            // wakeup for up to 500us.
+            .min_wait_usec = 500u,
             .flags         = IORING_REG_WAIT_TS,
             .sigmask       = 0,
             .sigmask_sz    = 0,
@@ -65,13 +65,6 @@ int ring_enter(RingContext *r, unsigned submit, unsigned min_complete, int timeo
         flags |= IORING_ENTER_GETEVENTS | IORING_ENTER_EXT_ARG | IORING_ENTER_EXT_ARG_REG;
         arg    = (void *)(uintptr_t)0u;
         argz   = sizeof(struct io_uring_reg_wait);
-    } else if (timeout_ms >= 0) {
-        fallback_ts.tv_sec  = timeout_ms / 1000;
-        fallback_ts.tv_nsec = (long)(timeout_ms % 1000) * 1000000L;
-        fallback_garg.ts    = (uint64_t)(uintptr_t)&fallback_ts;
-        flags              |= IORING_ENTER_GETEVENTS | IORING_ENTER_EXT_ARG;
-        arg                 = &fallback_garg;
-        argz                = sizeof(fallback_garg);
     }
     if ((flags & IORING_ENTER_GETEVENTS) != 0) {
         flags |= r->wait_flags;

@@ -2,6 +2,7 @@
 #include "ring/ring.h"
 #include <errno.h>
 #include <fcntl.h>
+#include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -11,7 +12,7 @@
 // live.world is the placement the process last saved.
 // ground z                 the hit plane. The grid is already on.
 // smooth 0|1               every solid, faceted or rounded
-// cube x y z               yaw 38000, one turn, no glow
+// cube x y z               center. A cube that has not been shoved keeps this point.
 // cube x y z yaw N spin 0|1 inf 0|1 glow 0|1
 // solid Name x y z yaw N spin 0|1 inf 0|1 glow 0|1
 // mesh                     the OBJ, one turn from yaw 0
@@ -98,9 +99,8 @@ static int place_cube(const char *line, int number) {
         fprintf(stderr, "[World] %s:%d cube needs x y z\n", source_name(), number);
         return -1;
     }
-    if (z != 0.0f) {
-        fprintf(stderr, "[World] %s:%d cube z is %.3f. The fillet draw sits on the ground, z = 0.\n",
-                source_name(), number, (double)z);
+    if (!isfinite(x) || !isfinite(y) || !isfinite(z)) {
+        fprintf(stderr, "[World] %s:%d cube position is not finite\n", source_name(), number);
         return -1;
     }
     bool ok = false;
@@ -203,9 +203,8 @@ static int place_gone(const char *line, int number) {
                     source_name(), number);
             return -1;
         }
-        if (g.at.z != 0.0f) {
-            fprintf(stderr, "[World] %s:%d cube z is %.3f. The fillet draw sits on the ground, z = 0.\n",
-                    source_name(), number, (double)g.at.z);
+        if (!isfinite(g.at.x) || !isfinite(g.at.y) || !isfinite(g.at.z)) {
+            fprintf(stderr, "[World] %s:%d cube position is not finite\n", source_name(), number);
             return -1;
         }
         g.kind = k_removed_cube;

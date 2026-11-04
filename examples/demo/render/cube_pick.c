@@ -1,4 +1,5 @@
 #include "frame/cube.h"
+#include "frame/fillet.h"
 #include "render/cube_int.h"
 #include <math.h>
 #include <stdio.h>
@@ -33,8 +34,6 @@ static_assert(k_corner_base == 240u, "corner cap base");
 static_assert(k_corner_base + 8u * k_corner_samples == k_fillet_verts, "corner cap count");
 
 static const float k_radius = 0.10f;
-static const float k_deg    = 0.017453292519943295f;
-static const float k_edge   = 120.0f;
 
 static float    s_rest[k_verts * 3u];
 static float    s_nrm[k_verts * 3u];
@@ -353,19 +352,9 @@ static void shown_disp(uint32_t id, float o[3]) {
     raw_disp(id, o);
 }
 
-static void pose_world(const float in[3], float yaw_deg, float origin_x, float origin_y, float o[3]) {
-    float ax = 28.0f * k_deg;
-    float ay = yaw_deg * k_deg;
-    float cx = cosf(ax);
-    float sx = sinf(ax);
-    float rx = in[0];
-    float ry = in[1] * cx - in[2] * sx;
-    float rz = in[1] * sx + in[2] * cx;
-    float cy = cosf(ay);
-    float sy = sinf(ay);
-    o[0] = (rx * cy + rz * sy) * k_edge + origin_x;
-    o[1] = ry * k_edge + origin_y;
-    o[2] = (-rx * sy + rz * cy) * k_edge;
+static void pose_world(const float in[3], float yaw_deg, float origin_x, float origin_y,
+                       float origin_z, float o[3]) {
+    fillet_place(in, fillet_rad(yaw_deg), k_fillet_half, origin_x, origin_y, origin_z, o);
 }
 
 static bool ray_tri(const float o[3], const float d[3], const float a[3], const float b[3], const float c[3],
@@ -436,7 +425,8 @@ bool cube_surface_ready(void) {
 }
 
 bool cube_surface_hit(uint32_t heat_slot, float yaw_deg, float origin_x, float origin_y,
-                      const CameraRay *ray, float *t_hit, float *hx, float *hy, float *hz) {
+                      float origin_z, const CameraRay *ray, float *t_hit, float *hx, float *hy,
+                      float *hz) {
     if (!s_ready || ray == nullptr || heat_slot >= k_cube_heat_slots) {
         return false;
     }
@@ -449,7 +439,7 @@ bool cube_surface_hit(uint32_t heat_slot, float yaw_deg, float origin_x, float o
             s_rest[(size_t)i * 3u + 1u] + disp[1],
             s_rest[(size_t)i * 3u + 2u] + disp[2],
         };
-        pose_world(local, yaw_deg, origin_x, origin_y, s_world + (size_t)i * 3u);
+        pose_world(local, yaw_deg, origin_x, origin_y, origin_z, s_world + (size_t)i * 3u);
     }
     float origin[3] = { ray->ox, ray->oy, ray->oz };
     float dir[3] = { ray->dx, ray->dy, ray->dz };
@@ -903,9 +893,9 @@ bool cube_surface_self_check(void) {
     float hx = 0.0f;
     float hy = 0.0f;
     float hz = 0.0f;
-    bool hit = cube_surface_hit(0u, 38.0f, 0.0f, 0.0f, &mid, &t, &hx, &hy, &hz);
+    bool hit = cube_surface_hit(0u, 38.0f, 0.0f, 0.0f, 0.0f, &mid, &t, &hx, &hy, &hz);
     float far_t = 0.0f;
-    bool miss = cube_surface_hit(0u, 38.0f, 0.0f, 0.0f, &far, &far_t, &hx, &hy, &hz);
+    bool miss = cube_surface_hit(0u, 38.0f, 0.0f, 0.0f, 0.0f, &far, &far_t, &hx, &hy, &hz);
     if (!hit || !(t > 1000.0f) || miss) {
         fprintf(stderr, "[Cube Error] Rest-pose pick missed the center ray or hit x=360\n");
         return false;

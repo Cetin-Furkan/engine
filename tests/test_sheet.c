@@ -215,6 +215,21 @@ static void test_gravity_and_elastic_presets(void) {
     for (int i = 0; i < 85; ++i) {
         (void)sheet_integrate(0.008f);
     }
+
+    // Verify procedural polyring directive and World 7 sheet preset
+    const char *rings =
+        "bounds 500 300\n"
+        "polyring -160 120 40 8 0.90\n"
+        "polyring 0 120 40 6 0.70\n"
+        "polyring 160 120 40 3 0.25\n";
+    CHECK(sheet_load_memory(rings, strlen(rings)) == 0);
+    CHECK(sheet_dyn_count() == 3u);
+    sheet_select_world(7u);
+    CHECK(sheet_load() == 0);
+    CHECK(sheet_rigid_count() == 2u);
+    CHECK(sheet_soft_count() == 2u);
+    CHECK(sheet_dyn_count() == 4u);
+    sheet_select_world(0u);
 }
 
 int main(void) {

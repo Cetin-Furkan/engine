@@ -43,6 +43,10 @@ const char *world_selected_title(void) {
         return "Hybrid 3D+2D Click-to-Draw, Gravity & Multi-Elasticity";
     case 6u:
         return "3D+2D Switchable Restitution Staircase & Bumper Lab";
+    case 7u:
+        return "Procedural C23 WorldBuilder: Kinetic Cathedral & Cascade";
+    case 8u:
+        return "Baklan & Beşparmak Dağı: Dynamic SSD Streamed DEM & Satellite Map";
     default:
         return "Default Sandbox (Switchable 3D / 2D / Hybrid)";
     }
@@ -77,6 +81,16 @@ void world_apply_policy(void) {
     case 6u:
         // World 6: 3D+2D switchable restitution staircase & bumper lab, Tab mode switch allowed.
         policy_apply_world(MODE_3D, PERM_NONE, PERM_NONE, false);
+        break;
+    case 7u:
+        // World 7: Procedural C23 WorldBuilder (Hybrid 3D+2D + click-to-draw + Tab mode switch).
+        policy_apply_world(MODE_HYBRID, PERM_DRAW, PERM_NONE, false);
+        break;
+    case 8u:
+        // World 8: Baklan & Beşparmak Dağı SSD-Streamed DEM + Satellite Map (Pure 3D Map, Z-up turntable mouse controls).
+        policy_apply_world(MODE_3D, PERM_NONE, PERM_PLOT_CYCLE | PERM_OBJ_SPAWN | PERM_MODE_SWITCH, false);
+        camera_set_turntable_mode(true);
+        camera_set_home_pose(1595.0f, -650.0f, 520.0f, -0.18f, 0.52f, 0.16f);
         break;
     default:
         policy_boot();
@@ -158,6 +172,7 @@ void world_reset(void) {
     table_kinds_reset();
     solid_kind_reset();
     mesh_kind_reset();
+    terrain_kind_reset();
     spin_clear();
     camera_reset();
     face_self_check();

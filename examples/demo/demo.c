@@ -15,6 +15,7 @@
 #include "frame/shape.h"
 #include "frame/sheet.h"
 #include "frame/solid.h"
+#include "frame/terrain.h"
 #include "frame/text.h"
 #include "frame/world.h"
 #include "input/pointer.h"
@@ -121,7 +122,7 @@ static void demo_destroy_targets(VulkanContext *vk, EngineTargets *targets) {
 // ------------------------------------------------------------------- hooks
 
 static void print_worlds_usage(const char *prog) {
-    printf("Usage: %s [--world=<0..6> | -w <0..6>] [--list-worlds] [--help]\n\n"
+    printf("Usage: %s [--world=<0..8> | -w <0..8>] [--list-worlds] [--help]\n\n"
            "Selectable Worlds & Capability Masks:\n"
            "  --world=0  Default Sandbox (3D / 2D / Hybrid switchable via Tab)\n"
            "  --world=1  [3D-Only | PERM_DRAW=on  | Tab=locked] Click-to-Draw Studio (Points -> Lines -> Faces)\n"
@@ -129,7 +130,9 @@ static void print_worlds_usage(const char *prog) {
            "  --world=3  [2D-Only | Gravity+Soft  | Tab=locked] Deformable Soft Patches & Elastic Polygons\n"
            "  --world=4  [2D-Only | PERM_DRAW=on  | Tab=locked] 2D Click-to-Draw Polygon Workshop & Sheet\n"
            "  --world=5  [Hybrid  | 3D+2D+Draw    | Tab=open  ] Combined 3D+2D Gravity, Soft Bodies & Draw\n"
-           "  --world=6  [3D+2D   | Multi-Bounce  | Tab=open  ] Restitution Staircase (0.08..0.94) & Bumper Lab\n",
+           "  --world=6  [3D+2D   | Multi-Bounce  | Tab=open  ] Restitution Staircase (0.08..0.94) & Bumper Lab\n"
+           "  --world=7  [Hybrid  | C23 Builder   | Tab=open  ] Procedural Kinetic Cathedral & Polyring Cascade\n"
+           "  --world=8  [3D/Map  | RelPtr2D+SSD  | Tab=open  ] Baklan & Beşparmak Dağı Real DEM + Satellite Map\n",
            prog != nullptr ? prog : "engine");
     fflush(stdout);
 }
@@ -164,6 +167,14 @@ static bool parse_world_arg(const char *arg, uint32_t *out_id) {
     }
     if (strcmp(arg, "bounce") == 0 || strcmp(arg, "elastic") == 0) {
         *out_id = 6u;
+        return true;
+    }
+    if (strcmp(arg, "procedural") == 0 || strcmp(arg, "cathedral") == 0) {
+        *out_id = 7u;
+        return true;
+    }
+    if (strcmp(arg, "map") == 0 || strcmp(arg, "besparmak") == 0 || strcmp(arg, "baklan") == 0) {
+        *out_id = 8u;
         return true;
     }
     char *end = nullptr;
@@ -226,6 +237,7 @@ static int demo_init(VulkanContext *vk, RingCqeFn forward_cqe, void *forward_use
         plane_init(vk) != 0 || material_init(vk) != 0 ||
         plot_init(vk, forward_cqe, forward_user) != 0 ||
         mesh_init(vk, forward_cqe, forward_user) != 0 ||
+        terrain_init(vk) != 0 ||
         gimbal_init(vk) != 0 || hud_init(vk) != 0 || text_init(vk) != 0 || grid_init(vk) != 0) {
         return -1;
     }
@@ -239,6 +251,7 @@ static void demo_shutdown(VulkanContext *vk) {
     text_shutdown(vk);
     hud_shutdown(vk);
     gimbal_shutdown(vk);
+    terrain_shutdown(vk);
     mesh_shutdown(vk);
     plot_shutdown(vk);
     material_shutdown(vk);
@@ -378,6 +391,9 @@ static bool demo_key(uint32_t key, EngineKeyContext *ctx) {
             bool mesh_has = false;
             bool mesh_bytes = mesh_reload(ctx->reload_cqe, nullptr, &mesh_has);
             if (world_apply_mesh(mesh_has, mesh_bytes)) {
+                changed = true;
+            }
+            if (terrain_reload()) {
                 changed = true;
             }
         }

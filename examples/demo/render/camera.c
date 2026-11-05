@@ -1,4 +1,5 @@
 #include "frame/camera.h"
+#include "backend/backend.h"
 #include "frame/material.h"
 #include "frame/policy.h"
 #include "engine/app.h"
@@ -58,6 +59,13 @@ static uint32_t s_t0 = 0;
 static bool     s_have_t0 = false;
 static float    s_held_yaw = 0.0f;
 static float    s_held_pitch = 0.0f;
+static float    s_home_x = 0.0f;
+static float    s_home_y = 0.0f;
+static float    s_home_z = 0.0f;
+static float    s_home_yaw = 0.0f;
+static float    s_home_pitch = 0.0f;
+static float    s_home_zoom = 1.0f;
+static bool     s_turntable_z = false;
 static bool     s_logged = false;
 // The last numpad 5 put the view on the front. The next 5, while it
 // is still there, sets the back. Home, another view, or a yaw or
@@ -161,11 +169,18 @@ static Vec3 unit_or(Vec3 v, Vec3 fallback) {
 
 // q rotates world into camera. Rx(+pitch) sends the look direction down,
 // so the stored X rotation is the opposite of the pitch angle.
+// In Z-up turntable map mode (s_turntable_z), yaw rotates around the vertical
+// world Z axis first, followed by tilt Rx(-pitch), keeping the horizon level.
 static void store_yaw_pitch(Pose *p, float yaw, float pitch) {
     float hy = yaw * 0.5f;
     float hp = -pitch * 0.5f;
-    Quat qy = { 0.0f, sinf(hy), 0.0f, cosf(hy) };
     Quat qp = { sinf(hp), 0.0f, 0.0f, cosf(hp) };
+    if (s_turntable_z) {
+        Quat qz = { 0.0f, 0.0f, sinf(hy), cosf(hy) };
+        quat_store(p, normalize_q(mul_q(qp, qz)));
+        return;
+    }
+    Quat qy = { 0.0f, sinf(hy), 0.0f, cosf(hy) };
     quat_store(p, normalize_q(mul_q(qy, qp)));
 }
 
@@ -232,8 +247,29 @@ static void hold_flat(void) {
     s_held_pitch = 0.0f;
 }
 
+static void sync_turntable_ground_z(void) {
+    if (!s_turntable_z) {
+        return;
+    }
+    s_live.x = clampf(s_live.x, -k_terrain_world_half, k_terrain_world_half);
+    s_live.y = clampf(s_live.y, -k_terrain_world_half, k_terrain_world_half);
+    s_live.z = backend_sample_elevation_world_z(s_live.x, s_live.y);
+}
+
 static void translate_view(float dt, int move_x, int move_y) {
     if (move_x == 0 && move_y == 0) {
+        return;
+    }
+    float scale = k_move_speed * dt / s_live.zoom;
+    float sx = (float)move_x * scale;
+    float sy = (float)move_y * scale;
+    if (s_turntable_z) {
+        float cy = cosf(s_held_yaw);
+        float sy_w = sinf(s_held_yaw);
+        float dy1 = sy / fmaxf(cosf(s_held_pitch), 0.25f);
+        s_live.x += sx * cy + dy1 * sy_w;
+        s_live.y += -sx * sy_w + dy1 * cy;
+        sync_turntable_ground_z();
         return;
     }
     Vec3 right;
@@ -241,9 +277,6 @@ static void translate_view(float dt, int move_x, int move_y) {
     Vec3 look;
     view_basis(quat_of(&s_live), &right, &up, &look);
     (void)look;
-    float scale = k_move_speed * dt / s_live.zoom;
-    float sx = (float)move_x * scale;
-    float sy = (float)move_y * scale;
     s_live.x += right.x * sx + up.x * sy;
     s_live.y += right.y * sx + up.y * sy;
     s_live.z += right.z * sx + up.z * sy;
@@ -296,14 +329,22 @@ static void integrate(float dt) {
             s_held_yaw = wrap_pi(s_held_yaw + (float)axes.yaw * k_yaw_rate * dt);
         }
         if (axes.pitch != 0) {
-            s_held_pitch = step_pitch(s_held_pitch, axes.pitch, dt);
+            if (s_turntable_z) {
+                s_held_pitch = clampf(s_held_pitch + (float)axes.pitch * k_pitch_rate * dt, 0.0f, 1.36f);
+            } else {
+                s_held_pitch = step_pitch(s_held_pitch, axes.pitch, dt);
+            }
         }
         store_yaw_pitch(&s_live, s_held_yaw, s_held_pitch);
     }
 
     if (axes.zoom != 0) {
         s_live.zoom *= expf((float)axes.zoom * k_zoom_rate * dt);
-        s_live.zoom = clampf(s_live.zoom, k_camera_zoom_min, k_camera_zoom_max);
+        if (s_turntable_z) {
+            s_live.zoom = clampf(s_live.zoom, 0.025f, 16.0f);
+        } else {
+            s_live.zoom = clampf(s_live.zoom, k_camera_zoom_min, k_camera_zoom_max);
+        }
     }
 
     translate_view(dt, axes.pan_x, axes.pan_y);
@@ -369,6 +410,13 @@ void camera_reset(void) {
     s_have_t0 = false;
     s_held_yaw = 0.0f;
     s_held_pitch = 0.0f;
+    s_home_x = 0.0f;
+    s_home_y = 0.0f;
+    s_home_z = 0.0f;
+    s_home_yaw = 0.0f;
+    s_home_pitch = 0.0f;
+    s_home_zoom = 1.0f;
+    s_turntable_z = false;
     s_kp5_front = false;
     check_identity();
     if (!s_logged) {
@@ -458,17 +506,46 @@ bool camera_snap_front(void) {
     return true;
 }
 
-bool camera_home(void) {
-    bool changed = s_live.qx != 0.0f || s_live.qy != 0.0f || s_live.qz != 0.0f ||
-                   s_live.qw != 1.0f || s_live.x != 0.0f || s_live.y != 0.0f ||
-                   s_live.z != 0.0f || s_live.zoom != 1.0f ||
-                   s_held_yaw != 0.0f || s_held_pitch != 0.0f;
+void camera_set_turntable_mode(bool enabled) {
+    s_turntable_z = enabled;
+    store_yaw_pitch(&s_live, s_held_yaw, s_held_pitch);
+    s_shown = s_live;
+}
+
+void camera_set_home_pose(float x, float y, float z, float yaw, float pitch, float zoom) {
+    s_home_x = x;
+    s_home_y = y;
+    s_home_z = z;
+    s_home_yaw = wrap_pi(yaw);
+    s_home_pitch = s_turntable_z ? clampf(pitch, 0.0f, 1.36f) : clampf(pitch, -k_pitch_limit, k_pitch_limit);
+    s_home_zoom = clampf(zoom, k_camera_zoom_min, k_camera_zoom_max);
+
     s_live = (Pose){
-        .qw   = 1.0f,
-        .zoom = 1.0f,
+        .x    = s_home_x,
+        .y    = s_home_y,
+        .z    = s_home_z,
+        .zoom = s_home_zoom,
     };
-    s_held_yaw = 0.0f;
-    s_held_pitch = 0.0f;
+    s_held_yaw = s_home_yaw;
+    s_held_pitch = s_home_pitch;
+    store_yaw_pitch(&s_live, s_held_yaw, s_held_pitch);
+    s_shown = s_live;
+    s_kp5_front = false;
+}
+
+bool camera_home(void) {
+    Pose target = {
+        .x    = s_home_x,
+        .y    = s_home_y,
+        .z    = s_home_z,
+        .zoom = s_home_zoom,
+    };
+    store_yaw_pitch(&target, s_home_yaw, s_home_pitch);
+    bool changed = !pose_same(&s_live, &target) ||
+                   s_held_yaw != s_home_yaw || s_held_pitch != s_home_pitch;
+    s_live = target;
+    s_held_yaw = s_home_yaw;
+    s_held_pitch = s_home_pitch;
     s_kp5_front = false;
     if (!changed) {
         return false;
@@ -542,30 +619,58 @@ bool camera_pointer_drag(float dx, float dy, uint32_t buttons) {
     }
     bool changed = false;
     if ((buttons & ENG_BUTTON_RIGHT) != 0 && !policy_active()->lock_2d_quat) {
-        float yaw_d = policy_allows(PERM_CAM_YAW) ? dx * 0.005f : 0.0f;
-        float pitch_d = policy_allows(PERM_CAM_PITCH) ? -dy * 0.005f : 0.0f;
-        if (yaw_d != 0.0f || pitch_d != 0.0f) {
-            s_kp5_front = false;
-            s_held_yaw = wrap_pi(s_held_yaw + yaw_d);
-            s_held_pitch = add_pitch(s_held_pitch, pitch_d);
-            store_yaw_pitch(&s_live, s_held_yaw, s_held_pitch);
-            changed = true;
+        if (s_turntable_z) {
+            float yaw_d   = policy_allows(PERM_CAM_YAW) ? -dx * 0.0055f : 0.0f;
+            float pitch_d = policy_allows(PERM_CAM_PITCH) ? -dy * 0.0050f : 0.0f;
+            if (yaw_d != 0.0f || pitch_d != 0.0f) {
+                s_kp5_front = false;
+                s_held_yaw = wrap_pi(s_held_yaw + yaw_d);
+                s_held_pitch = clampf(s_held_pitch + pitch_d, 0.0f, 1.36f);
+                store_yaw_pitch(&s_live, s_held_yaw, s_held_pitch);
+                changed = true;
+            }
+        } else {
+            float yaw_d = policy_allows(PERM_CAM_YAW) ? dx * 0.005f : 0.0f;
+            float pitch_d = policy_allows(PERM_CAM_PITCH) ? -dy * 0.005f : 0.0f;
+            if (yaw_d != 0.0f || pitch_d != 0.0f) {
+                s_kp5_front = false;
+                s_held_yaw = wrap_pi(s_held_yaw + yaw_d);
+                s_held_pitch = add_pitch(s_held_pitch, pitch_d);
+                store_yaw_pitch(&s_live, s_held_yaw, s_held_pitch);
+                changed = true;
+            }
         }
     }
-    if ((buttons & ENG_BUTTON_MIDDLE) != 0) {
-        float sx = policy_allows(PERM_CAM_PAN_X) ? dx : 0.0f;
-        float sy = policy_allows(PERM_CAM_PAN_Y) ? -dy : 0.0f;
-        if ((sx != 0.0f || sy != 0.0f) && s_live.zoom != 0.0f) {
-            Vec3 right;
-            Vec3 up;
-            Vec3 look;
-            view_basis(quat_of(&s_live), &right, &up, &look);
-            (void)look;
-            float scale = 1.0f / s_live.zoom;
-            s_live.x += (right.x * sx + up.x * sy) * scale;
-            s_live.y += (right.y * sx + up.y * sy) * scale;
-            s_live.z += (right.z * sx + up.z * sy) * scale;
-            changed = true;
+    uint32_t pan_buttons = ENG_BUTTON_MIDDLE | (s_turntable_z ? ENG_BUTTON_LEFT : 0u);
+    if ((buttons & pan_buttons) != 0) {
+        if (s_turntable_z) {
+            float sx = policy_allows(PERM_CAM_PAN_X) ? -dx : 0.0f;
+            float sy = policy_allows(PERM_CAM_PAN_Y) ? dy : 0.0f;
+            if ((sx != 0.0f || sy != 0.0f) && s_live.zoom > 0.0f) {
+                float dx1 = sx / s_live.zoom;
+                float dy1 = sy / (s_live.zoom * fmaxf(cosf(s_held_pitch), 0.22f));
+                float cy  = cosf(s_held_yaw);
+                float syw = sinf(s_held_yaw);
+                s_live.x += dx1 * cy + dy1 * syw;
+                s_live.y += -dx1 * syw + dy1 * cy;
+                sync_turntable_ground_z();
+                changed = true;
+            }
+        } else {
+            float sx = policy_allows(PERM_CAM_PAN_X) ? -dx : 0.0f;
+            float sy = policy_allows(PERM_CAM_PAN_Y) ? dy : 0.0f;
+            if ((sx != 0.0f || sy != 0.0f) && s_live.zoom != 0.0f) {
+                Vec3 right;
+                Vec3 up;
+                Vec3 look;
+                view_basis(quat_of(&s_live), &right, &up, &look);
+                (void)look;
+                float scale = 1.0f / s_live.zoom;
+                s_live.x += (right.x * sx + up.x * sy) * scale;
+                s_live.y += (right.y * sx + up.y * sy) * scale;
+                s_live.z += (right.z * sx + up.z * sy) * scale;
+                changed = true;
+            }
         }
     }
     return changed;
@@ -575,9 +680,32 @@ bool camera_zoom_steps(float steps) {
     if (steps == 0.0f || !policy_allows(PERM_CAM_ZOOM)) {
         return false;
     }
-    float next = clampf(s_live.zoom * expf(steps * 0.18f), k_camera_zoom_min, k_camera_zoom_max);
-    if (next == s_live.zoom) {
+    float old_zoom = s_live.zoom;
+    float min_z = s_turntable_z ? 0.025f : k_camera_zoom_min;
+    float max_z = s_turntable_z ? 16.0f : k_camera_zoom_max;
+    float next = clampf(old_zoom * expf(steps * 0.22f), min_z, max_z);
+    if (next == old_zoom) {
         return false;
+    }
+    if (s_turntable_z) {
+        int32_t px = 0;
+        int32_t py = 0;
+        const WaylandContext *w = wayland_get_context();
+        if (w != nullptr && w->scene_opaque_w > 0u && w->scene_opaque_h > 0u &&
+            pointer_client_xy(&px, &py) && py >= 0) {
+            float scene_w = (float)w->scene_opaque_w;
+            float scene_h = (float)w->scene_opaque_h;
+            float cx = (float)px - scene_w * 0.5f;
+            float cy = scene_h * 0.5f - (float)py;
+            float inv_delta = (1.0f / old_zoom) - (1.0f / next);
+            float dx1 = cx * inv_delta;
+            float dy1 = (cy / fmaxf(cosf(s_held_pitch), 0.25f)) * inv_delta;
+            float cyaw = cosf(s_held_yaw);
+            float syaw = sinf(s_held_yaw);
+            s_live.x += dx1 * cyaw + dy1 * syaw;
+            s_live.y += -dx1 * syaw + dy1 * cyaw;
+            sync_turntable_ground_z();
+        }
     }
     s_live.zoom = next;
     return true;

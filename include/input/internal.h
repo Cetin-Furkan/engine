@@ -55,6 +55,10 @@ typedef struct InputCursor {
     uint32_t cursor_bytes;
     // True after F_SEAL_WRITE sticks. The compositor then maps an immutable arrow.
     bool     cursor_sealed;
+    bool     left_client_down;
+    bool     left_dragged;
+    float    left_down_x;
+    float    left_down_y;
 } InputCursor;
 
 typedef struct InputSpawn {

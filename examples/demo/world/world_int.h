@@ -116,6 +116,7 @@ void table_kinds_check(void);
 
 void ground_reset(void);
 bool ground_set(int axis, float offset);
+void ground_set_visible(bool visible);
 void ground_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height);
 
 void face_reset(void);
@@ -164,6 +165,10 @@ bool mesh_kind_pose(int32_t yaw_milli, bool spinning, bool infinite, bool glow);
 const WorldOps *mesh_ops(void);
 bool mesh_kind_apply(bool has, bool bytes);
 
+void terrain_kind_reset(void);
+bool terrain_kind_spawn(void);
+const WorldOps *terrain_ops(void);
+
 // A removed cube, solid, or mesh. Newest is the last entry. Faces are not stored.
 enum : int {
     k_removed_cube  = 0,
@@ -190,5 +195,32 @@ const WorldRemoved *world_removed_at(uint32_t index);
 void overlay_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height);
 bool overlay_busy(void);
 void overlay_commit(void);
+
+// Programmatic C23 WorldBuilder API: constructs complex multi-object worlds
+// directly in C23 code or via composite scene-file directives (ringcube,
+// tower, arcsolid) without requiring individual per-object text lines.
+typedef struct WorldBuilder {
+    uint32_t cubes_placed;
+    uint32_t solids_placed;
+    uint32_t blueprints_placed;
+    bool     smooth_solids;
+    bool     failed;
+} WorldBuilder;
+
+void world_builder_begin(WorldBuilder *wb, bool smooth_solids);
+bool world_builder_add_blueprint(WorldBuilder *wb, WorldBlueprint bp);
+bool world_builder_add_cube(WorldBuilder *wb, Coord at, int32_t yaw_milli,
+                            bool spinning, bool infinite, bool glow, float restitution);
+bool world_builder_add_solid(WorldBuilder *wb, uint32_t kind, Coord at, int32_t yaw_milli,
+                             bool spinning, bool infinite, bool glow, float restitution);
+bool world_builder_add_cube_ring(WorldBuilder *wb, Coord center, float radius,
+                                 uint32_t count, float restitution, bool glow);
+bool world_builder_add_cube_tower(WorldBuilder *wb, Coord base, float step_z,
+                                  uint32_t count, float restitution);
+bool world_builder_add_solid_arc(WorldBuilder *wb, Coord center, float radius,
+                                 float dz, float bounce_min, float bounce_max);
+[[nodiscard]] int world_builder_commit(const WorldBuilder *wb);
+[[nodiscard]] int world_build_procedural_cathedral(void);
+[[nodiscard]] int world_build_besparmak_terrain(void);
 
 #endif /* ENGINE_WORLD_INT_H */

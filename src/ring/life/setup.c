@@ -1,4 +1,5 @@
 #include "ring/internal.h"
+#include "system/system.h"
 #include <errno.h>
 #include <stdio.h>
 #include <string.h>
@@ -73,7 +74,8 @@ int ring_context_init(RingContext *r, const char *name, bool with_pbuf) {
         fprintf(stderr, "[Ring Error] Arena mmap of %zu bytes failed: %s\n", len, strerror(errno));
         return -ENOMEM;
     }
-    memset(arena, 0, len);
+    system_vma_advise_arena(arena, len);
+    system_vma_set_name(arena, len, "engine:io_uring_arena");
 
     r->arena     = arena;
     r->arena_len = len;

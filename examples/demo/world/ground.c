@@ -19,6 +19,10 @@ bool ground_set(int axis, float offset) {
     return true;
 }
 
+void ground_set_visible(bool visible) {
+    s_on = visible;
+}
+
 void ground_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height) {
     if (!s_on) {
         return;

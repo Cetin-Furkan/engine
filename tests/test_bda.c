@@ -19,7 +19,7 @@ VulkanResult vulkan_find_memory_type(const VulkanContext *vk, uint32_t type_bits
 // Disable real Vulkan creation for unit testing pool logic
 #define create_raw_block disabled_create_raw_block
 #define destroy_raw_block disabled_destroy_raw_block
-#include "../src/vulkan/bda.c"
+#include "../src/vulkan/memory/bda.c"
 #undef create_raw_block
 #undef destroy_raw_block
 

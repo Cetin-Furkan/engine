@@ -1,0 +1,11 @@
+# World 7: Procedural Kinetic Cathedral & 2D Polyring Cascade
+# Uses the composite polyring directive (polyring x y radius sides bounce)
+bounds 600 320
+rigid -460 -160 110 18 -14 0.86 1
+rigid 460 -160 110 18 14 0.86 1
+soft -260 -210 6 4 32 28 1.2 0.84
+soft 260 -210 6 4 32 135 2.4 0.90
+polyring -320 190 42 8 0.92
+polyring -110 210 42 6 0.76
+polyring 110 210 42 5 0.54
+polyring 320 190 42 3 0.24

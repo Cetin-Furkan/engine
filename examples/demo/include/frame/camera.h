@@ -64,6 +64,8 @@ bool camera_snap_front(void);
 // Opening pose: origin, zoom 1, identity quaternion. Pan and zoom
 // come back with the orientation. True when the pose changed.
 bool camera_home(void);
+void camera_set_home_pose(float x, float y, float z, float yaw, float pitch, float zoom);
+void camera_set_turntable_mode(bool enabled);
 
 // Orientation only. x, y, z, and zoom stay. Refused while the flat
 // profile locks the quaternion. A second front, while the held yaw

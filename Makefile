@@ -75,11 +75,17 @@ $(GEN_DIR)/plane.frag.spv: shaders/plane.frag.slang
 $(GEN_DIR)/bevel.comp.spv: shaders/face_grid.slang
 $(GEN_DIR)/heat.comp.spv: shaders/heat_nbr.slang shaders/face_grid.slang
 $(GEN_DIR)/cube.vert.spv: shaders/camera.slang shaders/material.slang shaders/face_grid.slang
+$(GEN_DIR)/cube.frag.spv: shaders/lighting.slang
 $(GEN_DIR)/solid.vert.spv: shaders/camera.slang shaders/material.slang
+$(GEN_DIR)/solid.frag.spv: shaders/lighting.slang
 $(GEN_DIR)/shape.vert.spv: shaders/camera.slang shaders/material.slang
 $(GEN_DIR)/plot.vert.spv: shaders/camera.slang
 $(GEN_DIR)/gimbal.vert.spv: shaders/camera.slang
 $(GEN_DIR)/mesh.vert.spv: shaders/camera.slang shaders/material.slang
+$(GEN_DIR)/mesh.frag.spv: shaders/lighting.slang
+$(GEN_DIR)/terrain_filter.comp.spv: shaders/terrain_math.slang
+$(GEN_DIR)/terrain.vert.spv: shaders/camera.slang shaders/terrain_math.slang
+$(GEN_DIR)/terrain.frag.spv: shaders/camera.slang shaders/terrain_math.slang shaders/lighting.slang
 
 -include $(wildcard $(GEN_DIR)/*.d)
 
@@ -90,6 +96,7 @@ $(OBJ_DIR)/examples/demo/render/plane.o: $(GEN_DIR)/plane.vert.spv $(GEN_DIR)/pl
 $(OBJ_DIR)/examples/demo/render/plot.o: $(GEN_DIR)/plot.vert.spv $(GEN_DIR)/plot.frag.spv $(GEN_DIR)/plot.comp.spv
 $(OBJ_DIR)/examples/demo/render/gimbal.o: $(GEN_DIR)/gimbal.vert.spv $(GEN_DIR)/gimbal.frag.spv
 $(OBJ_DIR)/examples/demo/render/mesh.o: $(GEN_DIR)/mesh.vert.spv $(GEN_DIR)/mesh.frag.spv
+$(OBJ_DIR)/examples/demo/render/terrain.o: $(GEN_DIR)/terrain.vert.spv $(GEN_DIR)/terrain.frag.spv
 $(OBJ_DIR)/examples/demo/render/hud.o: $(GEN_DIR)/hud.vert.spv $(GEN_DIR)/hud.frag.spv
 $(OBJ_DIR)/examples/demo/render/grid.o: $(GEN_DIR)/grid.comp.spv
 
@@ -105,6 +112,7 @@ $(OBJ_DIR)/examples/demo/text/draw/draw.o: $(GEN_DIR)/text.vert.spv $(GEN_DIR)/t
 $(OBJ_DIR)/examples/demo/text/face/face.o: examples/demo/text/face/bundled/InterVariable.ttf
 $(OBJ_DIR)/src/chrome/gpu.o: $(GEN_DIR)/chrome.vert.spv $(GEN_DIR)/chrome.frag.spv
 $(OBJ_DIR)/src/input/page/page.o: $(GEN_DIR)/input.comp.spv
+$(OBJ_DIR)/src/backend/math/gpu/directory.o: $(GEN_DIR)/terrain_filter.comp.spv
 
 # Compiler & Preprocessor Flags
 CFLAGS ?= $(C23_FLAGS) -D_GNU_SOURCE -Wall -Wextra -Wunused-function -Werror=unused-function -Wmissing-declarations \
@@ -143,7 +151,7 @@ $(TARGET): $(OBJS)
 		cat $(BUILD_DIR)/link.log >&2; \
 		exit 1; \
 	fi
-	@dead=$$(grep -E "removing unused section '\.text\.[^']*' in file '.*(src/vulkan|src/frame|src/ring|src/wayland|src/input|src/chrome|src/system)" $(BUILD_DIR)/link.log || true); \
+	@dead=$$(grep -E "removing unused section '\.text\.[^']*' in file '.*(src/vulkan|src/frame|src/ring|src/wayland|src/input|src/chrome|src/system|src/backend)" $(BUILD_DIR)/link.log || true); \
 	if [ -n "$$dead" ]; then \
 		echo -e "\033[0;31m[Link Error] Dead/hallucinated functions detected:\033[0m" >&2; \
 		echo "$$dead" >&2; rm -f $@; exit 1; \
@@ -257,5 +265,12 @@ test: $(CONFIG_MK)
 	./build/test_text
 	$(CC) $(CFLAGS) -o build/test_bda tests/test_bda.c -lvulkan
 	./build/test_bda
+	$(CC) $(CFLAGS) -o build/test_backend tests/test_backend.c \
+		src/backend/math/pointer/relptr2d.c \
+		src/backend/core/cell/dispatch.c \
+		src/backend/terrain/storage/synth_besparmak.c \
+		src/backend/terrain/storage/pack_io.c \
+		src/backend/terrain/stream/lod_select.c -lm
+	./build/test_backend
 
 .PHONY: all debug release run run-release release-patch release-minor release-major info help clean clear recheck distclean test

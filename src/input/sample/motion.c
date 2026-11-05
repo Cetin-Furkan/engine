@@ -73,6 +73,8 @@ bool input_on_pointer(WaylandContext *w, uint16_t opcode,
         s_ptr.close_hit = false;
         s_ptr.title_hit = false;
         s_ptr.edge = 0;
+        s_ptr.left_client_down = false;
+        s_ptr.left_dragged = false;
         return true;
     }
     if (opcode == 2u) {
@@ -92,7 +94,19 @@ bool input_on_pointer(WaylandContext *w, uint16_t opcode,
         float ny = fixed_to_px(fy);
         float dx = nx - s_ptr.x;
         float dy = ny - s_ptr.y;
+        if (s_ptr.left_client_down && !s_ptr.left_dragged && (s_ptr.buttons & ENG_BUTTON_LEFT) != 0u) {
+            float ldx = nx - s_ptr.left_down_x;
+            float ldy = ny - s_ptr.left_down_y;
+            if (ldx * ldx + ldy * ldy >= 16.0f) {
+                s_ptr.left_dragged = true;
+                dx = ldx;
+                dy = ldy;
+            }
+        }
         uint32_t drag = s_ptr.buttons & (ENG_BUTTON_RIGHT | ENG_BUTTON_MIDDLE);
+        if (s_ptr.left_dragged && (s_ptr.buttons & ENG_BUTTON_LEFT) != 0u) {
+            drag |= ENG_BUTTON_LEFT;
+        }
         if (s_ptr.focus == w->surface_id && drag != 0 && (dx != 0.0f || dy != 0.0f)) {
             s_drag_dx += dx;
             s_drag_dy += dy;
@@ -121,30 +135,48 @@ bool input_on_pointer(WaylandContext *w, uint16_t opcode,
                 s_ptr.buttons &= ~bit;
             }
         }
-        if (state == 1u && button == BTN_LEFT) {
-            if (s_ptr.frame_pending_retarget && s_ptr.focus != 0) {
-                retarget(w, s_ptr.frame_entering);
-                s_ptr.frame_pending_retarget = false;
-                s_ptr.frame_entering = false;
-            }
-            if (s_ptr.close_hit) {
-                // The idle loop treats this as a clean exit.
-                s_ptr.resize_pending = false;
-                s_ptr.move_pending = false;
-                w->toplevel_closed = true;
-            } else if (s_ptr.edge != 0 && w->xdg_toplevel_id != 0) {
-                s_ptr.move_pending = false;
-                s_ptr.resize_pending = true;
-                s_ptr.resize_serial = serial;
-                s_ptr.resize_edge = s_ptr.edge;
-            } else if (s_ptr.title_hit && w->xdg_toplevel_id != 0) {
-                s_ptr.resize_pending = false;
-                s_ptr.move_pending = true;
-                s_ptr.move_serial = serial;
-            } else if (s_ptr.focus == w->surface_id && s_spawn_n < k_spawn_cap) {
-                s_spawn[s_spawn_n].x = px_floor_i32(s_ptr.x);
-                s_spawn[s_spawn_n].y = px_floor_i32(s_ptr.y);
-                s_spawn_n++;
+        if (button == BTN_LEFT) {
+            if (state == 1u) {
+                if (s_ptr.frame_pending_retarget && s_ptr.focus != 0) {
+                    retarget(w, s_ptr.frame_entering);
+                    s_ptr.frame_pending_retarget = false;
+                    s_ptr.frame_entering = false;
+                }
+                if (s_ptr.close_hit) {
+                    // The idle loop treats this as a clean exit.
+                    s_ptr.resize_pending = false;
+                    s_ptr.move_pending = false;
+                    s_ptr.left_client_down = false;
+                    s_ptr.left_dragged = false;
+                    w->toplevel_closed = true;
+                } else if (s_ptr.edge != 0 && w->xdg_toplevel_id != 0) {
+                    s_ptr.move_pending = false;
+                    s_ptr.resize_pending = true;
+                    s_ptr.resize_serial = serial;
+                    s_ptr.resize_edge = s_ptr.edge;
+                    s_ptr.left_client_down = false;
+                    s_ptr.left_dragged = false;
+                } else if (s_ptr.title_hit && w->xdg_toplevel_id != 0) {
+                    s_ptr.resize_pending = false;
+                    s_ptr.move_pending = true;
+                    s_ptr.move_serial = serial;
+                    s_ptr.left_client_down = false;
+                    s_ptr.left_dragged = false;
+                } else if (s_ptr.focus == w->surface_id) {
+                    s_ptr.left_client_down = true;
+                    s_ptr.left_dragged = false;
+                    s_ptr.left_down_x = s_ptr.x;
+                    s_ptr.left_down_y = s_ptr.y;
+                }
+            } else {
+                if (s_ptr.left_client_down && !s_ptr.left_dragged &&
+                    s_ptr.focus == w->surface_id && s_spawn_n < k_spawn_cap) {
+                    s_spawn[s_spawn_n].x = px_floor_i32(s_ptr.left_down_x);
+                    s_spawn[s_spawn_n].y = px_floor_i32(s_ptr.left_down_y);
+                    s_spawn_n++;
+                }
+                s_ptr.left_client_down = false;
+                s_ptr.left_dragged = false;
             }
         }
         return true;

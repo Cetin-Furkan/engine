@@ -461,6 +461,32 @@ static int parse_sheet(Sheet *dst, const char *text, size_t len, const char *nam
                     fprintf(stderr, "[Sheet] %s:%d soft needs x y cols rows spacing [spring damp [bounce]]\n", name, number);
                     return -1;
                 }
+            } else if (strncmp(p, "polyring", 8) == 0) {
+                float px = 0.0f;
+                float py = 0.0f;
+                float radius = 0.0f;
+                unsigned sides = 0u;
+                float bounce = 0.65f;
+                char tail = 0;
+                int got = sscanf(p, "polyring %f %f %f %u %f %c",
+                                 &px, &py, &radius, &sides, &bounce, &tail);
+                if ((got != 4 && got != 5) || !finite2(px, py) || !isfinite(radius) ||
+                    radius < 6.0f || radius > 800.0f || sides < 3u || sides > 8u) {
+                    fprintf(stderr, "[Sheet] %s:%d polyring needs x y radius sides(3..8) [bounce]\n",
+                            name, number);
+                    return -1;
+                }
+                float rlx[k_dyn_verts];
+                float rly[k_dyn_verts];
+                for (uint32_t v = 0u; v < sides; ++v) {
+                    float a = 6.28318530717958647692f * (float)v / (float)sides;
+                    rlx[v] = cosf(a) * radius;
+                    rly[v] = sinf(a) * radius;
+                }
+                if (add_dyn(dst, px, py, 0.0f, sides, rlx, rly, got == 5 ? bounce : 0.65f) != 0) {
+                    fprintf(stderr, "[Sheet] %s:%d polyring shape was refused\n", name, number);
+                    return -1;
+                }
             } else if (strncmp(p, "dyn", 3) == 0) {
                 unsigned n = 0;
                 float bounce = 0.0f;
@@ -702,7 +728,7 @@ int sheet_save_path(const char *path) {
     return write_all(path, body, used);
 }
 
-static const char *k_preset_sheets[6] = {
+static const char *k_preset_sheets[8] = {
     // World 1 (3D only; minimal sheet if inspected)
     "rigid -220 80 90 50 0\n"
     "rigid 220 80 90 50 18\n"
@@ -770,15 +796,29 @@ static const char *k_preset_sheets[6] = {
     "44 0\n0 38\n-44 0\n0 -38\n"
     "dyn 380 140 0 3 0.15\n"
     "44 -28\n0 46\n-44 -28\n",
+    // World 7: Procedural Kinetic Cathedral & 2D Polyring Cascade
+    "bounds 600 320\n"
+    "rigid -460 -160 110 18 -14 0.86 1\n"
+    "rigid 460 -160 110 18 14 0.86 1\n"
+    "soft -260 -210 6 4 32 28 1.2 0.84\n"
+    "soft 260 -210 6 4 32 135 2.4 0.90\n"
+    "polyring -320 190 42 8 0.92\n"
+    "polyring -110 210 42 6 0.76\n"
+    "polyring 110 210 42 5 0.54\n"
+    "polyring 320 190 42 3 0.24\n",
+    // World 8: Baklan & Beşparmak Dağı SSD Streamed DEM & Map (2D contour overlay if switched to Hybrid)
+    "bounds 600 320\n"
+    "polyring -94 316 32 6 0.78\n"
+    "polyring 103 83 48 8 0.88\n",
 };
 
 void sheet_select_world(uint32_t world_id) {
-    s_world_id = world_id <= 6u ? world_id : 0u;
+    s_world_id = world_id <= 8u ? world_id : 0u;
 }
 
 int sheet_load(void) {
     char path[1024];
-    if (s_world_id >= 1u && s_world_id <= 6u) {
+    if (s_world_id >= 1u && s_world_id <= 8u) {
         char rel[64];
         char rel_old[64];
         snprintf(rel, sizeof rel, "examples/demo/world/sheet%u.world", s_world_id);
@@ -833,7 +873,7 @@ int sheet_save(void) {
 }
 
 bool sheet_reload(void) {
-    if (s_world_id >= 1u && s_world_id <= 6u) {
+    if (s_world_id >= 1u && s_world_id <= 8u) {
         return sheet_load() == 0;
     }
     char path[1024];

@@ -28,7 +28,7 @@ static const char *k_path_legacy = "world/opening.world";
 static const char *k_live = "examples/demo/world/live.world";
 static const char *k_live_legacy = "world/live.world";
 
-static const char *k_preset_worlds[k_world_preset_max] = {
+static const char *k_preset_worlds[6] = {
     // World 1: 3D-Only Click-to-Draw Studio (open central court framed by glowing pillars)
     "ground z\n"
     "smooth 0\n"
@@ -362,6 +362,77 @@ static int place_smooth(const char *line, int number) {
     return 0;
 }
 
+static int place_ringcube(const char *line, int number) {
+    float cx = 0.0f;
+    float cy = 0.0f;
+    float cz = 0.0f;
+    float radius = 0.0f;
+    unsigned count = 0u;
+    float bounce = -1.0f;
+    int glow = 1;
+    char tail = 0;
+    int got = sscanf(line, "ringcube %f %f %f %f %u %f %d %c",
+                     &cx, &cy, &cz, &radius, &count, &bounce, &glow, &tail);
+    if ((got != 5 && got != 6 && got != 7) || (got == 7 && !flag_bit(glow))) {
+        fprintf(stderr, "[World] %s:%d ringcube needs cx cy cz radius count [bounce [glow]]\n",
+                source_name(), number);
+        return -1;
+    }
+    if (!world_builder_add_cube_ring(nullptr, (Coord){ cx, cy, cz }, radius, count,
+                                     got >= 6 ? bounce : -1.0f, got == 7 ? (glow != 0) : true)) {
+        fprintf(stderr, "[World] %s:%d ringcube placement refused\n", source_name(), number);
+        return -1;
+    }
+    return 0;
+}
+
+static int place_tower(const char *line, int number) {
+    float bx = 0.0f;
+    float by = 0.0f;
+    float bz = 0.0f;
+    float step_z = 0.0f;
+    unsigned count = 0u;
+    float bounce = -1.0f;
+    char tail = 0;
+    int got = sscanf(line, "tower %f %f %f %f %u %f %c",
+                     &bx, &by, &bz, &step_z, &count, &bounce, &tail);
+    if (got != 5 && got != 6) {
+        fprintf(stderr, "[World] %s:%d tower needs x y z step_z count [bounce]\n",
+                source_name(), number);
+        return -1;
+    }
+    if (!world_builder_add_cube_tower(nullptr, (Coord){ bx, by, bz }, step_z, count,
+                                      got == 6 ? bounce : -1.0f)) {
+        fprintf(stderr, "[World] %s:%d tower placement refused\n", source_name(), number);
+        return -1;
+    }
+    return 0;
+}
+
+static int place_arcsolid(const char *line, int number) {
+    float cx = 0.0f;
+    float cy = 0.0f;
+    float cz = 0.0f;
+    float radius = 0.0f;
+    float dz = 0.0f;
+    float b0 = 0.18f;
+    float b1 = 0.92f;
+    char tail = 0;
+    int got = sscanf(line, "arcsolid %f %f %f %f %f %f %f %c",
+                     &cx, &cy, &cz, &radius, &dz, &b0, &b1, &tail);
+    if (got != 5 && got != 7) {
+        fprintf(stderr, "[World] %s:%d arcsolid needs cx cy cz radius dz [b_min b_max]\n",
+                source_name(), number);
+        return -1;
+    }
+    if (!world_builder_add_solid_arc(nullptr, (Coord){ cx, cy, cz }, radius, dz,
+                                     got == 7 ? b0 : 0.18f, got == 7 ? b1 : 0.92f)) {
+        fprintf(stderr, "[World] %s:%d arcsolid placement refused\n", source_name(), number);
+        return -1;
+    }
+    return 0;
+}
+
 // Compile-time placements. Empty by default: the demo boots into the
 // universal metric grid with zero objects. Register custom C objects
 // here (ops + state pointers, or an init_fn) to spawn them at startup.
@@ -375,15 +446,8 @@ static const WorldBlueprint k_startup_objects[STARTUP_BLUEPRINTS_COUNT] = {
 static int place_blueprints(void) {
 #if STARTUP_BLUEPRINTS_COUNT > 0
     for (size_t i = 0; i < STARTUP_BLUEPRINTS_COUNT; ++i) {
-        const WorldBlueprint *bp = &k_startup_objects[i];
-        if (bp->init_fn != nullptr) {
-            if (!bp->init_fn(bp->at, bp->data)) {
-                return -1;
-            }
-        } else if (bp->ops != nullptr) {
-            if (table_add(bp->ops, bp->data, bp->at, bp->spin) < 0) {
-                return -1;
-            }
+        if (!world_builder_add_blueprint(nullptr, k_startup_objects[i])) {
+            return -1;
         }
     }
 #endif
@@ -459,6 +523,15 @@ static int open_document(char *buf, size_t cap, size_t *len) {
         if (read_named(rel_legacy, buf, cap, len) == 0) {
             return 0;
         }
+        if (wid == 7u) {
+            // World 7 is constructed directly in C23 via WorldBuilder when no
+            // external world7.world override file is present.
+            return 2;
+        }
+        if (wid == 8u) {
+            // World 8 boots the Baklan & Beşparmak Dağı streamed DEM + satellite map.
+            return 3;
+        }
         const char *preset = k_preset_worlds[wid - 1u];
         size_t plen = strlen(preset);
         if (plen + 1u >= cap) {
@@ -515,10 +588,18 @@ static int parse_document(char *buf, size_t len) {
                 step = place_ground(p, number);
             } else if (strncmp(p, "smooth", 6) == 0) {
                 step = place_smooth(p, number);
+            } else if (strncmp(p, "ringcube", 8) == 0) {
+                step = place_ringcube(p, number);
+            } else if (strncmp(p, "tower", 5) == 0) {
+                step = place_tower(p, number);
+            } else if (strncmp(p, "arcsolid", 8) == 0) {
+                step = place_arcsolid(p, number);
             } else if (strncmp(p, "cube", 4) == 0) {
                 step = place_cube(p, number);
             } else if (strncmp(p, "solid", 5) == 0) {
                 step = place_solid(p, number);
+            } else if (strncmp(p, "terrain", 7) == 0) {
+                step = terrain_kind_spawn() ? 0 : -1;
             } else if (strncmp(p, "mesh", 4) == 0) {
                 step = place_mesh(p, number);
             } else if (strncmp(p, "gone", 4) == 0) {
@@ -553,6 +634,20 @@ int world_load(void) {
         if (doc == 1) {
             table_publish();
             rc = 0;
+        } else if (doc == 2) {
+            rc = world_build_procedural_cathedral();
+            if (rc == 0) {
+                printf("[World] Loaded World %u (%s) via C23 WorldBuilder\n",
+                       world_selected_id(), world_selected_title());
+                fflush(stdout);
+            }
+        } else if (doc == 3) {
+            rc = world_build_besparmak_terrain();
+            if (rc == 0) {
+                printf("[World] Loaded World %u (%s) via GPU-Math Terrain Backend\n",
+                       world_selected_id(), world_selected_title());
+                fflush(stdout);
+            }
         } else if (doc == 0) {
             rc = parse_document(buf, len);
             if (rc == 0) {
@@ -617,6 +712,9 @@ static int append_object(char *body, size_t cap, size_t *used, const WorldObj *o
     if (o->ops == mesh_ops()) {
         return append_line(body, cap, used, "mesh yaw %d spin %d inf %d glow %d\n",
                            yaw, spinning, infinite, glow);
+    }
+    if (o->ops == terrain_ops()) {
+        return append_line(body, cap, used, "terrain\n");
     }
     const char *name = o->ops->name != nullptr ? o->ops->name(o) : "object";
     fprintf(stderr, "[World] %s is not written to the live placement.\n", name);

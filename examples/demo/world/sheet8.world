@@ -1,0 +1,4 @@
+# World 8: Baklan & Beşparmak Dağı SSD Streamed DEM & Map (2D contour overlay in Hybrid mode)
+bounds 600 320
+polyring -94 316 32 6 0.78
+polyring 103 83 48 8 0.88

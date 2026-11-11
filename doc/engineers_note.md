@@ -14,7 +14,7 @@
   - Version: Clean semantic version (`0.1.0`).
 
 ### 2. Version Management & GitHub Releases
-- Single source of truth is [VERSION](VERSION).
+- Single source of truth is [`VERSION`](../VERSION).
 - Intentional release targets:
   - `make release-patch` (e.g., `0.1.0` $\rightarrow$ `0.1.1`)
   - `make release-minor` (e.g., `0.1.0` $\rightarrow$ `0.2.0`)

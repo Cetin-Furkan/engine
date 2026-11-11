@@ -23,23 +23,24 @@ Immediately south-southeast of **Baklan, Denizli** lies **Beşparmak Dağı** (t
 | **Baklan Ovası (Plain Floor)** | $37.995000^\circ\text{ N}$ | $29.595000^\circ\text{ E}$ | $\approx 828\text{--}842\text{ m}$ | Flat agricultural parcel grid northwest of the massif |
 | **Beşparmak Dağı (West Peak / OSM Node `11061240540`)** | $37.952201^\circ\text{ N}$ | $29.617113^\circ\text{ E}$ | $\approx 1,307\text{ m}$ | Western prominent rocky crest overlooking Baklan |
 | **Beşparmak Dağı (Main Summit Ridge)** | $37.960556^\circ\text{ N}$ | $29.636667^\circ\text{ E}$ | $\approx 1,690.8\text{ m}$ | Highest five-fingered spine of the Beşparmak massif |
-| **Full Quadtree Bounding Box** | $37.822802^\circ\text{ N} \dots 38.099983^\circ\text{ N}$ | $29.443359^\circ\text{ E} \dots 29.794922^\circ\text{ E}$ | $700.0\text{ m} \dots 1,690.8\text{ m}$ | $31.0\text{ km} \times 31.0\text{ km}$ ($\approx 960\text{ km}^2$) Web Mercator quadtree pyramid (`world_x, world_y` $\in [-2400, +2400]$) |
+| **Full Quadtree Bounding Box** | $37.857507^\circ\text{ N} \dots 38.065392^\circ\text{ N}$ | $29.487305^\circ\text{ E} \dots 29.750977^\circ\text{ E}$ | $810.0\text{ m} \dots 1,691.0\text{ m}$ | $24.0\text{ km} \times 24.0\text{ km}$ (`1.0` world unit = `1.0` real meter, `world_x, world_y` $\in [-12000, +12000]$) |
 
-### 1.2 Web Mercator Quadtree Tile Pyramid (`LOD 0` $\rightarrow$ `LOD 3`, `128x128` per Tile)
+### 1.2 Web Mercator Quadtree Tile Pyramid (`LOD 0` $\rightarrow$ `LOD 4`, `256x256` per Tile)
 
-The expanded $31\text{ km} \times 31\text{ km}$ region is mapped onto a **4-Level Restricted Quadtree Pyramid** ($1 + 4 + 16 + 64 = 85$ tiles, `128x128` height samples + `128x128` RGBA8 texels = `98,304 bytes` = `24 × 4 KB` blocks per tile, with $64$ `z=13` outer tiles + $64$ `z=14` high-resolution core tiles over Baklan & Beşparmak Dağı):
+The $24.0\text{ km} \times 24.0\text{ km}$ region is mapped onto a **5-Level Complete Quadtree Pyramid** ($1 + 4 + 16 + 64 + 256 = 341$ tiles, `256x256` height samples + `256x256` RGBA8 texels = `393,216 bytes` = `96 × 4 KB` blocks per tile, totaling `134,111,232 bytes` = `127.90 MiB` in `.gmpack` v5):
 
-| Quadtree Level | Web Mercator Source ($z$) | Tile Grid ($N \times N$) | Tile Count | World Tile Span | Ground Sample Spacing ($\Delta s$) | Per-Tile Mesh & Payload (`98,304 B`) |
+| Quadtree Level | Web Mercator Source ($z$) | Tile Grid ($N \times N$) | Tile Count | World Tile Span | Ground Sample Spacing ($\Delta s$) | Per-Tile Payload (`393,216 B`) |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **`LOD 0` (Root Overview)** | $z = 11..13$ | $1 \times 1$ | $1$ | $4800 \times 4800$ | $\approx 242\text{ m/sample}$ | $128 \times 128$ DEM + RGBA8 ($96,774$ verts) |
-| **`LOD 1` (Regional Basin)** | $z = 12..13$ | $2 \times 2$ | $4$ | $2400 \times 2400$ | $\approx 121\text{ m/sample}$ | $4 \times (128 \times 128)$ DEM + RGBA8 |
-| **`LOD 2` (Ridges & Valleys)** | $z = 13..14$ | $4 \times 4$ | $16$ | $1200 \times 1200$ | $\approx 60\text{ m/sample}$ | $16 \times (128 \times 128)$ DEM + RGBA8 |
-| **`LOD 3` (Fine Crags & Fields)** | $z = 13 + z = 14\text{ Core}$ | $8 \times 8$ | $64$ | $600 \times 600$ | $\approx 15\text{--}30\text{ m/sample}$ | $64 \times (128 \times 128)$ DEM + RGBA8 |
+| **`LOD 0` (Root Overview)** | $z = 12$ | $1 \times 1$ | $1$ | $24.0\text{ km} \times 24.0\text{ km}$ | $\approx 94.1\text{ m/sample}$ | $256 \times 256$ `u16` DEM + RGBA8 |
+| **`LOD 1` (Regional Basin)** | $z = 13$ | $2 \times 2$ | $4$ | $12.0\text{ km} \times 12.0\text{ km}$ | $\approx 47.1\text{ m/sample}$ | $4 \times (256 \times 256)$ DEM + RGBA8 |
+| **`LOD 2` (Ridges & Valleys)** | $z = 13$ | $4 \times 4$ | $16$ | $6.0\text{ km} \times 6.0\text{ km}$ | $\approx 23.5\text{ m/sample}$ | $16 \times (256 \times 256)$ DEM + RGBA8 |
+| **`LOD 3` (Massif & Fields)** | $z = 14$ | $8 \times 8$ | $64$ | $3.0\text{ km} \times 3.0\text{ km}$ | $\approx 11.8\text{ m/sample}$ | $64 \times (256 \times 256)$ DEM + RGBA8 |
+| **`LOD 4` (Ultra-HD Crags)** | $z = 15..16$ | $16 \times 16$ | $256$ | $1.5\text{ km} \times 1.5\text{ km}$ | $\approx 5.88\text{ m/sample}$ | $256 \times (256 \times 256)$ DEM + RGBA8 |
 
 ### 1.3 Real Data Sources & Offline/Online Self-Healing Pipeline
 
 1. **Measured Digital Elevation Model (DEM)**:
-   - Fetched from **AWS Mapzen Terrarium SRTM/GMTED** (`https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png`) across both an $8\times 8$ `z=13` outer grid ($64$ tiles) and an $8\times 8$ `z=14` high-resolution inner core ($64$ tiles) centered directly on Baklan and Beşparmak Dağı.
+   - Fetched from **AWS Mapzen Terrarium SRTM/GMTED** (`https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png`) across the Baklan Plain and Beşparmak Dağı massif.
    - Decoded via the exact Terrarium metric formula:
      $$h(\text{meters}) = \left(R \cdot 256.0 + G + \frac{B}{256.0}\right) - 32768.0$$
 2. **True-Color Satellite Ortho-Imagery (`srgb_to_linear` + 16-Tap Bicubic)**:
@@ -47,18 +48,18 @@ The expanded $31\text{ km} \times 31\text{ km}$ region is mapped onto a **4-Leve
 3. **Self-Contained C23 Synthesis & Persistence Guarantee**:
    - The binary archive is stored on SSD at `examples/demo/maps/baklan_besparmak.gmpack`.
    - `scripts/fetch_besparmak_map.py` downloads the real AWS Terrarium SRTM elevation tiles + Esri/OpenTopoMap imagery for Baklan and Beşparmak Dağı and compiles `examples/demo/maps/baklan_besparmak.gmpack`.
-   - Furthermore, if the engine boots on an air-gapped machine where `baklan_besparmak.gmpack` is absent, `src/backend/terrain/storage/synth_besparmak.c` deterministically synthesizes the complete 85-tile Baklan + Beşparmak Dağı multi-peak ridge model (calibrated to the exact WGS84 coordinates and 830 m–1,612 m elevation profile), **writes the `.gmpack` archive to SSD**, and **re-reads its tiles dynamically on demand via `io_uring`** as the user zooms and pans.
+   - Furthermore, if the engine boots on an air-gapped machine where `baklan_besparmak.gmpack` is absent, `src/backend/terrain/storage/synth_besparmak.c` deterministically synthesizes the complete 341-tile Baklan + Beşparmak Dağı multi-peak ridge model (calibrated to the exact WGS84 coordinates and 810 m–1,691 m elevation profile), **writes the `.gmpack` archive to SSD**, and **re-reads its tiles dynamically on demand via `io_uring`** as the user zooms and pans.
 
 ---
 
 ## 2. Next-Generation Pointer & Memory Architecture (2025–2026)
 
-Classic 64-bit host pointers (`void *`) cannot be serialized to disk, break when moved between CPU `mmap` and GPU `VkDeviceAddress` (`BDA`) arenas, and require multi-hop pointer chasing across L1 cache lines. Building on the architectures in [`pointers.md`](file:///home/arch-cetin/projects/engine-v2/pointers.md), the `src/backend/` subsystem introduces four co-designed pointer primitives that execute identically on the CPU and inside Slang 2026 SPIR-V 1.6 shaders:
+Classic 64-bit host pointers (`void *`) cannot be serialized to disk, break when moved between CPU `mmap` and GPU `VkDeviceAddress` (`BDA`) arenas, and require multi-hop pointer chasing across L1 cache lines. Building on the architectures in [`pointers.md`](pointers.md), the `src/backend/` subsystem introduces four co-designed pointer primitives that execute identically on the CPU and inside Slang 2026 SPIR-V 1.6 shaders:
 
 ```mermaid
 flowchart LR
     subgraph SSD["SSD Storage (.gmpack Archive)"]
-        PACK["256B PULSE Root Window\n+ 85 RelPtr2D Quadtree Nodes\n+ 4KB-Aligned Tile Blocks"]
+        PACK["24KB Header (256B PULSE Dir\n+ 341 RelPtr2D Quadtree Nodes)\n+ 4KB-Aligned Tile Blocks"]
     end
     subgraph CPU["CPU L1 Cache (src/backend/)"]
         CELL["64-Byte Stateful Function Cell\nalignas(64) GpuMathStreamCell\n(8B fn_ptr + 56B Inline State)"]
@@ -67,7 +68,7 @@ flowchart LR
     subgraph GPU["Vulkan 1.4 BDA Arena (VkDeviceAddress)"]
         DIR["256B Active GPU Window\n(GpuMathPageDirectory)"]
         NODES["RelPtr2D Quadtree Array\n+ Lilliput 64-Bit Tile Headers"]
-        TILES["4KB-Aligned Resident Tile Pool\n(64x64 fp16/u16 DEM + RGBA8)"]
+        TILES["4KB-Aligned Resident Tile Pool\n(256x256 u16 DEM + RGBA8)"]
     end
 
     PACK -->|"io_uring PREAD (4KB Block)"| URING
@@ -102,22 +103,22 @@ Every link between the directory header, quadtree nodes, parent/child tiles, and
 
 ### 2.2 Project Lilliput-Style 64-Bit Unified Tile Header (`GpuMathTileHeader`)
 
-Inspired by **JDK 25 Project Lilliput (JEP 519)** from [`pointers.md`](file:///home/arch-cetin/projects/engine-v2/pointers.md), every resident tile in the BDA pool is aligned to a **$4,096\text{-byte}$ ($2^{12}$) boundary** and begins with a single **64-bit Unified Tile Header**:
+Inspired by **JDK 25 Project Lilliput (JEP 519)** from [`pointers.md`](pointers.md), every resident tile in the BDA pool is aligned to a **$4,096\text{-byte}$ ($2^{12}$) boundary** and begins with a single **64-bit Unified Tile Header**:
 
 ```
  63              44 43          28 27    24 23    20 19          10 9            0
 +------------------+--------------+--------+--------+--------------+--------------+
 | 20b 4KB BlockIdx | 16b Morton Z | 4b LOD |4b Flags| 10b MaxElev  | 10b MinElev  |
-| (Arena Offset)   | (Interleaved)| (0..3) |Resident| (0..2047 m)  | (0..2047 m)  |
+| (Arena Offset)   | (Interleaved)| (0..4) |Resident| (0..2047 m)  | (0..2047 m)  |
 +------------------+--------------+--------+--------+--------------+--------------+
 ```
 
 - **16-Bit Morton ($Z$-Order) Spatial Key**: Interleaves the 8-bit tile $X$ and 8-bit tile $Y$ coordinates ($\text{morton\_encode2d}(x, y)$) so spatially adjacent 2D tiles on Beşparmak Dağı lie adjacent in 1D SSD file order and GPU L2 cache lines.
-- **Inline Elevation Bounds (`MinElev`, `MaxElev`)**: Quantizes the tile's minimum and maximum elevation in meters ($[0, 2047]\text{ m}$, covering Baklan's $828\text{ m}$ floor through Beşparmak Dağı's $1,612\text{ m}$ peak) so GPU frustum/ray culling and hypsometric shading know the exact vertical bounds before reading a single elevation sample.
+- **Inline Elevation Bounds (`MinElev`, `MaxElev`)**: Quantizes the tile's minimum and maximum elevation in meters ($[0, 2047]\text{ m}$, covering Baklan's $810\text{ m}$ floor through Beşparmak Dağı's $1,691\text{ m}$ peak) so GPU frustum/ray culling and hypsometric shading know the exact vertical bounds before reading a single elevation sample.
 
 ### 2.3 64-Byte Stateful Function Cell (`GpuMathStreamCell`, `alignas(64)`)
 
-Inspired by **Clef / TVM FFI 64-Byte Stateful Function Cells** in [`pointers.md`](file:///home/arch-cetin/projects/engine-v2/pointers.md), every asynchronous SSD $\rightarrow$ GPU streaming operation in `src/backend/core/cell/dispatch.c` is represented as a single L1-cache-line-aligned **Flat Closure Cell**:
+Inspired by **Clef / TVM FFI 64-Byte Stateful Function Cells** in [`pointers.md`](pointers.md), every asynchronous SSD $\rightarrow$ GPU streaming operation in `src/backend/core/cell/dispatch.c` is represented as a single L1-cache-line-aligned **Flat Closure Cell**:
 
 ```c
 typedef struct GpuMathStreamCell GpuMathStreamCell;
@@ -128,12 +129,12 @@ struct alignas(64) GpuMathStreamCell {
     RelPtr2D          rel_tile;        // Bytes 8..15:  2D Self-Relative pointer to SSD tile block
     uint64_t          gpu_bda_dst;     // Bytes 16..23: Target Vulkan BDA address in resident pool
     uint64_t          ssd_file_offset; // Bytes 24..31: Exact byte offset in .gmpack archive
-    uint32_t          tile_id;         // Bytes 32..35: Quadtree node index (0..84)
+    uint32_t          tile_id;         // Bytes 32..35: Quadtree node index (0..340)
     uint32_t          morton_key;      // Bytes 36..39: 2D Morton Z-order key + LOD
-    uint32_t          bytes;           // Bytes 40..43: Payload size (24,576 bytes = 6 x 4KB blocks)
+    uint32_t          bytes;           // Bytes 40..43: Payload size (393,216 bytes = 96 x 4KB blocks)
     uint32_t          slot_index;      // Bytes 44..47: Resident GPU cache slot index
     uint32_t          generation;      // Bytes 48..51: Temporal safety generation counter
-    uint8_t           lod;             // Byte  52:     Quadtree LOD (0..3)
+    uint8_t           lod;             // Byte  52:     Quadtree LOD (0..4)
     uint8_t           state;           // Byte  53:     CELL_IDLE, CELL_ARMED, CELL_READY, CELL_POISON
     uint8_t           epoch;           // Byte  54:     CHERI-D inline 1-byte lifetime ID
     uint8_t           inline_id;       // Byte  55:     Cache-line tail verification byte
@@ -144,11 +145,11 @@ static_assert(sizeof(GpuMathStreamCell) == 64u, "Stateful Function Cell must be 
 
 ### 2.4 256-Byte PULSE Active GPU Window (`GpuMathPageDirectory`, `alignas(256)`)
 
-At the base of the GPU BDA terrain buffer sits a **256-byte aligned Active Descriptor Window** (`GpuMathPageDirectory`), followed immediately by the 85 quadtree node descriptors (`GpuMathQuadNode`, 32 bytes each) and the resident 4 KB-aligned tile pool:
+At the base of the GPU BDA terrain buffer sits a `24,576-byte` (`6 × 4 KB`) metadata header (`GpuMathArchiveHeader`): a **256-byte aligned Active Descriptor Window** (`GpuMathPageDirectory`), followed immediately by the `341` quadtree node descriptors (`GpuMathQuadNode`, `64 bytes` = 1 L1 cache line each) and up to 16 interactive bird's-eye ortho-overlay slots, followed by the resident 4 KB-aligned tile pool:
 
-- **Each Tile Payload (`GpuMathTileBlock`, $98,304\text{ bytes} = 24 \times 4,096\text{ B}$)**:
-  - `uint16_t height_u16[128 * 128]` ($32,768\text{ bytes} = 8\text{ blocks}$): Measured elevation in $1/16\text{th}$ meter fixed-point ($0.0625\text{ m}$ vertical resolution across $[0, 4095.9375]\text{ m}$), plus GPU-computed normal/slope derivatives.
-  - `uint32_t imagery_rgba8[128 * 128]` ($65,536\text{ bytes} = 16\text{ blocks}$): Real true-color Esri satellite photography for every grid square in the tile (sampled via 16-tap Catmull-Rom bicubic interpolation and converted via IEC 61966-2-1 `srgb_to_linear` in `shaders/terrain_math.slang`).
+- **Each Tile Payload (`GpuMathTileBlock`, $393,216\text{ bytes} = 96 \times 4,096\text{ B}$)**:
+  - `uint16_t height_u16[256 * 256]` ($131,072\text{ bytes} = 32\text{ blocks}$): Measured elevation in $1/16\text{th}$ meter fixed-point ($0.0625\text{ m}$ vertical resolution across $[0, 4095.9375]\text{ m}$), plus GPU-computed normal/slope derivatives.
+  - `uint32_t imagery_rgba8[256 * 256]` ($262,144\text{ bytes} = 64\text{ blocks}$): Real true-color Esri satellite photography for every grid square in the tile (sampled via 16-tap Catmull-Rom bicubic interpolation and converted via IEC 61966-2-1 `srgb_to_linear` in `shaders/terrain_math.slang`).
 
 ---
 

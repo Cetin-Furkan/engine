@@ -1,488 +1,299 @@
-# Modular C23 Engine (v0.1 Alpha)
+# engine-v2 (`v0.1.0`)
 
-> *"To truly understand a machine, you must refuse to inherit the compromises of the past thirty years. We did not build another wrapper; we reinvented the wheel from the silicon up."*
+**Pure ISO C23 (`-std=c23`) · Linux 7.1+ `io_uring` · Raw Wayland Wire · DRM Timeline Explicit Sync · Vulkan 1.4 Descriptorless BDA · Slang 2026 (SPIR-V 1.6)**
+
+`engine-v2` is a 3D, 2D, and geospatial simulation/graphics engine written from scratch in strict ISO C23 (~53,000 lines of C23 and Slang, compiling into a single `2.2 MiB` release binary with shaders and fonts embedded directly inside the executable via C23 `#embed`).
+
+It uses **no windowing libraries** (`SDL`, `GLFW`), **no protocol wrappers** (`libwayland-client`), **no ring wrappers** (`liburing`), **no Vulkan WSI swapchain** (`VK_KHR_swapchain`), and **no Vulkan descriptor sets** (`VkDescriptorSet`). Instead, a single thread talks straight to the Linux kernel over a registered `io_uring` instance, speaks the Wayland binary wire protocol over a Unix socket, presents exported `DMA-BUF` images synchronized with Linux DRM `drm_syncobj` timelines, and addresses all GPU buffers through raw 64-bit GPU pointers (`VK_KHR_buffer_device_address`).
 
 ---
 
-### Key Architectural Pillars
-- **Strict ISO C23 (`-std=c23`)** · Zero external runtime dependencies · Zero wrapper middleware.
-- **Bare-Metal Linux 7.1+ Kernel Runtime** · Direct `io_uring` event loop · Zero-overhead idle sleep.
-- **Hand-Crafted Wayland Wire Protocol** · Custom binary codec · Zero `libwayland`.
-- **Pure Linux DRM Timeline Explicit Sync** · PRIME `DMA-BUF` surfaces · Zero `VkSwapchainKHR` (WSI-free).
-- **Vulkan 1.4 Descriptorless BDA** · 64-bit Buffer Device Addresses · Zero `VkDescriptorSet` / descriptor pools.
-- **Slang 2026 Shading Language** · Target SPIR-V 1.6 · Direct GPU pointer arithmetic.
-- **Relocatable Spatial Pointer Algebra** · 64-bit 2D Self-Relative Pointers (`RelPtr2D`) · Lilliput 64-bit compact headers.
-- **Hybrid Multi-Modal Simulation** · 3D rigid bodies · 128³ heat compute lattice · 2D mass-spring soft bodies.
-- **Geodetic & Photogrammetric Survey Fusion** · Real $24\times 24\,\text{km}$ DEM terrain streaming · Multi-View Stereo (MVS).
-- **Capability-Masked Security Engine** · Granular `PolicyMask` · Cryptographic-style policy sealing.
+## Documentation Map
+
+This README gives a clear, human-readable tour of why the engine exists, what it does, how it compares to conventional engines, and how to build and run it. For code-level deep dives, read the companion engineering documents:
+
+| Document | What It Covers |
+| :--- | :--- |
+| **[`doc/PLATFORM_AND_RENDER_INTERNALS.md`](doc/PLATFORM_AND_RENDER_INTERNALS.md)** | Low-level code walkthrough of `src/`: `io_uring` arena flags & side-CQE relays, raw Wayland wire framing, WSI-free `DMA-BUF` + DRM syncobj swapchain, cache-line layouts, Vulkan 1.4 BDA slab allocator, `#embed`ded Slang 2026 pipelines, and the linker dead-code gate. |
+| **[`doc/WORKFLOW_CONTROLS_AND_EXTENSIBILITY.md`](doc/WORKFLOW_CONTROLS_AND_EXTENSIBILITY.md)** | How `EngineApp` (`include/engine/app.h`) works, keyboard/mouse routing, capability masking (`PolicyMask` & sealing), `F1`–`F10` live world switching, `.world` / `sheet.world` / `.manifest` / `window.chrome` DSL grammars, the C23 `WorldBuilder` API, and copy-paste customization recipes. |
+| **[`TERRAIN_BACKEND_ARCHITECTURE.md`](TERRAIN_BACKEND_ARCHITECTURE.md)** | World 8's $24\times 24\text{ km}$ Baklan & Beşparmak Dağı `.gmpack` streaming backend, `RelPtr2D` 2D self-relative pointers, Lilliput 64-bit tile headers, 64-byte stateful cells, GPU `vkCmdDrawIndirectCount` culling, Brown-Conrady lens calibration, Multi-View Stereo (MVS), and WGS84 geodetic fusion. |
+| **[`doc/ARCHITECTURE_COMPARISON.md`](doc/ARCHITECTURE_COMPARISON.md)** | Concrete, layer-by-layer architectural comparison of `engine-v2` against Unreal/Unity/Godot, `SDL3`/`GLFW` + `VkSwapchainKHR` stacks, and `GDAL` + `Cesium` + offline photogrammetry pipelines—including honest trade-offs. |
+| **[`pointers.md`](pointers.md)** | Research background behind the 2025–2026 pointer architectures implemented in `src/backend/` (`RelPtr2D`, Project Lilliput compact headers, 64-byte flat closures, CHERI-D inline lifetime IDs, and PULSE active windows). |
+| **[`doc/engineers_note.md`](doc/engineers_note.md)** | Build segregation (`build/debug` vs. `build/release`), semantic version tagging, and Vulkan/DRM runtime contracts. |
 
 ---
 
 ## Table of Contents
 
-1. [The Manifesto: Why We Reinvented the Wheel](#1-the-manifesto-why-we-reinvented-the-wheel)
-2. [What This Engine Is Doing (Systems Architecture)](#2-what-this-engine-is-doing-systems-architecture)
-   - [The Single Seam Principle](#the-single-seam-principle)
-   - [The Bare-Metal `io_uring` Asynchronous Event Loop](#the-bare-metal-io_uring-asynchronous-event-loop)
-   - [True Zero-Overhead Idle Sleep (0% CPU / 0% GPU)](#true-zero-overhead-idle-sleep-0-cpu--0-gpu)
-   - [Descriptorless Vulkan 1.4 BDA Memory Subsystem](#descriptorless-vulkan-14-bda-memory-subsystem)
-   - [WSI-Free Wayland Wire & DRM Timeline Explicit Sync](#wsi-free-wayland-wire--drm-timeline-explicit-sync)
-3. [Groundbreaking Data Structures & Pointer Mathematics](#3-groundbreaking-data-structures--pointer-mathematics)
-   - [2D Self-Relative Pointers (`RelPtr2D`)](#2d-self-relative-pointers-relptr2d)
-   - [Lilliput 64-bit Compact Headers](#lilliput-64-bit-compact-headers)
-   - [64-Byte Cache-Line Stateful Function Cells (`GpuMathStreamCell`)](#64-byte-cache-line-stateful-function-cells-gpumathstreamcell)
-4. [What It Is Capable Of Doing (Features & Capabilities)](#4-what-it-is-capable-of-doing-features--capabilities)
-   - [Multi-Modal Physics & Geometry Systems](#multi-modal-physics--geometry-systems)
-   - [Photogrammetric & Geodetic Survey Fusion Engine](#photogrammetric--geodetic-survey-fusion-engine)
-   - [Declarative Scene DSLs & Live Hot-Reloading](#declarative-scene-dsls--live-hot-reloading)
-   - [Capability Masking & Workspace Policies](#capability-masking--workspace-policies)
-   - [Runtime World Hot-Switching (`F1`..`F10` / `0`)](#runtime-world-hot-switching-f1f10--0)
-   - [Programmatic C23 `WorldBuilder` API](#programmatic-c23-worldbuilder-api)
-5. [The Horizon: Version 0.1 is Just the Beginning](#5-the-horizon-version-01-is-just-the-beginning)
-6. [Quick Start & Build Instructions](#6-quick-start--build-instructions)
-7. [World Tour Reference (`--world=0..9`)](#7-world-tour-reference---world09)
+1. [Why We Rebuilt the Wheel from Scratch](#1-why-we-rebuilt-the-wheel-from-scratch)
+2. [How `engine-v2` Compares to Other Engines & Stacks](#2-how-engine-v2-compares-to-other-engines--stacks)
+3. [How the Engine Works (Plain-English Architecture)](#3-how-the-engine-works-plain-english-architecture)
+4. [What `v0.1.0` Is Capable Of Today](#4-what-v010-is-capable-of-today)
+5. [Version `0.1.0` Is Only the Foundation: What Comes Next](#5-version-010-is-only-the-foundation-what-comes-next)
+6. [Quick Start: Build, Test, Run & GPU Selection](#6-quick-start-build-test-run--gpu-selection)
+7. [Selectable Worlds (`--world=0..9` & Live `F1`–`F10` Switching)](#7-selectable-worlds---world09--live-f1f10-switching)
 8. [Interactive Controls Reference](#8-interactive-controls-reference)
-9. [Repository Architecture Directory](#9-repository-architecture-directory)
+9. [Repository Directory Layout](#9-repository-directory-layout)
 
 ---
 
-## 1. The Manifesto: Why We Reinvented the Wheel
+## 1. Why We Rebuilt the Wheel from Scratch
 
-### The Crisis of Modern Engine Bloat
-For over three decades, game and simulation engines have accumulated layers of legacy compromises:
-- **Abstraction Upon Abstraction**: Modern software stacks hide simple hardware truths behind millions of lines of legacy middleware. Windowing wrappers (SDL, GLFW) drag along legacy X11 abstractions. Window System Integrations (Vulkan WSI `VkSwapchainKHR`) introduce unpredictable presentation queues, thread stalls, and hidden compositor round-trips.
-- **Resource Exhaustion by Default**: Booting an "empty" scene in popular commercial engines spins multiple worker threads, consumes hundreds of megabytes of resident memory, burns GPU watts polling for events that never occur, and allocates thousands of descriptor sets through complex dynamic pools.
-- **Pervasive Leaky Abstractions**: Developers are taught to treat the operating system as an enemy to be abstracted away, rather than a precision instrument to be harnessed directly.
+In almost every modern graphics project or game engine on Linux, putting a single interactive scene on screen passes through five or six layers of general-purpose middleware:
 
-### The Zero-Middleware Philosophy
-We asked a fundamental question:
-> **What does a high-performance simulation and graphics engine look like if we start completely from scratch in 2026, targeting only pure modern Linux kernel primitives and modern Vulkan hardware?**
-
-To answer this, we strictly banned every ubiquitous third-party helper library:
-- **No `libwayland-client`**: We wrote our own binary wire codec directly over Linux Unix sockets.
-- **No `liburing`**: We construct, map, submit, and reap kernel rings via raw `syscall(__NR_io_uring_register, ...)`.
-- **No SDL / GLFW**: We parse raw evdev scancodes, manage xkb state tables, and maintain cursor protocols directly.
-- **No `VkSwapchainKHR`**: We allocate raw Linux `DMA-BUF` graphics surfaces in Vulkan device-local memory and present them via `wp_linux_drm_syncobj_v1` DRM timeline synchronization primitives.
-- **No `<stdbool.h>` or Legacy C Idioms**: Built with pure, modern ISO C23 (`-std=c23`) using true language booleans (`bool`, `true`, `false`), `nullptr`, `<stdbit.h>`, compound literals, and strict type safety.
-
-The result is **`engine-v2`**: a radical, single-process, deterministic software system that runs at the bare metal with zero hidden costs, microsecond wakeups, and mathematical elegance.
-
----
-
-## 2. What This Engine Is Doing (Systems Architecture)
-
-```mermaid
-flowchart TD
-    subgraph Hardware["Hardware & Kernel Space (Linux 7.1+)"]
-        DRM["DRM Timeline Syncobjs & PRIME DMA-BUFs"]
-        URING["io_uring Single-Issuer Ring (DEFER_TASKRUN)"]
-        SYS["prctl(TIMERSLACK 1ns) · madvise(HUGEPAGES) · timerfd"]
-        EV["Wayland Unix Socket & evdev Hardware Input"]
-    end
-
-    subgraph Platform["Engine Platform Subsystem (src/)"]
-        RING["src/ring/\nRaw Kernel Submission/Completion Rings"]
-        WIRE["src/wayland/\nHand-Rolled Binary Wire Codec"]
-        VK["src/vulkan/\nDescriptorless 64-bit BDA Memory Pools"]
-        LOOP["src/frame/loop/\nSingle-Threaded CQE Demultiplexer"]
-        INPUT["src/input/\nLock-Free Seqlock Sub-Pixel Input Page"]
-    end
-
-    subgraph Hosted["Hosted Application Seam (examples/demo/)"]
-        SEAM["EngineApp Interface\n(include/engine/app.h)"]
-        POL["WorkspacePolicy Engine\n(16-bit Capability Mask & Sealing)"]
-        PHYS["Hybrid Solvers\n(3D OBB/Sphere · 128³ Heat · 2D Soft)"]
-        GEO["Geodetic Survey Engine\n(MVS Fusion · WGS-84 GCPs · CDLOD)"]
-        SHADERS["Slang 2026 SPIR-V 1.6\n(Push-Constant 64-bit GPU Pointers)"]
-    end
-
-    Hardware <--> Platform
-    Platform <--> Hosted
+```text
+Your Code -> Engine Scene Graph -> SDL3 / GLFW -> libwayland-client (locks + heap proxies)
+          -> epoll / worker threads -> Vulkan WSI (VkSwapchainKHR + vkWaitForFences)
+          -> VkDescriptorPool / VkDescriptorSet -> GPU Driver
 ```
 
-### The Single Seam Principle
-The engine is bifurcated across **one strict, immutable boundary** defined in [`include/engine/app.h`](include/engine/app.h):
-1. **The Platform Engine (`src/`, `include/`)**: Owns kernel introspection, CPU topology probes, ring memory allocations, raw Wayland wire IPC, DMA-BUF surfaces, Vulkan 1.4 logical devices, BDA memory slabs, and the frame clock. **It contains zero knowledge of 3D geometry, meshes, physics, terrain, or keybindings.**
-2. **The Hosted Program (`examples/demo/`)**: Implements the `const EngineApp *engine_app(void)` interface. It owns the scene graphs, cameras, capability masks, physics solvers, photogrammetric pipelines, and rendering passes.
+Each layer was written at a different time to hide old operating system quirks. Together, they create problems that are almost impossible to fix from the top:
+- **Idle CPU & GPU burn**: Even when nothing on screen has moved for ten minutes, standard game loops keep waking `60`–`240` times per second, polling sockets and re-submitting identical frames.
+- **Hidden presentation & resize stalls**: `VkSwapchainKHR` hides buffer ownership inside the driver. Dragging a window edge routinely triggers `VK_ERROR_OUT_OF_DATE_KHR` and `vkDeviceWaitIdle()` hitches, while `vkWaitForFences` blocks the CPU thread waiting on previous frames.
+- **Descriptor bureaucracy**: Managing `VkDescriptorSetLayout`, pool sizes, and `vkUpdateDescriptorSets` burns CPU time when modern GPUs already have real 64-bit virtual memory pointers.
+- **Pointer serialization walls**: Standard 64-bit `void*` host pointers break the moment data touches an SSD or a GPU buffer, forcing engines to parse disk formats into temporary CPU heap allocations and copy reorganized structs to VRAM.
 
-### The Bare-Metal `io_uring` Asynchronous Event Loop
-Instead of spawning thread pools that fight for CPU cache coherence and trigger kernel context switches, the engine runs on a **single execution thread** governed by Linux `io_uring` ([`src/frame/loop/run.c`](src/frame/loop/run.c)):
-- Configured with `IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN | IORING_SETUP_NO_MMAP | IORING_SETUP_REGISTERED_FD_ONLY`.
-- Maps application-managed anonymous memory slabs for SQ, CQ, provided buffer rings (`PBUF`), and timer buffer rings (`SIM`).
-- Registers fixed file descriptors and sets `prctl(PR_SET_TIMERSLACK, 1UL)` so kernel wakeups occur within **1 nanosecond** of expiration instead of the standard $50\,\mu\text{s}$ operating system default.
-- Multiplexes the Wayland wire socket, signals (`signalfd`), simulation ticks (`timerfd`), filesystem changes (`inotify`), and asynchronous disk reads (`ring_read_file_all`) without a single polling spinlock.
+With `engine-v2`, we made a deliberate engineering choice: **do not wrap legacy layers—build the foundation directly on Linux 7.1+ and Vulkan 1.4 first.**
 
-### True Zero-Overhead Idle Sleep (0% CPU / 0% GPU)
-In standard software, an open window continually polls or renders idle frames. In `engine-v2`:
-- Physics and motions run on a dedicated $8\,\text{ms}$ interval `timerfd` ($\Delta t = 125\,\text{Hz}$).
-- When all 3D bodies settle, soft meshes stop deforming, and the camera halts, `frame_sim_wanted()` returns `false`.
-- The engine disarms the simulation `timerfd`, logs `Loop idle`, and drops into `io_uring_enter2(ENTER_GETEVENTS | NO_IOWAIT)`.
-- **The process consumes 0.0% CPU and 0.0% GPU cycles.** It sleeps peacefully in kernel wait queues until the user moves the pointer or hits a key.
-
-### Descriptorless Vulkan 1.4 BDA Memory Subsystem
-Traditional Vulkan code spends significant CPU time allocating descriptor sets, binding descriptor pools, and writing descriptor copies. 
-
-This engine eliminates the entire concept of descriptors:
-- **Zero `VkDescriptorSet`**: Shaders receive 64-bit Buffer Device Addresses (`uint64_t`) directly via `vkCmdPushConstants2`.
-- **Slang 2026 Pointer Dereferencing**: Shaders cast these raw 64-bit pointers directly to struct pointers in GPU registers:
-  ```slang
-  // shaders/camera.slang
-  MaterialTable *materials = (MaterialTable*)push_constants.materials_bda;
-  float4 base_color = materials->entries[instance_id].albedo;
-  ```
-- **64 MiB Unified Device Slabs ([`src/vulkan/memory/bda.c`](src/vulkan/memory/bda.c))**: Memory is managed in 64 MiB device-local slabs backed by an intrusive, cache-aligned coalescing free-list (`BDA_STORAGE_ALIGN = 64`). ReBAR (`DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT`) slabs are automatically leveraged so CPU ray-queries can read live GPU compute fields with zero staging stalls.
-
-### WSI-Free Wayland Wire & DRM Timeline Explicit Sync
-We do not use `VkSwapchainKHR`. Instead, we communicate directly with the compositor and the Linux Direct Rendering Manager (DRM):
-1. **Wayland Wire Codec ([`src/wayland/wire/`](src/wayland/wire/))**: Reads and writes raw Wayland wire streams directly to socket memory using ring-backed `sendmsg`/`recvmsg` with `SCM_RIGHTS` file descriptor passing.
-2. **Exportable PRIME DMA-BUFs**: Frame buffers are allocated on the Vulkan device with `VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT`, exported via `vkGetMemoryFdKHR`, and imported into Wayland via `zwp_linux_dmabuf_v1`.
-3. **DRM Timeline Syncobjs**: Frame synchronization occurs entirely via explicit kernel timeline syncobjs (`wp_linux_drm_syncobj_manager_v1`). GPU execution signals an exported timeline `sync_file` descriptor, which is imported into the compositor via `DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE`. The compositor and GPU synchronize directly in kernel space without CPU stalling.
+Version `0.1.0` is that foundation. Instead of rushing to ship high-level game editors on top of leaky middleware, we built the hardest system layers cleanly from zero—so every higher-level tool added in `v0.2` and beyond inherits `0.0%` idle overhead, zero-copy SSD-to-GPU pointers, instant live world switching, and total control over every frame.
 
 ---
 
-## 3. Groundbreaking Data Structures & Pointer Mathematics
+## 2. How `engine-v2` Compares to Other Engines & Stacks
 
-```mermaid
-classDiagram
-    class RelPtr2D {
-        +int32_t delta_x
-        +int32_t delta_y
-        +resolve(base_addr) void*
-        +bind(from, to) RelPtr2D
-    }
+For the full subsystem-by-subsystem breakdown (syscalls, cache lines, timelines, and honest trade-offs), see **[`doc/ARCHITECTURE_COMPARISON.md`](doc/ARCHITECTURE_COMPARISON.md)**. Here is the summary in plain numbers and mechanics:
 
-    class LilliputHeader64 {
-        +uint32_t morton_key : 32
-        +uint16_t min_elev_m : 14
-        +uint16_t max_elev_m : 14
-        +uint8_t flags : 4
-    }
-
-    class GpuMathStreamCell {
-        +uint32_t cell_signature
-        +uint32_t cheri_inline_id
-        +RelPtr2D child_offsets[4]
-        +float elevation_matrix[8]
-    }
-
-    GpuMathStreamCell --> RelPtr2D : navigates
-    GpuMathStreamCell --> LilliputHeader64 : packed header
-```
-
-### 2D Self-Relative Pointers (`RelPtr2D`)
-Standard pointers store 64-bit absolute virtual memory addresses. If you write an absolute pointer to disk or transfer it to the GPU, it breaks unless swizzled. 
-
-[`include/backend/math/relptr2d.h`](include/backend/math/relptr2d.h) introduces **`RelPtr2D`**:
-- A 64-bit integer packing two signed 32-bit offsets $(\Delta x, \Delta y)$ relative to the pointer's own position in memory:
-  $$\text{target\_address} = \text{self\_address} + \Delta x + (\Delta y \times \text{stride})$$
-- Enables complex quadtree spatial graphs and spatial scene hierarchies to be written straight from SSD into GPU VRAM or transferred across network sockets **with zero pointer patching, zero deserialization passes, and zero fixup tables**.
-
-### Lilliput 64-bit Compact Headers
-Inspired by high-density managed runtimes, [`include/backend/math/cell64.h`](include/backend/math/cell64.h) implements 64-bit unified node headers:
-- **32-Bit Morton Z-Order Key**: Interleaves $(X, Y)$ spatial coordinates into a single 1D space-filling curve key for instant spatial hashing and bounding checks.
-- **Quantized Elevation Bounds**: Compresses minimum elevation ($14\,\text{bits}$, $0.5\,\text{m}$ resolution) and maximum elevation ($14\,\text{bits}$) for instant camera frustum culling.
-- **Status Flags**: Packed into the remaining 4 bits (residence, dirty state, LOD depth).
-
-### 64-Byte Cache-Line Stateful Function Cells (`GpuMathStreamCell`)
-Every stream cell in the terrain and compute pipeline is aligned to exactly **64 bytes—the exact width of an x86-64 and GPU L1 cache line**.
-- Guaranteed zero false sharing across CPU cores and GPU wavefronts.
-- Includes a CHERI-D inspired inline lifetime generation ID tag (`cheri_inline_id`) to mathematically prevent temporal use-after-free aliasing in recycled memory slabs.
+| Area | Typical Engine (`UE5` / `Unity` / `Godot`) | Custom Native (`SDL3`/`GLFW` + Vulkan WSI) | **`engine-v2` (`v0.1.0`)** |
+| :--- | :--- | :--- | :--- |
+| **Compiled Footprint** | `80 MiB` – `500+ MiB` + external shader/pak folders | `5 MiB` – `30 MiB` + wrapper `.so`s + external `.spv`s | **`2.2 MiB` single release ELF** (SPIR-V 1.6 & font `#embed`ded at compile time) |
+| **Idle Resource Usage** | Continuous tick loop (`60–240 Hz` CPU/GPU wakeups) | Poll loop or coarse event wait | **`0.0%` CPU & `0.0%` GPU**. Disarms `timerfd`, logs `Loop idle`, sleeps in kernel |
+| **OS I/O & Timers** | Thread pools + `epoll`/`poll` + mutexes/`futex` | `poll()` on socket + blocking file `read()` | **Single-issuer `io_uring`** (`NO_MMAP`, `DEFER_TASKRUN`, `REGISTERED_FD_ONLY`, `1 ns` timer slack) |
+| **Windowing & Swapchain** | Wrapper $\to$ `libwayland` + `VkSwapchainKHR` | `libwayland` + `VkSwapchainKHR` + `vkWaitForFences` | **Hand-rolled Wayland wire + exported `DMA-BUF` + `wp_linux_drm_syncobj_v1` timelines** (zero fence waits) |
+| **Window Titlebar** | XWayland / `libdecor` (`wl_shm` CPU software copy) | Compositor SSD or `libdecor` `wl_shm` | **GPU fragment shader into its own `DMA-BUF` on a desynced `wl_subsurface`** |
+| **GPU Resource Binding** | Descriptor pools / global bindless descriptor heaps | `VkDescriptorSet` + `vkUpdateDescriptorSets` | **Zero `VkDescriptorSet`s**. Raw 64-bit `VkDeviceAddress` pointers in push constants |
+| **Spatial Data Pointers** | Host `void*` + deserialization & pointer fixup passes | Separate disk, CPU, and GPU data structures | **`RelPtr2D` (64b 2D self-relative block pointers)** + Lilliput 64b headers; identical bytes on SSD, CPU & GPU |
+| **Terrain + Survey Pipeline** | Separate offline tools (`COLMAP` + `GDAL` + `Cesium`) | Custom heightmap loader (static) | **Single binary**: `io_uring` `.gmpack` streaming + live `inotify` Brown-Conrady MVS & WGS84 RBF fusion |
+| **Dead Code Policy** | Millions of lines of unexercised engine branches | Unused helpers silently kept or stripped | **Hard linker gate**: build fails (`[Link Error]`) if *any* function in `src/` is unused |
 
 ---
 
-## 4. What It Is Capable Of Doing (Features & Capabilities)
+## 3. How the Engine Works (Plain-English Architecture)
 
-### Multi-Modal Physics & Geometry Systems
-The engine seamlessly blends distinct physical domains within the same coordinate frame:
-- **3D Rigid & Elastic Body Mechanics ([`examples/demo/world/motion.c`](examples/demo/world/motion.c))**: Volume-preserving squash-and-stretch deformation ($\text{scale}_z = \text{clamp}(1 + s, 0.45, 1.85)$), restitution sorting ($e = 0.08 .. 0.92$), and orientation integration across cubes, tetrahedrons, octahedrons, icosahedrons, cylinders, cones, and tori.
-- **128³ FP16 Volumetric Lattice & Fillet Heat Engine ([`examples/demo/render/grid.c`](examples/demo/render/grid.c))**: Real-time 3D heat diffusion solver executed on GPU compute queues. Clicking an object injects thermal energy that propagates across geometric fillets and visually radiates through emission shaders.
-- **2D Mass-Spring Soft Patches ([`examples/demo/world/sheet.c`](examples/demo/world/sheet.c))**: Dynamic spring-damper lattices with customizable stiffness ($k_s$), damping ($k_d$), and restitution that deform elastically against static obstacles.
-- **SAT Convex Polygon Collisions**: High-speed Separating Axis Theorem solvers governing 2D bounce arenas.
-- **Interactive Ear-Clipped Polygon Faces ([`examples/demo/world/face/clip.c`](examples/demo/world/face/clip.c))**: Clicking on the metric ground plane places real-time vertices. Hitting `F` or closing the loop automatically ear-clips the concave/convex vertices into rendered 3D planar polygons.
-
----
-
-### Photogrammetric & Geodetic Survey Fusion Engine
-Integrated in [`src/backend/terrain/survey/`](src/backend/terrain/survey/) and World 8 (`--world=besparmak`):
+### One Strict Seam Between Platform and Program (`include/engine/app.h`)
+The codebase is split cleanly in two across a single C struct (`EngineApp` in [`include/engine/app.h`](include/engine/app.h)):
+- **Platform Engine (`main.c`, `src/`, `include/`)**: Knows how to probe CPU caches and `io_uring` opcodes, manage ring buffers, speak Wayland, allocate `DMA-BUF` surfaces and 64 MiB Vulkan BDA slabs, track refresh pacing, and harvest hardware GPU timestamps. **It does not know what a cube, a terrain tile, a plot, or a keybinding is.**
+- **Hosted Application (`examples/demo/`)**: Implements `const EngineApp *engine_app(void)` and supplies the 10 selectable worlds, 3D/2D/Hybrid physics solvers, capability-masked input policies, `.world`/`.manifest` parsers, and Slang draw passes. You can replace `examples/demo/` with an entirely different application without touching `src/`.
 
 ```mermaid
 flowchart LR
-    A["Raw Photos\n(Drone / Phone)"] --> B["Camera Model\n(Brown-Conrady Distortion)"]
-    C["Geodetic GCPs\n(WGS-84 Benchmark)"] --> D["Wendland C2 RBF\nElevation Warper"]
-    B --> E["Multi-View Stereo (MVS)\nPatch-ZNCC Triangulation"]
-    D --> F["Fused Dynamic DEM\n(LOD 0..4 GM-Pack)"]
-    E --> F
-    F --> G["GPU Frustum & AABB Cull\n(terrain_cull.comp.slang)"]
-    G --> H["Single vkCmdDrawIndirectCount\nDirect BDA Rendering"]
+    subgraph Kernel["Linux 7.1+ Kernel"]
+        URING["io_uring\n(SINGLE_ISSUER | DEFER_TASKRUN\nNO_MMAP | REGISTERED_FD_ONLY)"]
+        DRM["DRM Render Node\n(drm_syncobj Timelines & PRIME DMA-BUF)"]
+        TIMERS["timerfd (8 ms) · signalfd · inotify\nprctl(TIMERSLACK 1ns) · MADV_HUGEPAGE"]
+    end
+
+    subgraph Platform["Platform Engine (src/)"]
+        SYS["system/ + ring/"]
+        WL["wayland/ + chrome/\nRaw Wire & GPU Titlebar"]
+        VK["vulkan/\n64 MiB BDA Slabs & Maintenance5 Pipes"]
+        FRM["frame/ + input/\nExplicit-Sync Slots & Seqlock Input"]
+    end
+
+    subgraph App["Hosted Program (examples/demo/)"]
+        SEAM["EngineApp Seam\n(include/engine/app.h)"]
+        POL["WorkspacePolicy\n16-Bit Capability Mask"]
+        SOLVERS["3D Elastic Solids · 128³ Heat\n2D Soft Patches · Ear-Clipped Faces"]
+        TERRAIN["World 8 Survey & DEM Streamer\nRelPtr2D · MVS · DrawIndirectCount"]
+    end
+
+    TIMERS --> SYS
+    URING <--> SYS
+    SYS --> WL & FRM
+    DRM <--> WL & VK
+    WL & VK --> FRM
+    FRM <--> SEAM
+    SEAM --> POL & SOLVERS & TERRAIN
 ```
 
-1. **$24\times 24\,\text{km}$ Real SRTM Terrain Streaming**:
-   Streams real-world elevation ($788.6\,\text{m}$ to $1,638.0\,\text{m}$) and satellite imagery of Turkey's Beşparmak Dağı & Baklan plain from a $136\,\text{MiB}$ `.gmpack` archive lazily via batched `io_uring` read SQEs without stuttering.
-2. **Drone & Smartphone Ingestion**:
-   Directly ingests uncalibrated camera photos with preset sensors (iPhone 15 Pro, DJI Mavic 3 Enterprise, Sony RX100) or explicit focal lengths. Corrects lens distortion via radial ($k_1, k_2, k_3$) and tangential ($p_1, p_2$) Brown-Conrady coefficients.
-3. **Multi-View Stereo (MVS) Dense Triangulation**:
-   Sweeps depth rays across overlapping camera frustums, computing zero-mean normalized cross-correlation (Patch-ZNCC) to triangulate dense 3D surface elevations.
-4. **Geodetic Ground Control Points (GCPs) & Fault Breaklines**:
-   Incorporates high-precision WGS-84 surveyed benchmarks and fault lines, applying compactly-supported **Wendland $C^2$ Radial Basis Functions (RBF)** to adjust local terrain meshes smoothly.
-5. **GPU-Driven Indirect Culling**:
-   `terrain_cull.comp.slang` tests `RelPtr2D` quadtree leaf nodes against the camera frustum and Lilliput elevation bounds, atomically emitting indirect draw commands to drive presentation via a single `vkCmdDrawIndirectCount` call.
+### Single-Threaded `io_uring` Loop & True `0%` Idle Sleep
+Instead of juggling render threads, RHI threads, and file-loader threads with mutexes:
+1. Everything runs on **one thread** inside [`src/frame/loop/run.c`](src/frame/loop/run.c).
+2. Persistent file descriptors (Wayland socket, compositor release `eventfd`, `signalfd`, `inotify`, and the `8 ms` simulation `timerfd`) sit in registered kernel slots (`0..5`), serviced by multishot provided-buffer rings (`PBUF` and `SIM`).
+3. **Physics never step on `vsync`**: The Wayland `wl_surface.frame` callback only measures monitor refresh rate (`period_q8` EMA) and paces rendering. Physics integrate strictly on fixed `8 ms` (`125 Hz`) ticks from `timerfd`, capped at `5` steps per wake so hitches never cause physics explosions.
+4. **Idle means genuinely asleep**: The moment spinning/falling bodies come to rest, heat diffusion finishes, and camera keys are released, `frame_sim_wanted()` returns `false`. The engine disarms `timerfd`, prints `Loop idle`, and sleeps in `io_uring_enter2` using **`0.0%` CPU and `0.0%` GPU** until you move the mouse, press a key, or save a watched file.
+
+### WSI-Free Swapchain & DRM Timeline Sync (`src/wayland/`, `src/frame/present/`)
+When presenting a frame:
+1. The GPU renders into an exported `DMA-BUF` image (`slot[0]` or `slot[1]`) inside a single dynamic rendering pass (with single-pass MSAA resolve when active) and records 4 hardware `vkCmdWriteTimestamp2` queries to measure exact GPU compute and render microseconds.
+2. `vkQueueSubmit2` signals a Vulkan timeline semaphore (for host BDA memory retirement) alongside an exported `SYNC_FD` semaphore imported straight into the Wayland acquire `drm_syncobj` timeline (`DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE`).
+3. The CPU sends `wp_linux_drm_syncobj_surface_v1.set_acquire_point`, `set_release_point`, and `wl_surface.commit` over the raw Wayland socket—**never calling `vkWaitForFences`**. When the compositor finishes displaying the buffer, it signals the release timeline, waking `io_uring` via an `eventfd`.
+4. On muxless hybrid laptops (e.g., discrete NVIDIA GPU rendering onto an integrated AMD/Intel Wayland compositor), the engine automatically renders in fast device-local VRAM and issues `vkCmdCopyImage2` (`prime_copy`) into a cross-GPU linear `DMA-BUF`.
+
+### Descriptorless 64-Bit GPU Pointers & Next-Gen Spatial Addressing
+- **Vulkan 1.4 BDA (`src/vulkan/memory/bda.c`)**: `BdaSystem` manages `64 MiB` device-local slabs with a coalescing free-list (auto-mapped over ReBAR when supported), coherent staging slices, and a `16 MiB` dual-half per-frame transient bump ring. Slang 2026 shaders receive `uint64_t` GPU addresses in push constants and dereference typed structs directly.
+- **`RelPtr2D`, Lilliput 64-bit Headers & 64-Byte Cells (`src/backend/`)**:
+  - **`RelPtr2D`** ([`include/backend/math/relptr2d.h`](include/backend/math/relptr2d.h)) packs a signed 20-bit `4 KB` block offset ($\pm 2\text{ GiB}$), inline 16-bit `(dX, dY)` grid coordinates, `LOD`, and an 8-bit `epoch ^ 0xA5` integrity tag into 64 bits. A single shift-add (`self + (delta << 12)`) resolves the same pointer on SSD, in CPU RAM, and inside GPU shaders—zero pointer swizzling when streaming tiles from disk to VRAM.
+  - **`GpuMathTileHeader`** packs block offset, 16-bit Morton Z-order curve key, LOD, residency flags, and quantized min/max elevation (`0..2047 m`) into a single **8-byte** Lilliput-style header.
+  - **`GpuMathStreamCell`** (`alignas(64)`) packs the completion function pointer, `RelPtr2D`, BDA destination, SSD offset, and CHERI-D `epoch`/`inline_id` lifetime bytes into **one exact 64-byte L1 cache line**.
 
 ---
 
-### Declarative Scene DSLs & Live Hot-Reloading
-Scenes, 2D sheets, and photogrammetric surveys are defined in human-readable declarative text files that hot-reload in real-time via `inotify` and `io_uring`:
+## 4. What `v0.1.0` Is Capable Of Today
 
-#### 1. The 3D Scene DSL (`.world`)
-```text
-ground z                     # Metric infinite ground plane at z=0
-mode hybrid                  # Initial workspace: 3d, 2d, or hybrid
-camera 0 -450 200 0 -0.32 1.0 0 # X Y Z yaw pitch zoom turntable
-clear 0.02 0.04 0.08         # Deep obsidian clear color (RGB)
-
-# Physical Primitives: Kind X Y Z yaw spin inf glow bounce
-cube 0 -180 600 yaw 38000 spin 1 inf 0 glow 1 bounce 0.85
-solid Icosahedron -460 150 640 yaw 18000 spin 1 inf 1 glow 1 bounce 0.90
-
-# Procedural Composite Directives
-ringcube 0 0 0 450 12 0.85 1 # Circular ring of 12 glowing cubes
-tower 100 100 0 40 8 0.70    # Stacking column of 8 cubes
-```
-
-#### 2. The 2D Sheet Physics DSL (`sheet.world`)
-```text
-gravity 0 -680               # 2D gravity vector (gx, gy)
-bounds 580 310               # Arena half-extents
-
-# Rigid Bodies & Deformable Meshes
-rigid 0 -240 450 20 15 0.90 1
-soft -340 150 5 4 32 22 2.2 0.78
-```
-
-#### 3. The Photogrammetric Survey DSL (`besparmak_survey.manifest`)
-```text
-mvs_config 18.0 0.40 0.55     # MVS search range (m), step (m), and min ZNCC
-photo "drone_ridge.png" preset="DJI Mavic 3 Enterprise" lat=37.9522 lon=29.6171 alt=1850 yaw=45 pitch=-60 roll=0 weight=0.95 mvs=1
-point_wgs84 37.960556 29.636667 1690.8 120.0 0.98   # Summit benchmark with 120m RBF influence
-breakline_wgs84 37.9522 29.6171 1307.0 37.9605 29.6366 1690.8 45.0 0.95 # Ridge spine
-```
+- **Pure Empty Boot by Default (`World 0`)**: Running `./build/release/bin/engine` with no flags boots a completely blank, zero-permission sealed engine—zero objects, no grid, no HUD, no lazy terrain allocation—proving that the platform engine carries zero scene baggage unless asked.
+- **3D Rigid/Elastic Physics & 128³ GPU Heat Compute**: Cubes and 6 smooth/faceted solids (`Tetrahedron`, `Octahedron`, `Icosahedron`, `Cylinder`, `Cone`, `Torus`) drop, collide, and deform with volume-preserving squash-and-stretch ($\text{scale}_{xy} = 1/\sqrt{\text{scale}_z}$), while clicks inject 5-second thermal pulses solved across a 128³ fp16 GPU volume lattice.
+- **2D Soft-Body & Convex Polygon Physics (`sheet.c`)**: Tunable mass-spring deformable meshes (jelly to stiff), oriented rigid bumpers, and Separating Axis Theorem (SAT) convex polygons running standalone (`MODE_2D`) or composited live over 3D worlds (`MODE_HYBRID`).
+- **Interactive Click-to-Draw Ear-Clipped Faces (`face.c`, `clip.c`)**: Granting `PERM_DRAW` lets ground clicks place vertices and preview edges; clicking the first corner or pressing `F` ear-clips arbitrary non-self-intersecting polygons into live 3D/2D faces.
+- **$24\times 24\text{ km}$ Streamed Real-World DEM Terrain + Live Photogrammetry (`World 8`)**:
+  - Streams a 5-level (`LOD 0..4`, `341` tiles, `256×256` `1/16 m` SRTM elevation + Esri satellite imagery, `127.90 MiB`) archive of **Baklan & Beşparmak Dağı (Denizli, Türkiye)** on demand from SSD via `io_uring`, with air-gapped C23 self-synthesis if the `.gmpack` file is absent.
+  - Culls quadtree leaves on the GPU (`shaders/terrain_cull.comp.slang`) and renders visible tiles with a single `vkCmdDrawIndirectCount` call, 16-tap Catmull-Rom bicubic filtering, screen-space `20 m` / `100 m` contour lines, and two-point geodesic survey ticks.
+  - Live-fuses smartphone/drone photos (12 built-in sensor presets, Brown-Conrady radial/tangential lens distortion, EXIF/XMP GPS & gimbal pose), **Multi-View Stereo (MVS) Patch-ZNCC** elevation sweeps, and RTK-GNSS WGS84 control points/breaklines (`Wendland C2 RBF`) whenever `besparmak_survey.manifest` is saved.
+- **Capability-Masked Input & Three World Authoring Paths**:
+  - Every camera, object, plot, draw, and mode-switch operation passes through a 16-bit `PolicyMask` (`WorkspacePolicy`) that can be granted, revoked, rebound, or permanently **sealed** per world.
+  - Author worlds via declarative `.world` / `sheet.world` files (live-reloaded via `inotify`), programmatic C23 `WorldBuilder` calls (`World 7`), or interactive in-window editing (auto-saved to `live.world`), complete with 3D math/CSV plots and HarfBuzz/FreeType SDF text boxes.
 
 ---
 
-### Capability Masking & Workspace Policies
-Security and modal interaction are enforced through fine-grained capability masks ([`examples/demo/include/frame/policy.h`](examples/demo/include/frame/policy.h)):
+## 5. Version `0.1.0` Is Only the Foundation: What Comes Next
 
-```c
-enum : uint32_t {
-    PERM_NONE         = 0u,
-    PERM_CAM_PAN_X    = 1u << 0,  // Arrow keys, Middle-Drag
-    PERM_CAM_ZOOM     = 1u << 2,  // Mouse Wheel, +/-
-    PERM_CAM_YAW      = 1u << 3,  // Q/E, Right-Drag X
-    PERM_CAM_PITCH    = 1u << 4,  // C/V, Right-Drag Y
-    PERM_OBJ_SELECT   = 1u << 6,  // Left-Click picking
-    PERM_OBJ_SPAWN    = 1u << 7,  // 1..6 solid creation
-    PERM_MODE_SWITCH  = 1u << 14, // Tab key workspace cycling
-    PERM_DRAW         = 1u << 15, // Ground click-to-draw polygon faces
-};
-```
-- **Profiles**:
-  - `policy_blender()` (`MODE_3D`): Full 6-DOF quaternion camera and 3D authoring permissions.
-  - `policy_matplotlib()` (`MODE_2D`): Locks camera to front identity view; **strictly revokes yaw and pitch capabilities**.
-  - `policy_hybrid()` (`MODE_HYBRID`): Simultaneous 3D and 2D authoring.
-- **Policy Sealing**:
-  Calling `policy_seal(p)` irreversibly locks the policy. Any subsequent calls to `policy_grant()`, `policy_revoke()`, or `policy_rebind_key()` are permanently rejected.
+`v0.1.0` proves the hardest architectural bet: a single-process, zero-wrapper C23 engine can drive Wayland explicit sync, Vulkan 1.4 descriptorless BDA, hybrid physics, and real-time MVS terrain fusion inside a `2.2 MiB` binary with `0%` idle cost.
+
+Future releases build directly on these primitives:
+1. **General glTF / Streaming Asset Archive on `RelPtr2D`**: Extending the zero-swizzle `.gmpack` block-pointer format beyond terrain to general hierarchical 3D meshes, PBR material atlases, and skeletal rigs paged straight from NVMe to BDA slabs via `io_uring`.
+2. **GPU-Driven Scene Graph & Ray-Traced Lighting / 3D Gaussian Splatting**: Scaling the `vkCmdDrawIndirectCount` compute culling pipeline to tens of thousands of general 3D instances, hardware ray queries (`VK_KHR_ray_query`), and BDA-addressed Gaussian splat reconstructions alongside survey meshes.
+3. **Zero-Copy `io_uring` Networking & PipeWire / Compute Audio**: Using the same single-issuer `io_uring` ring for deterministic UDP state synchronization and low-latency audio buffer submission without adding background framework threads.
+4. **In-Engine Authoring & Inspection Tools**: Expanding the declarative `chrome/` + SDF text + `WorkspacePolicy` layers into a full capability-gated scene inspector and terrain/survey engineering workbench.
 
 ---
 
-### Runtime World Hot-Switching (`F1`..`F10` / `0`)
-Pressing `F1` through `F10` (or `0`) switches between 10 built-in world configurations in real time:
-- **No Swapchain Recreation**: Reuses allocated Vulkan pipelines, memory slabs, and Wayland surfaces.
-- **State Serialization**: Automatically flushes active changes to `live.world` before swapping.
-- **Zero-Allocation Transition**: Flushes object tables and re-populates target scenes seamlessly.
+## 6. Quick Start: Build, Test, Run & GPU Selection
 
----
+### System Prerequisites
+- **OS & Session**: Linux kernel `7.1+` (developed and tested on `7.3`) inside an active Wayland session (`$WAYLAND_DISPLAY` with `zwp_linux_dmabuf_v1` and `wp_linux_drm_syncobj_v1`).
+- **Toolchain**: `gcc` (`>= 14`, supporting `-std=c23` and `#embed`), `slangc` (Slang 2026 targeting SPIR-V 1.6), Vulkan 1.4 loader & headers (`VK_API_VERSION_1_4`), `freetype2`, `harfbuzz`, `fontconfig`, `xkbcommon`, and `libpng`.
 
-### Programmatic C23 `WorldBuilder` API
-Construct complex procedural environments purely in C23 code without touching DSL text files:
-
-```c
-#include "world/world_int.h"
-#include "frame/policy.h"
-
-int build_custom_amphitheater(void) {
-    WorldBuilder wb;
-    world_builder_begin(&wb, true /* smooth solids */);
-
-    // 1. Configure workspace and camera
-    world_builder_set_mode(&wb, MODE_HYBRID);
-    world_builder_set_draw(&wb, true);
-    world_builder_set_clear(&wb, 0.02f, 0.04f, 0.08f);
-    world_builder_set_camera(&wb, 0.0f, -500.0f, 250.0f, 0.0f, -0.30f, 1.0f, false);
-
-    // 2. Procedural Ring of Glowing Cubes
-    Coord center = { 0.0f, 0.0f, 0.0f };
-    world_builder_add_cube_ring(&wb, center, 400.0f /* radius */, 16 /* count */, 0.85f /* bounce */, true /* glow */);
-
-    // 3. Commit directly into live scene tables
-    return world_builder_commit(&wb);
-}
-```
-
----
-
-## 5. The Horizon: Version 0.1 is Just the Beginning
-
-> [!IMPORTANT]
-> **Version 0.1 is not a finished game engine—it is a proven architectural foundation.**
-
-By proving that an engine can operate with zero middleware, zero descriptor sets, raw kernel explicit sync, and zero idle overhead, `engine-v2` lays the groundwork for the next generation of real-time computing systems:
-
-```mermaid
-flowchart TD
-    V01["Version 0.1: The Foundation\n(io_uring · C23 · BDA · Wayland Wire · RelPtr2D)"]
-
-    V01 --> F1["Native 3D Gaussian Splatting (3DGS) &\nNeural Radiance Reconstruction"]
-    V01 --> F2["Kernel-Direct Network Synchronization\n(Zero-Copy io_uring UDP Mesh Sync)"]
-    V01 --> F3["Direct Waveform Compute Acoustics\n(Ray-Traced Audio Fields)"]
-    V01 --> F4["Multi-GPU Clustered BDA\n(Heterogeneous Discrete + iGPU Work Sharing)"]
-    V01 --> F5["Self-Compiling Slang Graphs\n(In-Engine Shader Metaprogramming)"]
-```
-
-1. **Native 3D Gaussian Splatting (3DGS) & Neural Fields**:
-   With descriptorless BDA memory and direct 64-bit GPU pointer addressing, radiance fields and Gaussian ellipsoids become first-class memory primitives rendered alongside geometric meshes without copy overhead.
-2. **Zero-Copy Networked Distributed State**:
-   Leveraging `io_uring`'s registered buffer rings and `RelPtr2D` self-relative addressing to transmit live simulation states across machines with zero serialization or allocation.
-3. **GPU Compute-Driven Physical Acoustics**:
-   Simulating wave-equation sound propagation across geometry and terrain directly on Vulkan compute queues.
-4. **Clustered Multi-GPU BDA Rendering**:
-   Expanding explicit sync and DMA-BUF export to partition rendering seamlessly across discrete GPUs and integrated accelerators on the same PCIe bus.
-
----
-
-## 6. Quick Start & Build Instructions
-
-### System Requirements
-- **OS**: Linux Kernel `7.1+` (tested and developed on Linux `7.3`).
-- **Compositor**: Native Wayland session (`$WAYLAND_DISPLAY` set).
-- **Compiler**: Modern C23-compliant GCC (`gcc >= 14` with `-std=c23`).
-- **Shader Compiler**: Slang 2026 (`slangc` targeting SPIR-V 1.6).
-- **Libraries**: Vulkan 1.4 loader, `freetype2`, `harfbuzz`, `fontconfig`, `libpng`, `xkbcommon`.
-
-### Compilation
+### Build & Verify
 ```bash
-# Clone the repository
-git clone https://github.com/your-org/engine-v2.git
-cd engine-v2
-
-# 1. Build optimized debug binary (-O0 -g3)
+# 1. Build debug binary (-O0 -g3 -> build/debug/bin/engine)
 make
 
-# 2. Build high-performance release binary (-O3 -flto=auto -DNDEBUG)
+# 2. Build LTO release binary (-O3 -flto=auto -DNDEBUG -> build/release/bin/engine)
 make release
 
-# 3. Build native CPU-tuned binary (-march=native)
+# 3. Build CPU-tuned native release binary (-march=native)
 make release NATIVE=1
 
-# 4. Run the comprehensive unit test suite (All 9 suites)
+# 4. Run all 9 standalone unit & subsystem test suites
+#    (handles, clock, world, motion, policy, sheet, text, bda, backend)
 make test
 ```
 
-### Multi-GPU Selection
+### Run & Select GPUs
 ```bash
-# Force a specific probed GPU index
-ENGINE_GPU_INDEX=0 ./build/release/bin/engine --world=8
+# Default boot: Pure Empty Engine (World 0 — blank obsidian viewport, sealed policy)
+./build/release/bin/engine
 
-# Prefer a GPU vendor or name substring with automatic fallback
-ENGINE_GPU=NVIDIA ./build/release/bin/engine --world=5
-ENGINE_GPU=Intel  ./build/release/bin/engine --world=3
+# List all 10 built-in world presets (0..9)
+./build/release/bin/engine --list-worlds
+
+# Launch directly into a specific world or custom .world file
+./build/release/bin/engine --world=8               # Baklan & Beşparmak Dağı DEM + Survey Map
+./build/release/bin/engine --world=5               # Hybrid 3D + 2D Soft-Body & Draw Sandbox
+./build/release/bin/engine --world=my_scene.world  # Custom declarative .world file
+
+# Force a GPU by device index or vendor/name substring (automatic fallback if unavailable)
+ENGINE_GPU_INDEX=0 ./build/release/bin/engine --world=2
+ENGINE_GPU=NVIDIA  ./build/release/bin/engine --world=8
+ENGINE_GPU=Intel   ./build/release/bin/engine --world=3
 ```
+
+### Ingest Drone / Smartphone Survey Photos into World 8
+```bash
+./scripts/ingest_survey_photo.py --list-presets
+./scripts/ingest_survey_photo.py \
+    --image my_drone_shot.png \
+    --phone "DJI Mavic 3 Enterprise" --focal-mm 12.29 \
+    --lat 37.90582 --lon 29.68415 --alt 1980 \
+    --yaw 35 --pitch -60 --roll 0
+```
+If World 8 is open when `besparmak_survey.manifest` updates, `io_uring` `inotify` automatically re-fuses the affected DEM tiles in place without resetting your camera.
 
 ---
 
-## 7. World Tour Reference (`--world=0..9`)
+## 7. Selectable Worlds (`--world=0..9` & Live `F1`–`F10` Switching)
 
-Launch any world directly from the command line:
-```bash
-./build/release/bin/engine --world=<id>
-```
+Press **`F1`–`F9`** at any time inside the running window to switch straight into Worlds `1..9`, or press **`F10` / `0`** to return to the Pure Empty Engine (`World 0`)—all in place, without restarting the process or recreating the Vulkan device.
 
-| World Flag | Name | Workspace | Key Highlights |
-| :---: | :--- | :---: | :--- |
-| `--world=0` | **Pure Empty Engine** *(Default)* | `MODE_3D` | Opens with literally nothing. Zero objects, no ground grid, no HUD, no gimbal, dark obsidian clear color. Policy is sealed. The ultimate blank slate. |
-| `--world=1` | **3D Draw Studio** | `MODE_3D` | Click on the metric ground plane to place vertices and preview connecting lines. Press `F` or click the start point to ear-clip them into a rendered 3D surface. |
-| `--world=2` | **3D Gravity & Elastic Solids** | `MODE_3D` | Elevated icosahedrons, tori, octahedrons, cones, cylinders, and cubes falling with volume-preserving squash-and-stretch elasticity. |
-| `--world=3` | **2D Soft Bodies & Polygons** | `MODE_2D` | Mass-spring soft patches (jelly, medium, stiff) and convex polygons bouncing off static angled bumpers under 2D gravity. |
-| `--world=4` | **2D Draw Workshop** | `MODE_2D` | Clean 2D canvas with interactive point-and-click polygon drawing alongside soft patches. |
-| `--world=5` | **Hybrid 3D + 2D Sandbox** | `MODE_HYBRID` | Simultaneous 3D falling elastic solids and 2D deformable soft meshes in one unified viewport. |
-| `--world=6` | **Restitution & Bumper Lab** | `MODE_3D` | Side-by-side drop test of 6 distinct geometric solids with restitution graded from $0.14$ to $0.92$. |
-| `--world=7` | **Procedural C23 Cathedral** | `MODE_HYBRID` | Generated entirely via the programmatic C23 `WorldBuilder` API (`builder.c`) without external files. |
-| `--world=8` | **Beşparmak Dağı & Survey Fusion** | `MODE_3D` | $24\times 24\,\text{km}$ real SRTM DEM + satellite imagery streaming from SSD via `io_uring`, photogrammetric camera models, and WGS-84 GCP fusion. |
-| `--world=9` | **Full Interactive Sandbox** | `MODE_3D` | Full interactive showcase with math/CSV data plots, HarfBuzz/FreeType SDF text, and live object editing. |
+| World Flag | Alias | Mode | `Tab` Switch | `PERM_DRAW` | What It Demonstrates |
+| :--- | :--- | :--- | :---: | :---: | :--- |
+| `--world=0` | `pure` / `empty` | `MODE_3D` | **Sealed** | Off | **Pure Empty Engine (Default)**: Zero 3D/2D objects, no ground grid, no gimbal, no HUD, no plots, sealed `PERM_NONE` policy. |
+| `--world=1` | `draw3d` | `MODE_3D` | Locked | **ON** | **3D Click-to-Draw Studio**: Ground clicks place vertices and edges; clicking the first corner or pressing `F` ear-clips them into a 3D face. |
+| `--world=2` | `gravity3d` | `MODE_3D` | Locked | Off (`KP9`) | **3D Gravity & Elastic Solids**: `Icosahedron`, `Torus`, `Octahedron`, `Cone`, `Tetrahedron`, `Cylinder`, and cubes falling with graded bounce (`0.08..0.90`) and squash-and-stretch deformation. |
+| `--world=3` | `soft2d` | `MODE_2D` | Locked | Off (`KP9`) | **2D Soft Bodies & Polygons**: 3 mass-spring soft patches (`spring=22, 58, 145`) and SAT convex polygons rebounding off angled fixed bumpers. |
+| `--world=4` | `draw2d` | `MODE_2D` | Locked | **ON** | **2D Polygon Workshop**: Open 2D drawing canvas surrounded by live soft-body patches and elastic polygons. |
+| `--world=5` | `hybrid` | `MODE_HYBRID` | Open | **ON** | **Hybrid 3D + 2D Sandbox**: Simultaneous 3D falling elastic solids, 2D deformable soft patches, and active click-to-draw faces. |
+| `--world=6` | `bounce` | `MODE_3D` | Open | Off (`KP9`) | **Restitution Staircase & Bumper Lab**: Side-by-side drop lineup of all 6 solids and 3 cubes (`bounce=0.14..0.92`) paired with a 2D bumper arena. |
+| `--world=7` | `procedural` | `MODE_HYBRID` | Open | **ON** | **Procedural C23 Cathedral**: Built purely in C23 via `WorldBuilder` (`builder.c`) with zero external `.world` files—cube amphitheater, helical solid spiral, and harmonic 2D chamber. |
+| `--world=8` | `besparmak` / `map` | `MODE_3D` | Locked | Survey 2-Pt | **Baklan & Beşparmak Dağı $24\times 24\text{ km}$ DEM & Survey Fusion**: 341-tile `io_uring` SSD-streamed SRTM DEM + Esri satellite map, GPU indirect frustum culling, contours, and live MVS/GCP photogrammetric fusion. |
+| `--world=9` | `sandbox` | `MODE_3D` | Open | Off (`KP9`) | **Full Interactive Sandbox**: Persistent scene editing (`live.world`), 2D `sheet.world`, 3D math/CSV plots, and HarfBuzz/FreeType SDF text boxes. |
 
 ---
 
 ## 8. Interactive Controls Reference
 
-| Input | `3D` Mode | `2D` Mode | `Hybrid` Mode |
+| Input | `3D` Profile (`MODE_3D`) | `2D` Profile (`MODE_2D`) | `Hybrid` Profile (`MODE_HYBRID`) |
 | :--- | :--- | :--- | :--- |
-| **`F1` .. `F9` / `F10` (`0`)** | Hot-switch to Worlds `1..9` / Pure Empty Engine (`0`) | Same | Same |
-| **Left Click (Ground)** | Place polygon vertex (when `PERM_DRAW` is active) | Place polygon vertex | Place polygon vertex |
-| **Left Click (Object)** | Pick & shove 3D body; in World 8 sets Geodesic Survey | Pick & shove 2D body | Pick 2D body first, else 3D body |
-| **First Point Click / `F`** | Ear-clip 3+ points into a solid planar face | Ear-clip into 2D face | Ear-clip points into face |
-| **`Tab`** | Cycle `3D` $\to$ `2D` (if unmasked) | Cycle `2D` $\to$ `Hybrid` | Cycle `Hybrid` $\to$ `3D` |
-| **`1` .. `6`** | Spawn Tetrahedron, Octahedron, Icosahedron, Cylinder, Cone, Torus | Disabled | Spawn 3D Solid `1..6` |
-| **`S` / `G`** | Toggle smooth normals / Toggle material glow | Toggle face glow | Smooth solids / Toggle glow |
-| **`R` / `F5`** | Toggle infinite spin / Impart rotational impulse | Toggle 2D spin | Toggle spin / Impart impulse |
-| **`X` / `Delete` / `Backspace`** | Delete selected object or remove last drawn point | Delete selected 2D body | Delete selection or point |
-| **`Z`** | Undo: Restore last deleted solid with its pose and restitution | Disabled | Restore last deleted 3D object |
-| **Middle-Drag / Arrows** | Pan camera on screen axes | Pan 2D camera | Pan camera on screen axes |
-| **Right-Drag / `Q`,`E` / `C`,`V`** | Orbit camera yaw and pitch | Locked (`lock_2d_quat`) | Orbit camera yaw and pitch |
-| **Mouse Wheel / `+` / `-`** | Smooth metric zoom ($0.0001\times$ to $10000\times$) | Smooth zoom | Smooth zoom |
-| **`Numpad 8, 2, 4, 6, 5, 1`** | Camera snaps: Top / Bottom / Left / Right / Front-Back / Home | Snap Front (`KP5`), Home (`KP1`) | Full Numpad camera snaps |
-| **`Numpad 7` / `Numpad 9`** | Toggle orientation gimbal / Toggle `PERM_DRAW` | Toggle `PERM_DRAW` | Toggle gimbal / `PERM_DRAW` |
-| **`K` / `Numpad 0`** | Toggle $20\,\text{m}$ / $100\,\text{m}$ topographic contour lines (World 8) | Toggle contours | Toggle contours |
-| **`M` / `L`** | Cycle 3D math plot / Hot-reload active `.world` & `.manifest` | Cycle plot / Reload `sheet.world` | Cycle plot / Hot-reload all DSLs |
-| **Hold `T` + 2 Clicks** | Place interactive SDF text box (Type text, `Esc` to commit) | Place SDF text box | Place SDF text box |
+| **`F1` .. `F9` / `F10`, `0`** | Switch live to World `1..9` / `World 0` | Switch live to World `1..9` / `World 0` | Switch live to World `1..9` / `World 0` |
+| **Left Click (Empty)** | Place polygon vertex (when `PERM_DRAW` on) | Place polygon vertex (`PERM_DRAW`) | Place polygon vertex (`PERM_DRAW`) |
+| **Left Click (Object / Map)** | Pick/shove 3D object + 5s heat; in World 8 sets A$\to$B geodesic survey | Pick & shove 2D rigid/soft/polygon body | Shove 2D body first, else pick/shove 3D object |
+| **First Vertex Click / `F`** | Ear-clip $\ge 3$ points into 3D face | Ear-clip $\ge 3$ points into 2D face | Ear-clip $\ge 3$ points into face |
+| **`Tab`** | Switch `3D` $\to$ `2D` (if `PERM_MODE_SWITCH` set) | Switch `2D` $\to$ `Hybrid` | Switch `Hybrid` $\to$ `3D` |
+| **`1` .. `6`** | Spawn/select Tetrahedron, Octahedron, Icosahedron, Cylinder, Cone, Torus | Disabled | Spawn/select 3D solid `1..6` |
+| **`S` / `G` / `R` / `F5`** | Smooth normals / Toggle glow / Infinite spin / Respin | Spin/glow on 2D faces (`PERM_DRAW`) | Smooth / Glow / Spin / Respin |
+| **`X` / `Del` / `Bksp` / `Esc`** | Delete selected object or open corner / Cancel | Delete 2D selection or corner / Cancel | Delete 2D or 3D selection / Cancel |
+| **`Z`** | Restore last deleted cube, solid, or mesh | Disabled | Restore last deleted 3D object |
+| **Arrows / Middle-Drag** | Pan camera on screen axes (1:1 ground pan in World 8) | Pan 2D sheet camera | Pan camera on screen axes |
+| **`Q`,`E` / `C`,`V` / Right-Drag** | Orbit camera yaw & pitch (Z-up turntable in World 8) | Locked (`lock_2d_quat = true`) | Orbit camera yaw & pitch |
+| **Wheel / `+` / `-`** | Zoom in/out (`0.0001x` .. `10,000x`, zoom-to-cursor in World 8) | Zoom in/out | Zoom in/out |
+| **`Numpad 8,2,4,6,5,1,7,9`** | Top/Bottom/Left/Right/Front-Back/Home/Gimbal/Toggle `PERM_DRAW` | Home (`KP1`), Front (`KP5`), `PERM_DRAW` (`KP9`) | Full Numpad camera & `PERM_DRAW` controls |
+| **`K` / `Numpad 0`** | Toggle `20 m` / `100 m` elevation contour lines (World 8) | Toggle contours | Toggle contours |
+| **`M` / `L`** | Cycle math/CSV plot / Hot-reload `.world`, CSV, OBJ & `.manifest` | Cycle plot / Hot-reload `.world`, CSV & `sheet.world` | Cycle plot / Hot-reload all active files |
+| **Hold `T` + 2 Clicks** | Place interactive SDF text box (type UTF-8, `Esc` to finish) | Place interactive SDF text box | Place interactive SDF text box |
 
 ---
 
-## 9. Repository Architecture Directory
+## 9. Repository Directory Layout
 
 ```text
+main.c               Process entrypoint: CLI configure, signal block, ordered boot & reverse-LIFO shutdown
+Makefile             Segregated debug/release build, Slang->SPIR-V 1.6 #embed rules, dead-code linker gate
+chrome/              Declarative window.chrome specification for the GPU subsurface titlebar
+doc/                 Deep-dive engineering guides (platform internals, workflow/controls, comparisons, notes)
+
 include/
-├── backend/         GPU-Math, Terrain Streaming & Photogrammetric/Geodetic Survey headers
-├── chrome/          Declarative window chrome box, layer, spec & GPU pass headers
-├── engine/          app.h — the single seam between platform and hosted application
-├── frame/           FrameClock, generation handles & frame loop state
-├── input/           Lock-free seqlock input page & Wayland pointer/keyboard headers
-├── ring/            Registered io_uring context, SQ/CQ/PBUF/SIM arenas & async chains
-├── system/          Kernel & hardware capabilities (CPU topology, io_uring query, VMA)
+├── backend/         GPU-Math, RelPtr2D, 64B Stateful Cells, .gmpack & Photogrammetric Survey APIs
+├── chrome/          Window bar layout, layer/control spec & GPU pass headers
+├── engine/          app.h — the single seam between platform engine and hosted program
+├── frame/           64B FrameClock, SlotRef generation handles & frame subsystem entrypoints
+├── input/           Lock-free seqlock GPU input page & Wayland seat/pointer/keyboard headers
+├── ring/            Registered io_uring context, SQ/CQ/PBUF/SIM arenas & linked file chains
+├── system/          CPU topology/ISA probe, io_uring kernel feature query & VMA/hugepage tuning
 ├── util/            Zero-allocation FmtBuf integer/string formatting
-├── vulkan/          Vulkan 1.4 context, device scoring, BDA slabs/arenas & pipeline bank
+├── vulkan/          Vulkan 1.4 context, device scorer, 64 MiB BDA slab system & pipeline bank
 └── wayland/         Raw Wayland wire codec, DMA-BUF tranches & DRM syncobj timelines
 
 src/
-├── backend/
-│   ├── core/        64-byte Stateful Function Cell dispatcher + CHERI-D inline_id
-│   ├── math/        2D Self-Relative Pointers (RelPtr2D), Morton Z & Lilliput64
-│   └── terrain/     .gmpack SSD reader/writer, CDLOD stream pager & MVS photogrammetry
-├── chrome/          Window bar layout, SDF/vector chrome rendering & inotify spec parser
-├── frame/           io_uring event loop, ordered boot, 8 ms timerfd sim & DRM explicit present
-├── input/           Sub-pixel motion accumulator, xkb keymap, seat lifecycle & wire decoders
-├── ring/            NO_MMAP arena allocation, VMA naming, registered FDs & linked async chains
-├── system/          CPUID topology/ISA detector, chained IORING_REGISTER_QUERY & hugepages
-├── vulkan/          Descriptorless BDA allocator, DMA-BUF export & Maintenance5 pipeline bank
-└── wayland/         Ring-backed sendmsg/recvmsg wire framing & SCM_RIGHTS FD passing
+├── backend/         RelPtr2D math, 64B cell dispatcher, .gmpack pager/synthesizer & MVS/GCP survey fusion
+├── chrome/          Window bar layout, SDF/vector chrome renderer & spec parser
+├── frame/           io_uring event loop, 8 ms timerfd driver, GPU timestamp profiler & DRM explicit present
+├── input/           Wayland seat wire decoders, sub-pixel pointer accumulator, xkb keymap & GPU input page
+├── ring/            NO_MMAP ring setup, provided-buffer rings, registered FDs & async file chains
+├── system/          CPUID detector, chained IORING_REGISTER_QUERY, RLIMITs & VMA naming
+├── vulkan/          Instance/device bring-up, prime_copy, coalescing BDA allocator & Maintenance5 pipes
+└── wayland/         Socket connection, wire sendmsg/recvmsg + SCM_RIGHTS & surface/toplevel lifecycle
 
-shaders/             Slang 2026 shaders compiled to SPIR-V 1.6 (camera, material, lighting,
-                     terrain_cull, terrain, cube, solid, shape, plane, plot, gimbal, mesh, hud)
-examples/demo/       Hosted 3D/2D/Hybrid application, multi-path WorldBuilder, 10 world presets,
-                     Baklan & Beşparmak Dağı SSD map archive, 3D/2D solvers & SDF text engine
-tests/               Standalone unit test suites (handles, clock, world, motion, policy, sheet,
-                     text, bda, backend)
+shaders/             Slang 2026 shaders compiled to SPIR-V 1.6 and #embedded into the binary
+examples/demo/       Hosted 3D/2D/Hybrid program, WorkspacePolicy, WorldBuilder, 10 worlds, DEM archive & SDF text
+scripts/             Environment probe, AWS/Esri .gmpack builder & EXIF/XMP survey photo ingestion CLI
+tests/               9 standalone unit test suites (handles, clock, world, motion, policy, sheet, text, bda, backend)
 ```
-
----
-
-<p align="center">
-  <b>Modular C23 Engine · Built from the metal up.</b>
-</p>

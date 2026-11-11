@@ -43,13 +43,10 @@ void note_sim_idle(void) {
 }
 
 void frame_note_picture(void) {
-    frame_state.scene_dirty = true;
     // The click plants the poke before it returns. The present that follows
     // consumes that poke, and without this latch the same turn disarms the
     // 8 ms timer. The dent is then one frozen picture.
-    if (engine_app()->record_poke_pending()) {
-        frame_state.sim_hot = true;
-    }
+    frame_note_damage_rect(0, 0, UINT32_MAX, UINT32_MAX);
 }
 
 // Hold keys are polled. A press does not note a picture, so the timer
@@ -129,6 +126,10 @@ void sim_on_timer(uint64_t expirations) {
         FrameStep first = { .first = true, .paint = true };
         if (engine_app()->advance(frame_clock_sim_stamp(&frame_state.clock), &first)) {
             frame_state.scene_dirty = true;
+            if (!frame_state.pending_damage_set) {
+                frame_state.pending_damage_full = true;
+                frame_state.pending_damage_set  = true;
+            }
         }
         frame_state.sim_latched = true;
     }
@@ -157,14 +158,18 @@ void sim_on_timer(uint64_t expirations) {
         frame_state.pending_heat = heat;
         if (heat > 0) {
             frame_state.pending_sim_stamp = wall;
-            frame_state.scene_dirty = true;
+            frame_note_picture();
         } else if (pulse && engine_app()->record_poke_pending()) {
             frame_state.pending_sim_stamp = wall;
-            frame_state.scene_dirty = true;
+            frame_note_picture();
         }
         for (uint32_t i = 0; i < steps; ++i) {
             if (engine_app()->advance(stamps[i], &step)) {
                 frame_state.scene_dirty = true;
+                if (!frame_state.pending_damage_set) {
+                    frame_state.pending_damage_full = true;
+                    frame_state.pending_damage_set  = true;
+                }
             }
         }
     }

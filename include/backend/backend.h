@@ -6,6 +6,7 @@
 #include "backend/terrain/pack.h"
 #include "backend/terrain/stream.h"
 #include "backend/terrain/survey.h"
+#include "ring/ring.h"
 #include "vulkan/core.h"
 
 // ============================================================================
@@ -55,6 +56,10 @@ bool               backend_compute_terrain_profile(float ax, float ay,
 // Saves any live state or reloads the .gmpack archive and survey manifest from SSD on demand (L key).
 [[nodiscard]] bool backend_reload_pack(void);
 
+// Harvests an asynchronous io_uring tile-read CQE submitted by backend_update_camera_zoom.
+// Returns true when a newly resident .epack tile flipped ready in GPU BDA memory.
+[[nodiscard]] bool backend_on_cqe(const struct io_uring_cqe *cqe);
+
 // Returns the resolved path of the active photogrammetric/geodetic survey manifest,
 // and retrieves the most recent multi-view stereo & survey fusion statistics.
 const char        *backend_survey_manifest_path(void);
@@ -71,5 +76,26 @@ bool               backend_overlay_adjust_transparency(float delta_transparency)
 bool               backend_overlay_stretch_2d(int step_x, int step_y);
 bool               backend_overlay_commit_upload(void);
 bool               backend_overlay_get_center(float *out_wx, float *out_wy);
+
+typedef struct BackendBenchStats {
+    uint64_t bda_arena_bytes;
+    uint64_t indirect_bytes;
+    uint64_t overlay_arena_bytes;
+    uint64_t fused_cache_bytes;
+    uint64_t stream_uring_us_total;
+    uint64_t stream_boot_uring_us;
+    uint32_t slot_capacity;
+    uint32_t resident_tiles;
+    uint32_t active_leaves;
+    uint32_t visible_leaves;
+    uint32_t stream_loads_total;
+    uint32_t stream_uring_turns;
+    uint32_t stream_async_cqes;
+    uint32_t stream_fixed_buf_reads;
+    bool     initialized;
+    bool     zero_copy_uma;
+} BackendBenchStats;
+
+void               backend_get_bench_stats(BackendBenchStats *out);
 
 #endif /* ENGINE_BACKEND_H */

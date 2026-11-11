@@ -203,6 +203,9 @@ void destroy_frame_gpu(VulkanContext *vk, FrameSlot *frame) {
         if (frame->cmd_buf != VK_NULL_HANDLE && vk->cmd_pool != VK_NULL_HANDLE) {
             vkFreeCommandBuffers(vk->device, vk->cmd_pool, 1, &frame->cmd_buf);
         }
+        if (frame->transfer_cmd_buf != VK_NULL_HANDLE && vk->transfer_cmd_pool != VK_NULL_HANDLE) {
+            vkFreeCommandBuffers(vk->device, vk->transfer_cmd_pool, 1, &frame->transfer_cmd_buf);
+        }
         destroy_prime_color(vk, frame);
         if (frame->image_view != VK_NULL_HANDLE) {
             vkDestroyImageView(vk->device, frame->image_view, nullptr);
@@ -214,6 +217,7 @@ void destroy_frame_gpu(VulkanContext *vk, FrameSlot *frame) {
         frame->image.dmabuf_fd = -1;
     }
     frame->cmd_buf = VK_NULL_HANDLE;
+    frame->transfer_cmd_buf = VK_NULL_HANDLE;
     frame->image_view = VK_NULL_HANDLE;
     frame->view_format = VK_FORMAT_UNDEFINED;
     frame->prime_image = VK_NULL_HANDLE;
@@ -263,12 +267,15 @@ void clear_pixels(FrameSlot *frame) {
     frame->prime_image   = VK_NULL_HANDLE;
     frame->prime_memory  = VK_NULL_HANDLE;
     frame->prime_view    = VK_NULL_HANDLE;
-    frame->targets       = (EngineTargets){0};
-    frame->cmd_buf       = VK_NULL_HANDLE;
-    frame->acquire_point = 0;
-    frame->wl_buffer_id  = 0;
-    frame->foreign_owned = false;
-    frame->ts_armed      = false;
+    frame->targets          = (EngineTargets){0};
+    frame->cmd_buf          = VK_NULL_HANDLE;
+    frame->transfer_cmd_buf = VK_NULL_HANDLE;
+    frame->surface_damage   = (FrameRect){0};
+    frame->copy_damage      = (FrameRect){0};
+    frame->acquire_point    = 0;
+    frame->wl_buffer_id     = 0;
+    frame->foreign_owned    = false;
+    frame->ts_armed         = false;
 }
 
 bool slot_has_pixels(const FrameSlot *frame) {
@@ -276,6 +283,7 @@ bool slot_has_pixels(const FrameSlot *frame) {
            (frame->image.image != VK_NULL_HANDLE ||
             frame->image_view != VK_NULL_HANDLE ||
             frame->cmd_buf != VK_NULL_HANDLE ||
+            frame->transfer_cmd_buf != VK_NULL_HANDLE ||
             frame->wl_buffer_id != 0 ||
             frame->targets.depth_image != VK_NULL_HANDLE ||
             frame->targets.coverage_image != VK_NULL_HANDLE ||
@@ -385,17 +393,20 @@ int alloc_content_image(
     *out = (VulkanExportableImage){ .dmabuf_fd = -1 };
     *tranche_kind = "general";
 
-    if (wl->feedback_cross_device) {
+    const char *force_prime_env = getenv("ENGINE_FORCE_PRIME");
+    const bool force_prime = (force_prime_env != nullptr && force_prime_env[0] == '1');
+    if (wl->feedback_cross_device || force_prime) {
         // Draw in device-local memory and copy into a buffer the display GPU
         // can import. A color attachment on that buffer is the fallback when
         // the driver will not export a transfer-only image.
+        bool foreign_mem = wl->feedback_cross_device;
         if (alloc_modifier_list(vk, width, height, VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                                 wl->all_modifiers, wl->all_modifier_count,
-                                true, true, out) == 0) {
+                                true, foreign_mem, out) == 0) {
             *tranche_kind = "cross-device";
         } else if (alloc_modifier_list(vk, width, height, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
                                        wl->all_modifiers, wl->all_modifier_count,
-                                       false, true, out) == 0) {
+                                       false, foreign_mem, out) == 0) {
             *tranche_kind = "cross-device";
         }
     } else if (wl->scanout_modifier_count > 0 &&

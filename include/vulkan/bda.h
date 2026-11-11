@@ -72,11 +72,12 @@ typedef struct BdaPool {
 } BdaPool;
 
 typedef struct BdaSystem {
-    BdaPool  device_pool;   // Dedicated device-local VRAM
-    BdaPool  staging_pool;  // Host-visible coherent RAM
+    BdaPool  device_pool;   // Dedicated device-local VRAM (or unified LLC UMA pool)
+    BdaPool  staging_pool;  // Host-visible coherent RAM (unused when unified_uma is true)
     BdaBlock transient_ring;// Two frame halves. See bda_transient_begin_frame.
     uint32_t transient_slot;
     VkDeviceSize transient_at[2];
+    bool     unified_uma;
     bool     is_initialized;
 } BdaSystem;
 

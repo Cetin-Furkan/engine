@@ -53,7 +53,7 @@ int cell64_arm(GpuMathStreamCell *cell,
     cell->ssd_file_offset = ssd_file_offset;
     cell->tile_id         = tile_id;
     cell->morton_key      = (uint32_t)relptr2d_morton2d_encode((uint8_t)gx, (uint8_t)gy);
-    cell->bytes           = k_gmpack_tile_bytes;
+    cell->bytes           = k_epack_tile_bytes;
     cell->slot_index      = slot_index;
     cell->lod             = lod;
     cell->state           = k_cell_state_armed;

@@ -28,6 +28,12 @@ examples/demo/world/live.world.tmp
 examples/demo/world/sheet.live
 examples/demo/world/sheet.live.tmp
 
+# Auto-synthesized compressed terrain cache (.epack v1) & local benchmark runs
+examples/demo/maps/*.epack
+examples/demo/maps/*.epack.tmp
+benchmarks/
+__pycache__/
+
 # Logs & debugging
 *.log
 vgcore.*

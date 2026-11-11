@@ -100,10 +100,13 @@ static int install_resize(WaylandContext *wl, VulkanContext *vk) {
     shown()->prime_image     = fresh.prime_image;
     shown()->prime_memory    = fresh.prime_memory;
     shown()->prime_view      = fresh.prime_view;
-    shown()->view_format     = fresh.view_format;
-    shown()->targets         = fresh.targets;
-    shown()->cmd_buf         = fresh.cmd_buf;
-    shown()->acquire_point   = fresh.acquire_point;
+    shown()->view_format      = fresh.view_format;
+    shown()->targets          = fresh.targets;
+    shown()->cmd_buf          = fresh.cmd_buf;
+    shown()->transfer_cmd_buf = fresh.transfer_cmd_buf;
+    shown()->surface_damage   = fresh.surface_damage;
+    shown()->copy_damage      = fresh.copy_damage;
+    shown()->acquire_point    = fresh.acquire_point;
     shown()->wl_buffer_id    = fresh.wl_buffer_id;
     shown()->foreign_owned   = fresh.foreign_owned;
     shown()->release_pending = true;
@@ -238,6 +241,10 @@ static int queue_replacement(WaylandContext *wl, VulkanContext *vk, uint32_t wid
     int queued = wayland_queue_turn_commit(
         wl,
         new_buffer,
+        fresh.image.width,
+        fresh.image.height,
+        0,
+        0,
         fresh.image.width,
         fresh.image.height,
         wl->acquire_timeline_id,

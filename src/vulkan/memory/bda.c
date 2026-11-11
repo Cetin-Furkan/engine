@@ -297,22 +297,32 @@ int bda_system_init(VulkanContext *vk) {
     }
     s_bda_sys = (BdaSystem){0};
 
-    // Device-local high-speed VRAM slab pool
+    const bool uma = vk->device_info.is_true_uma;
+    const VkDeviceSize slab_size = vk->device_info.recommended_bda_slab_mib > 0u
+        ? ((VkDeviceSize)vk->device_info.recommended_bda_slab_mib * 1024ull * 1024ull)
+        : BDA_DEFAULT_SLAB_SIZE;
+    s_bda_sys.unified_uma = uma;
+
+    // Device-local high-speed VRAM slab pool (or unified zero-staging LLC pool on UMA iGPUs)
     s_bda_sys.device_pool = (BdaPool){
-        .slab_size      = BDA_DEFAULT_SLAB_SIZE,
+        .slab_size      = slab_size,
         .usage          = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
                           VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                           VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                           VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
                           VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
                           VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
-        .mem_flags      = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-        .is_host_mapped = false,
+        .mem_flags      = uma ? (VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+                                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+                                 VK_MEMORY_PROPERTY_HOST_CACHED_BIT)
+                              : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+        .is_host_mapped = uma,
     };
 
-    // Host-visible coherent staging RAM slab pool
+    // Host-visible coherent staging RAM slab pool (bypassed on unified UMA)
     s_bda_sys.staging_pool = (BdaPool){
-        .slab_size      = BDA_DEFAULT_SLAB_SIZE,
+        .slab_size      = slab_size,
         .usage          = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
                           VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                           VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
@@ -325,16 +335,16 @@ int bda_system_init(VulkanContext *vk) {
         .is_host_mapped = true,
     };
 
-    // Per-frame 16 MiB transient bump ring. Shaders read it, so a ReBAR
-    // heap wins over a larger uncached system-RAM heap. Cached system RAM
-    // is the fallback when the device has no host-visible device-local type.
+    // Per-frame transient bump ring (4 MiB on UMA iGPUs, 16 MiB on discrete GPUs).
+    VkDeviceSize transient_bytes = uma ? (4ull * 1024ull * 1024ull) : (16ull * 1024ull * 1024ull);
     VkBufferUsageFlags transient_usage = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
                                          VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-    (void)create_raw_block(vk, 16u * 1024u * 1024u, transient_usage,
-                           VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
-                               VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                               VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                           true, &s_bda_sys.transient_ring);
+    VkMemoryPropertyFlags transient_mem = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+                                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                          VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+                                          (uma ? VK_MEMORY_PROPERTY_HOST_CACHED_BIT : 0u);
+    (void)create_raw_block(vk, transient_bytes, transient_usage,
+                           transient_mem, true, &s_bda_sys.transient_ring);
 
     s_bda_sys.is_initialized = true;
     return 0;
@@ -376,7 +386,8 @@ BdaSlice bda_alloc_staging(VulkanContext *vk, VkDeviceSize size, VkDeviceSize al
             return (BdaSlice){0};
         }
     }
-    return alloc_from_pool(vk, &s_bda_sys.staging_pool, size, align);
+    BdaPool *pool = s_bda_sys.unified_uma ? &s_bda_sys.device_pool : &s_bda_sys.staging_pool;
+    return alloc_from_pool(vk, pool, size, align);
 }
 
 BdaSlice bda_alloc_transient(VulkanContext *vk, VkDeviceSize size, VkDeviceSize align) {
@@ -484,18 +495,20 @@ int da_buffer_create(VulkanContext *vk, VkDeviceSize size, VkBufferUsageFlags us
     // flags the caller passed. The slab still carries storage, transfer,
     // index, and indirect for the requests that fit.
     bool usage_fits = false;
+    bool use_staging_pool = false;
     if (size <= 16u * 1024u * 1024u) {
         if (!s_bda_sys.is_initialized) {
             if (bda_system_init(vk) != 0) {
                 return -1;
             }
         }
-        const BdaPool *pool = host ? &s_bda_sys.staging_pool : &s_bda_sys.device_pool;
+        use_staging_pool = host && !s_bda_sys.unified_uma;
+        const BdaPool *pool = use_staging_pool ? &s_bda_sys.staging_pool : &s_bda_sys.device_pool;
         usage_fits = usage_fits_slab(usage, pool->usage);
     }
     if (usage_fits) {
-        BdaSlice slice = host ? bda_alloc_staging(vk, size, BDA_STORAGE_ALIGN)
-                              : bda_alloc_device(vk, size, BDA_STORAGE_ALIGN);
+        BdaSlice slice = use_staging_pool ? bda_alloc_staging(vk, size, BDA_STORAGE_ALIGN)
+                                          : bda_alloc_device(vk, size, BDA_STORAGE_ALIGN);
         if (slice.buffer != VK_NULL_HANDLE) {
             out->buffer          = slice.buffer;
             out->memory          = VK_NULL_HANDLE; // suballocated from pool
@@ -510,8 +523,12 @@ int da_buffer_create(VulkanContext *vk, VkDeviceSize size, VkBufferUsageFlags us
 
     // Dedicated fallback allocation
     BdaBlock block = {0};
-    VkMemoryPropertyFlags flags = host
-        ? (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
+    const bool want_mapped = host || vk->device_info.is_true_uma;
+    VkMemoryPropertyFlags flags = want_mapped
+        ? (VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+           VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+           VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+           VK_MEMORY_PROPERTY_HOST_CACHED_BIT)
         : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
     if (create_raw_block(vk, size, usage, flags, host, &block) != 0) {
         return -1;

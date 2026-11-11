@@ -98,6 +98,8 @@ static int record_bar(VulkanContext *vk, FrameSlot *frame, uint64_t signal_point
     if (make_bar_view(vk, frame) != 0) {
         return -1;
     }
+    frame->surface_damage = (FrameRect){ 0, 0, frame->image.width, frame->image.height };
+    frame->copy_damage    = frame->surface_damage;
     VkResult res = VK_SUCCESS;
     if (frame->cmd_buf == VK_NULL_HANDLE) {
         VkCommandBufferAllocateInfo alloc_info = {
@@ -180,47 +182,19 @@ static int record_bar(VulkanContext *vk, FrameSlot *frame, uint64_t signal_point
     }
 
     // The bar signals the shared acquire timeline at its own point and does
-    // not wait on the previous point. That wait held the bar draw until the
-    // scene's color pass finished. Both submits go to this one queue, in
-    // order, and the later signal's scope already includes the earlier
-    // commands, so the compositor still observes the points in order.
-    VkCommandBufferSubmitInfo cmd_submit = {
-        .sType         = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
-        .commandBuffer = frame->cmd_buf,
-    };
-    VkSemaphoreSubmitInfo signal_infos[2] = {
-        {
-            .sType     = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
-            .semaphore = frame_state.acquire,
-            .value     = signal_point,
-            .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
-        },
-        {
-            .sType     = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
-            .semaphore = frame_state.acquire_sync,
-            .value     = 0,
-            .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
-        },
-    };
-    VkSubmitInfo2 submit = {
-        .sType                    = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
-        .waitSemaphoreInfoCount   = 0u,
-        .pWaitSemaphoreInfos      = nullptr,
-        .commandBufferInfoCount   = 1,
-        .pCommandBufferInfos      = &cmd_submit,
-        .signalSemaphoreInfoCount = 2,
-        .pSignalSemaphoreInfos    = signal_infos,
-    };
-    res = vkQueueSubmit2(vk->queues.graphics_queue, 1, &submit, VK_NULL_HANDLE);
-    if (res != VK_SUCCESS) {
-        fprintf(stderr, "[Chrome Error] Bar submit failed: %s (%d)\n",
-                vulkan_vkresult_to_str(res), (int)res);
+    // not wait on the previous point on the graphics queue. When async PRIME
+    // transfer is active, frame_submit_slot_commands preserves strict timeline
+    // signal order across queues.
+    bool async_prime = frame_use_async_prime_transfer(vk, frame);
+    if (frame_submit_slot_commands(vk, frame, frame_state.acquire, signal_point,
+                                   0u, VK_PIPELINE_STAGE_2_NONE) != 0) {
         return -1;
     }
     frame->acquire_point = signal_point;
     frame_state.sync_point = signal_point;
     frame->foreign_owned = true;
-    if (publish_acquire_point(vk, signal_point) < 0) {
+    VkSemaphore sync_sem = async_prime ? frame_state.prime_acquire_sync : frame_state.acquire_sync;
+    if (publish_acquire_point_from(vk, sync_sem, signal_point) < 0) {
         (void)wait_acquire_point(vk, signal_point);
         return -1;
     }

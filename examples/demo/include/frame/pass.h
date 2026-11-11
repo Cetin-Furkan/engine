@@ -36,5 +36,6 @@ void pass_coverage_destroy(VulkanContext *vk, PassCoverage *coverage);
 
 VkFormat pass_depth_format(void);
 VkSampleCountFlagBits pass_raster_samples(void);
+void pass_pool_stats(uint64_t *out_depth_bytes, uint64_t *out_cover_bytes);
 
 #endif /* ENGINE_FRAME_PASS_H */

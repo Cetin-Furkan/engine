@@ -204,20 +204,11 @@ float4 main(FSInput input) : SV_Target0 {
 
     if (tile_bda != 0ull) {
         float sharp_vis = (1.0 - smoothstep(1.5, 14.0, fw_m)) * (1.0 - ortho_coverage);
-        if (sharp_vis > 0.02) {
-            // Close-up Ultra-HD view: 16-tap Catmull-Rom bicubic + 4-tap direct texel CAS unsharp mask
-            img_srgb = tile_sample_bicubic_imagery(tile_bda, input.tile_uv);
-            float texel_step = 0.85 / float(k_tile_dim - 1u);
-            float3 c_n = tile_sample_bilinear_imagery(tile_bda, input.tile_uv + float2(0.0, texel_step)).rgb;
-            float3 c_s = tile_sample_bilinear_imagery(tile_bda, input.tile_uv - float2(0.0, texel_step)).rgb;
-            float3 c_e = tile_sample_bilinear_imagery(tile_bda, input.tile_uv + float2(texel_step, 0.0)).rgb;
-            float3 c_w = tile_sample_bilinear_imagery(tile_bda, input.tile_uv - float2(texel_step, 0.0)).rgb;
-            float3 blur = 0.25 * (c_n + c_s + c_e + c_w);
-            img_srgb.rgb = clamp(img_srgb.rgb + (img_srgb.rgb - blur) * (0.48 * sharp_vis), float3(0.0), float3(1.0));
-        } else if (fw_m < 28.0) {
-            img_srgb = tile_sample_bicubic_imagery(tile_bda, input.tile_uv);
+        if (fw_m < 28.0) {
+            // Close/mid Ultra-HD view: 2x2-block-prefetched 16-tap Catmull-Rom bicubic + fused 5-tap CAS
+            img_srgb = tile_sample_bicubic_imagery(tile_bda, input.tile_uv, 0.48 * sharp_vis);
         } else {
-            // Mid/far view: 4-tap hardware-rate bilinear sample (4x lower memory bandwidth)
+            // Far view: single-BC1-block fast bilinear sample
             img_srgb = tile_sample_bilinear_imagery(tile_bda, input.tile_uv);
         }
 

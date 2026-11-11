@@ -19,13 +19,18 @@
 #include "frame/terrain.h"
 #include "frame/text.h"
 #include "frame/world.h"
+#include "frame/frame.h"
+#include "ring/ring.h"
+#include "vulkan/core.h"
 #include "input/pointer.h"
 #include "world/world_int.h"
 #include <linux/input-event-codes.h>
 #include <math.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 // The hosted program. Boot draws the metric grid and no objects.
 // opening.world places each cube line on z = 0. Clicks build faces.
@@ -121,10 +126,113 @@ static void demo_destroy_targets(VulkanContext *vk, EngineTargets *targets) {
     *targets = (EngineTargets){0};
 }
 
+// ------------------------------------------------------------------- bench
+
+static uint32_t s_bench_target      = 0u;
+static uint32_t s_bench_frames      = 0u;
+static uint32_t s_bench_samples     = 0u;
+static uint64_t s_bench_last_seq    = 0u;
+static uint64_t s_bench_sum_tot_ns  = 0u;
+static uint64_t s_bench_sum_comp_ns = 0u;
+static uint64_t s_bench_sum_rend_ns = 0u;
+static uint64_t s_bench_min_tot_ns  = UINT64_MAX;
+static uint64_t s_bench_max_tot_ns  = 0u;
+static uint64_t s_bench_t0_ns       = 0u;
+static bool     s_bench_live_draw   = false;
+static bool     s_bench_done        = false;
+
+static void read_proc_rss_kib(uint64_t *out_rss_kib, uint64_t *out_hwm_kib) {
+    uint64_t rss = 0u;
+    uint64_t hwm = 0u;
+    FILE *fp = fopen("/proc/self/status", "r");
+    if (fp != nullptr) {
+        char line[256];
+        while (fgets(line, sizeof line, fp) != nullptr) {
+            unsigned long long v = 0ull;
+            if (sscanf(line, "VmRSS: %llu kB", &v) == 1) {
+                rss = (uint64_t)v;
+            } else if (sscanf(line, "VmHWM: %llu kB", &v) == 1) {
+                hwm = (uint64_t)v;
+            }
+        }
+        fclose(fp);
+    }
+    if (out_rss_kib != nullptr) {
+        *out_rss_kib = rss;
+    }
+    if (out_hwm_kib != nullptr) {
+        *out_hwm_kib = hwm;
+    }
+}
+
+static void emit_bench_summary(uint32_t width, uint32_t height, uint64_t modifier) {
+    uint64_t now_ns = ring_mono_ns();
+    double wall_ms = (s_bench_t0_ns != 0u && now_ns > s_bench_t0_ns)
+        ? ((double)(now_ns - s_bench_t0_ns) / 1000000.0)
+        : 0.0;
+    double avg_tot  = s_bench_samples > 0u ? ((double)s_bench_sum_tot_ns / (1000.0 * s_bench_samples)) : 0.0;
+    double avg_comp = s_bench_samples > 0u ? ((double)s_bench_sum_comp_ns / (1000.0 * s_bench_samples)) : 0.0;
+    double avg_rend = s_bench_samples > 0u ? ((double)s_bench_sum_rend_ns / (1000.0 * s_bench_samples)) : 0.0;
+    double min_tot  = s_bench_min_tot_ns == UINT64_MAX ? 0.0 : ((double)s_bench_min_tot_ns / 1000.0);
+    double max_tot  = (double)s_bench_max_tot_ns / 1000.0;
+
+    BdaStats bda = {0};
+    bda_get_stats(&bda);
+    uint64_t depth_pool_bytes = 0u;
+    uint64_t cover_pool_bytes = 0u;
+    pass_pool_stats(&depth_pool_bytes, &cover_pool_bytes);
+    BackendBenchStats bstat = {0};
+    backend_get_bench_stats(&bstat);
+    uint64_t rss_kib = 0u;
+    uint64_t hwm_kib = 0u;
+    read_proc_rss_kib(&rss_kib, &hwm_kib);
+    uint32_t objects = 0u;
+    uint32_t verts = 0u;
+    world_stats(&objects, &verts);
+    VulkanContext *vk = vulkan_get_context();
+
+    printf("[Bench] world=%u res=%ux%u msaa=%ux frames=%u samples=%u wall_ms=%.2f "
+           "gpu_total_us(avg=%.2f,min=%.2f,max=%.2f) gpu_compute_us=%.2f gpu_render_us=%.2f "
+           "pass_pool_mib=%.2f(depth=%.2f,cover=%.2f) "
+           "bda_dev_mib=%.2f/%.2f bda_stg_mib=%.2f/%.2f "
+           "terrain_arena_mib=%.2f overlay_arena_mib=%.2f fused_cache_mib=%.2f "
+           "tiles_res=%u/%u stream_loads=%u uring_us=%llu uring_boot_us=%llu async_cqes=%u fixed_buf_reads=%u zero_copy_uma=%u "
+           "rss_mib=%.2f hwm_mib=%.2f objs=%u verts=%u mod=0x%llx gpu=\"%s\" profile=\"%s\"\n",
+           world_selected_id(),
+           width, height,
+           (uint32_t)pass_raster_samples(),
+           s_bench_frames, s_bench_samples, wall_ms,
+           avg_tot, min_tot, max_tot, avg_comp, avg_rend,
+           (double)(depth_pool_bytes + cover_pool_bytes) / (1024.0 * 1024.0),
+           (double)depth_pool_bytes / (1024.0 * 1024.0),
+           (double)cover_pool_bytes / (1024.0 * 1024.0),
+           (double)bda.device_allocated / (1024.0 * 1024.0),
+           (double)bda.device_capacity / (1024.0 * 1024.0),
+           (double)bda.staging_allocated / (1024.0 * 1024.0),
+           (double)bda.staging_capacity / (1024.0 * 1024.0),
+           (double)bstat.bda_arena_bytes / (1024.0 * 1024.0),
+           (double)bstat.overlay_arena_bytes / (1024.0 * 1024.0),
+           (double)bstat.fused_cache_bytes / (1024.0 * 1024.0),
+           bstat.resident_tiles, bstat.slot_capacity,
+           bstat.stream_loads_total,
+           (unsigned long long)bstat.stream_uring_us_total,
+           (unsigned long long)bstat.stream_boot_uring_us,
+           bstat.stream_async_cqes,
+           bstat.stream_fixed_buf_reads,
+           bstat.zero_copy_uma ? 1u : 0u,
+           (double)rss_kib / 1024.0,
+           (double)hwm_kib / 1024.0,
+           objects, verts,
+           (unsigned long long)modifier,
+           vk != nullptr ? vk->device_info.name : "unknown",
+           vk != nullptr ? vulkan_profile_to_str(vk->device_info.execution_profile) : "unknown");
+    fflush(stdout);
+}
+
 // ------------------------------------------------------------------- hooks
 
 static void print_worlds_usage(const char *prog) {
-    printf("Usage: %s [--world=<0..9|name|file.world> | -w <0..9|name|file.world>] [--image=<path.png|jpg>] [--list-worlds] [--help]\n\n"
+    printf("Usage: %s [--world=<0..9|name|file.world> | -w <0..9|name|file.world>] [--image=<path.png|jpg>] [--bench[=<frames>]] [--list-worlds] [--help]\n\n"
            "Pure Engine Default & Built-On-Top Worlds:\n"
            "  --world=0  [Pure    | Empty Canvas  | Sealed    ] Pure Empty Engine (Default: 0 objects, 0 grid, 0 HUD)\n"
            "  --world=1  [3D-Only | PERM_DRAW=on  | Tab=locked] Click-to-Draw Studio (Points -> Lines -> Faces)\n"
@@ -219,6 +327,22 @@ static int demo_configure(int argc, char **argv) {
             print_worlds_usage(argv[0]);
             return 1;
         }
+        if (strcmp(a, "--bench") == 0) {
+            s_bench_target = 90u;
+            frame_set_bench_mode(true);
+            continue;
+        }
+        if (strncmp(a, "--bench=", 8) == 0) {
+            char *end = nullptr;
+            unsigned long n = strtoul(a + 8, &end, 10);
+            if (end == a + 8 || *end != '\0' || n < 10ul || n > 100000ul) {
+                fprintf(stderr, "[Engine] Invalid --bench frame count '%s' (expected 10..100000)\n", a + 8);
+                return -1;
+            }
+            s_bench_target = (uint32_t)n;
+            frame_set_bench_mode(true);
+            continue;
+        }
         if (strncmp(a, "--image=", 8) == 0) {
             backend_overlay_set_custom_path(a + 8);
             continue;
@@ -293,8 +417,10 @@ static int demo_init(VulkanContext *vk, RingCqeFn forward_cqe, void *forward_use
 }
 
 static void demo_shutdown(VulkanContext *vk) {
-    (void)world_save();
-    (void)sheet_save();
+    if (s_bench_target == 0u) {
+        (void)world_save();
+        (void)sheet_save();
+    }
     grid_shutdown(vk);
     text_shutdown(vk);
     hud_shutdown(vk);
@@ -338,6 +464,7 @@ static void demo_release_frame(uint64_t signal_point) {
 }
 
 static void demo_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height, bool live) {
+    s_bench_live_draw = live;
     world_draw(cmd, width, height, live);
 }
 
@@ -348,6 +475,40 @@ static void demo_draw_overlay(VkCommandBuffer cmd, uint32_t width, uint32_t heig
     hud_prepare(frame_ms, have_stamp, modifier);
     hud_draw(cmd, width, height, format, depth_format, samples);
     text_draw(cmd, width, height, format, depth_format, samples);
+
+    bool is_live_scene = s_bench_live_draw;
+    s_bench_live_draw = false;
+    if (s_bench_target > 0u && !s_bench_done && is_live_scene) {
+        if (s_bench_frames == 0u) {
+            s_bench_t0_ns = ring_mono_ns();
+        }
+        s_bench_frames++;
+        if (s_bench_frames > 10u) {
+            uint64_t comp_ns = 0u;
+            uint64_t rend_ns = 0u;
+            uint64_t tot_ns  = 0u;
+            uint64_t seq     = 0u;
+            frame_gpu_raw_ns(&comp_ns, &rend_ns, &tot_ns, &seq);
+            if (seq != s_bench_last_seq && tot_ns > 0u) {
+                s_bench_last_seq = seq;
+                s_bench_sum_tot_ns  += tot_ns;
+                s_bench_sum_comp_ns += comp_ns;
+                s_bench_sum_rend_ns += rend_ns;
+                if (tot_ns < s_bench_min_tot_ns) {
+                    s_bench_min_tot_ns = tot_ns;
+                }
+                if (tot_ns > s_bench_max_tot_ns) {
+                    s_bench_max_tot_ns = tot_ns;
+                }
+                s_bench_samples++;
+            }
+        }
+        if (s_bench_frames >= s_bench_target) {
+            s_bench_done = true;
+            emit_bench_summary(width, height, modifier);
+            (void)kill(getpid(), SIGTERM);
+        }
+    }
 }
 
 static bool demo_simulation(uint32_t time_ms, const FrameStep *step, uint32_t *heat_dt) {
@@ -361,7 +522,27 @@ static bool demo_advance(uint32_t time_ms, const FrameStep *step) {
     int32_t py = 0;
     bool have = pointer_client_xy(&px, &py);
     text_arm_tick(text_is_visible() && pointer_key_down(KEY_T), have, px, py);
-    return world_advance(time_ms);
+    bool moved = world_advance(time_ms);
+    if (s_bench_target > 0u && !s_bench_done) {
+        uint32_t wid = world_selected_id();
+        if (wid == 8u) {
+            // Deterministic LOD 0 -> LOD 4 zoom + pan sweep to exercise io_uring SSD tile streaming
+            (void)camera_zoom_steps(0.18f);
+            (void)camera_pointer_drag(4.0f, 2.0f, ENG_BUTTON_MIDDLE);
+        } else if (wid != 0u) {
+            if (policy_mode() == MODE_2D) {
+                (void)camera_pointer_drag(2.0f, 1.0f, ENG_BUTTON_MIDDLE);
+            } else {
+                (void)camera_pointer_drag(2.2f, 0.4f, ENG_BUTTON_RIGHT);
+            }
+        } else {
+            // Static Pure Engine canvas: report only bounded HUD region dirty
+            // so cross-GPU PRIME DMA copy and Wayland damage_buffer transfer <2% of pixels.
+            frame_note_damage_rect(0, 0, 320u, 64u);
+        }
+        return true;
+    }
+    return moved;
 }
 
 static bool demo_click(float origin_x, float origin_y) {
@@ -602,6 +783,9 @@ static bool demo_key(uint32_t key, EngineKeyContext *ctx) {
 }
 
 static bool demo_camera_active(void) {
+    if (s_bench_target > 0u && !s_bench_done) {
+        return true;
+    }
     if (world_selected_id() == 8u && !demo_shift_down()) {
         if (pointer_key_down(KEY_W) || pointer_key_down(KEY_A) ||
             pointer_key_down(KEY_S) || pointer_key_down(KEY_D)) {
@@ -667,6 +851,7 @@ static const EngineApp s_app = {
     .consume_spin      = world_consume_spin,
     .commit            = world_commit,
     .note_cqe          = hud_note_cqe,
+    .on_cqe            = backend_on_cqe,
     .turn_report       = hud_turn_report,
     .click             = demo_click,
     .drag              = demo_drag,

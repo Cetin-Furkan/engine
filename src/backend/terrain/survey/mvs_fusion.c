@@ -640,6 +640,89 @@ static bool photo_overlaps_tile(const TerrainSurveyPhoto *ph,
              max_v < -64.0f || min_v > (float)ph->intrinsics.height_px + 64.0f);
 }
 
+bool backend_survey_tile_may_overlap(const TerrainSurveyDataset *ds,
+                                     const GpuMathQuadNode      *node) {
+    if (ds == nullptr || node == nullptr) {
+        return false;
+    }
+    if (ds->photo_count == 0u && ds->ortho_overlay_count == 0u &&
+        ds->point_count == 0u && ds->breakline_count == 0u) {
+        return false;
+    }
+
+    for (uint32_t i = 0u; i < ds->ortho_overlay_count && i < k_survey_max_ortho_overlays; ++i) {
+        const TerrainOrthoOverlay *ov = &ds->ortho_overlays[i];
+        if (ov->rgba_pixels == nullptr || ov->half_span_x <= 0.0f || ov->half_span_y <= 0.0f ||
+            ov->blend_weight <= 0.0f) {
+            continue;
+        }
+        if (ov->center_x + ov->half_span_x >= node->world_min_x &&
+            ov->center_x - ov->half_span_x <= node->world_max_x &&
+            ov->center_y + ov->half_span_y >= node->world_min_y &&
+            ov->center_y - ov->half_span_y <= node->world_max_y) {
+            return true;
+        }
+    }
+
+    float span_x = fmaxf(node->world_max_x - node->world_min_x, 1.0f);
+    float step_m = span_x / (float)(k_gmpack_tile_dim - 1u);
+    float min_kernel_r = step_m * 1.15f;
+
+    for (uint32_t i = 0u; i < ds->point_count; ++i) {
+        const TerrainSurveyPoint *pt = &ds->points[i];
+        float r = fmaxf(pt->radius_m, min_kernel_r);
+        if (pt->world_x + r >= node->world_min_x && pt->world_x - r <= node->world_max_x &&
+            pt->world_y + r >= node->world_min_y && pt->world_y - r <= node->world_max_y) {
+            return true;
+        }
+    }
+
+    for (uint32_t i = 0u; i < ds->breakline_count; ++i) {
+        const TerrainSurveyBreakline *bl = &ds->breaklines[i];
+        float r     = fmaxf(bl->radius_m, min_kernel_r);
+        float min_x = fminf(bl->world_ax, bl->world_bx) - r;
+        float max_x = fmaxf(bl->world_ax, bl->world_bx) + r;
+        float min_y = fminf(bl->world_ay, bl->world_by) - r;
+        float max_y = fmaxf(bl->world_ay, bl->world_by) + r;
+        if (max_x >= node->world_min_x && min_x <= node->world_max_x &&
+            max_y >= node->world_min_y && min_y <= node->world_max_y) {
+            return true;
+        }
+    }
+
+    if (ds->photo_count > 0u) {
+        uint32_t blk_idx = 0u;
+        uint16_t morton  = 0u;
+        uint8_t  lod     = 0u;
+        uint8_t  flags   = 0u;
+        float    node_min_e = 0.0f;
+        float    node_max_e = 0.0f;
+        gpumath_tile_header_unpack(node->header, &blk_idx, &morton, &lod, &flags, &node_min_e, &node_max_e);
+        if (node_max_e <= node_min_e) {
+            node_min_e = k_besparmak_elev_min;
+            node_max_e = k_besparmak_elev_max;
+        }
+        float min_e = node_min_e - 60.0f;
+        float max_e = node_max_e + 60.0f;
+        for (uint32_t i = 0u; i < ds->photo_count && i < k_survey_max_photos; ++i) {
+            const TerrainSurveyPhoto *ph = &ds->photos[i];
+            if ((ph->pose.use_agl || ph->pose.altitude_msl_m <= 0.0f) && ph->pose.height_agl_m > 0.0f) {
+                if (ph->pose.world_x >= node->world_min_x - 200.0f &&
+                    ph->pose.world_x <= node->world_max_x + 200.0f &&
+                    ph->pose.world_y >= node->world_min_y - 200.0f &&
+                    ph->pose.world_y <= node->world_max_y + 200.0f) {
+                    return true;
+                }
+            }
+            if (photo_overlaps_tile(ph, node, min_e, max_e)) {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
 bool backend_survey_fuse_tile(TerrainSurveyDataset *ds,
                               GpuMathArchiveHeader *hdr,
                               uint32_t              node_index,

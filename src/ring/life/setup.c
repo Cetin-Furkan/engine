@@ -65,7 +65,12 @@ int ring_context_init(RingContext *r, const char *name, bool with_pbuf) {
         len = r->sim_bufs_off + (size_t)ENG_SIM_PBUF_ENTRIES * ENG_SIM_PBUF_LEN;
     }
     r->fixed_off = ring_align_up(len, page);
-    len = r->fixed_off + (size_t)ENG_FBUF_INOTIFY_LEN + ENG_FBUF_SIGNAL_LEN + ENG_FBUF_RELEASE_LEN;
+    size_t fixed_bytes = (size_t)ENG_FBUF_INOTIFY_LEN + ENG_FBUF_SIGNAL_LEN + ENG_FBUF_RELEASE_LEN;
+    if (with_pbuf) {
+        fixed_bytes += (size_t)ENG_FBUF_PAGER_COUNT * (size_t)ENG_FBUF_PAGER_LEN;
+        r->pager_fixed_on = true;
+    }
+    len = r->fixed_off + fixed_bytes;
     r->wait_off = ring_align_up(len, page);
     len = r->wait_off + page;
 
@@ -201,7 +206,7 @@ int ring_context_init(RingContext *r, const char *name, bool with_pbuf) {
            ENG_PBUF_LEN,
            with_pbuf ? ENG_SIM_PBUF_ENTRIES : 0u,
            ENG_SIM_PBUF_LEN,
-           ENG_FBUF_COUNT,
+           r->fixed_count,
            ENG_FIXED_FILES);
     return 0;
 }

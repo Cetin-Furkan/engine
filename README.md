@@ -18,6 +18,9 @@ This README gives a clear, human-readable tour of why the engine exists, what it
 | **[`doc/WORKFLOW_CONTROLS_AND_EXTENSIBILITY.md`](doc/WORKFLOW_CONTROLS_AND_EXTENSIBILITY.md)** | How `EngineApp` (`include/engine/app.h`) works, keyboard/mouse routing, capability masking (`PolicyMask` & sealing), `F1`–`F10` live world switching, `.world` / `sheet.world` / `.manifest` / `window.chrome` DSL grammars, the C23 `WorldBuilder` API, and copy-paste customization recipes. |
 | **[`TERRAIN_BACKEND_ARCHITECTURE.md`](TERRAIN_BACKEND_ARCHITECTURE.md)** | World 8's $24\times 24\text{ km}$ Baklan & Beşparmak Dağı `.gmpack` streaming backend, `RelPtr2D` 2D self-relative pointers, Lilliput 64-bit tile headers, 64-byte stateful cells, GPU `vkCmdDrawIndirectCount` culling, Brown-Conrady lens calibration, Multi-View Stereo (MVS), and WGS84 geodetic fusion. |
 | **[`doc/ARCHITECTURE_COMPARISON.md`](doc/ARCHITECTURE_COMPARISON.md)** | Concrete, layer-by-layer architectural comparison of `Engine` against Unreal/Unity/Godot, `SDL3`/`GLFW` + `VkSwapchainKHR` stacks, and `GDAL` + `Cesium` + offline photogrammetry pipelines—including honest trade-offs. |
+| **[`doc/V02_GPU_PROFILES_AND_2026_ALGORITHMS.md`](doc/V02_GPU_PROFILES_AND_2026_ALGORITHMS.md)** | `Engine v0.2` Dual-Architecture specification (`UMA_IGPU`, `DISCRETE_DIRECT`, `HYBRID_MUXLESS`) and 2026 algorithms roadmap (`.epack` v1 codec, async `io_uring`, quantized meshlets, `SSILVB`, Split Radiance Cascades, `AVBD`, `2DGS`). |
+| **[`doc/BENCHMARK_V01_VS_V02_M1.md`](doc/BENCHMARK_V01_VS_V02_M1.md)** | Hardware benchmark report comparing `v0.1` Baseline vs `v0.2` Milestone 1 (`UMA_IGPU` zero-staging BDA pool, `HOST_CACHED` LLC ranking, adaptive `2x MSAA`, `-69.7%` UMA RAM reduction). |
+| **[`doc/BENCHMARK_V02_M2.md`](doc/BENCHMARK_V02_M2.md)** | Three-way empirical report (`v0.1` vs `v0.2-M1` vs `v0.2-M2`): `0.00 ms` non-blocking `io_uring` tile streaming, `3.84x` `.epack` v1 GPU-decoded terrain codec (`4.01x` total World 8 RAM reduction), and `HYBRID_MUXLESS` partial-damage PRIME presentation. |
 | **[`pointers.md`](pointers.md)** | Research background behind the 2025–2026 pointer architectures implemented in `src/backend/` (`RelPtr2D`, Project Lilliput compact headers, 64-byte flat closures, CHERI-D inline lifetime IDs, and PULSE active windows). |
 | **[`doc/engineers_note.md`](doc/engineers_note.md)** | Build segregation (`build/debug` vs. `build/release`), semantic version tagging, and Vulkan/DRM runtime contracts. |
 
@@ -26,7 +29,7 @@ This README gives a clear, human-readable tour of why the engine exists, what it
 ## Table of Contents
 
 1. [Why We Rebuilt the Wheel from Scratch](#1-why-we-rebuilt-the-wheel-from-scratch)
-2. [How `Engine` Compares to Other Engines & Stacks](#2-how-Engine-compares-to-other-engines--stacks)
+2. [How `Engine` Compares to Other Engines & Stacks](#2-how-engine-compares-to-other-engines--stacks)
 3. [How the Engine Works (Plain-English Architecture)](#3-how-the-engine-works-plain-english-architecture)
 4. [What `v0.1.0` Is Capable Of Today](#4-what-v010-is-capable-of-today)
 5. [Version `0.1.0` Is Only the Foundation: What Comes Next](#5-version-010-is-only-the-foundation-what-comes-next)

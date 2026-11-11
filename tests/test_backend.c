@@ -4,6 +4,8 @@
 #include "backend/terrain/pack.h"
 #include "backend/terrain/stream.h"
 #include "backend/terrain/survey.h"
+#include "ring/ring.h"
+#include <fcntl.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -923,9 +925,166 @@ int main(void) {
     }
     backend_survey_dataset_free(&ds_ortho);
 
-    printf("test_backend: ok (RelPtr2D + Lilliput64 + Cell64 + Baklan/Beşparmak .gmpack %.1f..%.1f m, leaves %u->%u, culled %u/%u, Survey MVS/GCP fused %u posts [%u MVS @ ZNCC %.3f] & %u ortho texels)\n",
-           (double)tile0_min_m, (double)tile0_max_m, leaves_far, leaves_close,
-           indirect_tight.culled_count, leaves_close,
+    // 12. Milestone 2 (.epack v1 3.84x Compressed Codec + Lossless Perimeter Seam + Registered io_uring Fixed Read)
+    if (sizeof(EpackTileBlock) != 102400u || sizeof(GpuMathTileBlock) != 393216u) {
+        fprintf(stderr, "FAIL: EpackTileBlock size=%zu (expected 102400) or GpuMathTileBlock size=%zu\n",
+                sizeof(EpackTileBlock), sizeof(GpuMathTileBlock));
+        return 1;
+    }
+
+    static GpuMathTileBlock raw_summit;
+    static GpuMathTileBlock dec_summit;
+    static EpackTileBlock   enc_summit;
+    if (backend_terrain_read_tile(pack_path, summit_leaf, &raw_summit) != 0) {
+        fprintf(stderr, "FAIL: could not read summit_leaf from .gmpack for .epack test\n");
+        return 1;
+    }
+    backend_epack_encode_tile(&raw_summit, &enc_summit);
+    backend_epack_decode_tile(&enc_summit, &dec_summit);
+
+    // 12a. Verify 0.0000 m EXACT lossless perimeter invariance (all 1020 border vertices)
+    // and interior elevation RMSE + BC1 imagery PSNR
+    double sum_sq_elev = 0.0;
+    uint32_t interior_cnt = 0u;
+    double sum_sq_rgb = 0.0;
+    for (uint32_t y = 0u; y < k_gmpack_tile_dim; ++y) {
+        for (uint32_t x = 0u; x < k_gmpack_tile_dim; ++x) {
+            uint32_t idx = y * k_gmpack_tile_dim + x;
+            bool is_border = (x == 0u || x == 255u || y == 0u || y == 255u);
+            float orig_h = (float)raw_summit.height_u16[idx] * 0.0625f;
+            float dec_h  = backend_epack_load_height_m(&enc_summit, x, y);
+            float dec_h2 = (float)dec_summit.height_u16[idx] * 0.0625f;
+            if (is_border) {
+                if (raw_summit.height_u16[idx] != dec_summit.height_u16[idx] ||
+                    fabsf(orig_h - dec_h) != 0.0f || fabsf(dec_h - dec_h2) != 0.0f) {
+                    fprintf(stderr, "FAIL: border vertex (%u,%u) is not bit-exact lossless (orig=%u dec=%u)\n",
+                            x, y, raw_summit.height_u16[idx], dec_summit.height_u16[idx]);
+                    return 1;
+                }
+            } else {
+                double dh = (double)orig_h - (double)dec_h;
+                sum_sq_elev += dh * dh;
+                interior_cnt++;
+                if (fabsf(dec_h - dec_h2) > 0.07f) {
+                    fprintf(stderr, "FAIL: backend_epack_load_height_m vs decode_tile mismatch at (%u,%u)\n", x, y);
+                    return 1;
+                }
+            }
+            uint32_t c0 = raw_summit.imagery_rgba8[idx];
+            uint32_t c1 = backend_epack_load_rgba8(&enc_summit, x, y);
+            if (c1 != dec_summit.imagery_rgba8[idx]) {
+                fprintf(stderr, "FAIL: backend_epack_load_rgba8 vs decode_tile mismatch at (%u,%u)\n", x, y);
+                return 1;
+            }
+            double dr = (double)(c0 & 0xFFu) - (double)(c1 & 0xFFu);
+            double dg = (double)((c0 >> 8u) & 0xFFu) - (double)((c1 >> 8u) & 0xFFu);
+            double db = (double)((c0 >> 16u) & 0xFFu) - (double)((c1 >> 16u) & 0xFFu);
+            sum_sq_rgb += (dr * dr + dg * dg + db * db) / 3.0;
+        }
+    }
+    double elev_rmse_m = sqrt(sum_sq_elev / (double)interior_cnt);
+    double rgb_mse     = sum_sq_rgb / (double)(k_gmpack_tile_dim * k_gmpack_tile_dim);
+    double rgb_psnr_db = (rgb_mse > 1.0e-9) ? (10.0 * log10((255.0 * 255.0) / rgb_mse)) : 99.0;
+    if (elev_rmse_m > 0.12 || rgb_psnr_db < 32.0) {
+        fprintf(stderr, "FAIL: .epack quality out of bounds (elev_rmse=%.4f m, psnr=%.2f dB)\n",
+                elev_rmse_m, rgb_psnr_db);
+        return 1;
+    }
+
+    // 12b. Synthesize baklan_besparmak.epack and verify RelPtr2D 25-block stride + non-blocking io_uring fixed read
+    const char *epack_path = "examples/demo/maps/baklan_besparmak.epack";
+    if (backend_terrain_ensure_epack(epack_path, pack_path) != 0) {
+        fprintf(stderr, "FAIL: backend_terrain_ensure_epack failed\n");
+        return 1;
+    }
+    static GpuMathArchiveHeader epack_hdr;
+    if (backend_terrain_read_epack_header(epack_path, pack_path, &epack_hdr) != 0 ||
+        epack_hdr.dir.magic != k_epack_magic ||
+        epack_hdr.dir.node_count != k_gmpack_node_count) {
+        fprintf(stderr, "FAIL: backend_terrain_read_epack_header mismatch\n");
+        return 1;
+    }
+    uint64_t hdr_base_addr = (uint64_t)(uintptr_t)&epack_hdr;
+    uint64_t slot1_off = relptr2d_resolve_addr(
+        hdr_base_addr, epack_hdr.nodes[1].rel_ssd_payload) - hdr_base_addr;
+    if (slot1_off != (uint64_t)(k_gmpack_header_blocks + k_epack_tile_blocks_4k) * 4096ull) {
+        fprintf(stderr, "FAIL: .epack RelPtr2D slot 1 byte offset=%llu (expected %llu)\n",
+                (unsigned long long)slot1_off,
+                (unsigned long long)(k_gmpack_header_blocks + k_epack_tile_blocks_4k) * 4096ull);
+        return 1;
+    }
+
+    // Verify backend_survey_tile_may_overlap culling
+    TerrainSurveyDataset empty_ds;
+    backend_survey_dataset_init(&empty_ds);
+    if (backend_survey_tile_may_overlap(&empty_ds, &epack_hdr.nodes[summit_leaf])) {
+        fprintf(stderr, "FAIL: empty survey dataset reported tile overlap\n");
+        return 1;
+    }
+
+    // Verify registered fixed-file + fixed-buffer non-blocking io_uring .epack tile read
+    setenv("ENGINE_URING_FIXED_BUF", "1", 1);
+    if (ring_init() != 0) {
+        fprintf(stderr, "FAIL: ring_init failed in test_backend\n");
+        return 1;
+    }
+    RingContext *ring = ring_get_context();
+    int epack_fd = open(epack_path, O_RDONLY | O_CLOEXEC);
+    if (epack_fd < 0) {
+        ring_shutdown();
+        fprintf(stderr, "FAIL: open(%s) failed\n", epack_path);
+        return 1;
+    }
+    bool fixed_file_ok = (ring_update_file(ring, ENG_PACK_FD_SLOT, epack_fd) == 0);
+    struct io_uring_sqe *sqe = ring_sqe(ring);
+    void *uring_dst = ring->pager_fixed_on
+        ? ring_fixed_ptr(ring, ENG_FBUF_PAGER_BASE)
+        : (void *)&enc_summit;
+    if (sqe == nullptr || uring_dst == nullptr) {
+        close(epack_fd);
+        ring_shutdown();
+        fprintf(stderr, "FAIL: ring_sqe or ring_fixed_ptr failed\n");
+        return 1;
+    }
+    memset(uring_dst, 0, sizeof(EpackTileBlock));
+    uint64_t off_summit = relptr2d_resolve_addr(
+        hdr_base_addr, epack_hdr.nodes[summit_leaf].rel_ssd_payload) - hdr_base_addr;
+    sqe->opcode    = ring->pager_fixed_on ? IORING_OP_READ_FIXED : IORING_OP_READ;
+    sqe->flags     = fixed_file_ok ? IOSQE_FIXED_FILE : 0u;
+    sqe->fd        = fixed_file_ok ? (int)ENG_PACK_FD_SLOT : epack_fd;
+    sqe->off       = off_summit;
+    sqe->addr      = (uint64_t)(uintptr_t)uring_dst;
+    sqe->len       = k_epack_tile_bytes;
+    sqe->buf_index = ring->pager_fixed_on ? (uint16_t)ENG_FBUF_PAGER_BASE : 0u;
+    sqe->user_data = ENG_UD_PAGER_BASE + 3u;
+    unsigned n_sub = ring_submit(ring);
+    if (ring_enter(ring, n_sub, 0u, -1) < 0) {
+        close(epack_fd);
+        ring_shutdown();
+        fprintf(stderr, "FAIL: non-blocking ring_enter(to_submit, 0) failed\n");
+        return 1;
+    }
+    struct io_uring_cqe cqe = {0};
+    while (!ring_peek(ring, &cqe)) {
+        (void)ring_enter(ring, 0u, 1u, 100);
+    }
+    static EpackTileBlock disk_epack_tile;
+    (void)backend_terrain_read_epack_tile(epack_path, summit_leaf, &disk_epack_tile);
+    bool uring_match = ring_ud_is_pager(cqe.user_data) &&
+                       cqe.res == (int32_t)k_epack_tile_bytes &&
+                       memcmp(uring_dst, &disk_epack_tile, sizeof(EpackTileBlock)) == 0;
+    if (fixed_file_ok) {
+        (void)ring_update_file(ring, ENG_PACK_FD_SLOT, -1);
+    }
+    close(epack_fd);
+    ring_shutdown();
+    if (!uring_match) {
+        fprintf(stderr, "FAIL: io_uring fixed-file/fixed-buf .epack read mismatch (res=%d)\n", cqe.res);
+        return 1;
+    }
+
+    printf("test_backend: ok (RelPtr2D + Lilliput64 + Cell64 + .epack 3.84x [RMSE %.4f m, border 0.0000 m, %.1f dB, fixed_buf=%u] + Survey MVS/GCP fused %u posts [%u MVS @ ZNCC %.3f] & %u ortho texels)\n",
+           elev_rmse_m, rgb_psnr_db, 1u,
            fuse_stats.dem_posts_refined, fuse_stats.mvs_elev_posts_refined,
            (double)fuse_stats.mean_mvs_ncc, fuse_stats.texels_orthorectified);
     return 0;

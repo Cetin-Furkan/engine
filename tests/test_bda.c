@@ -404,6 +404,44 @@ static void test_bda_stats(void) {
     s_bda_sys = (BdaSystem){0};
 }
 
+static void test_bda_unified_uma_zero_staging(void) {
+    VkBufferUsageFlags slab = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+                              VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                              VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                              VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                              VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+                              VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
+    s_bda_sys = (BdaSystem){0};
+    s_bda_sys.is_initialized = true;
+    s_bda_sys.unified_uma = true;
+    s_bda_sys.device_pool.usage = slab;
+    s_bda_sys.device_pool.is_host_mapped = true;
+    add_mock_block(&s_bda_sys.device_pool, 64 * 1024);
+
+    VulkanContext vk = {0};
+    vk.device = (VkDevice)(uintptr_t)0x1;
+    vk.device_info.is_true_uma = true;
+
+    DaBuffer host_buf = {0};
+    CHECK(da_buffer_create(&vk, 512, VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                           true, &host_buf) == 0);
+    CHECK(host_buf.is_suballocated);
+    CHECK(host_buf.map != nullptr);
+
+    BdaStats st = {0};
+    bda_get_stats(&st);
+    CHECK(st.device_allocated == 512);
+    CHECK(st.staging_allocated == 0);
+    CHECK(st.staging_capacity == 0);
+
+    da_buffer_destroy(&vk, &host_buf);
+    bda_get_stats(&st);
+    CHECK(st.device_allocated == 0);
+
+    free_mock_pool(&s_bda_sys.device_pool);
+    s_bda_sys = (BdaSystem){0};
+}
+
 int main(void) {
     test_da_buffer_write_bounds();
     test_bda_alloc_and_free();
@@ -413,6 +451,7 @@ int main(void) {
     test_bda_arena_returns_slice();
     test_bda_usage_and_transient();
     test_bda_stats();
+    test_bda_unified_uma_zero_staging();
     if (s_failures != 0) {
         fprintf(stderr, "%d check(s) failed\n", s_failures);
         return 1;

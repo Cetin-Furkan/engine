@@ -2,6 +2,7 @@
 #define ENGINE_FRAME_INTERNAL_H
 
 #include "engine/app.h"
+#include "frame/frame.h"
 #include "frame/clock.h"
 #include "frame/handle.h"
 #include "chrome/gpu.h"
@@ -19,6 +20,7 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/eventfd.h>
 #include <sys/inotify.h>
@@ -88,6 +90,9 @@ typedef struct FrameSlot {
     VkImage               prime_image;
     VkDeviceMemory        prime_memory;
     VkImageView           prime_view;
+    VkCommandBuffer       transfer_cmd_buf;
+    FrameRect             surface_damage;
+    FrameRect             copy_damage;
 } FrameSlot;
 
 typedef EngineRelay RunRelay;
@@ -145,6 +150,19 @@ typedef struct FrameState {
     bool     inotify_stop;
     bool     inotify_warned;
     bool     world_dirty;
+    bool     bench_uncapped;
+    uint64_t last_gpu_comp_ns;
+    uint64_t last_gpu_rend_ns;
+    uint64_t last_gpu_tot_ns;
+    uint64_t gpu_samples_retired;
+    VkSemaphore prime_ready_sem;
+    VkSemaphore prime_acquire_sync;
+    uint64_t prime_ready_point;
+    uint64_t last_transfer_acquire_point;
+    bool     pending_damage_set;
+    bool     pending_damage_full;
+    FrameRect pending_damage;
+    FrameRect prev_turn_damage;
     // One eventfd for the life of the process. DRM_IOCTL_SYNCOBJ_EVENTFD is
     // issued only while shutting down, for the point still on screen. The turn
     // does not sleep on it. Slots keep release_eventfd at -1 so a reap cannot
@@ -246,7 +264,7 @@ int drm_syncobj_to_fd(int drm_fd, uint32_t handle);
 void drm_syncobj_destroy(int drm_fd, uint32_t *handle);
 int create_acquire_semaphore(VulkanContext *vk, VkSemaphore *out_timeline, VkSemaphore *out_sync);
 int create_acquire_timeline(WaylandContext *wl);
-int publish_acquire_point(VulkanContext *vk, uint64_t point);
+int publish_acquire_point_from(VulkanContext *vk, VkSemaphore sync_sem, uint64_t point);
 int arm_slot_read(RingContext *ring, uint32_t slot, bool fixed, int raw_fd,
                          uint32_t buf_index, uint64_t user_data);
 int prep_cancel_fd(RingContext *ring, int fd, uint32_t slot, bool fixed, uint64_t user_data);
@@ -315,6 +333,21 @@ void frame_cmd_barriers(VkCommandBuffer cmd, const VkImageMemoryBarrier2 *barrie
 // Direct present releases the color attachment. A cross-device present copies
 // the device-local target into the export image, then releases that copy.
 void frame_cmd_finish_present(VkCommandBuffer cmd, const VulkanContext *vk, const FrameSlot *frame);
+int frame_submit_slot_commands(VulkanContext *vk, FrameSlot *frame, VkSemaphore acquire,
+                               uint64_t signal_point, uint64_t wait_point,
+                               VkPipelineStageFlags2 wait_stage);
+
+static inline bool frame_use_async_prime_transfer(const VulkanContext *vk, const FrameSlot *frame) {
+    return vk != nullptr && frame != nullptr &&
+           frame->image.prime_copy &&
+           frame->prime_image != VK_NULL_HANDLE &&
+           vk->queues.has_dedicated_transfer &&
+           vk->queues.transfer_family_index != vk->queues.graphics_family_index &&
+           !vk->queues.submission_aliased &&
+           vk->transfer_cmd_pool != VK_NULL_HANDLE &&
+           frame_state.prime_ready_sem != VK_NULL_HANDLE &&
+           frame_state.prime_acquire_sync != VK_NULL_HANDLE;
+}
 
 uint32_t sim_wall_ms(void);
 void note_sim_idle(void);

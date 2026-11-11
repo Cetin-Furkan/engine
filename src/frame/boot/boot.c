@@ -49,6 +49,14 @@ int frame_boot(void) {
     frame_state.acquire_handle = 0;
     frame_state.acquire = VK_NULL_HANDLE;
     frame_state.acquire_sync = VK_NULL_HANDLE;
+    frame_state.prime_ready_sem = VK_NULL_HANDLE;
+    frame_state.prime_acquire_sync = VK_NULL_HANDLE;
+    frame_state.prime_ready_point = 0;
+    frame_state.last_transfer_acquire_point = 0;
+    frame_state.pending_damage_set = true;
+    frame_state.pending_damage_full = true;
+    frame_state.pending_damage = (FrameRect){0};
+    frame_state.prev_turn_damage = (FrameRect){0};
     blank_frame(shown());
     blank_frame(spare());
     frame_state.spare_live = false;
@@ -154,6 +162,22 @@ int frame_boot(void) {
             open_drm_render_node(vk) == 0 &&
             alloc_content_image(vk, wl, content_w, content_h, &shown()->image, &tranche_kind) == 0 &&
             create_acquire_semaphore(vk, &frame_state.acquire, &frame_state.acquire_sync) == 0) {
+            if (vk->queues.has_dedicated_transfer &&
+                vk->queues.transfer_family_index != vk->queues.graphics_family_index &&
+                !vk->queues.submission_aliased &&
+                vk->transfer_cmd_pool != VK_NULL_HANDLE) {
+                (void)create_acquire_semaphore(vk, &frame_state.prime_ready_sem,
+                                               &frame_state.prime_acquire_sync);
+            }
+            if (wl->feedback_cross_device &&
+                !vk->device_info.profile_locked &&
+                vk->device_info.execution_profile == VULKAN_PROFILE_DISCRETE_DIRECT) {
+                vk->device_info.execution_profile         = VULKAN_PROFILE_HYBRID_MUXLESS;
+                vk->device_info.recommended_terrain_slots = 256u;
+                printf("[Vulkan] Promoted execution profile -> %s (cross-device Wayland scanout)\n",
+                       vulkan_profile_to_str(vk->device_info.execution_profile));
+                fflush(stdout);
+            }
             break;
         }
         // ENOENT is "this GPU was not named by the compositor". An allocation
@@ -166,6 +190,14 @@ int frame_boot(void) {
         if (feedback == 0) {
             fprintf(stderr,
                     "[Vulkan] This GPU cannot export a buffer or timeline the compositor can import.\n");
+        }
+        if (frame_state.prime_acquire_sync != VK_NULL_HANDLE) {
+            vkDestroySemaphore(vk->device, frame_state.prime_acquire_sync, nullptr);
+            frame_state.prime_acquire_sync = VK_NULL_HANDLE;
+        }
+        if (frame_state.prime_ready_sem != VK_NULL_HANDLE) {
+            vkDestroySemaphore(vk->device, frame_state.prime_ready_sem, nullptr);
+            frame_state.prime_ready_sem = VK_NULL_HANDLE;
         }
         if (frame_state.acquire_sync != VK_NULL_HANDLE) {
             vkDestroySemaphore(vk->device, frame_state.acquire_sync, nullptr);

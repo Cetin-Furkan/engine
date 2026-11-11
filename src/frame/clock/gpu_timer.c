@@ -31,6 +31,10 @@ static uint32_t ticks_to_us(uint64_t later, uint64_t earlier) {
 void gpu_timer_init(VulkanContext *vk) {
     frame_state.ts_pool      = VK_NULL_HANDLE;
     frame_state.ts_period_ns = 0.0f;
+    frame_state.last_gpu_comp_ns    = 0u;
+    frame_state.last_gpu_rend_ns    = 0u;
+    frame_state.last_gpu_tot_ns     = 0u;
+    frame_state.gpu_samples_retired = 0u;
     frame_state.slot[0].ts_armed = false;
     frame_state.slot[1].ts_armed = false;
     frame_state.slot[0].ts_base  = 0;
@@ -63,6 +67,10 @@ void gpu_timer_shutdown(VulkanContext *vk) {
     }
     frame_state.ts_pool      = VK_NULL_HANDLE;
     frame_state.ts_period_ns = 0.0f;
+    frame_state.last_gpu_comp_ns    = 0u;
+    frame_state.last_gpu_rend_ns    = 0u;
+    frame_state.last_gpu_tot_ns     = 0u;
+    frame_state.gpu_samples_retired = 0u;
     frame_state.slot[0].ts_armed = false;
     frame_state.slot[1].ts_armed = false;
 }
@@ -130,6 +138,11 @@ void gpu_timer_harvest(VulkanContext *vk, FrameSlot *frame) {
     if (res != VK_SUCCESS) {
         return;
     }
+    double period = (double)frame_state.ts_period_ns;
+    frame_state.last_gpu_comp_ns = ticks[1] > ticks[0] ? (uint64_t)((double)(ticks[1] - ticks[0]) * period) : 0u;
+    frame_state.last_gpu_rend_ns = ticks[3] > ticks[2] ? (uint64_t)((double)(ticks[3] - ticks[2]) * period) : 0u;
+    frame_state.last_gpu_tot_ns  = ticks[3] > ticks[0] ? (uint64_t)((double)(ticks[3] - ticks[0]) * period) : 0u;
+    frame_state.gpu_samples_retired++;
     frame_clock_note_gpu(&frame_state.clock,
                          ticks_to_us(ticks[1], ticks[0]),
                          ticks_to_us(ticks[3], ticks[2]),

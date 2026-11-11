@@ -23,7 +23,7 @@ void commit_turn_swap(WaylandContext *wl) {
 }
 
 static int queue_frame_only(WaylandContext *wl, bool *queued) {
-    int q = wayland_queue_turn_commit(wl, 0, 0, 0, 0, 0, 0, 0, true, false, 0);
+    int q = wayland_queue_turn_commit(wl, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, true, false, 0);
     if (q == 0) {
         *queued = true;
     }
@@ -63,7 +63,7 @@ bool turn_wants_step(const WaylandContext *wl) {
 
 int frame_watchdog(WaylandContext *wl, VulkanContext *vk, bool *queued) {
     *queued = false;
-    if (wl == nullptr || vk == nullptr || frame_state.turn_phase != k_turn_run) {
+    if (frame_state.bench_uncapped || wl == nullptr || vk == nullptr || frame_state.turn_phase != k_turn_run) {
         return 0;
     }
 
@@ -134,12 +134,16 @@ static int present_spare(WaylandContext *wl, VulkanContext *vk, bool *queued) {
         return -1;
     }
     engine_app()->simulation_commit(sim_stamp, heat_dt);
-    bool again = present_chain_wanted();
+    bool again = !frame_state.bench_uncapped && present_chain_wanted();
     int q = wayland_queue_turn_commit(
         wl,
         spare()->wl_buffer_id,
         spare()->image.width,
         spare()->image.height,
+        spare()->surface_damage.x,
+        spare()->surface_damage.y,
+        spare()->surface_damage.width,
+        spare()->surface_damage.height,
         wl->acquire_timeline_id,
         next,
         spare()->release_timeline_id,
@@ -188,7 +192,7 @@ int turn_step(WaylandContext *wl, VulkanContext *vk, bool *queued) {
         wl->frame_stamp_valid = false;
         if (!frame_state.scene_dirty) {
             note_sim_idle();
-            if (present_chain_wanted() && wl->frame_cb_id == 0) {
+            if (!frame_state.bench_uncapped && present_chain_wanted() && wl->frame_cb_id == 0) {
                 return queue_frame_only(wl, queued);
             }
             return 0;

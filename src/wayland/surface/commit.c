@@ -231,6 +231,10 @@ int wayland_queue_turn_commit(
     uint32_t        buffer_id,
     uint32_t        width,
     uint32_t        height,
+    int32_t         dmg_x,
+    int32_t         dmg_y,
+    uint32_t        dmg_w,
+    uint32_t        dmg_h,
     uint32_t        acquire_timeline,
     uint64_t        acquire_point,
     uint32_t        release_timeline,
@@ -310,7 +314,13 @@ int wayland_queue_turn_commit(
         wl_put_timeline_point(release_payload, release_timeline, release_point);
         uint32_t attach_payload[3] = { buffer_id, 0u, 0u };
         uint16_t damage_opcode = (w->compositor_bound_version >= 4u) ? 9u : 2u;
-        int32_t damage_payload[4] = { 0, 0, (int32_t)width, (int32_t)height };
+        bool sub_dmg = (dmg_w > 0u && dmg_h > 0u);
+        int32_t damage_payload[4] = {
+            sub_dmg ? dmg_x : 0,
+            sub_dmg ? dmg_y : 0,
+            sub_dmg ? (int32_t)dmg_w : (int32_t)width,
+            sub_dmg ? (int32_t)dmg_h : (int32_t)height,
+        };
         ok = wl_opaque_prepare(w, w->surface_id, &w->scene_opaque_id, &w->scene_opaque_w,
                                &w->scene_opaque_h, width, height, &scene_fresh) &&
              wayland_put_raw(w, w->explicit_sync_id, 1u, acquire_payload, sizeof acquire_payload) &&

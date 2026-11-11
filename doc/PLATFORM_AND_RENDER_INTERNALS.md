@@ -1,6 +1,6 @@
 # Platform & Render Internals: How the Low-Level Engine Works
 
-This document walks through the platform half of `engine-v2` (`main.c`, `include/`, and `src/`). Everything described here sits **below** the [`include/engine/app.h`](../include/engine/app.h) seam: it has no knowledge of cubes, terrain tiles, plots, or keybindings. Its job is to talk directly to the Linux 7.1+ kernel, the Wayland compositor socket, and the Vulkan 1.4 driver with zero wrapper libraries in between.
+This document walks through the platform half of **Engine** (`main.c`, `include/`, and `src/`). Everything described here sits **below** the [`include/engine/app.h`](../include/engine/app.h) seam: it has no knowledge of cubes, terrain tiles, plots, or keybindings. Its job is to talk directly to the Linux 7.1+ kernel, the Wayland compositor socket, and the Vulkan 1.4 driver with zero wrapper libraries in between.
 
 ---
 
@@ -114,7 +114,7 @@ Even the window titlebar avoids CPU `wl_shm` software rendering:
 
 ## 5. WSI-Free Explicit-Sync Swapchain & Frame Pacing (`src/frame/`)
 
-In standard Vulkan applications, `VK_KHR_swapchain` hides buffer ownership behind `vkAcquireNextImageKHR`, `vkQueuePresentKHR`, and `vkWaitForFences`. In `engine-v2`, [`src/frame/`](../src/frame/) implements its own explicit-sync presentation engine on top of `wp_linux_drm_syncobj_v1`.
+In standard Vulkan applications, `VK_KHR_swapchain` hides buffer ownership behind `vkAcquireNextImageKHR`, `vkQueuePresentKHR`, and `vkWaitForFences`. In **Engine**, [`src/frame/`](../src/frame/) implements its own explicit-sync presentation engine on top of `wp_linux_drm_syncobj_v1`.
 
 ```mermaid
 sequenceDiagram

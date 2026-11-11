@@ -83,6 +83,8 @@ typedef struct GpuCandidate {
 
     uint64_t                         device_local_bytes;
     uint64_t                         dedicated_vram_bytes;
+    bool                             is_true_uma;
+    bool                             has_uma_cached;
 } GpuCandidate;
 
 static void device_extension_list_free(DeviceExtensionList *list) {
@@ -211,6 +213,8 @@ static void measure_memory(GpuCandidate *candidate) {
     const VkPhysicalDeviceMemoryProperties *mem = &candidate->memory_properties;
     uint64_t device_local = 0;
     uint64_t dedicated = 0;
+    uint64_t coherent_local = 0;
+    bool     uma_cached = false;
     for (uint32_t heap = 0; heap < mem->memoryHeapCount; ++heap) {
         if ((mem->memoryHeaps[heap].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) == 0) {
             continue;
@@ -218,14 +222,30 @@ static void measure_memory(GpuCandidate *candidate) {
         device_local += mem->memoryHeaps[heap].size;
 
         bool pure_vram = false;
+        bool heap_coherent = false;
         for (uint32_t type = 0; type < mem->memoryTypeCount; ++type) {
+            if (mem->memoryTypes[type].heapIndex != heap) {
+                continue;
+            }
             VkMemoryPropertyFlags flags = mem->memoryTypes[type].propertyFlags;
-            if (mem->memoryTypes[type].heapIndex == heap &&
-                (flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0 &&
+            if ((flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0 &&
                 (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) == 0) {
                 pure_vram = true;
-                break;
             }
+            if ((flags & (VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                          VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) ==
+                (VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
+                heap_coherent = true;
+                if ((flags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) != 0) {
+                    uma_cached = true;
+                }
+            }
+        }
+        if (heap_coherent) {
+            coherent_local += mem->memoryHeaps[heap].size;
         }
         // Integrated and virtual devices expose system RAM as device-local. Only a
         // discrete GPU's non-host-visible heap is dedicated VRAM.
@@ -234,8 +254,12 @@ static void measure_memory(GpuCandidate *candidate) {
         }
     }
 
-    candidate->device_local_bytes = device_local;
+    candidate->device_local_bytes   = device_local;
     candidate->dedicated_vram_bytes = dedicated;
+    candidate->has_uma_cached       = uma_cached;
+    candidate->is_true_uma          = (dedicated == 0ull) &&
+                                      (coherent_local >= (512ull * 1024ull * 1024ull)) &&
+                                      (candidate->properties.deviceType != VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU);
 }
 
 static VulkanResult discover_queue_families(GpuCandidate *candidate) {
@@ -1027,6 +1051,43 @@ static VulkanResult open_candidate(VulkanContext *ctx, const GpuCandidate *chose
     ctx->device_info.drm_render_major = best.drm_render_major;
     ctx->device_info.drm_render_minor = best.drm_render_minor;
 
+    bool uma_hw = best.is_true_uma ||
+                  best.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
+    VulkanExecutionProfile profile = uma_hw
+        ? VULKAN_PROFILE_UMA_IGPU
+        : VULKAN_PROFILE_DISCRETE_DIRECT;
+    bool profile_locked = false;
+    const char *env_prof = getenv("ENGINE_GPU_PROFILE");
+    if (env_prof != nullptr && env_prof[0] != '\0' && !ascii_contains_ci(env_prof, "auto")) {
+        if (ascii_contains_ci(env_prof, "uma") || ascii_contains_ci(env_prof, "igpu")) {
+            profile = VULKAN_PROFILE_UMA_IGPU;
+            profile_locked = true;
+        } else if (ascii_contains_ci(env_prof, "hybrid") || ascii_contains_ci(env_prof, "prime")) {
+            profile = VULKAN_PROFILE_HYBRID_MUXLESS;
+            profile_locked = true;
+        } else if (ascii_contains_ci(env_prof, "discrete") || ascii_contains_ci(env_prof, "dgpu")) {
+            profile = VULKAN_PROFILE_DISCRETE_DIRECT;
+            profile_locked = true;
+        }
+    }
+    ctx->device_info.execution_profile = profile;
+    ctx->device_info.profile_locked    = profile_locked;
+    ctx->device_info.is_true_uma       = best.is_true_uma && (profile == VULKAN_PROFILE_UMA_IGPU);
+    ctx->device_info.has_uma_cached    = best.has_uma_cached;
+    if (profile == VULKAN_PROFILE_UMA_IGPU) {
+        ctx->device_info.recommended_msaa          = 2u;
+        ctx->device_info.recommended_bda_slab_mib  = 16u;
+        ctx->device_info.recommended_terrain_slots = 96u;
+    } else if (profile == VULKAN_PROFILE_HYBRID_MUXLESS) {
+        ctx->device_info.recommended_msaa          = 4u;
+        ctx->device_info.recommended_bda_slab_mib  = 64u;
+        ctx->device_info.recommended_terrain_slots = 256u;
+    } else {
+        ctx->device_info.recommended_msaa          = 4u;
+        ctx->device_info.recommended_bda_slab_mib  = 64u;
+        ctx->device_info.recommended_terrain_slots = 341u;
+    }
+
     FamilyPlan plans[3] = {0};
     uint32_t plan_count = 0;
     if (!family_plan_note(plans, &plan_count, 3, best.graphics_family, best.graphics_queue_count) ||
@@ -1234,6 +1295,13 @@ void vulkan_device_log(const VulkanContext *ctx) {
            VK_API_VERSION_MAJOR(ctx->device_info.api_version),
            VK_API_VERSION_MINOR(ctx->device_info.api_version),
            VK_API_VERSION_PATCH(ctx->device_info.api_version));
+    printf("[Vulkan] Execution Profile: %s | TrueUMA=%s (LLC-Cached=%s) | Defaults: MSAA=%ux, BDA-Slab=%uMiB, TerrainWindow=%u slots\n",
+           vulkan_profile_to_str(ctx->device_info.execution_profile),
+           ctx->device_info.is_true_uma ? "yes" : "no",
+           ctx->device_info.has_uma_cached ? "yes" : "no",
+           ctx->device_info.recommended_msaa,
+           ctx->device_info.recommended_bda_slab_mib,
+           ctx->device_info.recommended_terrain_slots);
 
     printf("[Vulkan] Queues: Graphics=family %u index %u, Compute=family %u index %u (%s), Transfer=family %u index %u (%s)\n",
            ctx->queues.graphics_family_index,

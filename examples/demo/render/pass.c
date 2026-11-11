@@ -1,6 +1,7 @@
 #include "frame/pass.h"
 #include "vulkan/memory.h"
 #include <stdio.h>
+#include <stdlib.h>
 
 static VkFormat              s_depth_format = VK_FORMAT_UNDEFINED;
 static VkSampleCountFlagBits s_samples = VK_SAMPLE_COUNT_1_BIT;
@@ -27,14 +28,29 @@ static VkSampleCountFlags image_sample_counts(VulkanContext *vk, VkFormat format
     return props.sampleCounts;
 }
 
-static VkSampleCountFlagBits pick_samples(VkSampleCountFlags counts) {
-    if ((counts & VK_SAMPLE_COUNT_8_BIT) != 0) {
+static uint32_t resolve_max_msaa(const VulkanContext *vk) {
+    const char *env = getenv("ENGINE_MSAA");
+    if (env != nullptr && env[0] != '\0') {
+        char *end = nullptr;
+        unsigned long v = strtoul(env, &end, 10);
+        if (end != env && *end == '\0' && (v == 1ul || v == 2ul || v == 4ul || v == 8ul)) {
+            return (uint32_t)v;
+        }
+    }
+    if (vk != nullptr && vk->device_info.recommended_msaa >= 1u) {
+        return vk->device_info.recommended_msaa;
+    }
+    return 4u;
+}
+
+static VkSampleCountFlagBits pick_samples(VkSampleCountFlags counts, uint32_t max_samples) {
+    if (max_samples >= 8u && (counts & VK_SAMPLE_COUNT_8_BIT) != 0) {
         return VK_SAMPLE_COUNT_8_BIT;
     }
-    if ((counts & VK_SAMPLE_COUNT_4_BIT) != 0) {
+    if (max_samples >= 4u && (counts & VK_SAMPLE_COUNT_4_BIT) != 0) {
         return VK_SAMPLE_COUNT_4_BIT;
     }
-    if ((counts & VK_SAMPLE_COUNT_2_BIT) != 0) {
+    if (max_samples >= 2u && (counts & VK_SAMPLE_COUNT_2_BIT) != 0) {
         return VK_SAMPLE_COUNT_2_BIT;
     }
     return VK_SAMPLE_COUNT_1_BIT;
@@ -63,12 +79,13 @@ int pass_init(VulkanContext *vk) {
         vk, VK_FORMAT_B8G8R8A8_SRGB, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
     VkSampleCountFlags depth_counts = image_sample_counts(
         vk, s_depth_format, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT);
-    s_samples = pick_samples(color_counts & depth_counts);
+    s_samples = pick_samples(color_counts & depth_counts, resolve_max_msaa(vk));
     return 0;
 }
 
 enum : uint32_t { k_pool = 16u };
-static const VkDeviceSize k_pool_gran = 16ull * 1024ull * 1024ull;
+static const VkDeviceSize k_pool_gran_discrete = 16ull * 1024ull * 1024ull;
+static const VkDeviceSize k_pool_gran_uma      =  4ull * 1024ull * 1024ull;
 
 typedef struct PoolSlot {
     VkDeviceMemory memory;
@@ -157,7 +174,10 @@ static int pool_acquire(VulkanContext *vk, PoolSlot *pool, const VkMemoryRequire
     if (mem != VULKAN_SUCCESS) {
         return -1;
     }
-    VkDeviceSize cap = (reqs->size + k_pool_gran - 1ull) & ~(k_pool_gran - 1ull);
+    VkDeviceSize gran = (vk->device_info.execution_profile == VULKAN_PROFILE_UMA_IGPU)
+        ? k_pool_gran_uma
+        : k_pool_gran_discrete;
+    VkDeviceSize cap = (reqs->size + gran - 1ull) & ~(gran - 1ull);
     if (cap < reqs->size) {
         cap = reqs->size;
     }
@@ -207,6 +227,25 @@ VkFormat pass_depth_format(void) {
 
 VkSampleCountFlagBits pass_raster_samples(void) {
     return s_samples;
+}
+
+void pass_pool_stats(uint64_t *out_depth_bytes, uint64_t *out_cover_bytes) {
+    uint64_t depth_sum = 0u;
+    uint64_t cover_sum = 0u;
+    for (uint32_t i = 0u; i < k_pool; ++i) {
+        if (s_depth_pool[i].memory != VK_NULL_HANDLE) {
+            depth_sum += (uint64_t)s_depth_pool[i].capacity;
+        }
+        if (s_cover_pool[i].memory != VK_NULL_HANDLE) {
+            cover_sum += (uint64_t)s_cover_pool[i].capacity;
+        }
+    }
+    if (out_depth_bytes != nullptr) {
+        *out_depth_bytes = depth_sum;
+    }
+    if (out_cover_bytes != nullptr) {
+        *out_cover_bytes = cover_sum;
+    }
 }
 
 static void release_depth_memory(PassDepth *depth) {

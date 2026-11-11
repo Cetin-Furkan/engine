@@ -7,19 +7,18 @@
 #include "vulkan/pipe.h"
 
 enum : uint32_t {
-    k_backend_cell_ring_cap       = 16u,
-    k_backend_overlay_max_dim     = 2048u,
-    k_backend_overlay_live_bytes  = k_backend_overlay_max_dim * k_backend_overlay_max_dim * 4u,
-    k_backend_overlay_arena_bytes = 48u * 1024u * 1024u,
-    k_backend_overlay_bda_bytes   = k_backend_overlay_live_bytes + k_backend_overlay_arena_bytes,
+    k_backend_cell_ring_cap           = 16u,
+    k_backend_overlay_max_dim         = 2048u,
+    k_backend_overlay_live_bytes      = k_backend_overlay_max_dim * k_backend_overlay_max_dim * 4u,
+    k_backend_overlay_arena_bytes     = 48u * 1024u * 1024u,
+    k_backend_overlay_arena_uma_bytes = 16u * 1024u * 1024u,
+    k_backend_overlay_bda_bytes       = k_backend_overlay_live_bytes + k_backend_overlay_arena_bytes,
+    k_backend_overlay_bda_uma_bytes   = k_backend_overlay_live_bytes + k_backend_overlay_arena_uma_bytes,
 };
 
-// Total GPU BDA buffer size:
-//   8,192 B (GpuMathArchiveHeader: 256B PULSE dir + 85*64B quadtree nodes + pad)
-// + 32 * 24,576 B (32 resident 4KB-aligned tile slots = 786,432 B)
-// = 794,624 bytes
+// Maximum GPU BDA buffer size (341 x 100 KiB = 33.32 MiB discrete; 96 x 100 KiB = 9.40 MiB UMA):
 enum : uint32_t {
-    k_backend_bda_bytes = k_gmpack_header_bytes + k_gmpack_gpu_slot_cap * k_gmpack_tile_bytes,
+    k_backend_bda_bytes = k_gmpack_header_bytes + k_gmpack_gpu_slot_cap * k_epack_tile_bytes,
 };
 
 typedef struct BackendState {
@@ -28,7 +27,7 @@ typedef struct BackendState {
     DaBuffer               indirect_buf;
     DaBuffer               overlay_buf;
     GpuMathArchiveHeader  *gpu_hdr;
-    GpuMathTileBlock      *gpu_tiles;
+    EpackTileBlock        *gpu_tiles;
     GpuMathIndirectBuffer *indirect_hdr;
     uint32_t              *overlay_gpu_pixels;
     uint32_t              *overlay_cpu_pixels;
@@ -53,24 +52,48 @@ typedef struct BackendState {
     uint64_t               dirty_slots_mask;
     uint32_t               dirty_slot_count;
     uint8_t                slot_dirty[k_gmpack_gpu_slot_cap];
+    uint8_t                slot_inflight[k_gmpack_gpu_slot_cap];
+    uint8_t                node_inflight[k_gmpack_node_count];
     uint32_t               slot_to_node[k_gmpack_gpu_slot_cap];
     uint32_t               slot_lru_clock[k_gmpack_gpu_slot_cap];
+    uint32_t               pending_needed[k_gmpack_gpu_slot_cap];
+    uint32_t               pending_needed_count;
     uint32_t               lru_tick;
     float                  last_focus_x;
     float                  last_focus_y;
     float                  last_zoom;
     bool                   initialized;
     bool                   have_focus;
+    bool                   pack_fixed_registered;
     int                    pack_fd;
+    uint8_t                cell_busy[k_backend_cell_ring_cap];
+    uint8_t                cell_uses_fixed_buf[k_backend_cell_ring_cap];
     uint8_t                node_fuse_state[k_gmpack_node_count];
-    GpuMathTileBlock      *fused_cache[k_gmpack_node_count];
+    EpackTileBlock        *fused_cache[k_gmpack_node_count];
+    GpuMathTileBlock      *fuse_scratch;
+    uint64_t               stream_uring_us_total;
+    uint64_t               stream_boot_uring_us;
+    uint32_t               stream_uring_turns_total;
+    uint32_t               stream_async_cqes;
+    uint32_t               stream_fixed_buf_reads;
+    uint32_t               slot_cap;
+    size_t                 bda_bytes;
+    size_t                 overlay_bda_bytes;
+    bool                   zero_copy_uma;
     char                   pack_path[1024];
+    char                   epack_path[1024];
     char                   survey_manifest_path[1024];
     TerrainSurveyDataset   survey;
     alignas(64) GpuMathStreamCell cells[k_backend_cell_ring_cap];
 } BackendState;
 
 extern BackendState g_backend;
+
+static inline uint32_t backend_slot_cap(void) {
+    return (g_backend.slot_cap >= 16u && g_backend.slot_cap <= k_gmpack_gpu_slot_cap)
+        ? g_backend.slot_cap
+        : k_gmpack_gpu_slot_cap;
+}
 
 // math/gpu/directory.c
 int  backend_gpu_directory_init(VulkanContext *vk);

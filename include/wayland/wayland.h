@@ -274,6 +274,8 @@ typedef struct WaylandContext {
     uint32_t parked_head;
     uint32_t nparked;
     uint32_t recv_cqes;
+    uint16_t noted_pager_mask;
+    int32_t  noted_pager_res[ENG_UD_PAGER_COUNT];
     bool     is_initialized;
 } WaylandContext;
 
@@ -483,6 +485,10 @@ void wayland_arm_bar(WaylandContext *w, uint32_t buffer, uint32_t width, uint32_
     uint32_t        buffer_id,
     uint32_t        width,
     uint32_t        height,
+    int32_t         dmg_x,
+    int32_t         dmg_y,
+    uint32_t        dmg_w,
+    uint32_t        dmg_h,
     uint32_t        acquire_timeline,
     uint64_t        acquire_point,
     uint32_t        release_timeline,

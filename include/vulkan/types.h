@@ -103,6 +103,25 @@ typedef struct VulkanQueueInfo {
 } VulkanQueueInfo;
 
 /**
+ * @brief Hardware-adaptive execution profile selected at boot (auto-probed or
+ * overridden via ENGINE_GPU_PROFILE=auto|uma|discrete|hybrid).
+ */
+typedef enum VulkanExecutionProfile {
+    VULKAN_PROFILE_DISCRETE_DIRECT = 0, // Dedicated PCIe VRAM, direct display scanout
+    VULKAN_PROFILE_UMA_IGPU        = 1, // Unified system + GPU memory (zero-copy LLC/BDA)
+    VULKAN_PROFILE_HYBRID_MUXLESS  = 2, // Discrete render GPU -> PCIe PRIME copy to iGPU scanout
+} VulkanExecutionProfile;
+
+static inline const char *vulkan_profile_to_str(VulkanExecutionProfile profile) {
+    switch (profile) {
+    case VULKAN_PROFILE_UMA_IGPU:        return "UMA_IGPU (Zero-Copy Shared LLC/BDA)";
+    case VULKAN_PROFILE_HYBRID_MUXLESS:  return "HYBRID_MUXLESS (Discrete Render + Cross-GPU PRIME)";
+    case VULKAN_PROFILE_DISCRETE_DIRECT:
+    default:                             return "DISCRETE_DIRECT (Dedicated PCIe VRAM)";
+    }
+}
+
+/**
  * @brief Hardware identity and verified capability flags for the selected physical device.
  */
 typedef struct VulkanDeviceInfo {
@@ -113,6 +132,15 @@ typedef struct VulkanDeviceInfo {
     uint32_t                         driver_version;
     uint32_t                         api_version;
     VkPhysicalDeviceMemoryProperties memory_properties;
+
+    // Hardware-adaptive execution profile and tuned resource budgets (v0.2 Milestone 1).
+    VulkanExecutionProfile           execution_profile;
+    bool                             profile_locked;
+    bool                             is_true_uma;
+    bool                             has_uma_cached;
+    uint32_t                         recommended_msaa;
+    uint32_t                         recommended_bda_slab_mib;
+    uint32_t                         recommended_terrain_slots;
 
     // Features and extensions enabled on the logical device. A true flag was
     // reported by the physical device and turned on at vkCreateDevice.

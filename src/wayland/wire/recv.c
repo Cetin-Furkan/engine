@@ -282,6 +282,12 @@ void wayland_on_cqe(WaylandContext *w, const struct io_uring_cqe *cqe) {
         w->noted_inotify_res = cqe->res;
         return;
     }
+    if (ring_ud_is_pager(cqe->user_data)) {
+        uint32_t idx = (uint32_t)(cqe->user_data - ENG_UD_PAGER_BASE);
+        w->noted_pager_mask |= (uint16_t)(1u << idx);
+        w->noted_pager_res[idx] = cqe->res;
+        return;
+    }
     if (cqe->user_data == ENG_UD_SIM_TIMER) {
         // Recycle the provided buffer here. A blocking wait can see several
         // ticks before the idle loop applies the note, and each tick owns a

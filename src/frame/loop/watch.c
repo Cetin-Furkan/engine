@@ -208,6 +208,10 @@ void engine_reload_cqe(const struct io_uring_cqe *cqe, void *user) {
     }
     if (wl != nullptr) {
         wayland_on_cqe(wl, cqe);
+    } else if (ring_ud_is_pager(cqe->user_data) && engine_app()->on_cqe != nullptr) {
+        if (engine_app()->on_cqe(cqe)) {
+            frame_note_picture();
+        }
     }
 }
 

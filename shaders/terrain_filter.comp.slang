@@ -16,12 +16,14 @@ struct FilterPush {
 
 [[vk::push_constant]] FilterPush pc;
 
+groupshared uint s_ao[8][8];
+
 [shader("compute")]
 [numthreads(8, 8, 1)]
-void main(uint3 tid : SV_DispatchThreadID) {
-    uint sx = tid.x;
-    uint sy = tid.y;
-    if (sx >= k_tile_dim || sy >= k_tile_dim || pc.dir_bda == 0ull || pc.rel_tile_ptr == 0ull) {
+void main(uint3 tid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID) {
+    uint ax = tid.x;
+    uint ay = tid.y;
+    if (ax >= k_ao_dim || ay >= k_ao_dim || pc.dir_bda == 0ull || pc.rel_tile_ptr == 0ull) {
         return;
     }
 
@@ -29,6 +31,10 @@ void main(uint3 tid : SV_DispatchThreadID) {
     if (tile_bda == 0ull) {
         return;
     }
+
+    // Map 128x128 AO grid coordinates onto the 256x256 .epack elevation posts (0 -> 0, 127 -> 255)
+    uint sx = min(uint(float(ax) * (255.0 / 127.0) + 0.5), k_tile_dim - 1u);
+    uint sy = min(uint(float(ay) * (255.0 / 127.0) + 0.5), k_tile_dim - 1u);
 
     uint xm = sx > 0u ? sx - 1u : 0u;
     uint xp = sx + 1u < k_tile_dim ? sx + 1u : k_tile_dim - 1u;
@@ -68,10 +74,17 @@ void main(uint3 tid : SV_DispatchThreadID) {
     float laplacian = (h01 + h21 + h10 + h12 - 4.0 * hc) / step_m;
     float ao = saturate(0.84 - 0.14 * grad - 0.22 * canyon_depth - 0.08 * clamp(-laplacian, -1.2, 1.2));
 
-    uint64_t img_bda = tile_bda + uint64_t(k_tile_height_bytes);
-    uint *texels = (uint *)img_bda;
-    uint idx = sy * k_tile_dim + sx;
-    uint raw = texels[idx] & 0x00FFFFFFu;
-    uint ao_byte = uint(clamp(ao * 255.0 + 0.5, 32.0, 255.0));
-    texels[idx] = raw | (ao_byte << 24u);
+    s_ao[gtid.y][gtid.x] = uint(clamp(ao * 255.0 + 0.5, 32.0, 255.0));
+    GroupMemoryBarrierWithGroupSync();
+
+    // Coalesce 4 adjacent uint8_t AO values into a single aligned 32-bit BDA store (zero atomics)
+    if ((gtid.x & 3u) == 0u) {
+        uint packed = s_ao[gtid.y][gtid.x + 0u]
+                    | (s_ao[gtid.y][gtid.x + 1u] << 8u)
+                    | (s_ao[gtid.y][gtid.x + 2u] << 16u)
+                    | (s_ao[gtid.y][gtid.x + 3u] << 24u);
+        uint *words = (uint *)tile_bda;
+        uint linear_idx = ay * k_ao_dim + ax;
+        words[k_ao_word_offset + (linear_idx >> 2u)] = packed;
+    }
 }

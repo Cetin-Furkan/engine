@@ -113,6 +113,14 @@ int frame_stop(void) {
         gpu_timer_shutdown(vk);
         input_gpu_shutdown(vk);
         bool destroy_shown = !release_held && !acquire_held;
+        if (!acquire_held && frame_state.prime_acquire_sync != VK_NULL_HANDLE) {
+            vkDestroySemaphore(vk->device, frame_state.prime_acquire_sync, nullptr);
+            frame_state.prime_acquire_sync = VK_NULL_HANDLE;
+        }
+        if (!acquire_held && frame_state.prime_ready_sem != VK_NULL_HANDLE) {
+            vkDestroySemaphore(vk->device, frame_state.prime_ready_sem, nullptr);
+            frame_state.prime_ready_sem = VK_NULL_HANDLE;
+        }
         if (!acquire_held && frame_state.acquire_sync != VK_NULL_HANDLE) {
             vkDestroySemaphore(vk->device, frame_state.acquire_sync, nullptr);
             frame_state.acquire_sync = VK_NULL_HANDLE;
@@ -128,6 +136,10 @@ int frame_stop(void) {
             if (shown()->cmd_buf != VK_NULL_HANDLE && vk->cmd_pool != VK_NULL_HANDLE) {
                 vkFreeCommandBuffers(vk->device, vk->cmd_pool, 1, &shown()->cmd_buf);
                 shown()->cmd_buf = VK_NULL_HANDLE;
+            }
+            if (shown()->transfer_cmd_buf != VK_NULL_HANDLE && vk->transfer_cmd_pool != VK_NULL_HANDLE) {
+                vkFreeCommandBuffers(vk->device, vk->transfer_cmd_pool, 1, &shown()->transfer_cmd_buf);
+                shown()->transfer_cmd_buf = VK_NULL_HANDLE;
             }
             if (shown()->image_view != VK_NULL_HANDLE) {
                 vkDestroyImageView(vk->device, shown()->image_view, nullptr);

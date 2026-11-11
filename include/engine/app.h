@@ -137,6 +137,9 @@ typedef struct EngineApp {
     bool (*consume_spin)(void);
     void (*commit)(void);
     void (*note_cqe)(void);
+    // Asynchronous io_uring completion hook for hosted-app tags (e.g. non-blocking
+    // terrain tile reads). Returns true when a newly resident resource warrants a picture.
+    bool (*on_cqe)(const struct io_uring_cqe *cqe);
     void (*turn_report)(uint32_t *frames, uint32_t *missed);
 
     // Input, already translated by the engine (window-center pixels,

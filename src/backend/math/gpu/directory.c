@@ -148,7 +148,8 @@ void backend_gpu_record_filter(VkCommandBuffer cmd) {
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g_backend.comp_pipe);
 
-    for (uint32_t slot = 0u; slot < k_gmpack_gpu_slot_cap; ++slot) {
+    const uint32_t slot_cap = backend_slot_cap();
+    for (uint32_t slot = 0u; slot < slot_cap; ++slot) {
         bool is_dirty = (g_backend.slot_dirty[slot] != 0u) ||
                         (slot < 64u && (mask & (1ull << slot)) != 0ull);
         if (!is_dirty) {
@@ -172,7 +173,7 @@ void backend_gpu_record_filter(VkCommandBuffer cmd) {
             .pad1             = 0u,
         };
         vulkan_cmd_push(cmd, g_backend.comp_layout, VK_SHADER_STAGE_COMPUTE_BIT, sizeof push, &push);
-        vkCmdDispatch(cmd, k_gmpack_tile_dim / 8u, k_gmpack_tile_dim / 8u, 1u);
+        vkCmdDispatch(cmd, k_epack_ao_dim / 8u, k_epack_ao_dim / 8u, 1u);
     }
 
     VkMemoryBarrier2 barrier = {

@@ -4,12 +4,70 @@
 // One command buffer: world, clear, HUD, then the acquire signal.
 // The bar is a separate surface and is not recorded here.
 
+static FrameRect clamp_rect_to_extent(FrameRect r, uint32_t w, uint32_t h) {
+    if (r.width == 0u || r.height == 0u) {
+        return (FrameRect){ .x = 0, .y = 0, .width = w, .height = h };
+    }
+    int64_t x0 = r.x < 0 ? 0 : r.x;
+    int64_t y0 = r.y < 0 ? 0 : r.y;
+    int64_t x1 = (int64_t)r.x + (int64_t)r.width;
+    int64_t y1 = (int64_t)r.y + (int64_t)r.height;
+    if (x1 > (int64_t)w) {
+        x1 = (int64_t)w;
+    }
+    if (y1 > (int64_t)h) {
+        y1 = (int64_t)h;
+    }
+    if (x0 >= x1 || y0 >= y1) {
+        return (FrameRect){ .x = 0, .y = 0, .width = w, .height = h };
+    }
+    return (FrameRect){
+        .x      = (int32_t)x0,
+        .y      = (int32_t)y0,
+        .width  = (uint32_t)(x1 - x0),
+        .height = (uint32_t)(y1 - y0),
+    };
+}
+
+static FrameRect union_rects_clamped(FrameRect a, FrameRect b, uint32_t w, uint32_t h) {
+    FrameRect ca = clamp_rect_to_extent(a, w, h);
+    FrameRect cb = clamp_rect_to_extent(b, w, h);
+    int64_t x0 = ca.x < cb.x ? ca.x : cb.x;
+    int64_t y0 = ca.y < cb.y ? ca.y : cb.y;
+    int64_t ax1 = (int64_t)ca.x + (int64_t)ca.width;
+    int64_t bx1 = (int64_t)cb.x + (int64_t)cb.width;
+    int64_t ay1 = (int64_t)ca.y + (int64_t)ca.height;
+    int64_t by1 = (int64_t)cb.y + (int64_t)cb.height;
+    int64_t x1 = ax1 > bx1 ? ax1 : bx1;
+    int64_t y1 = ay1 > by1 ? ay1 : by1;
+    return (FrameRect){
+        .x      = (int32_t)x0,
+        .y      = (int32_t)y0,
+        .width  = (uint32_t)(x1 - x0),
+        .height = (uint32_t)(y1 - y0),
+    };
+}
+
 // heat_dt is the simulation interval accumulated since the last present.
 // Zero draws the field as it stands.
 int record_and_submit_clear(VulkanContext *vk, FrameSlot *frame, VkSemaphore acquire,
                                    uint64_t signal_point, bool draw_live, uint32_t heat_dt) {
     if (ensure_frame_targets(vk, frame) != 0) {
         return -1;
+    }
+    FrameRect full_rect = { .x = 0, .y = 0, .width = frame->image.width, .height = frame->image.height };
+    FrameRect surf_dmg = full_rect;
+    if (draw_live && frame_state.pending_damage_set && !frame_state.pending_damage_full) {
+        surf_dmg = clamp_rect_to_extent(frame_state.pending_damage,
+                                        frame->image.width, frame->image.height);
+    }
+    frame->surface_damage = surf_dmg;
+    if (!draw_live || !frame->foreign_owned ||
+        frame_state.prev_turn_damage.width == 0u || frame_state.prev_turn_damage.height == 0u) {
+        frame->copy_damage = full_rect;
+    } else {
+        frame->copy_damage = union_rects_clamped(surf_dmg, frame_state.prev_turn_damage,
+                                                 frame->image.width, frame->image.height);
     }
     const bool srgb_view = frame->view_format == VK_FORMAT_B8G8R8A8_SRGB;
     VkResult res = VK_SUCCESS;
@@ -184,72 +242,34 @@ int record_and_submit_clear(VulkanContext *vk, FrameSlot *frame, VkSemaphore acq
         return -1;
     }
 
-    VkCommandBufferSubmitInfo cmd_submit = {
-        .sType         = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
-        .pNext         = nullptr,
-        .commandBuffer = frame->cmd_buf,
-        .deviceMask    = 0,
-    };
     // The field the shaders read was written by an earlier submit. That
     // submit signaled this acquire value at ALL_COMMANDS. Waiting it here
     // is what makes the write visible. The signal stage is the whole
     // command buffer, so a step waits at compute and a later draw waits
     // at vertex. The bake's seed stays at 0 because that queue was idled.
     uint64_t heat_point = engine_app()->record_published();
-    bool wait_heat = heat_point != 0 && heat_point < signal_point;
-    VkSemaphoreSubmitInfo wait_info = {
-        .sType       = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
-        .pNext       = nullptr,
-        .semaphore   = acquire,
-        .value       = heat_point,
-        .stageMask   = engine_app()->record_step_open() ? VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT
-                                                : VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT,
-        .deviceIndex = 0,
-    };
-    VkSemaphoreSubmitInfo signal_infos[2] = {
-        {
-            .sType       = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
-            .pNext       = nullptr,
-            .semaphore   = acquire,
-            .value       = signal_point,
-            .stageMask   = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
-            .deviceIndex = 0,
-        },
-        {
-            .sType       = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
-            .pNext       = nullptr,
-            .semaphore   = frame_state.acquire_sync,
-            .value       = 0,
-            .stageMask   = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
-            .deviceIndex = 0,
-        },
-    };
-    VkSubmitInfo2 submit_info = {
-        .sType                    = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
-        .pNext                    = nullptr,
-        .flags                    = 0,
-        .waitSemaphoreInfoCount   = wait_heat ? 1u : 0u,
-        .pWaitSemaphoreInfos      = wait_heat ? &wait_info : nullptr,
-        .commandBufferInfoCount   = 1,
-        .pCommandBufferInfos      = &cmd_submit,
-        .signalSemaphoreInfoCount = 2,
-        .pSignalSemaphoreInfos    = signal_infos,
-    };
-
-    res = vkQueueSubmit2(vk->queues.graphics_queue, 1, &submit_info, VK_NULL_HANDLE);
-    if (res != VK_SUCCESS) {
+    VkPipelineStageFlags2 wait_stage = engine_app()->record_step_open()
+        ? VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT
+        : VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT;
+    bool async_prime = frame_use_async_prime_transfer(vk, frame);
+    if (frame_submit_slot_commands(vk, frame, acquire, signal_point, heat_point, wait_stage) != 0) {
         frame->ts_armed = false;
+        frame_state.pending_damage_full = true;
+        frame_state.pending_damage_set  = true;
         engine_app()->release_frame(signal_point);
         engine_app()->record_abort();
-        fprintf(stderr, "[Engine Error] vkQueueSubmit2 failed: %s (%d)\n",
-                vulkan_vkresult_to_str(res), (int)res);
         return -1;
     }
     frame->acquire_point = signal_point;
     frame_state.sync_point = signal_point;
     frame->foreign_owned = true;
+    frame_state.prev_turn_damage    = draw_live ? frame->surface_damage : full_rect;
+    frame_state.pending_damage_set  = false;
+    frame_state.pending_damage_full = false;
+    frame_state.pending_damage      = (FrameRect){0};
     engine_app()->record_ok(signal_point);
-    if (publish_acquire_point(vk, signal_point) < 0) {
+    VkSemaphore sync_sem = async_prime ? frame_state.prime_acquire_sync : frame_state.acquire_sync;
+    if (publish_acquire_point_from(vk, sync_sem, signal_point) < 0) {
         (void)wait_acquire_point(vk, signal_point);
         return -1;
     }

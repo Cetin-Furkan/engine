@@ -45,6 +45,7 @@ enum : uint32_t {
     ENG_SCRATCH_FD_SLOT  = 3,
     ENG_INOTIFY_FD_SLOT  = 4,
     ENG_SIM_FD_SLOT      = 5,
+    ENG_PACK_FD_SLOT     = 6,
 };
 
 // Slices of one arena slab, registered together for IORING_OP_READ_FIXED.
@@ -52,10 +53,14 @@ enum : uint32_t {
     ENG_FBUF_INOTIFY     = 0,
     ENG_FBUF_SIGNAL      = 1,
     ENG_FBUF_RELEASE     = 2,
-    ENG_FBUF_COUNT       = 3,
+    ENG_FBUF_CORE_COUNT  = 3,
+    ENG_FBUF_PAGER_BASE  = 3,
+    ENG_FBUF_PAGER_COUNT = 16,
+    ENG_FBUF_COUNT       = ENG_FBUF_CORE_COUNT + ENG_FBUF_PAGER_COUNT,
     ENG_FBUF_INOTIFY_LEN = 4096,
     ENG_FBUF_SIGNAL_LEN  = 128,
     ENG_FBUF_RELEASE_LEN = 8,
+    ENG_FBUF_PAGER_LEN   = 102400, // 100 KiB = 25 x 4 KiB (.epack v1 tile block)
 };
 
 enum : uint64_t {
@@ -76,7 +81,13 @@ enum : uint64_t {
     ENG_UD_FILE_CANCEL = 15,
     ENG_UD_FRAME_TIMER = 16,
     ENG_UD_SIM_TIMER   = 17,
+    ENG_UD_PAGER_BASE  = 0x504147450000ULL,
+    ENG_UD_PAGER_COUNT = 16ULL,
 };
+
+static inline bool ring_ud_is_pager(uint64_t ud) {
+    return ud >= ENG_UD_PAGER_BASE && ud < (ENG_UD_PAGER_BASE + ENG_UD_PAGER_COUNT);
+}
 
 typedef struct RingContext {
     int                       fd;
@@ -130,7 +141,9 @@ typedef struct RingContext {
     uint8_t                  *fixed_base;
     uint32_t                  fixed_at[ENG_FBUF_COUNT];
     uint32_t                  fixed_len[ENG_FBUF_COUNT];
+    uint32_t                  fixed_count;
     bool                      fixed_on;
+    bool                      pager_fixed_on;
 
     bool                      ring_registered;
     int                       enter_fd;

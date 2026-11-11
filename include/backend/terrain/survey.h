@@ -238,6 +238,8 @@ int  backend_survey_add_tiepoint(TerrainSurveyDataset        *ds,
                                  const TerrainStereoTiePoint *tp);
 int  backend_survey_solve_tiepoints(TerrainSurveyDataset       *ds,
                                     const GpuMathPageDirectory *dir);
+bool backend_survey_tile_may_overlap(const TerrainSurveyDataset *ds,
+                                     const GpuMathQuadNode      *node);
 bool backend_survey_fuse_tile(TerrainSurveyDataset *ds,
                               GpuMathArchiveHeader *hdr,
                               uint32_t              node_index,

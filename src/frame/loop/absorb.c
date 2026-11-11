@@ -75,4 +75,21 @@ void absorb_side_cqes(RingContext *ring, WaylandContext *wl, VulkanContext *vk,
         wl->noted_sim_exp = 0;
         frame_apply_noted_sim(ring, expirations, res, alive, rearm_sim);
     }
+    if (wl->noted_pager_mask != 0u) {
+        uint16_t pmask = wl->noted_pager_mask;
+        wl->noted_pager_mask = 0u;
+        while (pmask != 0u) {
+            uint32_t idx = (uint32_t)__builtin_ctz((unsigned)pmask);
+            pmask &= (uint16_t)(pmask - 1u);
+            struct io_uring_cqe synth = {
+                .user_data = ENG_UD_PAGER_BASE + (uint64_t)idx,
+                .res       = wl->noted_pager_res[idx],
+                .flags     = 0u,
+            };
+            wl->noted_pager_res[idx] = 0;
+            if (engine_app()->on_cqe != nullptr && engine_app()->on_cqe(&synth)) {
+                frame_note_picture();
+            }
+        }
+    }
 }

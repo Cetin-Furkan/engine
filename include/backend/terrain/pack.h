@@ -38,6 +38,20 @@ enum : uint32_t {
     k_gmpack_total_bytes    = 24576u + 341u * 393216u, // 134,111,232 B (127.90 MiB)
     k_gmpack_gpu_slot_cap   = 341u,        // Direct 1:1 resident GPU BDA slot per quadtree node (zero eviction)
     k_gmpack_active_cut_cap = 64u,         // Max leaf tiles in the active zoom LOD cut
+
+    // v0.2 Milestone 2: .epack v1 GPU-Decoded Compressed Terrain Archive (3.84x smaller)
+    k_epack_magic           = 0x314B5045u, // "EPK1"
+    k_epack_version         = 1u,
+    k_epack_patch_grid      = 32u,         // 32x32 planar-residual patches of 8x8 posts
+    k_epack_patch_count     = 32u * 32u,   // 1,024 patches (48 B each = 49,152 B)
+    k_epack_color_grid      = 64u,         // 64x64 chroma-preserving BC1 blocks of 4x4 texels
+    k_epack_color_count     = 64u * 64u,   // 4,096 blocks (8 B each = 32,768 B)
+    k_epack_ao_dim          = 128u,        // 128x128 8-bit horizon AO grid (16,384 B)
+    k_epack_ao_samples      = 128u * 128u,
+    k_epack_tile_blocks_4k  = 25u,         // 25 x 4 KiB blocks = 102,400 B (100 KiB)
+    k_epack_tile_bytes      = 102400u,     // 3.84x smaller than 393,216 B .gmpack tile
+    k_epack_tile_words      = 25600u,      // 25,600 uint32_t words per tile
+    k_epack_total_bytes     = 24576u + 341u * 102400u, // 34,942,976 B (33.32 MiB)
 };
 
 static constexpr double k_besparmak_lat_min  = 37.857507156252030;
@@ -114,7 +128,45 @@ typedef struct GpuMathTileBlock {
     uint32_t imagery_rgba8[k_gmpack_tile_samples];
 } GpuMathTileBlock;
 
-static_assert(sizeof(GpuMathTileBlock) == k_gmpack_tile_bytes, "GpuMathTileBlock must be 24,576 bytes");
+static_assert(sizeof(GpuMathTileBlock) == k_gmpack_tile_bytes, "GpuMathTileBlock must be 393,216 bytes");
+
+// ============================================================================
+// .epack v1 GPU-Decoded Compressed Tile Block (102,400 Bytes = 25 x 4 KiB)
+// ============================================================================
+// Decoded directly in Slang 2026 shaders via Vulkan 1.4 Buffer Device Address:
+//   [0..49151]     48 KiB: 32x32 8x8 Planar + 5-Bit Residual Elevation Patches
+//   [49152..53247]  4 KiB: Lossless Perimeter Seam Ring (u16 height + RGB565 border)
+//   [53248..86015] 32 KiB: 64x64 4x4 Chroma-Preserving BC1-Style Albedo Blocks
+//   [86016..102399] 16 KiB: 128x128 8-Bit Horizon Ambient Occlusion Grid
+
+typedef struct EpackElevPatch {
+    uint16_t base_u16;     // base_m  = float(base_u16) * 0.125f - 2048.0f
+    int16_t  slope_x_i16;  // sx_m    = float(slope_x_i16) * (1.0f / 256.0f)
+    int16_t  slope_y_i16;  // sy_m    = float(slope_y_i16) * (1.0f / 256.0f)
+    uint16_t step_u16;     // step_m  = float(step_u16) * (1.0f / 1024.0f)
+    uint32_t lo4[8];       // 8 rows of 8 x 4-bit low residual nibbles
+    uint32_t hi1[2];       // 64 x 1-bit high residual MSB (q5 = lo4 | (hi1 << 4))
+} EpackElevPatch;
+
+static_assert(sizeof(EpackElevPatch) == 48u, "EpackElevPatch must be 48 bytes");
+
+typedef struct EpackColorBlock {
+    uint16_t c0_rgb565;    // Endpoint 0 (R5 in [4:0], G6 in [10:5], B5 in [15:11])
+    uint16_t c1_rgb565;    // Endpoint 1
+    uint32_t selectors;    // 16 x 2-bit interpolation weights {0, 1/3, 2/3, 1}
+} EpackColorBlock;
+
+static_assert(sizeof(EpackColorBlock) == 8u, "EpackColorBlock must be 8 bytes");
+
+typedef struct EpackTileBlock {
+    alignas(4096) EpackElevPatch elev_patches[k_epack_patch_count];   // Words 0..12287     (48 KiB)
+    uint16_t                     border_height_u16[4][k_gmpack_tile_dim]; // Words 12288..12799 (2 KiB)
+    uint16_t                     border_rgb565[4][k_gmpack_tile_dim];     // Words 12800..13311 (2 KiB)
+    EpackColorBlock              color_blocks[k_epack_color_count];   // Words 13312..21503 (32 KiB)
+    uint8_t                      ao_grid[k_epack_ao_samples];         // Words 21504..25599 (16 KiB)
+} EpackTileBlock;
+
+static_assert(sizeof(EpackTileBlock) == k_epack_tile_bytes, "EpackTileBlock must be 102,400 bytes");
 
 // 64-Byte Interactive Bird's-Eye Orthophoto Placement Descriptor (at offset 22080 of GpuMathArchiveHeader)
 enum : uint32_t {
@@ -187,5 +239,15 @@ static_assert(sizeof(GpuMathIndirectBuffer) == 1344u, "GpuMathIndirectBuffer mus
 [[nodiscard]] int      backend_terrain_read_header(const char *pack_path, GpuMathArchiveHeader *out_hdr);
 [[nodiscard]] int      backend_terrain_read_tile(const char *pack_path, uint32_t node_index, GpuMathTileBlock *out_tile);
 [[nodiscard]] int      backend_terrain_write_tile(const char *pack_path, uint32_t node_index, const GpuMathTileBlock *in_tile);
+
+// .epack v1 Codec & Archive I/O
+void                   backend_epack_encode_tile(const GpuMathTileBlock *src, EpackTileBlock *dst);
+void                   backend_epack_decode_tile(const EpackTileBlock *src, GpuMathTileBlock *dst);
+[[nodiscard]] float    backend_epack_load_height_m(const EpackTileBlock *tile, uint32_t sx, uint32_t sy);
+[[nodiscard]] uint32_t backend_epack_load_rgba8(const EpackTileBlock *tile, uint32_t sx, uint32_t sy);
+[[nodiscard]] int      backend_terrain_ensure_epack(const char *epack_path, const char *gmpack_path);
+[[nodiscard]] int      backend_terrain_read_epack_header(const char *epack_path, const char *gmpack_path, GpuMathArchiveHeader *out_hdr);
+[[nodiscard]] int      backend_terrain_read_epack_tile(const char *epack_path, uint32_t node_index, EpackTileBlock *out_tile);
+[[nodiscard]] int      backend_terrain_write_epack_tile(const char *epack_path, uint32_t node_index, const EpackTileBlock *in_tile);
 
 #endif /* ENGINE_BACKEND_TERRAIN_PACK_H */

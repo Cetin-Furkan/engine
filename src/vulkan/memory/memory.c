@@ -42,15 +42,24 @@ VulkanResult vulkan_find_memory_type(
             continue;
         }
 
-        // Device-local request: invisible VRAM outranks a host-visible mapping of
-        // the same heap. A host-visible request prefers ReBAR (device-local and
-        // host-visible), then cached system memory, then uncached write-combine.
-        const bool host_visible = (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0;
-        const bool host_cached = (flags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) != 0;
-        const bool device_local = (flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
+        // Device-local request: invisible VRAM outranks a host-visible mapping on
+        // discrete GPUs, while coherent LLC-cached UMA outranks uncached WC on iGPUs.
+        // A host-visible request prefers cached ReBAR/UMA, then ReBAR, then cached RAM.
+        const bool host_visible  = (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0;
+        const bool host_coherent = (flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
+        const bool host_cached   = (flags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) != 0;
+        const bool device_local  = (flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
         int rank = 1;
         if (want_device_local) {
-            rank = !host_visible ? 2 : 1;
+            if (!host_visible) {
+                rank = 4;
+            } else if (host_cached && host_coherent) {
+                rank = 3;
+            } else if (host_cached) {
+                rank = 2;
+            } else {
+                rank = 1;
+            }
         } else if ((required_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0) {
             if (device_local && host_cached) {
                 rank = 4;

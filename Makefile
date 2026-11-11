@@ -268,6 +268,7 @@ test: $(CONFIG_MK)
 	$(CC) $(CFLAGS) -o build/test_bda tests/test_bda.c -lvulkan
 	./build/test_bda
 	$(CC) $(CFLAGS) -o build/test_backend tests/test_backend.c \
+		$(shell find src/ring src/system -name '*.c') \
 		src/backend/math/pointer/relptr2d.c \
 		src/backend/core/cell/dispatch.c \
 		src/backend/terrain/storage/synth_besparmak.c \
@@ -279,4 +280,7 @@ test: $(CONFIG_MK)
 		-lpng16 -lm
 	./build/test_backend
 
-.PHONY: all debug release run run-release release-patch release-minor release-major info help clean clear recheck distclean test
+bench:
+	./scripts/run_benchmark.sh benchmarks/latest
+
+.PHONY: all debug release run run-release release-patch release-minor release-major info help clean clear recheck distclean test bench

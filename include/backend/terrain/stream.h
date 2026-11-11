@@ -70,12 +70,13 @@ uint32_t backend_stream_cull_frustum(const GpuMathArchiveHeader *hdr,
                                      GpuMathIndirectBuffer      *out_indirect);
 
 // Executes pending 64-byte Stateful Function Cells to stream needed quadtree
-// tiles from the SSD .gmpack file into the host-mapped GPU BDA resident pool.
-int backend_stream_page_ssd_tiles(const char           *pack_path,
-                                  GpuMathArchiveHeader *hdr,
-                                  GpuMathTileBlock     *gpu_tile_pool,
-                                  const uint32_t       *needed_nodes,
-                                  uint32_t              needed_count,
-                                  uint64_t             *out_dirty_slots_mask);
+// tiles from the SSD .epack archive into the host-mapped GPU BDA resident pool.
+int  backend_stream_page_ssd_tiles(const char           *epack_path,
+                                   GpuMathArchiveHeader *hdr,
+                                   EpackTileBlock       *gpu_tile_pool,
+                                   const uint32_t       *needed_nodes,
+                                   uint32_t              needed_count,
+                                   uint64_t             *out_dirty_slots_mask);
+void backend_stream_drain_inflight(void);
 
 #endif /* ENGINE_BACKEND_TERRAIN_STREAM_H */

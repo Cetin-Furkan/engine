@@ -293,16 +293,16 @@ static int import_sync_file_into_timeline(int drm_fd, uint32_t handle, uint64_t 
     return rc;
 }
 
-int publish_acquire_point(VulkanContext *vk, uint64_t point) {
+int publish_acquire_point_from(VulkanContext *vk, VkSemaphore sync_sem, uint64_t point) {
     if (vk == nullptr || vk->device == VK_NULL_HANDLE ||
-        frame_state.acquire_sync == VK_NULL_HANDLE ||
+        sync_sem == VK_NULL_HANDLE ||
         frame_state.drm_fd < 0 || frame_state.acquire_handle == 0 || point == 0) {
         return -1;
     }
     VkSemaphoreGetFdInfoKHR info = {
         .sType      = VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR,
         .pNext      = nullptr,
-        .semaphore  = frame_state.acquire_sync,
+        .semaphore  = sync_sem,
         .handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
     };
     int sync_fd = -1;

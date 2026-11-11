@@ -22,6 +22,8 @@ bool plot_reload(RingCqeFn on_cqe, void *on_user);
 
 bool plot_wants_frame(void);
 void plot_commit(void);
+void plot_set_visible(bool visible);
+bool plot_is_visible(void);
 
 // plot_begin claims a retired slice when the math or the file changed.
 // The copy and the dispatch land in that slice. A full ring keeps the

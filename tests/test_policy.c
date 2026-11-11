@@ -305,6 +305,50 @@ static void check_live(void) {
     CHECK(policy_allows(PERM_MODE_SWITCH));
     CHECK(policy_switch());
     CHECK(policy_mode() == MODE_3D);
+
+    // policy_set_mode preserves custom PERM_DRAW, PERM_MODE_SWITCH, and PERM_PLOT_CYCLE
+    policy_apply_world(MODE_3D, PERM_DRAW, PERM_MODE_SWITCH | PERM_PLOT_CYCLE, false);
+    CHECK(policy_set_mode(MODE_2D));
+    CHECK(policy_mode() == MODE_2D);
+    CHECK(policy_active()->lock_2d_quat);
+    CHECK(policy_allows(PERM_DRAW));
+    CHECK(!policy_allows(PERM_MODE_SWITCH));
+    CHECK(!policy_allows(PERM_PLOT_CYCLE));
+    CHECK(policy_can(policy_active(), ACT_CLOSE_FACE));
+    CHECK(policy_lookup(policy_active(), KEY_F, false) == ACT_CLOSE_FACE);
+
+    // Granting PERM_DRAW in 2D mode enables face close & spin/glow binds
+    policy_apply_world(MODE_2D, PERM_NONE, PERM_MODE_SWITCH, false);
+    CHECK(!policy_can(policy_active(), ACT_CLOSE_FACE));
+    CHECK(policy_grant(policy_active(), PERM_DRAW));
+    CHECK(policy_allows(PERM_DRAW));
+    CHECK(policy_can(policy_active(), ACT_CLOSE_FACE));
+    CHECK(policy_can(policy_active(), ACT_TOGGLE_SPIN));
+    CHECK(policy_can(policy_active(), ACT_TOGGLE_GLOW));
+    CHECK(policy_set_mode(MODE_HYBRID));
+    CHECK(policy_mode() == MODE_HYBRID);
+    CHECK(!policy_active()->lock_2d_quat);
+    CHECK(policy_allows(PERM_DRAW));
+    CHECK(!policy_allows(PERM_MODE_SWITCH));
+
+    // World 0: Pure Empty Engine — all permissions revoked and policy sealed
+    policy_apply_world(MODE_3D, PERM_NONE, 0xFFFFu, true);
+    CHECK(policy_mode() == MODE_3D);
+    CHECK(policy_active()->sealed);
+    CHECK(policy_active()->active_perms == PERM_NONE);
+    CHECK(!policy_allows(PERM_CAM_PAN_X));
+    CHECK(!policy_allows(PERM_OBJ_SELECT));
+    CHECK(!policy_allows(PERM_DRAW));
+    CHECK(!policy_switch());
+    CHECK(!policy_set_mode(MODE_2D));
+    CHECK(!policy_grant(policy_active(), PERM_DRAW));
+
+    // policy_boot resets from a sealed World 0 state back to unsealed 3D
+    policy_boot();
+    CHECK(!policy_active()->sealed);
+    CHECK(policy_mode() == MODE_3D);
+    CHECK(policy_allows(PERM_CAM_PAN_X));
+    CHECK(policy_allows(PERM_MODE_SWITCH));
 }
 
 int main(void) {

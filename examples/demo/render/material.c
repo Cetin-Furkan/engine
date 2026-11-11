@@ -23,6 +23,7 @@ static_assert(k_mat_face0 + k_mat_faces <= k_mat_mesh, "face slots");
 static_assert(k_mat_mesh < k_mat_cube_more, "mesh slot");
 static_assert(k_mat_cube_more < k_mat_none, "further cube looks");
 
+static VulkanContext  *s_vk = nullptr;
 static DaBuffer        s_buf;
 static VkDeviceAddress s_addr = 0;
 static MatSlot        *s_map = nullptr;
@@ -33,6 +34,7 @@ static const float k_emit_g = 0.38f;
 static const float k_emit_b = 0.14f;
 
 void material_shutdown(VulkanContext *vk) {
+    s_vk = nullptr;
     s_map = nullptr;
     s_addr = 0;
     da_buffer_destroy(vk, &s_buf);
@@ -42,19 +44,29 @@ int material_init(VulkanContext *vk) {
     if (vk == nullptr || vk->device == VK_NULL_HANDLE || vk->physical_device == VK_NULL_HANDLE) {
         return -1;
     }
-    if (s_buf.buffer != VK_NULL_HANDLE) {
-        return 0;
+    s_vk = vk;
+    return 0;
+}
+
+static bool material_ensure_ready(void) {
+    if (s_map != nullptr && s_addr != 0) {
+        return true;
+    }
+    if (s_vk == nullptr || s_vk->device == VK_NULL_HANDLE || s_vk->physical_device == VK_NULL_HANDLE) {
+        return false;
     }
     VkDeviceSize bytes = (VkDeviceSize)k_mat_slots * sizeof(MatSlot);
-    if (da_buffer_create(vk, bytes, VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, true, &s_buf) != 0) {
-        return -1;
+    if (da_buffer_create(s_vk, bytes, VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, true, &s_buf) != 0) {
+        return false;
     }
     s_map = s_buf.map;
     s_addr = s_buf.address;
     if (s_map == nullptr || s_addr == 0) {
         fprintf(stderr, "[Material Error] Look table device address is null\n");
-        material_shutdown(vk);
-        return -1;
+        da_buffer_destroy(s_vk, &s_buf);
+        s_map = nullptr;
+        s_addr = 0;
+        return false;
     }
     memset(s_map, 0, (size_t)bytes);
     if (!s_logged) {
@@ -62,7 +74,7 @@ int material_init(VulkanContext *vk) {
         fflush(stdout);
         s_logged = true;
     }
-    return 0;
+    return true;
 }
 
 VkDeviceAddress material_address(void) {
@@ -70,7 +82,13 @@ VkDeviceAddress material_address(void) {
 }
 
 void material_set(uint32_t slot, bool glow) {
-    if (s_map == nullptr || slot >= k_mat_slots) {
+    if (slot >= k_mat_slots) {
+        return;
+    }
+    if (!glow && s_map == nullptr) {
+        return;
+    }
+    if (!material_ensure_ready()) {
         return;
     }
     MatSlot *rec = &s_map[slot];

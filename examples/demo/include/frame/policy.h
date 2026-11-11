@@ -175,6 +175,10 @@ WorkspaceMode policy_mode(void);
 // previous copy. False when sealed or PERM_MODE_SWITCH is revoked.
 bool policy_switch(void);
 
+// Switches the live workspace profile to `mode` while preserving custom
+// draw, mode-switch, and plot-cycle permission flags. False when sealed.
+bool policy_set_mode(WorkspaceMode mode);
+
 // Applies a world preset's starting mode, permission grants/revocations,
 // and optional seal onto the live policy without mutating compiled profiles.
 void policy_apply_world(WorkspaceMode mode, uint32_t grant_perms,

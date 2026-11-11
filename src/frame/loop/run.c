@@ -199,8 +199,19 @@ int frame_run(void) {
             break;
         }
 
-        if (frame_state.inotify_fd >= 0 && frame_state.inotify_wd < 0) {
+        if (frame_state.inotify_fd >= 0) {
             ensure_inotify_watch();
+        }
+        if (!send_in_flight && !resend_wire && !frame_state.resize_pending &&
+            frame_state.world_dirty) {
+            frame_state.world_dirty = false;
+            if (engine_app()->reload_watched != nullptr &&
+                engine_app()->reload_watched()) {
+                frame_note_picture();
+            }
+            if (frame_state.inotify_fd >= 0) {
+                ensure_inotify_watch();
+            }
         }
         if (!send_in_flight && !resend_wire && !frame_state.resize_pending &&
             frame_state.chrome_dirty) {

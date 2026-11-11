@@ -1,8 +1,11 @@
 #include "world/world_int.h"
 #include "frame/camera.h"
+#include "frame/gimbal.h"
+#include "frame/hud.h"
 #include "frame/plot.h"
 #include "frame/policy.h"
 #include "frame/sheet.h"
+#include "frame/terrain.h"
 #include "frame/text.h"
 #include <stdio.h>
 #include <string.h>
@@ -16,13 +19,51 @@ enum : uint32_t { k_removed_cap = 24 };
 static WorldRemoved s_removed[k_removed_cap];
 static uint32_t     s_removed_n = 0;
 static uint32_t     s_world_id  = 0;
+static char         s_custom_file[1024];
+static float        s_clear_rgba[4] = { 0.015f, 0.018f, 0.024f, 1.0f };
+
+void world_set_clear_color(float r, float g, float b, float a) {
+    s_clear_rgba[0] = r;
+    s_clear_rgba[1] = g;
+    s_clear_rgba[2] = b;
+    s_clear_rgba[3] = a;
+}
+
+void world_clear_color(float out_rgba[4]) {
+    if (out_rgba == nullptr) {
+        return;
+    }
+    out_rgba[0] = s_clear_rgba[0];
+    out_rgba[1] = s_clear_rgba[1];
+    out_rgba[2] = s_clear_rgba[2];
+    out_rgba[3] = s_clear_rgba[3];
+}
 
 void world_select(uint32_t world_id) {
     if (world_id > k_world_preset_max) {
         world_id = 0u;
     }
     s_world_id = world_id;
+    s_custom_file[0] = '\0';
     sheet_select_world(s_world_id);
+}
+
+bool world_select_file(const char *path) {
+    if (path == nullptr || path[0] == '\0') {
+        return false;
+    }
+    int wrote = snprintf(s_custom_file, sizeof s_custom_file, "%s", path);
+    if (wrote <= 0 || (size_t)wrote >= sizeof s_custom_file) {
+        s_custom_file[0] = '\0';
+        return false;
+    }
+    s_world_id = k_world_custom_file;
+    sheet_select_world(9u);
+    return true;
+}
+
+const char *world_custom_path(void) {
+    return s_custom_file[0] != '\0' ? s_custom_file : nullptr;
 }
 
 uint32_t world_selected_id(void) {
@@ -31,6 +72,8 @@ uint32_t world_selected_id(void) {
 
 const char *world_selected_title(void) {
     switch (s_world_id) {
+    case 0u:
+        return "Pure Empty Engine (Zero Objects, Zero Overlays)";
     case 1u:
         return "3D-Only Click-to-Draw Studio (Points -> Lines -> Faces)";
     case 2u:
@@ -46,52 +89,64 @@ const char *world_selected_title(void) {
     case 7u:
         return "Procedural C23 WorldBuilder: Kinetic Cathedral & Cascade";
     case 8u:
-        return "Baklan & Beşparmak Dağı: Dynamic SSD Streamed DEM & Satellite Map";
+        return "Baklan & Beşparmak Dağı SSD-Streamed DEM + Satellite Map (Denizli, TR)";
+    case k_world_custom_file:
+        return s_custom_file[0] != '\0' ? s_custom_file : "Custom .world Document";
+    case 9u:
     default:
-        return "Default Sandbox (Switchable 3D / 2D / Hybrid)";
+        return "Interactive Full Sandbox (Switchable 3D / 2D / Hybrid + Plots)";
     }
 }
 
 void world_apply_policy(void) {
     switch (s_world_id) {
+    case 0u:
+        // World 0: Pure Empty Engine canvas. Revoke all permissions and seal.
+        policy_apply_world(MODE_3D, PERM_NONE, 0xFFFFu, true);
+        return;
     case 1u:
         // World 1: 3D-only, click-to-draw (PERM_DRAW) enabled at boot, mode switching locked.
-        policy_apply_world(MODE_3D, PERM_DRAW, PERM_MODE_SWITCH, false);
+        policy_apply_world(MODE_3D, PERM_DRAW, PERM_MODE_SWITCH | PERM_PLOT_CYCLE, false);
         break;
     case 2u:
         // World 2: 3D-only gravity & elastic non-cube solids, mode switching locked.
-        policy_apply_world(MODE_3D, PERM_NONE, PERM_MODE_SWITCH, false);
+        policy_apply_world(MODE_3D, PERM_NONE, PERM_MODE_SWITCH | PERM_PLOT_CYCLE, false);
         break;
     case 3u:
         // World 3: 2D-only gravity & deformable soft patches, mode switching locked.
-        policy_apply_world(MODE_2D, PERM_NONE, PERM_MODE_SWITCH, false);
+        policy_apply_world(MODE_2D, PERM_NONE, PERM_MODE_SWITCH | PERM_PLOT_CYCLE, false);
         (void)camera_snap_front();
         camera_commit();
         break;
     case 4u:
         // World 4: 2D-only with click-to-draw (PERM_DRAW) enabled at boot, mode switching locked.
-        policy_apply_world(MODE_2D, PERM_DRAW, PERM_MODE_SWITCH, false);
+        policy_apply_world(MODE_2D, PERM_DRAW, PERM_MODE_SWITCH | PERM_PLOT_CYCLE, false);
         (void)camera_snap_front();
         camera_commit();
         break;
     case 5u:
         // World 5: Hybrid 3D+2D with click-to-draw enabled at boot, Tab mode switch allowed.
-        policy_apply_world(MODE_HYBRID, PERM_DRAW, PERM_NONE, false);
+        policy_apply_world(MODE_HYBRID, PERM_DRAW, PERM_PLOT_CYCLE, false);
         break;
     case 6u:
         // World 6: 3D+2D switchable restitution staircase & bumper lab, Tab mode switch allowed.
-        policy_apply_world(MODE_3D, PERM_NONE, PERM_NONE, false);
+        policy_apply_world(MODE_3D, PERM_NONE, PERM_PLOT_CYCLE, false);
         break;
     case 7u:
         // World 7: Procedural C23 WorldBuilder (Hybrid 3D+2D + click-to-draw + Tab mode switch).
-        policy_apply_world(MODE_HYBRID, PERM_DRAW, PERM_NONE, false);
+        policy_apply_world(MODE_HYBRID, PERM_DRAW, PERM_PLOT_CYCLE, false);
         break;
     case 8u:
         // World 8: Baklan & Beşparmak Dağı SSD-Streamed DEM + Satellite Map (Pure 3D Map, Z-up turntable mouse controls).
         policy_apply_world(MODE_3D, PERM_NONE, PERM_PLOT_CYCLE | PERM_OBJ_SPAWN | PERM_MODE_SWITCH, false);
         camera_set_turntable_mode(true);
         camera_set_home_pose(1595.0f, -650.0f, 520.0f, -0.18f, 0.52f, 0.16f);
+        printf("[Bird's-Eye Overlay] Active at 50%% transparency | Keys: 'O'=+Transparency, 'P'=-Transparency, 'W/A/S/D'=Move parallel to map, 'Shift+WASD' (or I/U, J/N, ]/[)=0.5%% 2D Stretch, 'B'=Top-Down Bird's-Eye View, 'Enter'=Upload & Bake onto Map\n");
         break;
+    case k_world_custom_file:
+        policy_boot();
+        return;
+    case 9u:
     default:
         policy_boot();
         break;
@@ -102,6 +157,48 @@ void world_apply_policy(void) {
            policy_allows(PERM_MODE_SWITCH) ? "on" : "locked",
            policy_allows(PERM_DRAW) ? "on" : "off");
     fflush(stdout);
+}
+
+bool world_switch_to(uint32_t world_id) {
+    if (world_id > k_world_preset_max) {
+        return false;
+    }
+    (void)world_save();
+    (void)sheet_save();
+    world_select(world_id);
+    world_reset();
+    world_apply_policy();
+    if (world_load() != 0) {
+        return false;
+    }
+    printf("[World] Runtime hot-switched to World %u: %s\n",
+           s_world_id, world_selected_title());
+    fflush(stdout);
+    return true;
+}
+
+bool world_reload(void) {
+    if (s_world_id == 0u) {
+        return false;
+    }
+    if (s_world_id == 8u) {
+        bool ok = terrain_reload();
+        printf("[World] Hot-reloaded World 8 (%s) terrain & survey dataset\n",
+               world_selected_title());
+        fflush(stdout);
+        return ok;
+    }
+    world_reset();
+    world_apply_policy();
+    if (world_load() != 0) {
+        return false;
+    }
+    const char *src = world_source_path();
+    printf("[World] Hot-reloaded World %u (%s) from %s\n",
+           s_world_id, world_selected_title(),
+           src != nullptr ? src : "builtin");
+    fflush(stdout);
+    return true;
 }
 
 void world_removed_clear(void) {
@@ -173,8 +270,24 @@ void world_reset(void) {
     solid_kind_reset();
     mesh_kind_reset();
     terrain_kind_reset();
+    terrain_set_contours(false);
     spin_clear();
     camera_reset();
+    if (s_world_id == 0u) {
+        ground_set_visible(false);
+        gimbal_set_visible(false);
+        hud_set_visible(false);
+        plot_set_visible(false);
+        text_set_visible(false);
+        world_set_clear_color(0.015f, 0.018f, 0.024f, 1.0f);
+    } else {
+        ground_set_visible(true);
+        gimbal_set_visible(true);
+        hud_set_visible(true);
+        plot_set_visible(s_world_id == 9u);
+        text_set_visible(true);
+        world_set_clear_color(0.08f, 0.24f, 0.48f, 1.0f);
+    }
     face_self_check();
     table_kinds_check();
 }

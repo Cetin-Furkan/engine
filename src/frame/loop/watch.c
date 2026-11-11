@@ -10,22 +10,47 @@ static uint8_t *inotify_bytes(void) {
 }
 
 void ensure_inotify_watch(void) {
-    if (frame_state.inotify_fd < 0 || frame_state.inotify_wd >= 0) {
+    if (frame_state.inotify_fd < 0) {
         return;
     }
-    const ChromeSpec *spec = chrome_spec();
-    if (spec == nullptr || spec->path[0] == '\0') {
-        return;
-    }
-    int wd = inotify_add_watch(frame_state.inotify_fd, spec->path, k_inotify_mask);
-    if (wd < 0) {
-        if (!frame_state.inotify_warned) {
-            fprintf(stderr, "[Chrome] inotify watch failed: %s\n", strerror(errno));
-            frame_state.inotify_warned = true;
+    if (frame_state.inotify_wd < 0) {
+        const ChromeSpec *spec = chrome_spec();
+        if (spec != nullptr && spec->path[0] != '\0') {
+            int wd = inotify_add_watch(frame_state.inotify_fd, spec->path, k_inotify_mask);
+            if (wd < 0) {
+                if (!frame_state.inotify_warned) {
+                    fprintf(stderr, "[Chrome] inotify watch failed: %s\n", strerror(errno));
+                    frame_state.inotify_warned = true;
+                }
+            } else {
+                frame_state.inotify_wd = wd;
+            }
         }
-        return;
     }
-    frame_state.inotify_wd = wd;
+    const char *app_path = (engine_app()->watched_path != nullptr)
+        ? engine_app()->watched_path()
+        : nullptr;
+    if (app_path == nullptr || app_path[0] == '\0') {
+        if (frame_state.world_wd >= 0) {
+            (void)inotify_rm_watch(frame_state.inotify_fd, frame_state.world_wd);
+            frame_state.world_wd = -1;
+        }
+        frame_state.world_watch_path[0] = '\0';
+    } else {
+        if (frame_state.world_wd >= 0 &&
+            strcmp(frame_state.world_watch_path, app_path) != 0) {
+            (void)inotify_rm_watch(frame_state.inotify_fd, frame_state.world_wd);
+            frame_state.world_wd = -1;
+        }
+        if (frame_state.world_wd < 0) {
+            int wd = inotify_add_watch(frame_state.inotify_fd, app_path, k_inotify_mask);
+            if (wd >= 0) {
+                frame_state.world_wd = wd;
+                snprintf(frame_state.world_watch_path, sizeof(frame_state.world_watch_path),
+                         "%s", app_path);
+            }
+        }
+    }
 }
 
 static void absorb_inotify(int32_t res) {
@@ -41,12 +66,22 @@ static void absorb_inotify(int32_t res) {
         if (off + (int)step > res) {
             break;
         }
-        if ((ev->mask & (IN_IGNORED | IN_DELETE_SELF | IN_MOVE_SELF | IN_Q_OVERFLOW)) != 0) {
-            dropped = true;
-            frame_state.inotify_wd = -1;
-        }
-        if ((ev->mask & (k_inotify_mask | IN_IGNORED | IN_Q_OVERFLOW)) != 0) {
-            frame_state.chrome_dirty = true;
+        if (ev->wd == frame_state.world_wd && frame_state.world_wd >= 0) {
+            if ((ev->mask & (IN_IGNORED | IN_DELETE_SELF | IN_MOVE_SELF)) != 0) {
+                dropped = true;
+                frame_state.world_wd = -1;
+            }
+            if ((ev->mask & (k_inotify_mask | IN_IGNORED)) != 0) {
+                frame_state.world_dirty = true;
+            }
+        } else {
+            if ((ev->mask & (IN_IGNORED | IN_DELETE_SELF | IN_MOVE_SELF | IN_Q_OVERFLOW)) != 0) {
+                dropped = true;
+                frame_state.inotify_wd = -1;
+            }
+            if ((ev->mask & (k_inotify_mask | IN_IGNORED | IN_Q_OVERFLOW)) != 0) {
+                frame_state.chrome_dirty = true;
+            }
         }
         off += (int)step;
     }
@@ -98,9 +133,12 @@ void start_inotify(RingContext *ring, bool *armed) {
     }
     frame_state.inotify_fd = fd;
     frame_state.inotify_wd = -1;
+    frame_state.world_wd = -1;
+    frame_state.world_dirty = false;
+    frame_state.world_watch_path[0] = '\0';
     frame_state.inotify_fixed = false;
     ensure_inotify_watch();
-    if (frame_state.inotify_wd < 0) {
+    if (frame_state.inotify_wd < 0 && frame_state.world_wd < 0) {
         close(frame_state.inotify_fd);
         frame_state.inotify_fd = -1;
         return;

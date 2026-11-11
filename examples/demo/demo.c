@@ -1,4 +1,5 @@
 #include "chrome/gpu.h"
+#include "backend/backend.h"
 #include "engine/app.h"
 #include "vulkan/bda.h"
 #include "frame/camera.h"
@@ -21,6 +22,7 @@
 #include "input/pointer.h"
 #include "world/world_int.h"
 #include <linux/input-event-codes.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -122,9 +124,9 @@ static void demo_destroy_targets(VulkanContext *vk, EngineTargets *targets) {
 // ------------------------------------------------------------------- hooks
 
 static void print_worlds_usage(const char *prog) {
-    printf("Usage: %s [--world=<0..8> | -w <0..8>] [--list-worlds] [--help]\n\n"
-           "Selectable Worlds & Capability Masks:\n"
-           "  --world=0  Default Sandbox (3D / 2D / Hybrid switchable via Tab)\n"
+    printf("Usage: %s [--world=<0..9|name|file.world> | -w <0..9|name|file.world>] [--image=<path.png|jpg>] [--list-worlds] [--help]\n\n"
+           "Pure Engine Default & Built-On-Top Worlds:\n"
+           "  --world=0  [Pure    | Empty Canvas  | Sealed    ] Pure Empty Engine (Default: 0 objects, 0 grid, 0 HUD)\n"
            "  --world=1  [3D-Only | PERM_DRAW=on  | Tab=locked] Click-to-Draw Studio (Points -> Lines -> Faces)\n"
            "  --world=2  [3D-Only | Gravity+Bounce| Tab=locked] Non-Cube Solids Squash-and-Stretch Drop\n"
            "  --world=3  [2D-Only | Gravity+Soft  | Tab=locked] Deformable Soft Patches & Elastic Polygons\n"
@@ -132,16 +134,30 @@ static void print_worlds_usage(const char *prog) {
            "  --world=5  [Hybrid  | 3D+2D+Draw    | Tab=open  ] Combined 3D+2D Gravity, Soft Bodies & Draw\n"
            "  --world=6  [3D+2D   | Multi-Bounce  | Tab=open  ] Restitution Staircase (0.08..0.94) & Bumper Lab\n"
            "  --world=7  [Hybrid  | C23 Builder   | Tab=open  ] Procedural Kinetic Cathedral & Polyring Cascade\n"
-           "  --world=8  [3D/Map  | RelPtr2D+SSD  | Tab=open  ] Baklan & Beşparmak Dağı Real DEM + Satellite Map\n",
+           "  --world=8  [3D/Map  | RelPtr2D+SSD  | Tab=locked] Baklan & Beşparmak Dağı Real DEM + Satellite Map\n"
+           "  --world=9  [Sandbox | Full 3D/2D/Hyb| Tab=open  ] Interactive Full Sandbox (opening.world + sheet + Plots)\n"
+           "  --world=<path.world>                              Load a custom .world DSL scene file on top of the engine\n"
+           "  --image=<path.png|jpg>                            Load a custom bird's-eye image overlay into World 8 (50%% transparent)\n",
            prog != nullptr ? prog : "engine");
     fflush(stdout);
+}
+
+static bool has_world_suffix_or_sep(const char *arg) {
+    if (arg == nullptr || arg[0] == '\0') {
+        return false;
+    }
+    if (strchr(arg, '/') != nullptr) {
+        return true;
+    }
+    size_t len = strlen(arg);
+    return len > 6u && strcmp(arg + len - 6u, ".world") == 0;
 }
 
 static bool parse_world_arg(const char *arg, uint32_t *out_id) {
     if (arg == nullptr || arg[0] == '\0' || out_id == nullptr) {
         return false;
     }
-    if (strcmp(arg, "default") == 0) {
+    if (strcmp(arg, "pure") == 0 || strcmp(arg, "empty") == 0 || strcmp(arg, "none") == 0) {
         *out_id = 0u;
         return true;
     }
@@ -169,12 +185,17 @@ static bool parse_world_arg(const char *arg, uint32_t *out_id) {
         *out_id = 6u;
         return true;
     }
-    if (strcmp(arg, "procedural") == 0 || strcmp(arg, "cathedral") == 0) {
+    if (strcmp(arg, "procedural") == 0 || strcmp(arg, "cathedral") == 0 || strcmp(arg, "builder") == 0) {
         *out_id = 7u;
         return true;
     }
-    if (strcmp(arg, "map") == 0 || strcmp(arg, "besparmak") == 0 || strcmp(arg, "baklan") == 0) {
+    if (strcmp(arg, "map") == 0 || strcmp(arg, "besparmak") == 0 ||
+        strcmp(arg, "baklan") == 0 || strcmp(arg, "terrain") == 0) {
         *out_id = 8u;
+        return true;
+    }
+    if (strcmp(arg, "sandbox") == 0 || strcmp(arg, "default") == 0 || strcmp(arg, "all") == 0) {
+        *out_id = 9u;
         return true;
     }
     char *end = nullptr;
@@ -188,6 +209,7 @@ static bool parse_world_arg(const char *arg, uint32_t *out_id) {
 
 static int demo_configure(int argc, char **argv) {
     uint32_t chosen = 0u;
+    const char *custom_path = nullptr;
     for (int i = 1; i < argc; ++i) {
         const char *a = argv[i];
         if (a == nullptr) {
@@ -197,6 +219,22 @@ static int demo_configure(int argc, char **argv) {
             print_worlds_usage(argv[0]);
             return 1;
         }
+        if (strncmp(a, "--image=", 8) == 0) {
+            backend_overlay_set_custom_path(a + 8);
+            continue;
+        }
+        if (strncmp(a, "--overlay=", 10) == 0) {
+            backend_overlay_set_custom_path(a + 10);
+            continue;
+        }
+        if (strcmp(a, "--image") == 0 || strcmp(a, "--overlay") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "[Engine] Missing file path after '%s'\n", a);
+                return -1;
+            }
+            backend_overlay_set_custom_path(argv[++i]);
+            continue;
+        }
         const char *val = nullptr;
         if (strncmp(a, "--world=", 8) == 0) {
             val = a + 8;
@@ -204,7 +242,7 @@ static int demo_configure(int argc, char **argv) {
             val = a + 3;
         } else if (strcmp(a, "--world") == 0 || strcmp(a, "-w") == 0) {
             if (i + 1 >= argc) {
-                fprintf(stderr, "[Engine] Missing world number after '%s' (expected 0..%u)\n",
+                fprintf(stderr, "[Engine] Missing world number after '%s' (expected 0..%u or .world path)\n",
                         a, k_world_preset_max);
                 print_worlds_usage(argv[0]);
                 return -1;
@@ -217,19 +255,29 @@ static int demo_configure(int argc, char **argv) {
             print_worlds_usage(argv[0]);
             return -1;
         }
-        if (!parse_world_arg(val, &chosen)) {
-            fprintf(stderr, "[Engine] Invalid world '%s' (expected 0..%u)\n",
+        if (parse_world_arg(val, &chosen)) {
+            custom_path = nullptr;
+        } else if (has_world_suffix_or_sep(val)) {
+            custom_path = val;
+        } else {
+            fprintf(stderr, "[Engine] Invalid world '%s' (expected 0..%u, preset name, or .world path)\n",
                     val, k_world_preset_max);
             print_worlds_usage(argv[0]);
             return -1;
         }
     }
-    world_select(chosen);
+    if (custom_path != nullptr) {
+        if (!world_select_file(custom_path)) {
+            fprintf(stderr, "[Engine] Invalid world file path '%s'\n", custom_path);
+            return -1;
+        }
+    } else {
+        world_select(chosen);
+    }
     return 0;
 }
 
 static int demo_init(VulkanContext *vk, RingCqeFn forward_cqe, void *forward_user) {
-    policy_boot();
     world_apply_policy();
     if (pass_init(vk) != 0 ||
         chrome_gpu_bind_pass(vk, pass_depth_format(), pass_raster_samples()) != 0 ||
@@ -312,18 +360,21 @@ static bool demo_advance(uint32_t time_ms, const FrameStep *step) {
     int32_t px = 0;
     int32_t py = 0;
     bool have = pointer_client_xy(&px, &py);
-    text_arm_tick(pointer_key_down(KEY_T), have, px, py);
+    text_arm_tick(text_is_visible() && pointer_key_down(KEY_T), have, px, py);
     return world_advance(time_ms);
 }
 
 static bool demo_click(float origin_x, float origin_y) {
-    if (text_click(origin_x, origin_y, pointer_key_down(KEY_T))) {
+    if (text_is_visible() && text_click(origin_x, origin_y, pointer_key_down(KEY_T))) {
         return true;
     }
     return world_click(origin_x, origin_y);
 }
 
 static bool demo_text(const char *utf8, uint32_t bytes) {
+    if (!text_is_visible()) {
+        return false;
+    }
     return text_insert(utf8, bytes);
 }
 
@@ -342,8 +393,21 @@ static uint8_t demo_route_key(uint32_t key) {
         }
         return ENGINE_KEY_TAP;
     }
-    if (key == KEY_T) {
+    if (key == KEY_T && text_is_visible()) {
         return ENGINE_KEY_HOLD;
+    }
+    if ((key >= KEY_F1 && key <= KEY_F10) || key == KEY_0 ||
+        key == KEY_K || key == KEY_KP0) {
+        return ENGINE_KEY_TAP;
+    }
+    if (world_selected_id() == 8u) {
+        if (key == KEY_O || key == KEY_P ||
+            key == KEY_W || key == KEY_A || key == KEY_S || key == KEY_D ||
+            key == KEY_I || key == KEY_U || key == KEY_J || key == KEY_N ||
+            key == KEY_LEFTBRACE || key == KEY_RIGHTBRACE ||
+            key == KEY_B || key == KEY_ENTER || key == KEY_KPENTER) {
+            return ENGINE_KEY_TAP;
+        }
     }
     KeyRoute route = policy_route(policy_active(), (uint16_t)key, demo_shift_down());
     if (route == KEY_ROUTE_HOLD) {
@@ -356,8 +420,81 @@ static uint8_t demo_route_key(uint32_t key) {
 }
 
 static bool demo_key(uint32_t key, EngineKeyContext *ctx) {
-    if (text_on_key(key)) {
+    if (text_is_visible() && text_on_key(key)) {
         return true;
+    }
+    if (key == KEY_F10 || key == KEY_0) {
+        return world_switch_to(0u);
+    }
+    if (key >= KEY_F1 && key <= KEY_F9) {
+        if (key == KEY_F5 && !demo_shift_down() &&
+            policy_can(policy_active(), ACT_RESPIN) &&
+            table_selected() != nullptr) {
+            return world_respin_selected();
+        }
+        return world_switch_to((uint32_t)(key - KEY_F1 + 1u));
+    }
+    if (key == KEY_K || key == KEY_KP0) {
+        return terrain_toggle_contours();
+    }
+    if (world_selected_id() == 8u) {
+        bool shift = demo_shift_down();
+        if (key == KEY_O) {
+            // 'o' key -> more transparent (+5% transparency)
+            return backend_overlay_adjust_transparency(0.05f);
+        }
+        if (key == KEY_P) {
+            // 'p' key -> less transparent (-5% transparency)
+            return backend_overlay_adjust_transparency(-0.05f);
+        }
+        if (key == KEY_W || key == KEY_A || key == KEY_S || key == KEY_D) {
+            int ix = (key == KEY_D ? 1 : 0) - (key == KEY_A ? 1 : 0);
+            int iy = (key == KEY_W ? 1 : 0) - (key == KEY_S ? 1 : 0);
+            if (shift) {
+                // Shift + WASD stretches the bird's-eye image by 0.5% in X or Y
+                return backend_overlay_stretch_2d(ix, iy);
+            }
+            float rx = 1.0f;
+            float ry = 0.0f;
+            float fx = 0.0f;
+            float fy = 1.0f;
+            float zoom = 0.25f;
+            camera_map_basis(&rx, &ry, &fx, &fy, &zoom);
+            float step = 8.0f / fmaxf(zoom, 0.02f);
+            float dx = ((float)ix * rx + (float)iy * fx) * step;
+            float dy = ((float)ix * ry + (float)iy * fy) * step;
+            if (backend_overlay_move(dx, dy, true)) {
+                return true;
+            }
+            return false;
+        }
+        if (key == KEY_I) {
+            return backend_overlay_stretch_2d(1, 0);
+        }
+        if (key == KEY_U) {
+            return backend_overlay_stretch_2d(-1, 0);
+        }
+        if (key == KEY_J) {
+            return backend_overlay_stretch_2d(0, 1);
+        }
+        if (key == KEY_N) {
+            return backend_overlay_stretch_2d(0, -1);
+        }
+        if (key == KEY_RIGHTBRACE) {
+            return backend_overlay_stretch_2d(1, 1);
+        }
+        if (key == KEY_LEFTBRACE) {
+            return backend_overlay_stretch_2d(-1, -1);
+        }
+        if (key == KEY_B) {
+            float cx = 1595.0f;
+            float cy = -650.0f;
+            (void)backend_overlay_get_center(&cx, &cy);
+            return camera_snap_birdseye(cx, cy);
+        }
+        if (key == KEY_ENTER || key == KEY_KPENTER) {
+            return backend_overlay_commit_upload();
+        }
     }
     EngineAction act = policy_lookup(policy_active(), (uint16_t)key, demo_shift_down());
     if (!policy_can(policy_active(), act)) {
@@ -386,7 +523,10 @@ static bool demo_key(uint32_t key, EngineKeyContext *ctx) {
         EngineRelay relay;
         engine_relay_begin(&relay, ctx->signal_armed, ctx->got_signal,
                            ctx->signo, ctx->inotify_armed);
-        bool changed = plot_reload(ctx->reload_cqe, nullptr);
+        bool changed = world_reload();
+        if (plot_reload(ctx->reload_cqe, nullptr)) {
+            changed = true;
+        }
         if (policy_mode() != MODE_2D) {
             bool mesh_has = false;
             bool mesh_bytes = mesh_reload(ctx->reload_cqe, nullptr, &mesh_has);
@@ -462,6 +602,12 @@ static bool demo_key(uint32_t key, EngineKeyContext *ctx) {
 }
 
 static bool demo_camera_active(void) {
+    if (world_selected_id() == 8u && !demo_shift_down()) {
+        if (pointer_key_down(KEY_W) || pointer_key_down(KEY_A) ||
+            pointer_key_down(KEY_S) || pointer_key_down(KEY_D)) {
+            return true;
+        }
+    }
     return camera_motion_down() || camera_busy();
 }
 
@@ -472,14 +618,16 @@ static bool demo_drag(float dx, float dy, uint32_t buttons) {
 static const EngineApp s_app = {
     .help = "One turn, then io_uring idle. Points stay off until numpad 9. "
             "Empty clicks then place points, and F closes them into a face that stays. "
-            "R spins until R again. F5 turns the selection again. A click on a mesh "
+            "R spins until R again. F5 turns the selection again. F1-F9 switch worlds 1-9, "
+            "F10 or 0 switches to Pure Engine (World 0). K or numpad 0 toggles topographic "
+            "elevation contours in World 8. A click on a mesh "
             "selects it. A cube click plants heat for five seconds and shoves the cube. "
             "It stops on the ground and against other cubes, and that place is saved. "
             "It can be selected while other meshes are up. Its colors sweep on that clock, then hold. "
             "Keys 1-6 raise a tetrahedron, octahedron, icosahedron, cylinder, cone, and torus. "
             "S smooths edges. G opens or closes glow. Esc clears. Backspace, Delete, or X removes. "
             "Z puts the last removed cube, solid, or mesh back. "
-            "M cycles the math plot. L reloads the CSV chart and the OBJ mesh. "
+            "M cycles the math plot. L reloads the active .world scene, CSV chart, and OBJ mesh. "
             "In 2D and Hybrid, L also reads sheet.world again. "
             "Numpad 8, 2, 4, 6, and 5 set top, bottom, left, right, and front. "
             "Numpad 5 again sets the back. Home or numpad 1 restores the opening camera, "
@@ -499,6 +647,7 @@ static const EngineApp s_app = {
     .reset             = world_reset,
     .create_targets    = demo_create_targets,
     .destroy_targets   = demo_destroy_targets,
+    .clear_color       = world_clear_color,
     .record_compute    = demo_record_compute,
     .prepare_draw      = demo_prepare_draw,
     .claim_frame       = demo_claim_frame,
@@ -526,6 +675,8 @@ static const EngineApp s_app = {
     .key               = demo_key,
     .camera_active     = demo_camera_active,
     .route_key         = demo_route_key,
+    .watched_path      = world_source_path,
+    .reload_watched    = world_reload,
 };
 
 const EngineApp *engine_app(void) {

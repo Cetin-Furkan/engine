@@ -1,4 +1,7 @@
 # World 4: 2D-Only Click-to-Draw Polygon Workshop & Elastic Sheet
 # Capability mask: MODE_2D, PERM_DRAW granted at boot, PERM_MODE_SWITCH revoked.
+mode 2d
+tab 0
+draw 1
+sheet 4
 ground z
-cube 0 0 0

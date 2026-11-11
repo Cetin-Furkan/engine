@@ -159,6 +159,8 @@ static int bake_mesh(VulkanContext *vk) {
     return 0;
 }
 
+static bool s_solid_ready = false;
+
 void solid_shutdown(VulkanContext *vk) {
     if (vk != nullptr && vk->device != VK_NULL_HANDLE) {
         if (s_bake != VK_NULL_HANDLE) {
@@ -178,38 +180,40 @@ void solid_shutdown(VulkanContext *vk) {
     s_bake_layout = VK_NULL_HANDLE;
     s_layout = VK_NULL_HANDLE;
     s_addr = 0;
+    s_solid_ready = false;
 }
 
-int solid_init(VulkanContext *vk) {
-    if (vk == nullptr || vk->device == VK_NULL_HANDLE || vk->physical_device == VK_NULL_HANDLE) {
-        return -1;
+static bool solid_ensure_ready(void) {
+    if (s_solid_ready) {
+        return true;
     }
-    s_vk = vk;
-    if (s_layout != VK_NULL_HANDLE) {
-        return 0;
+    VulkanContext *vk = s_vk;
+    if (vk == nullptr || vk->device == VK_NULL_HANDLE || vk->physical_device == VK_NULL_HANDLE) {
+        return false;
     }
     VkFormat depth_format = pass_depth_format();
     VkSampleCountFlagBits samples = pass_raster_samples();
     if (depth_format == VK_FORMAT_UNDEFINED || samples == 0) {
         fprintf(stderr, "[Solid Error] The render pass has no depth format yet\n");
-        return -1;
+        return false;
     }
     VkPhysicalDeviceProperties props = {0};
     vkGetPhysicalDeviceProperties(vk->physical_device, &props);
     if (props.limits.maxPushConstantsSize < sizeof(SolidPush)) {
         fprintf(stderr, "[Solid Error] Push constants are %u bytes, a solid needs %zu\n",
                 props.limits.maxPushConstantsSize, sizeof(SolidPush));
-        return -1;
+        return false;
     }
     if (k_first[5][1] + k_count[5][1] != k_solid_verts) {
         fprintf(stderr, "[Solid Error] Mesh ranges do not cover %u verts\n", k_solid_verts);
-        return -1;
+        return false;
     }
     if (da_buffer_create(vk, (VkDeviceSize)k_solid_verts * 36u,
                          VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, false,
                          &s_solid_buf) != 0) {
         solid_shutdown(vk);
-        return -1;
+        s_vk = vk;
+        return false;
     }
     s_addr = s_solid_buf.address;
 
@@ -227,7 +231,8 @@ int solid_init(VulkanContext *vk) {
     if (res != VK_SUCCESS) {
         solid_fail("vkCreatePipelineLayout", res);
         solid_shutdown(vk);
-        return -1;
+        s_vk = vk;
+        return false;
     }
     VulkanGfxPipe gfx = {
         .vert          = k_vert_spv,
@@ -259,19 +264,31 @@ int solid_init(VulkanContext *vk) {
     if (res != VK_SUCCESS) {
         solid_fail("vkCreatePipelineLayout bake", res);
         solid_shutdown(vk);
-        return -1;
+        s_vk = vk;
+        return false;
     }
     s_bake = vulkan_compute_pipeline(vk, k_bake_spv, sizeof k_bake_spv, s_bake_layout);
     if (s_bake == VK_NULL_HANDLE) {
         solid_shutdown(vk);
-        return -1;
+        s_vk = vk;
+        return false;
     }
     if (bake_mesh(vk) != 0) {
         solid_shutdown(vk);
-        return -1;
+        s_vk = vk;
+        return false;
     }
+    s_solid_ready = true;
     printf("[Solid] 6 meshes, %u verts, faceted and rounded, baked on the GPU\n", k_solid_verts);
     fflush(stdout);
+    return true;
+}
+
+int solid_init(VulkanContext *vk) {
+    if (vk == nullptr || vk->device == VK_NULL_HANDLE || vk->physical_device == VK_NULL_HANDLE) {
+        return -1;
+    }
+    s_vk = vk;
     return 0;
 }
 
@@ -279,6 +296,9 @@ void solid_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height,
                 uint32_t kind, bool curved, float yaw_deg,
                 float origin_x, float origin_y, float origin_z,
                 float squash, bool selected) {
+    if (!solid_ensure_ready()) {
+        return;
+    }
     VkPipeline pipeline = vulkan_gfx_use(s_vk, &s_gfx);
     if (cmd == VK_NULL_HANDLE || pipeline == VK_NULL_HANDLE || width == 0 || height == 0 ||
         kind >= 6u) {

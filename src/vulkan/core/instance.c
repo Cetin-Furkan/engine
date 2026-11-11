@@ -201,9 +201,9 @@ VulkanResult vulkan_instance_create(VulkanContext *ctx) {
     VkApplicationInfo app_info = {
         .sType              = VK_STRUCTURE_TYPE_APPLICATION_INFO,
         .pNext              = nullptr,
-        .pApplicationName   = "Antigravity Engine",
+        .pApplicationName   = "C23 Engine",
         .applicationVersion = VK_MAKE_API_VERSION(0, 0, 1, 0),
-        .pEngineName        = "Antigravity",
+        .pEngineName        = "C23 Engine",
         .engineVersion      = VK_MAKE_API_VERSION(0, 0, 1, 0),
         .apiVersion         = VK_API_VERSION_1_4,
     };

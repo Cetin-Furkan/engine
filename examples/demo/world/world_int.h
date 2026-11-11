@@ -72,7 +72,7 @@ struct WorldObj {
     Spin           *spin;
 };
 
-enum : int { k_table_cap = 48 };
+enum : int { k_table_cap = 64 };
 
 void table_reset(void);
 int table_add(const WorldOps *ops, void *data, Coord at, Spin *spin);
@@ -117,6 +117,7 @@ void table_kinds_check(void);
 void ground_reset(void);
 bool ground_set(int axis, float offset);
 void ground_set_visible(bool visible);
+bool ground_is_visible(void);
 void ground_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height);
 
 void face_reset(void);
@@ -198,7 +199,8 @@ void overlay_commit(void);
 
 // Programmatic C23 WorldBuilder API: constructs complex multi-object worlds
 // directly in C23 code or via composite scene-file directives (ringcube,
-// tower, arcsolid) without requiring individual per-object text lines.
+// gridcube, tower, arcsolid, solidring, helix) without requiring individual
+// per-object text lines.
 typedef struct WorldBuilder {
     uint32_t cubes_placed;
     uint32_t solids_placed;
@@ -208,6 +210,18 @@ typedef struct WorldBuilder {
 } WorldBuilder;
 
 void world_builder_begin(WorldBuilder *wb, bool smooth_solids);
+void world_builder_set_ground(WorldBuilder *wb, bool visible);
+void world_builder_set_gimbal(WorldBuilder *wb, bool visible);
+void world_builder_set_hud(WorldBuilder *wb, bool visible);
+void world_builder_set_plot(WorldBuilder *wb, bool visible);
+void world_builder_set_text(WorldBuilder *wb, bool visible);
+void world_builder_set_clear(WorldBuilder *wb, float r, float g, float b);
+void world_builder_set_camera(WorldBuilder *wb, float x, float y, float z,
+                              float yaw, float pitch, float zoom, bool turntable);
+void world_builder_set_mode(WorldBuilder *wb, uint8_t mode);
+void world_builder_set_draw(WorldBuilder *wb, bool enabled);
+void world_builder_set_tab(WorldBuilder *wb, bool enabled);
+void world_builder_set_contours(WorldBuilder *wb, bool enabled);
 bool world_builder_add_blueprint(WorldBuilder *wb, WorldBlueprint bp);
 bool world_builder_add_cube(WorldBuilder *wb, Coord at, int32_t yaw_milli,
                             bool spinning, bool infinite, bool glow, float restitution);
@@ -215,10 +229,16 @@ bool world_builder_add_solid(WorldBuilder *wb, uint32_t kind, Coord at, int32_t 
                              bool spinning, bool infinite, bool glow, float restitution);
 bool world_builder_add_cube_ring(WorldBuilder *wb, Coord center, float radius,
                                  uint32_t count, float restitution, bool glow);
+bool world_builder_add_cube_grid(WorldBuilder *wb, Coord center, float step_x, float step_y,
+                                 uint32_t nx, uint32_t ny, float restitution, bool glow);
 bool world_builder_add_cube_tower(WorldBuilder *wb, Coord base, float step_z,
                                   uint32_t count, float restitution);
 bool world_builder_add_solid_arc(WorldBuilder *wb, Coord center, float radius,
                                  float dz, float bounce_min, float bounce_max);
+bool world_builder_add_solid_ring(WorldBuilder *wb, Coord center, float radius,
+                                  float bounce_min, float bounce_max);
+bool world_builder_add_helix(WorldBuilder *wb, Coord center, float radius,
+                             float step_z, uint32_t count, float restitution);
 [[nodiscard]] int world_builder_commit(const WorldBuilder *wb);
 [[nodiscard]] int world_build_procedural_cathedral(void);
 [[nodiscard]] int world_build_besparmak_terrain(void);

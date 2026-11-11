@@ -1,4 +1,7 @@
 # World 3: 2D-Only Gravity, Deformable Soft Bodies & Elastic Polygons
 # Capability mask: MODE_2D, PERM_MODE_SWITCH revoked (3D pass & compute remain dormant).
+mode 2d
+tab 0
+draw 0
+sheet 3
 ground z
-cube 0 0 0

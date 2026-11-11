@@ -9,6 +9,8 @@ public static const uint k_tile_height_bytes = 131072u;
 public static const uint k_tile_bytes        = 393216u;
 public static const uint k_dir_bytes         = 256u;
 public static const uint k_node_bytes        = 64u;
+public static const uint k_skirt_quads       = 64u;
+public static const uint k_skirt_verts       = 384u;
 
 public struct GpuMathQuadNodeGpu {
     public uint64_t rel_ssd_payload;
@@ -53,6 +55,33 @@ public uint load_active_leaf_index(uint64_t dir_bda, uint leaf_i) {
     return (leaf_i & 1u) != 0u ? (word >> 16u) : (word & 0xFFFFu);
 }
 
+// Read compacted post-cull visible_nodes[inst_i] from the BDA indirect draw buffer (offset 32)
+public uint load_visible_leaf_index(uint64_t dir_bda, uint64_t indirect_bda, uint inst_i) {
+    if (indirect_bda != 0ull) {
+        uint *visible_nodes = (uint *)(indirect_bda + 32ull);
+        return visible_nodes[inst_i];
+    }
+    return load_active_leaf_index(dir_bda, inst_i);
+}
+
+// Read per-instance dynamic vertex count from cmds[inst_i].vertex_count (word 72 + inst_i * 4)
+public uint load_visible_leaf_quads_side(uint64_t indirect_bda, uint inst_i, uint default_quads) {
+    if (indirect_bda != 0ull) {
+        uint *words = (uint *)indirect_bda;
+        uint vcnt = words[72u + inst_i * 4u];
+        if (vcnt <= (16u * 16u + k_skirt_quads) * 6u) {
+            return 16u;
+        }
+        if (vcnt <= (32u * 32u + k_skirt_quads) * 6u) {
+            return 32u;
+        }
+        if (vcnt <= (64u * 64u + k_skirt_quads) * 6u) {
+            return 64u;
+        }
+    }
+    return default_quads;
+}
+
 // Read one u16 height sample (in 1/16th meter units) from a 4KB-aligned tile block
 public float tile_load_height_m(uint64_t tile_bda, uint sx, uint sy) {
     uint cx = min(sx, k_tile_dim - 1u);
@@ -62,6 +91,31 @@ public float tile_load_height_m(uint64_t tile_bda, uint sx, uint sy) {
     uint w = words[idx >> 1u];
     uint u16_val = (idx & 1u) != 0u ? (w >> 16u) : (w & 0xFFFFu);
     return float(u16_val) * 0.0625;
+}
+
+// Fast 4-tap bilinear elevation + analytical (dh/du, dh/dv) gradient (4 BDA loads instead of 16)
+public float tile_sample_bilinear_height_grad_m(uint64_t tile_bda, float2 uv, out float2 out_dh_duv) {
+    float scale = float(k_tile_dim - 1u);
+    float2 tc = clamp(uv, float2(0.0), float2(1.0)) * scale;
+    uint x0 = uint(floor(tc.x));
+    uint y0 = uint(floor(tc.y));
+    uint x1 = min(x0 + 1u, k_tile_dim - 1u);
+    uint y1 = min(y0 + 1u, k_tile_dim - 1u);
+    float fx = tc.x - float(x0);
+    float fy = tc.y - float(y0);
+
+    float h00 = tile_load_height_m(tile_bda, x0, y0);
+    float h10 = tile_load_height_m(tile_bda, x1, y0);
+    float h01 = tile_load_height_m(tile_bda, x0, y1);
+    float h11 = tile_load_height_m(tile_bda, x1, y1);
+
+    float hx0 = lerp(h00, h10, fx);
+    float hx1 = lerp(h01, h11, fx);
+    out_dh_duv = float2(
+        lerp(h10 - h00, h11 - h01, fy) * scale,
+        (hx1 - hx0) * scale
+    );
+    return lerp(hx0, hx1, fy);
 }
 
 // Catmull-Rom 1D cubic weights and analytical first derivatives
@@ -142,6 +196,26 @@ public float3 srgb_to_linear(float3 c) {
     return select(c <= float3(0.04045), lo, hi);
 }
 
+// Fast 4-tap bilinear RGBA8 satellite imagery sample (4 BDA loads instead of 16)
+public float4 tile_sample_bilinear_imagery(uint64_t tile_bda, float2 uv) {
+    uint64_t img_bda = tile_bda + uint64_t(k_tile_height_bytes);
+    uint *texels = (uint *)img_bda;
+
+    float2 tc = clamp(uv, float2(0.0), float2(1.0)) * float(k_tile_dim - 1u);
+    uint x0 = uint(floor(tc.x));
+    uint y0 = uint(floor(tc.y));
+    uint x1 = min(x0 + 1u, k_tile_dim - 1u);
+    uint y1 = min(y0 + 1u, k_tile_dim - 1u);
+    float fx = tc.x - float(x0);
+    float fy = tc.y - float(y0);
+
+    float4 c00 = unpack_rgba8(texels[y0 * k_tile_dim + x0]);
+    float4 c10 = unpack_rgba8(texels[y0 * k_tile_dim + x1]);
+    float4 c01 = unpack_rgba8(texels[y1 * k_tile_dim + x0]);
+    float4 c11 = unpack_rgba8(texels[y1 * k_tile_dim + x1]);
+    return lerp(lerp(c00, c10, fx), lerp(c01, c11, fx), fy);
+}
+
 // 16-tap Catmull-Rom bicubic RGBA8 satellite imagery sample from a 4KB-aligned tile block
 public float4 tile_sample_bicubic_imagery(uint64_t tile_bda, float2 uv) {
     uint64_t img_bda = tile_bda + uint64_t(k_tile_height_bytes);
@@ -171,4 +245,81 @@ public float4 tile_sample_bicubic_imagery(uint64_t tile_bda, float2 uv) {
         sum += row * wy[dy + 1];
     }
     return clamp(sum, float4(0.0), float4(1.0));
+}
+
+// 64-Byte Interactive Bird's-Eye Orthophoto Placement Descriptor (at offset 22080 of GpuMathArchiveHeader)
+public struct GpuMathOrthoOverlayGpu {
+    public uint64_t pixels_bda;
+    public uint     width_px;
+    public uint     height_px;
+    public float    center_x;
+    public float    center_y;
+    public float    half_span_x;
+    public float    half_span_y;
+    public float    opacity;
+    public uint     active;
+    public float    scale_pct_x;
+    public float    scale_pct_y;
+    public uint     committed_cnt;
+    public uint     pad0;
+    public uint     pad1;
+    public uint     pad2;
+};
+
+public GpuMathOrthoOverlayGpu load_ortho_overlay(uint64_t dir_bda) {
+    GpuMathOrthoOverlayGpu *ov = (GpuMathOrthoOverlayGpu *)(dir_bda + 22080ull);
+    return ov[0];
+}
+
+public uint load_committed_ortho_count(uint64_t dir_bda) {
+    uint *cnt_ptr = (uint *)(dir_bda + 22144ull);
+    return min(cnt_ptr[0], 16u);
+}
+
+public GpuMathOrthoOverlayGpu load_committed_ortho_layer(uint64_t dir_bda, uint idx) {
+    GpuMathOrthoOverlayGpu *layers = (GpuMathOrthoOverlayGpu *)(dir_bda + 22208ull);
+    return layers[idx];
+}
+
+// 16-tap Catmull-Rom bicubic RGBA8 sampler + texel-space CAS sharpening for full-resolution ortho imagery
+public float4 overlay_sample_bicubic_rgba(uint64_t pixels_bda, uint width_px, uint height_px, float2 uv) {
+    if (pixels_bda == 0ull || width_px == 0u || height_px == 0u) {
+        return float4(0.0);
+    }
+    uint *texels = (uint *)pixels_bda;
+    int max_x = int(width_px) - 1;
+    int max_y = int(height_px) - 1;
+    float2 tc = clamp(uv, float2(0.0), float2(1.0)) * float2(float(max_x), float(max_y));
+    int ix = int(floor(tc.x));
+    int iy = int(floor(tc.y));
+    float fx = tc.x - float(ix);
+    float fy = tc.y - float(iy);
+
+    float4 wx = catmull_rom_weights(fx);
+    float4 wy = catmull_rom_weights(fy);
+
+    float4 sum = float4(0.0);
+    float3 c_center = float3(0.0);
+    float3 c_cross  = float3(0.0);
+    [unroll]
+    for (int dy = -1; dy <= 2; ++dy) {
+        uint cy = uint(clamp(iy + dy, 0, max_y));
+        float4 row = float4(0.0);
+        [unroll]
+        for (int dx = -1; dx <= 2; ++dx) {
+            uint cx = uint(clamp(ix + dx, 0, max_x));
+            float4 tex = unpack_rgba8(texels[cy * width_px + cx]);
+            row += tex * wx[dx + 1];
+            if (dx == 0 && dy == 0) {
+                c_center = tex.rgb;
+            } else if ((abs(dx) + abs(dy)) == 1) {
+                c_cross += tex.rgb * 0.25;
+            }
+        }
+        sum += row * wy[dy + 1];
+    }
+    float4 bicubic = clamp(sum, float4(0.0), float4(1.0));
+    float3 detail  = c_center - c_cross;
+    bicubic.rgb    = clamp(bicubic.rgb + detail * 0.32, float3(0.0), float3(1.0));
+    return bicubic;
 }

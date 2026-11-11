@@ -70,6 +70,9 @@ typedef struct GpuCandidate {
     bool                             supports_shader_subgroup_rotate_clustered;
     bool                             supports_shader_demote;
     bool                             supports_shader_draw_parameters;
+    bool                             supports_multi_draw_indirect;
+    bool                             supports_draw_indirect_count;
+    bool                             supports_draw_indirect_first_instance;
 
     bool                             has_drm_primary;
     bool                             has_drm_render;
@@ -477,6 +480,9 @@ static VulkanResult evaluate_device(GpuCandidate *candidate) {
         (feat14.shaderSubgroupRotateClustered == VK_TRUE);
     candidate->supports_shader_demote                = (feat13.shaderDemoteToHelperInvocation == VK_TRUE);
     candidate->supports_shader_draw_parameters       = (feat11.shaderDrawParameters == VK_TRUE);
+    candidate->supports_multi_draw_indirect          = (features2.features.multiDrawIndirect == VK_TRUE);
+    candidate->supports_draw_indirect_count          = (feat12.drawIndirectCount == VK_TRUE);
+    candidate->supports_draw_indirect_first_instance = (features2.features.drawIndirectFirstInstance == VK_TRUE);
     candidate->features_probed                       = true;
 
     if (!candidate->supports_dyn_render || !candidate->supports_sync2 ||
@@ -648,7 +654,7 @@ static void print_candidate(uint32_t index, const GpuCandidate *candidate) {
                candidate->supports_shader_subgroup_rotate_clustered ? "yes" : "no",
                candidate->supports_shader_demote ? "yes" : "no",
                candidate->supports_shader_draw_parameters ? "yes" : "no");
-        printf("      Features: DynRender=%s, LocalRead=%s, Sync2=%s, BDA=%s, ScalarLayout=%s, Timeline=%s, Anisotropy=%s, Maint5=%s, Maint6=%s, PushDesc=%s, HostImageCopy=%s, Int16=%s, Int64=%s, Storage16=%s, Float16=%s\n",
+        printf("      Features: DynRender=%s, LocalRead=%s, Sync2=%s, BDA=%s, ScalarLayout=%s, Timeline=%s, Anisotropy=%s, Maint5=%s, Maint6=%s, PushDesc=%s, HostImageCopy=%s, MultiDrawIndirect=%s, DrawIndirectCount=%s, Int16=%s, Int64=%s, Storage16=%s, Float16=%s\n",
                candidate->supports_dyn_render ? "yes" : "no",
                candidate->supports_dynamic_rendering_local_read ? "yes" : "no",
                candidate->supports_sync2 ? "yes" : "no",
@@ -660,6 +666,8 @@ static void print_candidate(uint32_t index, const GpuCandidate *candidate) {
                candidate->supports_maintenance6 ? "yes" : "no",
                candidate->supports_push_descriptors ? "yes" : "no",
                candidate->supports_host_image_copy ? "yes" : "no",
+               candidate->supports_multi_draw_indirect ? "yes" : "no",
+               candidate->supports_draw_indirect_count ? "yes" : "no",
                candidate->supports_shader_int16 ? "yes" : "no",
                candidate->supports_shader_int64 ? "yes" : "no",
                candidate->supports_storage_buffer_16bit ? "yes" : "no",
@@ -1009,6 +1017,9 @@ static VulkanResult open_candidate(VulkanContext *ctx, const GpuCandidate *chose
         best.supports_shader_subgroup_rotate_clustered;
     ctx->device_info.supports_shader_demote = best.supports_shader_demote;
     ctx->device_info.supports_shader_draw_parameters = best.supports_shader_draw_parameters;
+    ctx->device_info.supports_multi_draw_indirect = best.supports_multi_draw_indirect;
+    ctx->device_info.supports_draw_indirect_count = best.supports_draw_indirect_count;
+    ctx->device_info.supports_draw_indirect_first_instance = best.supports_draw_indirect_first_instance;
     ctx->device_info.has_drm_primary_node = best.has_drm_primary;
     ctx->device_info.has_drm_render_node = best.has_drm_render;
     ctx->device_info.drm_primary_major = best.drm_primary_major;
@@ -1091,6 +1102,7 @@ static VulkanResult open_candidate(VulkanContext *ctx, const GpuCandidate *chose
     VkPhysicalDeviceVulkan12Features feat12 = {
         .sType               = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
         .pNext               = &feat13,
+        .drawIndirectCount   = best.supports_draw_indirect_count ? VK_TRUE : VK_FALSE,
         .scalarBlockLayout   = VK_TRUE,
         .bufferDeviceAddress = VK_TRUE,
         .shaderFloat16       = VK_TRUE,
@@ -1106,9 +1118,11 @@ static VulkanResult open_candidate(VulkanContext *ctx, const GpuCandidate *chose
         .sType    = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
         .pNext    = &feat11,
         .features = {
-            .samplerAnisotropy = best.supports_anisotropy ? VK_TRUE : VK_FALSE,
-            .shaderInt16       = VK_TRUE,
-            .shaderInt64       = VK_TRUE,
+            .multiDrawIndirect         = best.supports_multi_draw_indirect ? VK_TRUE : VK_FALSE,
+            .drawIndirectFirstInstance = best.supports_draw_indirect_first_instance ? VK_TRUE : VK_FALSE,
+            .samplerAnisotropy         = best.supports_anisotropy ? VK_TRUE : VK_FALSE,
+            .shaderInt16               = VK_TRUE,
+            .shaderInt64               = VK_TRUE,
         },
     };
 
@@ -1145,11 +1159,11 @@ static VulkanResult open_candidate(VulkanContext *ctx, const GpuCandidate *chose
     ctx->queues.transfer_queue_index = family_plan_take(plans, plan_count, best.transfer_family);
     ctx->queues.submission_aliased =
         (ctx->queues.graphics_family_index == ctx->queues.compute_family_index &&
-         ctx->queues.graphics_queue_index == ctx->queues.compute_queue_index) ||
+          ctx->queues.graphics_queue_index == ctx->queues.compute_queue_index) ||
         (ctx->queues.graphics_family_index == ctx->queues.transfer_family_index &&
-         ctx->queues.graphics_queue_index == ctx->queues.transfer_queue_index) ||
+          ctx->queues.graphics_queue_index == ctx->queues.transfer_queue_index) ||
         (ctx->queues.compute_family_index == ctx->queues.transfer_family_index &&
-         ctx->queues.compute_queue_index == ctx->queues.transfer_queue_index);
+          ctx->queues.compute_queue_index == ctx->queues.transfer_queue_index);
 
     vkGetDeviceQueue(ctx->device, ctx->queues.graphics_family_index,
                      ctx->queues.graphics_queue_index, &ctx->queues.graphics_queue);
@@ -1248,7 +1262,7 @@ void vulkan_device_log(const VulkanContext *ctx) {
            ctx->device_info.supports_shader_subgroup_rotate_clustered ? "yes" : "no",
            ctx->device_info.supports_shader_demote ? "yes" : "no",
            ctx->device_info.supports_shader_draw_parameters ? "yes" : "no");
-    printf("[Vulkan] Capabilities: DMA-BUF=%s, DRM-Modifiers=%s, ForeignQueue=%s, Syncobj=%s, BDA=%s, ScalarLayout=%s, Anisotropy=%s, DynRender=%s, LocalRead=%s, Sync2=%s, Timeline=%s, Maint5=%s, Maint6=%s, PushDesc=%s, HostImageCopy=%s, Int16=%s, Int64=%s, Storage16=%s, Float16=%s\n",
+    printf("[Vulkan] Capabilities: DMA-BUF=%s, DRM-Modifiers=%s, ForeignQueue=%s, Syncobj=%s, BDA=%s, ScalarLayout=%s, Anisotropy=%s, DynRender=%s, LocalRead=%s, Sync2=%s, Timeline=%s, Maint5=%s, Maint6=%s, PushDesc=%s, HostImageCopy=%s, MultiDrawIndirect=%s, DrawIndirectCount=%s, Int16=%s, Int64=%s, Storage16=%s, Float16=%s\n",
            ctx->device_info.supports_dma_buf ? "yes" : "no",
            ctx->device_info.supports_drm_format_modifiers ? "yes" : "no",
            ctx->device_info.supports_queue_family_foreign ? "yes" : "no",
@@ -1264,6 +1278,8 @@ void vulkan_device_log(const VulkanContext *ctx) {
            ctx->device_info.supports_maintenance6 ? "yes" : "no",
            ctx->device_info.supports_push_descriptors ? "yes" : "no",
            ctx->device_info.supports_host_image_copy ? "yes" : "no",
+           ctx->device_info.supports_multi_draw_indirect ? "yes" : "no",
+           ctx->device_info.supports_draw_indirect_count ? "yes" : "no",
            ctx->device_info.supports_shader_int16 ? "yes" : "no",
            ctx->device_info.supports_shader_int64 ? "yes" : "no",
            ctx->device_info.supports_storage_buffer_16bit ? "yes" : "no",

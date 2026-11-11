@@ -41,6 +41,7 @@ static_assert(sizeof(PlanePush) == 32u, "plane push");
 static VulkanContext   *s_vk = nullptr;
 static VkPipelineLayout s_layout = VK_NULL_HANDLE;
 static VulkanGfxLive    s_gfx;
+static bool             s_logged = false;
 
 static void plane_fail(const char *what, VkResult res) {
     fprintf(stderr, "[Plane Error] %s: %s (%d)\n", what, vulkan_vkresult_to_str(res), (int)res);
@@ -64,21 +65,28 @@ int plane_init(VulkanContext *vk) {
         return -1;
     }
     s_vk = vk;
+    return 0;
+}
+
+static bool plane_ensure_ready(void) {
     if (s_layout != VK_NULL_HANDLE) {
-        return 0;
+        return true;
+    }
+    if (s_vk == nullptr || s_vk->device == VK_NULL_HANDLE || s_vk->physical_device == VK_NULL_HANDLE) {
+        return false;
     }
     VkFormat depth_format = pass_depth_format();
     VkSampleCountFlagBits samples = pass_raster_samples();
     if (depth_format == VK_FORMAT_UNDEFINED || samples == 0) {
         fprintf(stderr, "[Plane Error] The render pass has no depth format yet\n");
-        return -1;
+        return false;
     }
     VkPhysicalDeviceProperties props = {0};
-    vkGetPhysicalDeviceProperties(vk->physical_device, &props);
+    vkGetPhysicalDeviceProperties(s_vk->physical_device, &props);
     if (props.limits.maxPushConstantsSize < sizeof(PlanePush)) {
         fprintf(stderr, "[Plane Error] Push constants are %u bytes, the plane needs %zu\n",
                 props.limits.maxPushConstantsSize, sizeof(PlanePush));
-        return -1;
+        return false;
     }
 
     VkPushConstantRange push = {
@@ -91,12 +99,11 @@ int plane_init(VulkanContext *vk) {
         .pushConstantRangeCount = 1,
         .pPushConstantRanges    = &push,
     };
-    VkResult res = vkCreatePipelineLayout(vk->device, &layout_info, nullptr, &s_layout);
+    VkResult res = vkCreatePipelineLayout(s_vk->device, &layout_info, nullptr, &s_layout);
     if (res != VK_SUCCESS) {
         s_layout = VK_NULL_HANDLE;
         plane_fail("vkCreatePipelineLayout", res);
-        plane_shutdown(vk);
-        return -1;
+        return false;
     }
 
     // Drawn first, with depth test and depth write off. Later geometry
@@ -117,14 +124,20 @@ int plane_init(VulkanContext *vk) {
         .blend         = VK_FALSE,
     };
     vulkan_gfx_arm(&s_gfx, &gfx, VK_FORMAT_B8G8R8A8_SRGB, nullptr);
-    printf("[Plane] Screen-space metric grid behind the scene (live 10^k subdivisions).\n");
-    fflush(stdout);
-    return 0;
+    if (!s_logged) {
+        printf("[Plane] Screen-space metric grid behind the scene (live 10^k subdivisions).\n");
+        fflush(stdout);
+        s_logged = true;
+    }
+    return true;
 }
 
 void plane_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height) {
+    if (cmd == VK_NULL_HANDLE || width == 0 || height == 0 || !plane_ensure_ready()) {
+        return;
+    }
     VkPipeline pipeline = vulkan_gfx_use(s_vk, &s_gfx);
-    if (cmd == VK_NULL_HANDLE || pipeline == VK_NULL_HANDLE || width == 0 || height == 0) {
+    if (pipeline == VK_NULL_HANDLE) {
         return;
     }
     ViewPush view;

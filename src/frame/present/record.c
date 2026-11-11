@@ -76,6 +76,10 @@ int record_and_submit_clear(VulkanContext *vk, FrameSlot *frame, VkSemaphore acq
         engine_app()->prepare_draw(frame->cmd_buf, frame->targets.depth_image);
     }
 
+    float clear_rgba[4] = { 0.015f, 0.018f, 0.024f, 1.0f };
+    if (engine_app()->clear_color != nullptr) {
+        engine_app()->clear_color(clear_rgba);
+    }
     VkRenderingAttachmentInfo color_attachment = {
         .sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
         .pNext       = nullptr,
@@ -85,7 +89,14 @@ int record_and_submit_clear(VulkanContext *vk, FrameSlot *frame, VkSemaphore acq
         .loadOp      = VK_ATTACHMENT_LOAD_OP_CLEAR,
         .storeOp     = VK_ATTACHMENT_STORE_OP_STORE,
         .clearValue  = {
-            .color = { .float32 = { 0.08f, 0.24f, 0.48f, 1.0f } },
+            .color = {
+                .float32 = {
+                    clear_rgba[0],
+                    clear_rgba[1],
+                    clear_rgba[2],
+                    clear_rgba[3],
+                },
+            },
         },
     };
     VkRenderingInfo rendering_info = {

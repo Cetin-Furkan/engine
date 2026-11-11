@@ -1,6 +1,10 @@
 # World 6: 3D + 2D Switchable Restitution Staircase & Bumper Lab
 # Capability mask: MODE_3D at boot, PERM_MODE_SWITCH open (Tab switches 3D / 2D / Hybrid).
 # Side-by-side restitution comparison from heavy inelastic (0.14) to super-elastic (0.92).
+mode 3d
+tab 1
+draw 0
+sheet 6
 ground z
 smooth 1
 solid Cylinder -550 140 520 yaw 0 spin 1 inf 0 glow 0 bounce 0.14

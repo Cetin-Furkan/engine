@@ -14,29 +14,29 @@
 //   Longitude: 29.531250° E .. 29.707031° E
 //   Elevation: 824.0 m (Baklan Plain) .. 1,612.0 m (Beşparmak Dağı Summit)
 //
-// Restricted 5-Level Focal Quadtree Pyramid (256x256 samples per tile, 1.0 world unit = 1.0 meter):
-//   LOD 0 (z=12):  1 x 1 =  1 tile  (node    0, 24.0 km x 24.0 km overview)
-//   LOD 1 (z=13):  2 x 2 =  4 tiles (nodes   1..4,  12.0 km tiles)
-//   LOD 2 (z=13):  4 x 4 = 16 tiles (nodes   5..20,  6.0 km tiles)
-//   LOD 3 (z=14):  8 x 8 = 64 tiles (nodes  21..84,  3.0 km tiles)
-//   LOD 4 (z=15/16): 8 x 8 = 64 ultra-HD core tiles (nodes 85..148, 1.5 km tiles over Baklan & Beşparmak Dağı)
-//   Total Quadtree Nodes = 149 tiles
+// Complete 5-Level Quadtree Pyramid (256x256 samples per tile, 1.0 world unit = 1.0 meter):
+//   LOD 0 (z=12):  1 x 1 =   1 tile  (node    0, 24.0 km x 24.0 km overview)
+//   LOD 1 (z=13):  2 x 2 =   4 tiles (nodes   1..4,  12.0 km tiles)
+//   LOD 2 (z=13):  4 x 4 =  16 tiles (nodes   5..20,  6.0 km tiles)
+//   LOD 3 (z=14):  8 x 8 =  64 tiles (nodes  21..84,  3.0 km tiles)
+//   LOD 4 (z=15/16): 16 x 16 = 256 tiles (nodes 85..340, 1.5 km tiles across entire 24x24 km map)
+//   Total Quadtree Nodes = 341 tiles
 
 enum : uint32_t {
     k_gmpack_magic          = 0x32504D47u, // "GMP2"
-    k_gmpack_version        = 4u,
+    k_gmpack_version        = 5u,
     k_gmpack_lod_count      = 5u,
-    k_gmpack_node_count     = 149u,        // 1 + 4 + 16 + 64 + 64
+    k_gmpack_node_count     = 341u,        // 1 + 4 + 16 + 64 + 256 (complete 5-level quadtree)
     k_gmpack_tile_dim       = 256u,        // 256x256 samples per tile (65,536 posts/pixels)
     k_gmpack_tile_samples   = 256u * 256u, // 65,536 samples
     k_gmpack_height_bytes   = 65536u * 2u, // 131,072 B (32 x 4KB blocks of u16 elevation)
     k_gmpack_imagery_bytes  = 65536u * 4u, // 262,144 B (64 x 4KB blocks of RGBA8 imagery)
     k_gmpack_tile_bytes     = 393216u,     // 96 x 4KB blocks per tile (384 KiB)
     k_gmpack_tile_blocks_4k = 96u,
-    k_gmpack_header_blocks  = 3u,          // 3 x 4KB blocks = 12,288 B
-    k_gmpack_header_bytes   = 12288u,      // 3 x 4KB blocks (256B dir + 149*64B nodes + pad)
-    k_gmpack_total_bytes    = 12288u + 149u * 393216u, // 58,601,472 B (55.89 MiB)
-    k_gmpack_gpu_slot_cap   = 64u,         // Max simultaneously resident tiles in GPU BDA pool
+    k_gmpack_header_blocks  = 6u,          // 6 x 4KB blocks = 24,576 B
+    k_gmpack_header_bytes   = 24576u,      // 6 x 4KB blocks (256B dir + 341*64B nodes + 2496B pad)
+    k_gmpack_total_bytes    = 24576u + 341u * 393216u, // 134,111,232 B (127.90 MiB)
+    k_gmpack_gpu_slot_cap   = 341u,        // Direct 1:1 resident GPU BDA slot per quadtree node (zero eviction)
     k_gmpack_active_cut_cap = 64u,         // Max leaf tiles in the active zoom LOD cut
 };
 
@@ -116,19 +116,76 @@ typedef struct GpuMathTileBlock {
 
 static_assert(sizeof(GpuMathTileBlock) == k_gmpack_tile_bytes, "GpuMathTileBlock must be 24,576 bytes");
 
-// On-disk & in-memory 12,288-byte Metadata Prefix (3 x 4KB blocks)
+// 64-Byte Interactive Bird's-Eye Orthophoto Placement Descriptor (at offset 22080 of GpuMathArchiveHeader)
+enum : uint32_t {
+    k_gmpack_max_ortho_layers = 16u,
+};
+
+typedef struct GpuMathOrthoOverlay {
+    alignas(64) uint64_t pixels_bda; // Bytes 0..7:   Vulkan BDA of RGBA8 image pixels (width_px * height_px * 4B)
+    uint32_t width_px;               // Bytes 8..11:  Image width in pixels
+    uint32_t height_px;              // Bytes 12..15: Image height in pixels
+    float    center_x;               // Bytes 16..19: Bird's-eye center World X (meters, East = +X)
+    float    center_y;               // Bytes 20..23: Bird's-eye center World Y (meters, North = +Y)
+    float    half_span_x;            // Bytes 24..27: Half-width in World X (meters, stretched in 0.5% steps)
+    float    half_span_y;            // Bytes 28..31: Half-height in World Y (meters, stretched in 0.5% steps)
+    float    opacity;                // Bytes 32..35: 1.0 - transparency (default 0.50 = 50% transparent)
+    uint32_t active;                 // Bytes 36..39: 1 when interactive bird's-eye overlay preview is shown
+    float    scale_pct_x;            // Bytes 40..43: Cumulative X stretch % (starts at 100.0%, +-0.5% steps)
+    float    scale_pct_y;            // Bytes 44..47: Cumulative Y stretch % (starts at 100.0%, +-0.5% steps)
+    uint32_t committed_cnt;          // Bytes 48..51: Count of Enter uploads committed into tiles
+    uint32_t pad[3];                 // Bytes 52..63: Pad to 64 bytes
+} GpuMathOrthoOverlay;
+
+static_assert(sizeof(GpuMathOrthoOverlay) == 64u, "GpuMathOrthoOverlay must be 64 bytes");
+
+// On-disk & in-memory 24,576-byte Metadata Prefix (6 x 4KB blocks)
 typedef struct GpuMathArchiveHeader {
-    alignas(4096) GpuMathPageDirectory dir;          // Bytes 0..255
-    GpuMathQuadNode      nodes[k_gmpack_node_count]; // Bytes 256..9791 (149 * 64B)
-    uint8_t              pad_to_12k[k_gmpack_header_bytes - 256u - k_gmpack_node_count * 64u];
+    alignas(4096) GpuMathPageDirectory dir;                           // Bytes 0..255
+    GpuMathQuadNode      nodes[k_gmpack_node_count];                  // Bytes 256..22079 (341 * 64B)
+    GpuMathOrthoOverlay  overlay;                                     // Bytes 22080..22143 (64B live bird's-eye overlay state)
+    uint32_t             ortho_layer_count;                           // Bytes 22144..22147 (Committed full-res GPU ortho layers)
+    uint32_t             ortho_layer_pad[15];                         // Bytes 22148..22207 (Pad to 64B alignment)
+    GpuMathOrthoOverlay  ortho_layers[k_gmpack_max_ortho_layers];     // Bytes 22208..23231 (16 * 64B full-res layers)
+    uint8_t              pad_to_24k[k_gmpack_header_bytes - 23232u];  // Bytes 23232..24575 (Pad to 24,576 bytes)
 } GpuMathArchiveHeader;
 
-static_assert(sizeof(GpuMathArchiveHeader) == k_gmpack_header_bytes, "Archive header must be 12,288 bytes");
+static_assert(offsetof(GpuMathArchiveHeader, overlay) == 22080u, "overlay offset must be 22,080");
+static_assert(offsetof(GpuMathArchiveHeader, ortho_layer_count) == 22144u, "ortho_layer_count offset must be 22,144");
+static_assert(offsetof(GpuMathArchiveHeader, ortho_layers) == 22208u, "ortho_layers offset must be 22,208");
+static_assert(sizeof(GpuMathArchiveHeader) == k_gmpack_header_bytes, "Archive header must be 24,576 bytes");
+
+// 16-Byte Indirect Draw Command Record (matches VkDrawIndirectCommand layout)
+typedef struct GpuMathDrawCmd {
+    uint32_t vertex_count;
+    uint32_t instance_count;
+    uint32_t first_vertex;
+    uint32_t first_instance;
+} GpuMathDrawCmd;
+
+static_assert(sizeof(GpuMathDrawCmd) == 16u, "GpuMathDrawCmd must be 16 bytes");
+
+// 1,344-Byte (21 x 64B cache lines) GPU-Driven Indirect Culling & Draw Buffer
+// Written by shaders/terrain_cull.comp.slang and consumed by vkCmdDrawIndirectCount
+// (or vkCmdDrawIndirect fallback) + shaders/terrain.vert.slang via BDA.
+typedef struct GpuMathIndirectBuffer {
+    alignas(64) uint32_t draw_count;                          // Offset 0:   Visible leaf draw count (countBufferOffset = 0)
+    uint32_t             culled_count;                        // Offset 4:   Frustum-culled leaf count
+    uint32_t             active_leaf_total;                   // Offset 8:   Total active leaves before frustum culling
+    uint32_t             pad0;                                // Offset 12
+    GpuMathDrawCmd       single_cmd;                          // Offset 16:  Single instanced VkDrawIndirectCommand fallback
+    uint32_t             visible_nodes[k_gmpack_active_cut_cap]; // Offset 32:  Compacted visible quadtree leaf node indices
+    GpuMathDrawCmd       cmds[k_gmpack_active_cut_cap];       // Offset 288: Multi-draw VkDrawIndirectCommand array (64 * 16B)
+    uint32_t             pad_tail[8];                         // Offset 1312..1343: Pad to 64-byte multiple (1,344 B)
+} GpuMathIndirectBuffer;
+
+static_assert(sizeof(GpuMathIndirectBuffer) == 1344u, "GpuMathIndirectBuffer must be 1,344 bytes");
 
 [[nodiscard]] uint32_t backend_quadtree_level_base(uint8_t lod);
 [[nodiscard]] uint32_t backend_quadtree_node_index(uint8_t lod, uint8_t gx, uint8_t gy);
 [[nodiscard]] int      backend_terrain_ensure_pack(const char *pack_path);
 [[nodiscard]] int      backend_terrain_read_header(const char *pack_path, GpuMathArchiveHeader *out_hdr);
 [[nodiscard]] int      backend_terrain_read_tile(const char *pack_path, uint32_t node_index, GpuMathTileBlock *out_tile);
+[[nodiscard]] int      backend_terrain_write_tile(const char *pack_path, uint32_t node_index, const GpuMathTileBlock *in_tile);
 
 #endif /* ENGINE_BACKEND_TERRAIN_PACK_H */

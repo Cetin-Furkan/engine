@@ -57,6 +57,8 @@ static float s_shown_ax = 0.0f, s_shown_ay = 0.0f, s_shown_bx = 0.0f, s_shown_by
 static uint32_t s_fb_w = 0;
 static uint32_t s_fb_h = 0;
 static bool s_quad_warned = false;
+static bool s_text_visible = true;
+static bool s_shown_visible = true;
 
 static uint32_t hash_bytes(const char *s, uint32_t n) {
     uint32_t h = 2166136261u;
@@ -271,6 +273,9 @@ static void begin_edit(uint32_t slot) {
 }
 
 bool text_click(float x, float y, bool t_down) {
+    if (!s_text_visible) {
+        return false;
+    }
     if (t_down && s_anchor) {
         s_anchor = false;
         uint32_t id = alloc_run(s_ax, s_ay, x, y, "", true);
@@ -308,6 +313,10 @@ bool text_click(float x, float y, bool t_down) {
 }
 
 void text_arm_tick(bool t_down, bool have_xy, int32_t px, int32_t py) {
+    if (!s_text_visible) {
+        s_anchor = false;
+        return;
+    }
     if (s_anchor && !t_down) {
         s_anchor = false;
         printf("[Text] Box cancelled.\n");
@@ -479,7 +488,19 @@ bool text_on_key(uint32_t key) {
 }
 
 bool text_editing(void) {
-    return s_editing;
+    return s_text_visible && s_editing;
+}
+
+void text_set_visible(bool visible) {
+    s_text_visible = visible;
+    if (!visible) {
+        s_editing = false;
+        s_anchor = false;
+    }
+}
+
+bool text_is_visible(void) {
+    return s_text_visible;
 }
 
 static bool same_run(const Run *live, const ShownRun *shown) {
@@ -497,6 +518,12 @@ static bool same_run(const Run *live, const ShownRun *shown) {
 }
 
 bool text_busy(void) {
+    if (s_text_visible != s_shown_visible) {
+        return true;
+    }
+    if (!s_text_visible) {
+        return false;
+    }
     for (uint32_t i = 0; i < k_runs; ++i) {
         if (!same_run(&s_live[i], &s_shown[i])) {
             return true;
@@ -538,6 +565,7 @@ static void copy_shown(uint32_t slot) {
 }
 
 void text_commit(void) {
+    s_shown_visible = s_text_visible;
     for (uint32_t i = 0; i < k_runs; ++i) {
         copy_shown(i);
     }
@@ -555,19 +583,6 @@ void text_place_boot(void) {
     memset(s_shown, 0, sizeof s_shown);
     s_editing = false;
     s_anchor = false;
-    Run *run = &s_live[0];
-    run->used = true;
-    run->sealed = true;
-    run->gen = 1;
-    run->face = TEXT_FACE_SEALED;
-    run->px = 22.0f;
-    run->r = 0.93f;
-    run->g = 0.91f;
-    run->b = 0.86f;
-    run->a = 1.0f;
-    memcpy(run->utf8, "Antigravity", 12u);
-    run->nbytes = 11;
-    run->hash = hash_bytes(run->utf8, run->nbytes);
     text_commit();
 }
 
@@ -700,7 +715,7 @@ static uint32_t emit_run(TextQuad *out, uint32_t n, uint32_t cap, Run *run,
 uint32_t text_fill(TextQuad *out, uint32_t cap, uint32_t fb_w, uint32_t fb_h) {
     s_fb_w = fb_w;
     s_fb_h = fb_h;
-    if (out == nullptr || cap == 0u || fb_w == 0u || fb_h == 0u) {
+    if (!s_text_visible || out == nullptr || cap == 0u || fb_w == 0u || fb_h == 0u) {
         return 0;
     }
     uint32_t n = 0;

@@ -71,14 +71,21 @@ int gimbal_init(VulkanContext *vk) {
         return -1;
     }
     s_vk = vk;
+    return 0;
+}
+
+static bool gimbal_ensure_ready(void) {
     if (s_layout != VK_NULL_HANDLE) {
-        return 0;
+        return true;
+    }
+    if (s_vk == nullptr || s_vk->device == VK_NULL_HANDLE || s_vk->physical_device == VK_NULL_HANDLE) {
+        return false;
     }
     VkFormat depth_format = pass_depth_format();
     VkSampleCountFlagBits samples = pass_raster_samples();
     if (depth_format == VK_FORMAT_UNDEFINED || samples == 0) {
         fprintf(stderr, "[Gimbal Error] The render pass has no depth format yet\n");
-        return -1;
+        return false;
     }
     VkPushConstantRange push = {
         .stageFlags = VK_SHADER_STAGE_VERTEX_BIT,
@@ -89,12 +96,11 @@ int gimbal_init(VulkanContext *vk) {
         .pushConstantRangeCount = 1,
         .pPushConstantRanges    = &push,
     };
-    VkResult res = vkCreatePipelineLayout(vk->device, &layout_info, nullptr, &s_layout);
+    VkResult res = vkCreatePipelineLayout(s_vk->device, &layout_info, nullptr, &s_layout);
     if (res != VK_SUCCESS) {
         s_layout = VK_NULL_HANDLE;
         gimbal_fail("vkCreatePipelineLayout", res);
-        gimbal_shutdown(vk);
-        return -1;
+        return false;
     }
     VulkanGfxPipe gfx = {
         .vert          = k_vert_spv,
@@ -116,7 +122,7 @@ int gimbal_init(VulkanContext *vk) {
         fflush(stdout);
         s_logged = true;
     }
-    return 0;
+    return true;
 }
 
 // view_rotate from shaders/camera.inc. View +Z points at the camera.
@@ -168,6 +174,15 @@ bool gimbal_toggle(void) {
     return s_want != s_drawn;
 }
 
+void gimbal_set_visible(bool visible) {
+    s_want  = visible;
+    s_drawn = visible;
+}
+
+bool gimbal_is_visible(void) {
+    return s_want;
+}
+
 bool gimbal_busy(void) {
     return s_want != s_drawn;
 }
@@ -177,8 +192,11 @@ void gimbal_commit(void) {
 }
 
 void gimbal_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height) {
+    if (!s_want || cmd == VK_NULL_HANDLE || width == 0 || height == 0 || !gimbal_ensure_ready()) {
+        return;
+    }
     VkPipeline pipeline = vulkan_gfx_use(s_vk, &s_gfx);
-    if (!s_want || cmd == VK_NULL_HANDLE || pipeline == VK_NULL_HANDLE || width == 0 || height == 0) {
+    if (pipeline == VK_NULL_HANDLE) {
         return;
     }
     ViewPush view;

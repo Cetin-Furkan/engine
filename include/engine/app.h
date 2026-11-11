@@ -98,6 +98,9 @@ typedef struct EngineApp {
     int (*create_targets)(VulkanContext *vk, EngineTargets *targets,
                                         uint32_t width, uint32_t height);
     void (*destroy_targets)(VulkanContext *vk, EngineTargets *targets);
+    // Optional per-frame clear color query (RGBA in [0..1]). When null, the
+    // engine clears to its default dark neutral backdrop.
+    void (*clear_color)(float out_rgba[4]);
 
     // Recording, in command-buffer order: compute, then claim_frame (slice
     // ownership for this signal point), then prepare_draw, then one
@@ -162,6 +165,11 @@ typedef struct EngineApp {
     // it for polling, TAP queues one press. Null keeps the pointer's
     // built-in camera set and tap set.
     uint8_t (*route_key)(uint32_t evdev_key);
+
+    // Optional watched source file path (e.g. an active .world file) and
+    // hot-reload callback invoked when inotify detects a modification.
+    const char *(*watched_path)(void);
+    bool (*reload_watched)(void);
 } EngineApp;
 
 enum : uint8_t {

@@ -624,19 +624,21 @@ static int bake_mesh(VulkanContext *vk) {
     return 0;
 }
 
-int cube_init(VulkanContext *vk) {
-    if (vk == nullptr || vk->device == VK_NULL_HANDLE) {
-        return -1;
-    }
-    s_device = vk->device;
-    s_vk = vk;
+static bool s_cube_failed = false;
+
+static int cube_ensure_ready(void) {
     if (s_layout != VK_NULL_HANDLE) {
         return 0;
     }
+    if (s_cube_failed || s_vk == nullptr || s_vk->device == VK_NULL_HANDLE) {
+        return -1;
+    }
+    VulkanContext *vk = s_vk;
     VkFormat depth_format = pass_depth_format();
     VkSampleCountFlagBits sample_count = pass_raster_samples();
     if (depth_format == VK_FORMAT_UNDEFINED || sample_count == 0) {
         fprintf(stderr, "[Cube Error] The render pass has no depth format yet\n");
+        s_cube_failed = true;
         return -1;
     }
 
@@ -648,17 +650,22 @@ int cube_init(VulkanContext *vk) {
                              VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                          false, &s_index_buf) != 0) {
         cube_shutdown(vk);
+        s_vk = vk;
+        s_device = vk->device;
+        s_cube_failed = true;
         return -1;
     }
     s_mesh_addr = s_mesh_buf.address;
     s_index_addr = s_index_buf.address;
 
-    heat_live_clear();
     for (uint32_t i = 0; i < k_heat_copies; ++i) {
         if (da_buffer_create(vk, (VkDeviceSize)k_heat_slots * (VkDeviceSize)k_heat_stride,
                              VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, false,
                              &s_heat_bufs[i]) != 0) {
             cube_shutdown(vk);
+            s_vk = vk;
+            s_device = vk->device;
+            s_cube_failed = true;
             return -1;
         }
         s_heat_addr[i] = s_heat_bufs[i].address;
@@ -669,6 +676,9 @@ int cube_init(VulkanContext *vk) {
             s_heat_host.map == nullptr) {
             fprintf(stderr, "[Cube Error] Heat mirror was not mapped\n");
             cube_shutdown(vk);
+            s_vk = vk;
+            s_device = vk->device;
+            s_cube_failed = true;
             return -1;
         }
     }
@@ -688,6 +698,9 @@ int cube_init(VulkanContext *vk) {
     if (res != VK_SUCCESS) {
         cube_fail("vkCreatePipelineLayout", res);
         cube_shutdown(vk);
+        s_vk = vk;
+        s_device = vk->device;
+        s_cube_failed = true;
         return -1;
     }
 
@@ -721,11 +734,17 @@ int cube_init(VulkanContext *vk) {
     if (res != VK_SUCCESS) {
         cube_fail("vkCreatePipelineLayout compute", res);
         cube_shutdown(vk);
+        s_vk = vk;
+        s_device = vk->device;
+        s_cube_failed = true;
         return -1;
     }
     s_compute = vulkan_compute_pipeline(vk, k_bevel_spv, sizeof k_bevel_spv, s_compute_layout);
     if (s_compute == VK_NULL_HANDLE) {
         cube_shutdown(vk);
+        s_vk = vk;
+        s_device = vk->device;
+        s_cube_failed = true;
         return -1;
     }
     VkPushConstantRange heat_range = {
@@ -742,15 +761,24 @@ int cube_init(VulkanContext *vk) {
     if (res != VK_SUCCESS) {
         cube_fail("vkCreatePipelineLayout heat", res);
         cube_shutdown(vk);
+        s_vk = vk;
+        s_device = vk->device;
+        s_cube_failed = true;
         return -1;
     }
     s_heat_pipe = vulkan_compute_pipeline(vk, k_heat_spv, sizeof k_heat_spv, s_heat_layout);
     if (s_heat_pipe == VK_NULL_HANDLE) {
         cube_shutdown(vk);
+        s_vk = vk;
+        s_device = vk->device;
+        s_cube_failed = true;
         return -1;
     }
     if (bake_mesh(vk) != 0) {
         cube_shutdown(vk);
+        s_vk = vk;
+        s_device = vk->device;
+        s_cube_failed = true;
         return -1;
     }
     printf("[Cube] 240px centered, %u verts, bevel welded to the %u by %u face, %ux\n",
@@ -761,6 +789,19 @@ int cube_init(VulkanContext *vk) {
         printf("[Cube] Heat is copied to a host mirror.\n");
     }
     fflush(stdout);
+    return 0;
+}
+
+int cube_init(VulkanContext *vk) {
+    if (vk == nullptr || vk->device == VK_NULL_HANDLE) {
+        return -1;
+    }
+    s_device = vk->device;
+    s_vk = vk;
+    s_cube_failed = false;
+    if (s_layout == VK_NULL_HANDLE) {
+        heat_live_clear();
+    }
     return 0;
 }
 
@@ -779,6 +820,7 @@ static void release_heat_copies(VulkanContext *vk) {
 void cube_shutdown(VulkanContext *vk) {
     s_mesh_addr = 0;
     s_index_addr = 0;
+    s_cube_failed = false;
     vulkan_gfx_disarm(vk, &s_gfx);
     s_vk = nullptr;
     if (vk == nullptr || vk->device == VK_NULL_HANDLE) {
@@ -820,9 +862,12 @@ void cube_shutdown(VulkanContext *vk) {
 void cube_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height, float yaw_deg,
                float origin_x, float origin_y, float origin_z, float depth_bias, float phase,
                bool selected, uint32_t mat, uint32_t heat_slot) {
+    if (cmd == VK_NULL_HANDLE || width == 0 || height == 0 || !heat_slot_ok(heat_slot) ||
+        cube_ensure_ready() != 0) {
+        return;
+    }
     VkPipeline pipeline = vulkan_gfx_use(s_vk, &s_gfx);
-    if (cmd == VK_NULL_HANDLE || pipeline == VK_NULL_HANDLE || width == 0 || height == 0 ||
-        !heat_slot_ok(heat_slot)) {
+    if (pipeline == VK_NULL_HANDLE) {
         return;
     }
     const HeatLive *live = &s_live[heat_slot];
@@ -856,6 +901,9 @@ uint32_t cube_vertex_count(void) {
 }
 
 uint64_t cube_mesh_addr(void) {
+    if (s_mesh_addr == 0) {
+        (void)cube_ensure_ready();
+    }
     return s_mesh_addr;
 }
 
@@ -899,7 +947,8 @@ uint32_t cube_heat_step_dt(uint32_t slot) {
 }
 
 bool cube_heat_record(VkCommandBuffer cmd, uint32_t slot, float yaw_deg, uint32_t dt_ms) {
-    if (!heat_slot_ok(slot) || cmd == VK_NULL_HANDLE || s_heat_pipe == VK_NULL_HANDLE) {
+    if (!heat_slot_ok(slot) || cmd == VK_NULL_HANDLE || cube_ensure_ready() != 0 ||
+        s_heat_pipe == VK_NULL_HANDLE) {
         return false;
     }
     HeatLive *h = &s_live[slot];
@@ -1000,7 +1049,7 @@ void cube_heat_record_abort(uint32_t slot) {
 }
 
 bool cube_heat_poke(uint32_t slot, float origin_x, float origin_y, float origin_z) {
-    if (!heat_slot_ok(slot) || s_heat_pipe == VK_NULL_HANDLE) {
+    if (!heat_slot_ok(slot) || cube_ensure_ready() != 0 || s_heat_pipe == VK_NULL_HANDLE) {
         return false;
     }
     HeatLive *h = &s_live[slot];
@@ -1104,6 +1153,7 @@ void cube_heat_claim(uint32_t slot) {
     if (!heat_slot_ok(slot)) {
         return;
     }
+    (void)cube_ensure_ready();
     HeatLive *h = &s_live[slot];
     bool reseed = h->started || h->read != 0 || h->dirty || h->need_seed;
     *h = (HeatLive){0};

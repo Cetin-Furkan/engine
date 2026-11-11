@@ -81,6 +81,8 @@ static VkDeviceAddress  s_addr = 0;
 static uint8_t         *s_map = nullptr;
 static ShapeSlice       s_slice[k_slice_count];
 static int              s_active = -1;
+static VkSemaphore      s_frame_acquire = VK_NULL_HANDLE;
+static uint64_t         s_frame_point = 0;
 static bool             s_geom_warned = false;
 static bool             s_busy_warned = false;
 
@@ -92,6 +94,8 @@ static void shape_geom_reset(void) {
     s_map = nullptr;
     s_addr = 0;
     s_active = -1;
+    s_frame_acquire = VK_NULL_HANDLE;
+    s_frame_point = 0;
     s_device = VK_NULL_HANDLE;
     for (uint32_t i = 0; i < k_slice_count; ++i) {
         s_slice[i] = (ShapeSlice){0};
@@ -129,8 +133,117 @@ static int shape_geom_init(VulkanContext *vk) {
     return 0;
 }
 
+static bool shape_geom_ensure(void) {
+    if (s_map != nullptr) {
+        return true;
+    }
+    if (s_vk == nullptr || s_vk->device == VK_NULL_HANDLE) {
+        return false;
+    }
+    if (shape_geom_init(s_vk) != 0) {
+        return false;
+    }
+    printf("[Shape] Polygon fill, stroke, and marks from one point buffer\n");
+    fflush(stdout);
+    return true;
+}
+
+static bool shape_ensure_ready(void) {
+    if (s_layout != VK_NULL_HANDLE) {
+        return true;
+    }
+    if (s_vk == nullptr || s_vk->device == VK_NULL_HANDLE || s_vk->physical_device == VK_NULL_HANDLE) {
+        return false;
+    }
+    VkFormat depth_format = pass_depth_format();
+    VkSampleCountFlagBits samples = pass_raster_samples();
+    if (depth_format == VK_FORMAT_UNDEFINED || samples == 0) {
+        fprintf(stderr, "[Shape Error] The render pass has no depth format yet\n");
+        return false;
+    }
+
+    VkPhysicalDeviceProperties props = {0};
+    vkGetPhysicalDeviceProperties(s_vk->physical_device, &props);
+    if (props.limits.maxPushConstantsSize < sizeof(ShapePush)) {
+        fprintf(stderr, "[Shape Error] Push constants are %u bytes, the fill needs %zu\n",
+                props.limits.maxPushConstantsSize, sizeof(ShapePush));
+        return false;
+    }
+
+    VkPushConstantRange push = {
+        .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+        .offset     = 0,
+        .size       = sizeof(ShapePush),
+    };
+    VkPipelineLayoutCreateInfo layout_info = {
+        .sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .pushConstantRangeCount = 1,
+        .pPushConstantRanges    = &push,
+    };
+    VkResult res = vkCreatePipelineLayout(s_vk->device, &layout_info, nullptr, &s_layout);
+    if (res != VK_SUCCESS) {
+        s_layout = VK_NULL_HANDLE;
+        shape_fail("vkCreatePipelineLayout", res);
+        return false;
+    }
+
+    VulkanGfxPipe gfx = {
+        .vert          = k_vert_spv,
+        .vert_bytes    = sizeof k_vert_spv,
+        .frag          = k_frag_spv,
+        .frag_bytes    = sizeof k_frag_spv,
+        .layout        = s_layout,
+        .depth_format  = depth_format,
+        .samples       = samples,
+        .cull          = VK_CULL_MODE_NONE,
+        .depth_test    = VK_TRUE,
+        .depth_write   = VK_TRUE,
+        .depth_compare = VK_COMPARE_OP_LESS,
+        .blend         = VK_FALSE,
+    };
+    vulkan_gfx_arm(&s_gfx, &gfx, VK_FORMAT_B8G8R8A8_SRGB, nullptr);
+    return true;
+}
+
+static bool shape_claim_slice(void) {
+    if (s_active >= 0) {
+        return true;
+    }
+    if (s_device == VK_NULL_HANDLE || s_frame_point == 0u) {
+        return false;
+    }
+    uint64_t signal_point = s_frame_point;
+    for (uint32_t i = 0; i < k_slice_count; ++i) {
+        if (s_slice[i].point == signal_point) {
+            s_slice[i].used = 0;
+            s_active = (int)i;
+            return true;
+        }
+    }
+    uint64_t counter = 0;
+    bool have_counter = false;
+    if (s_frame_acquire != VK_NULL_HANDLE &&
+        vkGetSemaphoreCounterValue(s_device, s_frame_acquire, &counter) == VK_SUCCESS) {
+        have_counter = true;
+    }
+    for (uint32_t i = 0; i < k_slice_count; ++i) {
+        if (s_slice[i].point == 0u || (have_counter && counter >= s_slice[i].point)) {
+            s_slice[i].point = signal_point;
+            s_slice[i].used = 0;
+            s_active = (int)i;
+            return true;
+        }
+    }
+    s_frame_point = 0;
+    if (!s_busy_warned) {
+        fprintf(stderr, "[Shape Error] Face geometry is still on the GPU\n");
+        s_busy_warned = true;
+    }
+    return false;
+}
+
 static void *geom_alloc(uint32_t bytes, uint32_t align) {
-    if (s_active < 0 || s_map == nullptr || bytes == 0u || align == 0u) {
+    if (s_active < 0 || bytes == 0u || align == 0u || !shape_geom_ensure() || s_map == nullptr) {
         return nullptr;
     }
     ShapeSlice *slice = &s_slice[s_active];
@@ -157,101 +270,23 @@ int shape_init(VulkanContext *vk) {
         return -1;
     }
     s_vk = vk;
-    if (s_layout != VK_NULL_HANDLE) {
-        return 0;
-    }
-    VkFormat depth_format = pass_depth_format();
-    VkSampleCountFlagBits samples = pass_raster_samples();
-    if (depth_format == VK_FORMAT_UNDEFINED || samples == 0) {
-        fprintf(stderr, "[Shape Error] The render pass has no depth format yet\n");
-        return -1;
-    }
-
-    VkPhysicalDeviceProperties props = {0};
-    vkGetPhysicalDeviceProperties(vk->physical_device, &props);
-    if (props.limits.maxPushConstantsSize < sizeof(ShapePush)) {
-        fprintf(stderr, "[Shape Error] Push constants are %u bytes, the fill needs %zu\n",
-                props.limits.maxPushConstantsSize, sizeof(ShapePush));
-        return -1;
-    }
-
-    VkPushConstantRange push = {
-        .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-        .offset     = 0,
-        .size       = sizeof(ShapePush),
-    };
-    VkPipelineLayoutCreateInfo layout_info = {
-        .sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-        .pushConstantRangeCount = 1,
-        .pPushConstantRanges    = &push,
-    };
-    VkResult res = vkCreatePipelineLayout(vk->device, &layout_info, nullptr, &s_layout);
-    if (res != VK_SUCCESS) {
-        s_layout = VK_NULL_HANDLE;
-        shape_fail("vkCreatePipelineLayout", res);
-        shape_shutdown(vk);
-        return -1;
-    }
-
-    VulkanGfxPipe gfx = {
-        .vert          = k_vert_spv,
-        .vert_bytes    = sizeof k_vert_spv,
-        .frag          = k_frag_spv,
-        .frag_bytes    = sizeof k_frag_spv,
-        .layout        = s_layout,
-        .depth_format  = depth_format,
-        .samples       = samples,
-        .cull          = VK_CULL_MODE_NONE,
-        .depth_test    = VK_TRUE,
-        .depth_write   = VK_TRUE,
-        .depth_compare = VK_COMPARE_OP_LESS,
-        .blend         = VK_FALSE,
-    };
-    vulkan_gfx_arm(&s_gfx, &gfx, VK_FORMAT_B8G8R8A8_SRGB, nullptr);
-    if (shape_geom_init(vk) != 0) {
-        shape_shutdown(vk);
-        return -1;
-    }
-    printf("[Shape] Polygon fill, stroke, and marks from one point buffer\n");
-    fflush(stdout);
+    s_device = vk->device;
     return 0;
 }
 
 void shape_begin(VkSemaphore acquire, uint64_t signal_point) {
     s_active = -1;
-    if (s_map == nullptr || signal_point == 0u) {
-        return;
-    }
-    for (uint32_t i = 0; i < k_slice_count; ++i) {
-        if (s_slice[i].point == signal_point) {
-            s_slice[i].used = 0;
-            s_active = (int)i;
-            return;
-        }
-    }
-    uint64_t counter = 0;
-    bool have_counter = false;
-    if (s_device != VK_NULL_HANDLE && acquire != VK_NULL_HANDLE &&
-        vkGetSemaphoreCounterValue(s_device, acquire, &counter) == VK_SUCCESS) {
-        have_counter = true;
-    }
-    for (uint32_t i = 0; i < k_slice_count; ++i) {
-        if (s_slice[i].point == 0u || (have_counter && counter >= s_slice[i].point)) {
-            s_slice[i].point = signal_point;
-            s_slice[i].used = 0;
-            s_active = (int)i;
-            return;
-        }
-    }
-    if (!s_busy_warned) {
-        fprintf(stderr, "[Shape Error] Face geometry is still on the GPU\n");
-        s_busy_warned = true;
-    }
+    s_frame_acquire = acquire;
+    s_frame_point = signal_point;
 }
 
 void shape_release(uint64_t signal_point) {
     if (signal_point == 0u) {
         return;
+    }
+    if (s_frame_point == signal_point) {
+        s_frame_acquire = VK_NULL_HANDLE;
+        s_frame_point = 0;
     }
     for (uint32_t i = 0; i < k_slice_count; ++i) {
         if (s_slice[i].point == signal_point) {
@@ -283,10 +318,13 @@ void shape_draw_polygon(VkCommandBuffer cmd, uint32_t width, uint32_t height,
                         float fill_r, float fill_g, float fill_b,
                         float edge_r, float edge_g, float edge_b,
                         float stroke_half, float mark_half, uint32_t mat_index) {
+    if (cmd == VK_NULL_HANDLE || x == nullptr || y == nullptr || width == 0u || height == 0u ||
+        n == 0u || n > k_poly_points || tri_n > k_poly_tris || !shape_ensure_ready() ||
+        !shape_claim_slice()) {
+        return;
+    }
     VkPipeline pipeline = vulkan_gfx_use(s_vk, &s_gfx);
-    if (cmd == VK_NULL_HANDLE || pipeline == VK_NULL_HANDLE || s_layout == VK_NULL_HANDLE ||
-        s_active < 0 || x == nullptr || y == nullptr || width == 0u || height == 0u ||
-        n == 0u || n > k_poly_points || tri_n > k_poly_tris) {
+    if (pipeline == VK_NULL_HANDLE) {
         return;
     }
     float *pts = geom_alloc(n * 8u, 8u);

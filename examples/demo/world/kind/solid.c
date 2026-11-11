@@ -249,19 +249,13 @@ bool solid_kind_raise(uint32_t kind) {
         }
         return table_select(existing);
     }
-    SolidData *s = &s_solid[kind];
-    *s = (SolidData){0};
-    s->used = true;
-    s->kind = kind;
-    s->restitution = k_default_bounce[kind];
-    s->spin = spin_start(0);
-    int index = table_add(&s_ops, s, k_at[kind], &s->spin);
-    if (index < 0) {
-        s->used = false;
-        fprintf(stderr, "[World] No room for %s.\n", k_name[kind]);
+    if (!solid_kind_place(kind, k_at[kind], 0, true, false, false)) {
         return false;
     }
-    table_select_quiet(index);
+    int index = find_kind(kind);
+    if (index >= 0) {
+        table_select_quiet(index);
+    }
     printf("[Engine] %s up. One revolution, then it holds.\n", k_name[kind]);
     fflush(stdout);
     return true;

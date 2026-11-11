@@ -37,13 +37,13 @@ static float node_subdivide_priority(const GpuMathQuadNode *n, float focus_x, fl
         want = screen_px >= 240.0f;
         break;
     case 1u:
-        want = screen_px >= 260.0f && (dist <= span_x * 1.25f || dist_px <= 1800.0f);
+        want = screen_px >= 240.0f && (dist <= span_x * 1.65f || dist_px <= 2200.0f);
         break;
     case 2u:
-        want = screen_px >= 260.0f && (dist <= span_x * 1.15f || dist_px <= 1400.0f);
+        want = screen_px >= 240.0f && (dist <= span_x * 1.65f || dist_px <= 1900.0f);
         break;
     case 3u:
-        want = screen_px >= 260.0f && (dist <= span_x * 1.25f || dist_px <= 1100.0f);
+        want = screen_px >= 220.0f && (dist <= span_x * 2.25f || dist_px <= 2100.0f);
         break;
     default:
         want = false;
@@ -149,4 +149,137 @@ bool backend_stream_update_lod(GpuMathArchiveHeader *hdr,
     bool cut_changed = (next_count != prev_count) ||
                        (memcmp(prev_leaves, next_leaves, next_count * sizeof(uint16_t)) != 0);
     return cut_changed;
+}
+
+static bool tile_aabb_in_frustum_cpu(const GpuMathQuadNode   *node,
+                                     const TerrainCullParams *cull,
+                                     uint32_t                *out_tile_verts) {
+    if (node == nullptr || cull == nullptr) {
+        return false;
+    }
+    if (out_tile_verts != nullptr) {
+        *out_tile_verts = cull->verts_per_tile;
+    }
+    uint32_t blk      = 0u;
+    uint16_t morton   = 0u;
+    uint8_t  lod      = 0u;
+    uint8_t  flags    = 0u;
+    float    min_elev = 0.0f;
+    float    max_elev = 0.0f;
+    gpumath_tile_header_unpack(node->header, &blk, &morton, &lod, &flags, &min_elev, &max_elev);
+    (void)blk;
+    (void)morton;
+    (void)lod;
+    (void)flags;
+
+    if (max_elev <= min_elev) {
+        min_elev = 800.0f;
+        max_elev = 1720.0f;
+    } else {
+        min_elev = fmaxf(min_elev - 32.0f, 0.0f);
+        max_elev = max_elev + 32.0f;
+    }
+
+    float z0 = (min_elev - cull->elev_base_m) * cull->vertical_scale;
+    float z1 = (max_elev - cull->elev_base_m) * cull->vertical_scale;
+
+    float sx = fmaxf((float)cull->width, 1.0f) * 0.5f;
+    float sy = fmaxf((float)cull->height, 1.0f) * 0.5f;
+
+    float min_nx =  1.0e9f;
+    float min_ny =  1.0e9f;
+    float min_nz =  1.0e9f;
+    float max_nx = -1.0e9f;
+    float max_ny = -1.0e9f;
+    float max_nz = -1.0e9f;
+
+    for (uint32_t corner = 0u; corner < 8u; ++corner) {
+        float wx = ((corner & 1u) != 0u ? node->world_max_x : node->world_min_x) - cull->cam_x;
+        float wy = ((corner & 2u) != 0u ? node->world_max_y : node->world_min_y) - cull->cam_y;
+        float wz = ((corner & 4u) != 0u ? z1 : z0) - cull->cam_z;
+
+        // t = 2.0 * cross(q.xyz, v)
+        float tx = 2.0f * (cull->qy * wz - cull->qz * wy);
+        float ty = 2.0f * (cull->qz * wx - cull->qx * wz);
+        float tz = 2.0f * (cull->qx * wy - cull->qy * wx);
+
+        // vpos = v + q.w * t + cross(q.xyz, t)
+        float vx = wx + cull->qw * tx + (cull->qy * tz - cull->qz * ty);
+        float vy = wy + cull->qw * ty + (cull->qz * tx - cull->qx * tz);
+        float vz = wz + cull->qw * tz + (cull->qx * ty - cull->qy * tx);
+
+        float nx = (vx * cull->zoom) / sx;
+        float ny = (-vy * cull->zoom) / sy;
+        float nz = 0.5f - vz / 65536.0f;
+
+        if (nx < min_nx) min_nx = nx;
+        if (ny < min_ny) min_ny = ny;
+        if (nz < min_nz) min_nz = nz;
+        if (nx > max_nx) max_nx = nx;
+        if (ny > max_ny) max_ny = ny;
+        if (nz > max_nz) max_nz = nz;
+    }
+
+    const float k_guard = 1.08f;
+    if (max_nx < -k_guard || min_nx > k_guard ||
+        max_ny < -k_guard || min_ny > k_guard ||
+        max_nz < 0.0f     || min_nz > 1.0f) {
+        return false;
+    }
+
+    if (out_tile_verts != nullptr) {
+        float px_span = fmaxf((max_nx - min_nx) * sx, (max_ny - min_ny) * sy);
+        uint32_t v = cull->verts_per_tile;
+        if (px_span < 160.0f && v > (16u * 16u + 64u) * 6u) {
+            v = (16u * 16u + 64u) * 6u;
+        } else if (px_span < 340.0f && v > (32u * 32u + 64u) * 6u) {
+            v = (32u * 32u + 64u) * 6u;
+        }
+        *out_tile_verts = v;
+    }
+    return true;
+}
+
+uint32_t backend_stream_cull_frustum(const GpuMathArchiveHeader *hdr,
+                                     const TerrainCullParams    *cull,
+                                     GpuMathIndirectBuffer      *out_indirect) {
+    if (hdr == nullptr || cull == nullptr || out_indirect == nullptr) {
+        return 0u;
+    }
+    uint32_t count = hdr->dir.active_leaf_count;
+    if (count > k_gmpack_active_cut_cap) {
+        count = k_gmpack_active_cut_cap;
+    }
+
+    uint32_t visible = 0u;
+    for (uint32_t i = 0u; i < count; ++i) {
+        uint32_t node_idx = hdr->dir.active_leaves[i];
+        if (node_idx >= k_gmpack_node_count) {
+            continue;
+        }
+        const GpuMathQuadNode *node = &hdr->nodes[node_idx];
+        uint32_t tile_verts = cull->verts_per_tile;
+        if (tile_aabb_in_frustum_cpu(node, cull, &tile_verts)) {
+            uint32_t slot = visible++;
+            out_indirect->visible_nodes[slot] = node_idx;
+            out_indirect->cmds[slot] = (GpuMathDrawCmd){
+                .vertex_count   = tile_verts,
+                .instance_count = 1u,
+                .first_vertex   = 0u,
+                .first_instance = slot,
+            };
+        }
+    }
+
+    out_indirect->draw_count        = visible;
+    out_indirect->culled_count      = count - visible;
+    out_indirect->active_leaf_total = count;
+    out_indirect->pad0              = 0u;
+    out_indirect->single_cmd        = (GpuMathDrawCmd){
+        .vertex_count   = cull->verts_per_tile,
+        .instance_count = visible,
+        .first_vertex   = 0u,
+        .first_instance = 0u,
+    };
+    return visible;
 }

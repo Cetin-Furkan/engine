@@ -49,8 +49,8 @@ int wayland_create_toplevel_and_configure(
     (void)wayland_put_raw(w, w->xdg_surface_id, 1u, &w->xdg_toplevel_id, sizeof(w->xdg_toplevel_id));
 
     // 4. xdg_toplevel.set_title (request 2) and set_app_id (request 3)
-    (void)wl_append_string(w, w->xdg_toplevel_id, 2u, title != nullptr ? title : "Antigravity");
-    (void)wl_append_string(w, w->xdg_toplevel_id, 3u, app_id != nullptr ? app_id : "antigravity");
+    (void)wl_append_string(w, w->xdg_toplevel_id, 2u, title != nullptr ? title : "Engine");
+    (void)wl_append_string(w, w->xdg_toplevel_id, 3u, app_id != nullptr ? app_id : "engine");
 
     if (w->viewporter_id != 0) {
         uint32_t viewport = wayland_alloc_id(w);

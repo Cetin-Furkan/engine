@@ -14,6 +14,8 @@ void gimbal_shutdown(VulkanContext *vk);
 void gimbal_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height);
 
 bool gimbal_toggle(void);
+void gimbal_set_visible(bool visible);
+bool gimbal_is_visible(void);
 bool gimbal_busy(void);
 void gimbal_commit(void);
 

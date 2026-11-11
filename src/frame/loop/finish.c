@@ -153,6 +153,8 @@ int frame_loop_finish(RingContext *ring, WaylandContext *wl, VulkanContext *vk,
         close(frame_state.inotify_fd);
         frame_state.inotify_fd = -1;
         frame_state.inotify_wd = -1;
+        frame_state.world_wd = -1;
+        frame_state.world_watch_path[0] = '\0';
     }
     (void)sigprocmask(SIG_SETMASK, old_mask, nullptr);
 

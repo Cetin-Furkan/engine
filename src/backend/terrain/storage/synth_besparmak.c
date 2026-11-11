@@ -60,7 +60,7 @@ typedef struct RidgePeak {
     float  angle_rad;
 } RidgePeak;
 
-static float eval_besparmak_elevation_m(double lat, double lon) {
+float backend_eval_besparmak_elevation_m(double lat, double lon) {
     // Base Baklan Ovası floor (~832 m, gently sloping south-to-north toward Büyük Menderes)
     float base = 832.0f + (float)((37.996 - lat) * 95.0);
 
@@ -211,13 +211,9 @@ int backend_synth_besparmak_archive(const char *pack_path) {
     for (uint8_t lod = 0u; lod < k_gmpack_lod_count; ++lod) {
         uint8_t grid_n = (uint8_t)(1u << lod);
         float tile_span_world = (k_terrain_world_half * 2.0f) / (float)grid_n;
-        uint8_t gx_start = (lod == 4u) ? 4u : 0u;
-        uint8_t gx_end   = (lod == 4u) ? 12u : grid_n;
-        uint8_t gy_start = (lod == 4u) ? 4u : 0u;
-        uint8_t gy_end   = (lod == 4u) ? 12u : grid_n;
 
-        for (uint8_t gy = gy_start; gy < gy_end; ++gy) {
-            for (uint8_t gx = gx_start; gx < gx_end; ++gx) {
+        for (uint8_t gy = 0u; gy < grid_n; ++gy) {
+            for (uint8_t gx = 0u; gx < grid_n; ++gx) {
                 uint32_t idx = backend_quadtree_node_index(lod, gx, gy);
                 GpuMathQuadNode *node = &hdr->nodes[idx];
                 GpuMathTileBlock *blk = &tiles[idx];
@@ -248,7 +244,7 @@ int backend_synth_besparmak_archive(const char *pack_path) {
                     for (uint32_t sx = 0u; sx < k_gmpack_tile_dim; ++sx) {
                         double tx = (double)sx / (double)(k_gmpack_tile_dim - 1u);
                         double lon = lon0 + tx * (lon1 - lon0);
-                        float elev = eval_besparmak_elevation_m(lat, lon);
+                        float elev = backend_eval_besparmak_elevation_m(lat, lon);
                         if (elev < min_e) min_e = elev;
                         if (elev > max_e) max_e = elev;
                         sum_e += elev;
@@ -291,7 +287,7 @@ int backend_synth_besparmak_archive(const char *pack_path) {
                     ? (uint16_t)backend_quadtree_node_index((uint8_t)(lod - 1u), (uint8_t)(gx >> 1u), (uint8_t)(gy >> 1u))
                     : 0u;
                 RelPtr2D child_rel = k_relptr2d_null;
-                bool has_children = (lod < 3u) || (lod == 3u && gx >= 2u && gx < 6u && gy >= 2u && gy < 6u);
+                bool has_children = (lod + 1u < k_gmpack_lod_count);
                 if (has_children) {
                     uint32_t first_child = backend_quadtree_node_index((uint8_t)(lod + 1u),
                                                                        (uint8_t)(gx * 2u),
@@ -352,7 +348,7 @@ int backend_synth_besparmak_archive(const char *pack_path) {
     }
     close(fd);
     free(image);
-    printf("[Backend] Synthesized & saved 85-tile Baklan & Beşparmak Dağı archive to SSD: %s (%.2f MiB)\n",
+    printf("[Backend] Synthesized & saved 341-tile Baklan & Beşparmak Dağı archive to SSD: %s (%.2f MiB)\n",
            pack_path, (double)k_gmpack_total_bytes / (1024.0 * 1024.0));
     fflush(stdout);
     return 0;

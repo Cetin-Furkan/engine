@@ -109,6 +109,9 @@ static int submit_idle(VulkanContext *vk, VkCommandBuffer cmd) {
     return 0;
 }
 
+static VulkanContext   *s_vk = nullptr;
+static bool             s_grid_ready = false;
+
 void grid_shutdown(VulkanContext *vk) {
     if (vk != nullptr && vk->device != VK_NULL_HANDLE) {
         if (s_pipe != VK_NULL_HANDLE) {
@@ -119,6 +122,8 @@ void grid_shutdown(VulkanContext *vk) {
         }
         bda_arena_destroy(vk, &s_arena);
     }
+    s_vk = nullptr;
+    s_grid_ready = false;
     s_pipe = VK_NULL_HANDLE;
     s_layout = VK_NULL_HANDLE;
     s_field[0] = 0;
@@ -129,22 +134,24 @@ void grid_shutdown(VulkanContext *vk) {
     s_hold_logged = false;
 }
 
-int grid_init(VulkanContext *vk) {
-    if (vk == nullptr || vk->device == VK_NULL_HANDLE) {
-        return -1;
+static bool grid_ensure_ready(void) {
+    if (s_grid_ready) {
+        return true;
     }
-    if (s_pipe != VK_NULL_HANDLE) {
-        grid_shutdown(vk);
+    VulkanContext *vk = s_vk;
+    if (vk == nullptr || vk->device == VK_NULL_HANDLE) {
+        return false;
     }
     if (bda_arena_init(vk, &s_arena, k_arena_bytes, false) != 0) {
-        return -1;
+        return false;
     }
     bda_arena_reset(&s_arena);
     BdaSlice a = bda_arena_alloc(&s_arena, k_field_bytes, 256u);
     BdaSlice b = bda_arena_alloc(&s_arena, k_field_bytes, 256u);
     if (a.gpu == 0 || b.gpu == 0) {
         grid_shutdown(vk);
-        return -1;
+        s_vk = vk;
+        return false;
     }
     s_field[0] = a.gpu;
     s_field[1] = b.gpu;
@@ -163,12 +170,14 @@ int grid_init(VulkanContext *vk) {
     if (res != VK_SUCCESS) {
         grid_fail("vkCreatePipelineLayout", res);
         grid_shutdown(vk);
-        return -1;
+        s_vk = vk;
+        return false;
     }
     s_pipe = vulkan_compute_pipeline(vk, k_grid_spv, sizeof k_grid_spv, s_layout);
     if (s_pipe == VK_NULL_HANDLE) {
         grid_shutdown(vk);
-        return -1;
+        s_vk = vk;
+        return false;
     }
 
     VkCommandPool pool = vk->compute_cmd_pool != VK_NULL_HANDLE ? vk->compute_cmd_pool : vk->cmd_pool;
@@ -183,7 +192,8 @@ int grid_init(VulkanContext *vk) {
     if (res != VK_SUCCESS) {
         grid_fail("vkAllocateCommandBuffers", res);
         grid_shutdown(vk);
-        return -1;
+        s_vk = vk;
+        return false;
     }
     VkCommandBufferBeginInfo begin_info = {
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -194,28 +204,39 @@ int grid_init(VulkanContext *vk) {
         grid_fail("vkBeginCommandBuffer", res);
         vkFreeCommandBuffers(vk->device, pool, 1, &cmd);
         grid_shutdown(vk);
-        return -1;
+        s_vk = vk;
+        return false;
     }
     dispatch_grid(cmd, 0u, 1u, 0, s_field[0]);
     barrier_field(cmd, false);
     if (submit_idle(vk, cmd) != 0) {
         vkFreeCommandBuffers(vk->device, pool, 1, &cmd);
         grid_shutdown(vk);
-        return -1;
+        s_vk = vk;
+        return false;
     }
     vkFreeCommandBuffers(vk->device, pool, 1, &cmd);
     s_read = 0;
     s_step_open = false;
-    s_held = false;
-    s_hold_logged = false;
+    s_grid_ready = true;
     printf("[Grid] 128^3 fp16 lattice, center ball. The vertex shader samples it.\n");
     fflush(stdout);
+    return true;
+}
+
+int grid_init(VulkanContext *vk) {
+    if (vk == nullptr || vk->device == VK_NULL_HANDLE) {
+        return -1;
+    }
+    s_vk = vk;
     return 0;
 }
 
 void grid_record(VkCommandBuffer cmd, uint32_t dt_ms) {
-    if (cmd == VK_NULL_HANDLE || dt_ms == 0u || s_held || s_step_open ||
-        s_pipe == VK_NULL_HANDLE || s_field[0] == 0 || s_field[1] == 0) {
+    if (cmd == VK_NULL_HANDLE || dt_ms == 0u || s_held || s_step_open) {
+        return;
+    }
+    if (!grid_ensure_ready() || s_pipe == VK_NULL_HANDLE || s_field[0] == 0 || s_field[1] == 0) {
         return;
     }
     int dst = s_read ^ 1;
@@ -259,7 +280,7 @@ uint32_t grid_n(void) {
 }
 
 uint64_t grid_field_addr(void) {
-    if (s_field[0] == 0 || s_field[1] == 0) {
+    if (!grid_ensure_ready() || s_field[0] == 0 || s_field[1] == 0) {
         return 0;
     }
     int copy = s_step_open ? (s_read ^ 1) : s_read;

@@ -229,7 +229,20 @@ static void test_gravity_and_elastic_presets(void) {
     CHECK(sheet_rigid_count() == 2u);
     CHECK(sheet_soft_count() == 2u);
     CHECK(sheet_dyn_count() == 4u);
+
+    // World 9 (sandbox) loads examples/demo/world/sheet.world
+    sheet_select_world(9u);
+    CHECK(sheet_load() == 0);
+    CHECK(sheet_rigid_count() == 2u);
+    CHECK(sheet_soft_count() == 1u);
+    CHECK(sheet_dyn_count() == 1u);
+
+    // World 0 (pure empty engine) opens with literally zero 2D sheet objects
     sheet_select_world(0u);
+    CHECK(sheet_load() == 0);
+    CHECK(sheet_rigid_count() == 0u);
+    CHECK(sheet_soft_count() == 0u);
+    CHECK(sheet_dyn_count() == 0u);
 }
 
 int main(void) {

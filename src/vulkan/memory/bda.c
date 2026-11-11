@@ -434,6 +434,44 @@ void bda_transient_begin_frame(uint64_t signal_point) {
     s_bda_sys.transient_at[slot] = half * (VkDeviceSize)slot;
 }
 
+static VkDeviceSize pool_allocated_bytes(const BdaPool *pool) {
+    VkDeviceSize used = 0;
+    for (const BdaBlock *b = pool->blocks; b != nullptr; b = b->next) {
+        VkDeviceSize b_used = b->allocated;
+        const BdaRange *list = b->free_extra != nullptr ? b->free_extra : b->free_list;
+        for (uint32_t i = 0; i < b->free_count; ++i) {
+            if (b_used >= list[i].size) {
+                b_used -= list[i].size;
+            }
+        }
+        used += b_used;
+    }
+    return used;
+}
+
+void bda_get_stats(BdaStats *out) {
+    if (out == nullptr) {
+        return;
+    }
+    *out = (BdaStats){0};
+    if (!s_bda_sys.is_initialized) {
+        return;
+    }
+    out->device_allocated   = pool_allocated_bytes(&s_bda_sys.device_pool);
+    out->device_capacity    = s_bda_sys.device_pool.total_bytes;
+    out->device_blocks      = s_bda_sys.device_pool.block_count;
+    out->staging_allocated  = pool_allocated_bytes(&s_bda_sys.staging_pool);
+    out->staging_capacity   = s_bda_sys.staging_pool.total_bytes;
+    out->staging_blocks     = s_bda_sys.staging_pool.block_count;
+    out->transient_capacity = s_bda_sys.transient_ring.capacity;
+    if (s_bda_sys.transient_ring.capacity >= 2u) {
+        VkDeviceSize half = s_bda_sys.transient_ring.capacity / 2u;
+        VkDeviceSize u0 = s_bda_sys.transient_at[0] <= half ? s_bda_sys.transient_at[0] : half;
+        VkDeviceSize u1 = s_bda_sys.transient_at[1] >= half ? (s_bda_sys.transient_at[1] - half) : 0;
+        out->transient_used = u0 + u1;
+    }
+}
+
 int da_buffer_create(VulkanContext *vk, VkDeviceSize size, VkBufferUsageFlags usage,
                      bool host, DaBuffer *out) {
     if (vk == nullptr || vk->device == VK_NULL_HANDLE || out == nullptr || size == 0) {
@@ -488,9 +526,9 @@ int da_buffer_create(VulkanContext *vk, VkDeviceSize size, VkBufferUsageFlags us
     return 0;
 }
 
-static void return_to_pool(BdaPool *pool, VkBuffer buffer, VkDeviceSize offset, VkDeviceSize size) {
+static bool return_to_pool(BdaPool *pool, VkBuffer buffer, VkDeviceSize offset, VkDeviceSize size) {
     if (pool == nullptr || buffer == VK_NULL_HANDLE || size == 0) {
-        return;
+        return false;
     }
     for (BdaBlock *b = pool->blocks; b != nullptr; b = b->next) {
         if (b->buffer != buffer) continue;
@@ -538,7 +576,7 @@ static void return_to_pool(BdaPool *pool, VkBuffer buffer, VkDeviceSize offset, 
             if (offset + size == b->allocated) {
                 b->allocated = offset;
             } else if (!free_push(b, (BdaRange){ offset, size })) {
-                return;
+                return true;
             }
         }
 
@@ -555,8 +593,9 @@ static void return_to_pool(BdaPool *pool, VkBuffer buffer, VkDeviceSize offset, 
                 }
             }
         }
-        return;
+        return true;
     }
+    return false;
 }
 
 void da_buffer_destroy(VulkanContext *vk, DaBuffer *buf) {
@@ -564,8 +603,9 @@ void da_buffer_destroy(VulkanContext *vk, DaBuffer *buf) {
         return;
     }
     if (buf->is_suballocated) {
-        BdaPool *pool = (buf->map != nullptr) ? &s_bda_sys.staging_pool : &s_bda_sys.device_pool;
-        return_to_pool(pool, buf->buffer, buf->offset, buf->bytes);
+        if (!return_to_pool(&s_bda_sys.device_pool, buf->buffer, buf->offset, buf->bytes)) {
+            (void)return_to_pool(&s_bda_sys.staging_pool, buf->buffer, buf->offset, buf->bytes);
+        }
     } else if (vk != nullptr && vk->device != VK_NULL_HANDLE) {
         BdaBlock block = {
             .buffer   = buf->buffer,

@@ -268,6 +268,12 @@ static bool load_file(RingCqeFn on_cqe, void *on_user, bool *has) {
     return changed;
 }
 
+static RingCqeFn s_init_cqe = nullptr;
+static void     *s_init_user = nullptr;
+static bool      s_mesh_ready = false;
+
+static bool mesh_ensure_ready(void);
+
 void mesh_shutdown(VulkanContext *vk) {
     if (vk != nullptr && vk->device != VK_NULL_HANDLE && s_queue != VK_NULL_HANDLE) {
         (void)vkQueueWaitIdle(s_queue);
@@ -285,9 +291,12 @@ void mesh_shutdown(VulkanContext *vk) {
     s_armed = -1;
     s_armed_point = 0;
     s_armed_published = false;
+    s_mesh_ready = false;
     memset(s_slice, 0, sizeof s_slice);
     vulkan_gfx_disarm(vk, &s_gfx);
     s_vk = nullptr;
+    s_init_cqe = nullptr;
+    s_init_user = nullptr;
     if (vk != nullptr && vk->device != VK_NULL_HANDLE) {
         if (s_layout != VK_NULL_HANDLE) {
             vkDestroyPipelineLayout(vk->device, s_layout, nullptr);
@@ -297,14 +306,16 @@ void mesh_shutdown(VulkanContext *vk) {
     da_buffer_destroy(vk, &s_geom);
 }
 
-int mesh_init(VulkanContext *vk, RingCqeFn on_cqe, void *on_user) {
+static bool mesh_ensure_ready(void) {
+    if (s_mesh_ready) {
+        return true;
+    }
+    VulkanContext *vk = s_vk;
     if (vk == nullptr || vk->device == VK_NULL_HANDLE || vk->physical_device == VK_NULL_HANDLE) {
-        return -1;
+        return false;
     }
-    s_vk = vk;
-    if (s_layout != VK_NULL_HANDLE) {
-        return 0;
-    }
+    RingCqeFn on_cqe = s_init_cqe;
+    void *on_user = s_init_user;
     if (!plot_file_mesh_check()) {
         fprintf(stderr, "[Mesh Error] Triangulation self-check failed\n");
     }
@@ -312,19 +323,22 @@ int mesh_init(VulkanContext *vk, RingCqeFn on_cqe, void *on_user) {
     VkSampleCountFlagBits samples = pass_raster_samples();
     if (depth_format == VK_FORMAT_UNDEFINED || samples == 0) {
         fprintf(stderr, "[Mesh Error] The render pass has no depth format yet\n");
-        return -1;
+        return false;
     }
     VkPhysicalDeviceProperties props = {0};
     vkGetPhysicalDeviceProperties(vk->physical_device, &props);
     if (props.limits.maxPushConstantsSize < sizeof(MeshPush)) {
         fprintf(stderr, "[Mesh Error] Push constants are %u bytes, the mesh needs %zu\n",
                 props.limits.maxPushConstantsSize, sizeof(MeshPush));
-        return -1;
+        return false;
     }
     s_queue = vk->queues.graphics_queue;
     if (create_buffer(vk) != 0) {
         mesh_shutdown(vk);
-        return -1;
+        s_vk = vk;
+        s_init_cqe = on_cqe;
+        s_init_user = on_user;
+        return false;
     }
     VkPushConstantRange push = {
         .stageFlags = VK_SHADER_STAGE_VERTEX_BIT,
@@ -340,7 +354,10 @@ int mesh_init(VulkanContext *vk, RingCqeFn on_cqe, void *on_user) {
     if (res != VK_SUCCESS) {
         mesh_fail("vkCreatePipelineLayout", res);
         mesh_shutdown(vk);
-        return -1;
+        s_vk = vk;
+        s_init_cqe = on_cqe;
+        s_init_user = on_user;
+        return false;
     }
     VulkanGfxPipe gfx = {
         .vert          = k_vert_spv,
@@ -357,19 +374,28 @@ int mesh_init(VulkanContext *vk, RingCqeFn on_cqe, void *on_user) {
         .blend         = VK_FALSE,
     };
     vulkan_gfx_arm(&s_gfx, &gfx, VK_FORMAT_B8G8R8A8_SRGB, nullptr);
+    s_mesh_ready = true;
     (void)load_file(on_cqe, on_user, nullptr);
-    s_gen = 0;
-    s_shown_gen = 0;
     if (!s_logged) {
         printf("[Mesh] OBJ faces are a mesh. L reloads plots/mesh.obj.\n");
         fflush(stdout);
         s_logged = true;
     }
+    return true;
+}
+
+int mesh_init(VulkanContext *vk, RingCqeFn on_cqe, void *on_user) {
+    if (vk == nullptr || vk->device == VK_NULL_HANDLE || vk->physical_device == VK_NULL_HANDLE) {
+        return -1;
+    }
+    s_vk = vk;
+    s_init_cqe = on_cqe;
+    s_init_user = on_user;
     return 0;
 }
 
 bool mesh_reload(RingCqeFn on_cqe, void *on_user, bool *has) {
-    if (s_base == 0) {
+    if (!s_mesh_ready || s_base == 0) {
         if (has != nullptr) {
             *has = false;
         }
@@ -379,6 +405,9 @@ bool mesh_reload(RingCqeFn on_cqe, void *on_user, bool *has) {
 }
 
 bool mesh_has_triangles(void) {
+    if (!s_mesh_ready && s_vk != nullptr) {
+        (void)mesh_ensure_ready();
+    }
     return s_count >= 3u;
 }
 
@@ -387,6 +416,9 @@ uint32_t mesh_vertex_count(void) {
 }
 
 bool mesh_sphere(float *cx, float *cy, float *radius) {
+    if (!s_mesh_ready && s_vk != nullptr) {
+        (void)mesh_ensure_ready();
+    }
     if (s_count < 3u || s_radius <= 0.0f) {
         return false;
     }
@@ -496,6 +528,9 @@ void mesh_release(uint64_t signal_point) {
 
 void mesh_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height,
                float yaw_deg, bool selected) {
+    if (!mesh_ensure_ready()) {
+        return;
+    }
     VkPipeline pipeline = vulkan_gfx_use(s_vk, &s_gfx);
     if (cmd == VK_NULL_HANDLE || pipeline == VK_NULL_HANDLE || s_gpu_count < 3u ||
         s_draw_addr == 0 || width == 0u || height == 0u) {

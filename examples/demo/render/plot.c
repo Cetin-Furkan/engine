@@ -160,6 +160,13 @@ static void push_bytes(VkCommandBuffer cmd, VkPipelineLayout layout, VkShaderSta
     vulkan_cmd_push(cmd, layout, stage, size, bytes);
 }
 
+static RingCqeFn s_init_cqe = nullptr;
+static void     *s_init_user = nullptr;
+static bool      s_plot_ready = false;
+static bool      s_plot_visible = false;
+
+static bool plot_ensure_ready(void);
+
 void plot_shutdown(VulkanContext *vk) {
     if (vk != nullptr && vk->device != VK_NULL_HANDLE && s_queue != VK_NULL_HANDLE) {
         (void)vkQueueWaitIdle(s_queue);
@@ -176,6 +183,7 @@ void plot_shutdown(VulkanContext *vk) {
     s_armed_published = false;
     s_math_dirty = false;
     s_file_dirty = false;
+    s_plot_ready = false;
     memset(s_slice, 0, sizeof s_slice);
     if (vk != nullptr && vk->device != VK_NULL_HANDLE) {
         if (s_bake != VK_NULL_HANDLE) {
@@ -190,6 +198,8 @@ void plot_shutdown(VulkanContext *vk) {
     }
     vulkan_gfx_disarm(vk, &s_gfx);
     s_vk = nullptr;
+    s_init_cqe = nullptr;
+    s_init_user = nullptr;
     s_bake = VK_NULL_HANDLE;
     s_bake_layout = VK_NULL_HANDLE;
     s_layout = VK_NULL_HANDLE;
@@ -374,6 +384,12 @@ void plot_begin(VkSemaphore acquire, uint64_t signal_point) {
     s_armed_published = false;
     s_saved_math = false;
     s_saved_file = false;
+    if (!s_plot_visible) {
+        return;
+    }
+    if (!plot_ensure_ready()) {
+        return;
+    }
     if (s_map == nullptr || signal_point == 0u || (!s_math_dirty && !s_file_dirty)) {
         return;
     }
@@ -437,6 +453,9 @@ void plot_release(uint64_t signal_point) {
 }
 
 void plot_prepare(VkCommandBuffer cmd) {
+    if (!s_plot_visible) {
+        return;
+    }
     if (cmd == VK_NULL_HANDLE || !s_math_dirty || s_bake == VK_NULL_HANDLE) {
         if (s_mode == k_mode_off) {
             s_math_dirty = false;
@@ -501,6 +520,9 @@ static void draw_range(VkCommandBuffer cmd, uint32_t width, uint32_t height,
 }
 
 void plot_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height) {
+    if (!plot_is_visible() || !plot_ensure_ready()) {
+        return;
+    }
     VkPipeline pipeline = vulkan_gfx_use(s_vk, &s_gfx);
     if (cmd == VK_NULL_HANDLE || width == 0 || height == 0 || pipeline == VK_NULL_HANDLE ||
         s_draw_addr == 0) {
@@ -521,7 +543,23 @@ void plot_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height) {
     }
 }
 
+void plot_set_visible(bool visible) {
+    if (s_plot_visible != visible) {
+        s_plot_visible = visible;
+        s_gen++;
+    }
+    if (visible && s_vk != nullptr) {
+        (void)plot_ensure_ready();
+    }
+}
+
+bool plot_is_visible(void) {
+    return s_plot_visible;
+}
+
 bool plot_cycle(void) {
+    s_plot_visible = true;
+    (void)plot_ensure_ready();
     if (s_mode == k_mode_sin) {
         s_mode = k_mode_sinc;
     } else if (s_mode == k_mode_sinc) {
@@ -539,7 +577,7 @@ bool plot_cycle(void) {
 }
 
 bool plot_wants_frame(void) {
-    return s_gen != s_shown_gen || s_math_dirty || s_file_dirty;
+    return s_gen != s_shown_gen || (s_plot_visible && (s_math_dirty || s_file_dirty));
 }
 
 void plot_commit(void) {
@@ -636,6 +674,9 @@ static bool store_file(uint32_t n) {
 }
 
 bool plot_reload(RingCqeFn on_cqe, void *on_user) {
+    if (!s_plot_visible || !plot_ensure_ready()) {
+        return false;
+    }
     bool found = false;
     uint32_t n = plot_file_load(s_built, k_file_samples, &found, nullptr, on_cqe, on_user);
     if (s_base == 0) {
@@ -648,31 +689,36 @@ bool plot_reload(RingCqeFn on_cqe, void *on_user) {
     return changed;
 }
 
-int plot_init(VulkanContext *vk, RingCqeFn on_cqe, void *on_user) {
+static bool plot_ensure_ready(void) {
+    if (s_plot_ready) {
+        return true;
+    }
+    VulkanContext *vk = s_vk;
     if (vk == nullptr || vk->device == VK_NULL_HANDLE || vk->physical_device == VK_NULL_HANDLE) {
-        return -1;
+        return false;
     }
-    s_vk = vk;
-    if (s_layout != VK_NULL_HANDLE) {
-        return 0;
-    }
+    RingCqeFn on_cqe = s_init_cqe;
+    void *on_user = s_init_user;
     VkFormat depth_format = pass_depth_format();
     VkSampleCountFlagBits samples = pass_raster_samples();
     if (depth_format == VK_FORMAT_UNDEFINED || samples == 0) {
         fprintf(stderr, "[Plot Error] The render pass has no depth format yet\n");
-        return -1;
+        return false;
     }
     VkPhysicalDeviceProperties props = {0};
     vkGetPhysicalDeviceProperties(vk->physical_device, &props);
     if (props.limits.maxPushConstantsSize < sizeof(PlotPush)) {
         fprintf(stderr, "[Plot Error] Push constants are %u bytes, the plot needs %zu\n",
                 props.limits.maxPushConstantsSize, sizeof(PlotPush));
-        return -1;
+        return false;
     }
     s_queue = vk->queues.compute_queue != VK_NULL_HANDLE ? vk->queues.compute_queue : vk->queues.graphics_queue;
     if (create_buffer(vk) != 0) {
         plot_shutdown(vk);
-        return -1;
+        s_vk = vk;
+        s_init_cqe = on_cqe;
+        s_init_user = on_user;
+        return false;
     }
 
     VkPushConstantRange push = {
@@ -688,7 +734,10 @@ int plot_init(VulkanContext *vk, RingCqeFn on_cqe, void *on_user) {
     if (res != VK_SUCCESS) {
         plot_fail("vkCreatePipelineLayout", res);
         plot_shutdown(vk);
-        return -1;
+        s_vk = vk;
+        s_init_cqe = on_cqe;
+        s_init_user = on_user;
+        return false;
     }
     VkPushConstantRange bake_range = {
         .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
@@ -703,13 +752,19 @@ int plot_init(VulkanContext *vk, RingCqeFn on_cqe, void *on_user) {
     if (res != VK_SUCCESS) {
         plot_fail("vkCreatePipelineLayout bake", res);
         plot_shutdown(vk);
-        return -1;
+        s_vk = vk;
+        s_init_cqe = on_cqe;
+        s_init_user = on_user;
+        return false;
     }
 
     s_bake = vulkan_compute_pipeline(vk, k_bake_spv, sizeof k_bake_spv, s_bake_layout);
     if (s_bake == VK_NULL_HANDLE) {
         plot_shutdown(vk);
-        return -1;
+        s_vk = vk;
+        s_init_cqe = on_cqe;
+        s_init_user = on_user;
+        return false;
     }
     VulkanGfxPipe gfx = {
         .vert          = k_vert_spv,
@@ -730,19 +785,37 @@ int plot_init(VulkanContext *vk, RingCqeFn on_cqe, void *on_user) {
     if (pool == VK_NULL_HANDLE || s_queue == VK_NULL_HANDLE) {
         fprintf(stderr, "[Plot Error] Math bake needs compute queue and command pool\n");
         plot_shutdown(vk);
-        return -1;
+        s_vk = vk;
+        s_init_cqe = on_cqe;
+        s_init_user = on_user;
+        return false;
     }
     if (bake_math(vk) != 0) {
         plot_shutdown(vk);
-        return -1;
+        s_vk = vk;
+        s_init_cqe = on_cqe;
+        s_init_user = on_user;
+        return false;
     }
+    s_plot_ready = true;
     (void)plot_reload(on_cqe, on_user);
-    s_gen = 0;
-    s_shown_gen = 0;
     if (!s_logged) {
         printf("[Plot] Math curve on the GPU, off until M. M cycles sin, sinc, gaussian, off. L reloads plots/data.csv and plots/mesh.obj.\n");
         fflush(stdout);
         s_logged = true;
+    }
+    return true;
+}
+
+int plot_init(VulkanContext *vk, RingCqeFn on_cqe, void *on_user) {
+    if (vk == nullptr || vk->device == VK_NULL_HANDLE || vk->physical_device == VK_NULL_HANDLE) {
+        return -1;
+    }
+    s_vk = vk;
+    s_init_cqe = on_cqe;
+    s_init_user = on_user;
+    if (s_plot_visible) {
+        (void)plot_ensure_ready();
     }
     return 0;
 }

@@ -376,7 +376,7 @@ bool cube_kind_spawn_pose(Coord at, int32_t yaw_milli, bool spinning, bool infin
 }
 
 bool cube_kind_spawn(Coord at) {
-    return cube_kind_spawn_elastic(at, k_yaw_start_milli, true, false, false, 0.0f);
+    return cube_kind_spawn_pose(at, k_yaw_start_milli, true, false, false);
 }
 
 float cube_kind_restitution(const WorldObj *o) {
@@ -402,7 +402,7 @@ static void cube_kind_self_check(void) {
     bool hit = slab_hit(&mid, origin, yaw, k_fillet_half, &t_mid, nullptr);
     bool miss = slab_hit(&far, origin, yaw, k_fillet_half, &t_far, nullptr);
     bool plane = fabsf(mid.plane_x) < 1.0e-3f && fabsf(mid.plane_y) < 1.0e-3f;
-    bool mesh = cube_surface_self_check();
+    bool mesh = !cube_surface_ready() || cube_surface_self_check();
     if (!hit || miss || !plane || !mesh) {
         fprintf(stderr, "[World Error] Pick self-check failed\n");
         s_pick_logged = true;

@@ -43,6 +43,12 @@ void camera_bind(bool live);
 // The pose camera_bind selected. The clipmap snaps to this point.
 void camera_bound_xy(float *x, float *y);
 
+// Horizontal map-plane basis (right and forward unit vectors in XY) and live zoom.
+void camera_map_basis(float *right_x, float *right_y, float *fwd_x, float *fwd_y, float *out_zoom);
+
+// Snap camera directly overhead (top-down bird's-eye view) centered at (focus_x, focus_y).
+bool camera_snap_birdseye(float focus_x, float focus_y);
+
 // Fills the tail every draw push ends with. mat_index names one record
 // in the shared table. The address is 0 until that table exists.
 void view_push_fill(ViewPush *out, uint32_t mat_index);

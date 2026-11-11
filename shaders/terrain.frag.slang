@@ -11,6 +11,7 @@ import lighting;
 
 struct TerrainPush {
     uint64_t dir_bda;
+    uint64_t indirect_bda;
     uint     width;
     uint     height;
     float    elev_base_m;
@@ -18,8 +19,12 @@ struct TerrainPush {
     float    marker_x;
     float    marker_y;
     float    marker_active;
+    float    marker_b_x;
+    float    marker_b_y;
+    float    marker_b_active;
     float    cell_med;
     float    coarse;
+    uint     flags;
     uint     pad0;
     ViewPush view;
 };
@@ -33,8 +38,11 @@ struct FSInput {
     float2   tile_uv      : TEXCOORD2;
     float2   elev_span    : TEXCOORD3; // x = elev_m, y = resolved_tile_world_span
     nointerpolation uint64_t tile_rel_ptr : TEXCOORD4;
-    nointerpolation uint     tile_lod     : TEXCOORD5;
 };
+
+float slang_mod1(float x, float s) {
+    return x - s * floor(x / s);
+}
 
 float2 slang_mod2(float2 x, float s) {
     return x - s * floor(x / s);
@@ -50,6 +58,19 @@ float grid_line_mask(float2 world_xy, float step_world, float width_px) {
     float2 vis  = smoothstep(float2(6.0), float2(16.0), float2(s) / fw);
     line *= vis;
     return max(line.x, line.y);
+}
+
+// Screen-space derivative anti-aliased topographic contour line mask for interval step_m (meters)
+float contour_line_mask(float elev_m, float step_m, float width_px) {
+    float s = max(step_m, 1.0);
+    float half_s = s * 0.5;
+    float dist_m = abs(slang_mod1(elev_m + half_s, s) - half_s);
+    float fw_e   = clamp(fwidth(elev_m), 1.0e-3, s * 0.5);
+    float dist_px = dist_m / fw_e;
+    float line = 1.0 - smoothstep(width_px - 0.5, width_px + 0.5, dist_px);
+    // Fade out contours when lines compress closer than 3.5 screen pixels on near-vertical cliffs
+    float vis  = smoothstep(3.0, 8.5, s / fw_e);
+    return line * vis;
 }
 
 // Fast deterministic 2D hash in [-1, +1] for analytical derivative noise
@@ -120,52 +141,135 @@ float4 main(FSInput input) : SV_Target0 {
     float2 fw_xy = fwidth(input.world_pos.xy);
     float fw_m   = max(length(fw_xy), 0.05);
 
-    if (tile_bda != 0ull) {
-        // 16-tap Catmull-Rom bicubic satellite imagery sample
-        img_srgb = tile_sample_bicubic_imagery(tile_bda, input.tile_uv);
+    // 1. Sample Committed Full-Resolution Bird's-Eye Orthophoto Layers from GPU BDA Arena
+    float3 ortho_srgb        = float3(0.0);
+    float  ortho_coverage    = 0.0;
+    uint   committed_layers  = load_committed_ortho_count(pc.dir_bda);
+    for (uint li = 0u; li < committed_layers; ++li) {
+        GpuMathOrthoOverlayGpu layer = load_committed_ortho_layer(pc.dir_bda, li);
+        if (layer.active == 0u || layer.pixels_bda == 0ull || layer.width_px == 0u || layer.height_px == 0u) {
+            continue;
+        }
+        float2 l_half = max(float2(layer.half_span_x, layer.half_span_y), float2(1.0));
+        float2 l_rel  = (input.world_pos.xy - float2(layer.center_x, layer.center_y)) / l_half;
+        if (abs(l_rel.x) <= 1.0 && abs(l_rel.y) <= 1.0) {
+            float2 l_uv      = float2(0.5 * (l_rel.x + 1.0), 0.5 * (1.0 - l_rel.y));
+            float4 l_sample  = overlay_sample_bicubic_rgba(layer.pixels_bda, layer.width_px, layer.height_px, l_uv);
+            float  edge_dist = min(1.0 - abs(l_rel.x), 1.0 - abs(l_rel.y));
+            float  feather   = smoothstep(0.0, 0.02, edge_dist);
+            float  l_alpha   = saturate(layer.opacity * l_sample.a * feather);
+            ortho_srgb       = lerp(ortho_srgb, l_sample.rgb, l_alpha);
+            ortho_coverage   = saturate(ortho_coverage + l_alpha * (1.0 - ortho_coverage));
+        }
+    }
 
-        // High-frequency Contrast Adaptive Sharpening (CAS) from neighboring texels when zoomed in
-        float texel_step = 0.85 / float(k_tile_dim - 1u);
-        float sharp_vis  = 1.0 - smoothstep(1.5, 16.0, fw_m);
+    // 2. Sample Interactive Bird's-Eye Orthophoto Alignment Preview (50% default transparency, O/P opacity, WASD move, 0.5% 2D stretch)
+    GpuMathOrthoOverlayGpu ov = load_ortho_overlay(pc.dir_bda);
+    float  ov_border_mask = 0.0;
+    float  ov_corner_mask = 0.0;
+    float3 preview_srgb   = float3(0.0);
+    float  preview_alpha  = 0.0;
+    if (ov.active != 0u && ov.pixels_bda != 0ull && ov.width_px > 0u && ov.height_px > 0u) {
+        float2 half_span = max(float2(ov.half_span_x, ov.half_span_y), float2(1.0));
+        float2 d_xy = input.world_pos.xy - float2(ov.center_x, ov.center_y);
+        float2 rel  = d_xy / half_span;
+        if (abs(rel.x) <= 1.0 && abs(rel.y) <= 1.0) {
+            float2 ov_uv   = float2(0.5 * (rel.x + 1.0), 0.5 * (1.0 - rel.y));
+            float4 ov_srgb = overlay_sample_bicubic_rgba(ov.pixels_bda, ov.width_px, ov.height_px, ov_uv);
+            preview_srgb   = ov_srgb.rgb;
+            preview_alpha  = saturate(ov.opacity * ov_srgb.a);
+        }
+        // Screen-space anti-aliased bird's-eye alignment border & corner brackets
+        float2 dist_edge_m = abs(abs(d_xy) - half_span);
+        float  d_border_m  = (abs(rel.x) <= 1.02 && abs(rel.y) <= 1.02)
+                           ? min(dist_edge_m.x, dist_edge_m.y)
+                           : 1.0e6;
+        float  bw_m = clamp(fw_m * 1.8, 1.5, 22.0);
+        ov_border_mask = 1.0 - smoothstep(bw_m * 0.4, bw_m * 1.3, d_border_m);
+        float  corner_span_m = min(half_span.x, half_span.y) * 0.14;
+        if (abs(d_xy.x) >= half_span.x - corner_span_m &&
+            abs(d_xy.y) >= half_span.y - corner_span_m &&
+            abs(rel.x) <= 1.02 && abs(rel.y) <= 1.02) {
+            ov_corner_mask = 1.0 - smoothstep(bw_m * 0.8, bw_m * 2.2, d_border_m);
+        }
+        // Subtle center reticle
+        float d_center_m = length(d_xy);
+        float r_ret = clamp(fw_m * 8.0, 8.0, 60.0);
+        float center_cross = (1.0 - smoothstep(bw_m * 0.4, bw_m * 1.1, min(abs(d_xy.x), abs(d_xy.y)))) *
+                             (1.0 - smoothstep(r_ret * 0.8, r_ret * 1.2, d_center_m));
+        ov_border_mask = max(ov_border_mask, center_cross * 0.75);
+    }
+
+    float hi_res_photo_mask = max(ortho_coverage, preview_alpha);
+
+    if (tile_bda != 0ull) {
+        float sharp_vis = (1.0 - smoothstep(1.5, 14.0, fw_m)) * (1.0 - ortho_coverage);
         if (sharp_vis > 0.02) {
-            float3 c_n = tile_sample_bicubic_imagery(tile_bda, input.tile_uv + float2(0.0, texel_step)).rgb;
-            float3 c_s = tile_sample_bicubic_imagery(tile_bda, input.tile_uv - float2(0.0, texel_step)).rgb;
-            float3 c_e = tile_sample_bicubic_imagery(tile_bda, input.tile_uv + float2(texel_step, 0.0)).rgb;
-            float3 c_w = tile_sample_bicubic_imagery(tile_bda, input.tile_uv - float2(texel_step, 0.0)).rgb;
+            // Close-up Ultra-HD view: 16-tap Catmull-Rom bicubic + 4-tap direct texel CAS unsharp mask
+            img_srgb = tile_sample_bicubic_imagery(tile_bda, input.tile_uv);
+            float texel_step = 0.85 / float(k_tile_dim - 1u);
+            float3 c_n = tile_sample_bilinear_imagery(tile_bda, input.tile_uv + float2(0.0, texel_step)).rgb;
+            float3 c_s = tile_sample_bilinear_imagery(tile_bda, input.tile_uv - float2(0.0, texel_step)).rgb;
+            float3 c_e = tile_sample_bilinear_imagery(tile_bda, input.tile_uv + float2(texel_step, 0.0)).rgb;
+            float3 c_w = tile_sample_bilinear_imagery(tile_bda, input.tile_uv - float2(texel_step, 0.0)).rgb;
             float3 blur = 0.25 * (c_n + c_s + c_e + c_w);
             img_srgb.rgb = clamp(img_srgb.rgb + (img_srgb.rgb - blur) * (0.48 * sharp_vis), float3(0.0), float3(1.0));
+        } else if (fw_m < 28.0) {
+            img_srgb = tile_sample_bicubic_imagery(tile_bda, input.tile_uv);
+        } else {
+            // Mid/far view: 4-tap hardware-rate bilinear sample (4x lower memory bandwidth)
+            img_srgb = tile_sample_bilinear_imagery(tile_bda, input.tile_uv);
         }
 
-        // Exact C1-continuous analytical bicubic DEM surface normal (zero tile-edge seams)
+        // Adaptive analytical DEM surface normal: 16-tap C1 bicubic when zoomed in, 4-tap bilinear at distance
         float2 dh_duv = float2(0.0);
-        elev_m = tile_sample_bicubic_height_grad_m(tile_bda, input.tile_uv, dh_duv);
+        if (fw_m < 22.0) {
+            elev_m = tile_sample_bicubic_height_grad_m(tile_bda, input.tile_uv, dh_duv);
+        } else {
+            elev_m = tile_sample_bilinear_height_grad_m(tile_bda, input.tile_uv, dh_duv);
+        }
         float dzdx = (dh_duv.x / tile_span) * pc.vertical_scale;
         float dzdy = (dh_duv.y / tile_span) * pc.vertical_scale;
 
-        // Fuse multi-octave analytical-derivative FBM micro-relief for crisp close-up HD detail
-        float slope_raw = saturate(1.0 - 1.0 / sqrt(1.0 + dzdx * dzdx + dzdy * dzdy));
-        float3 fbm = terrain_detail_fbm(input.world_pos.xy, fw_m);
-        float micro_amp = lerp(1.1, 4.8, smoothstep(0.05, 0.32, slope_raw));
-        dzdx += fbm.y * micro_amp;
-        dzdy += fbm.z * micro_amp;
+        // Suppress synthetic procedural FBM normal blotches over real uploaded photographs
+        float synth_detail_w = 1.0 - hi_res_photo_mask;
+        if (synth_detail_w > 0.01) {
+            float slope_raw = saturate(1.0 - 1.0 / sqrt(1.0 + dzdx * dzdx + dzdy * dzdy));
+            float3 fbm = terrain_detail_fbm(input.world_pos.xy, fw_m);
+            float micro_amp = lerp(1.1, 4.8, smoothstep(0.05, 0.32, slope_raw)) * synth_detail_w;
+            dzdx += fbm.y * micro_amp;
+            dzdy += fbm.z * micro_amp;
 
-        // Horizontal karst limestone stratification on steep Beşparmak Dağı cliffs
-        float strata_vis = smoothstep(0.12, 0.38, slope_raw);
-        float strata_dh  = cos(elev_m * 0.42 + fbm.x * 1.8) * 0.16 * strata_vis;
-        world_nrm = normalize(float3(-(dzdx + strata_dh), -(dzdy + strata_dh), 1.0));
+            // Horizontal karst limestone stratification on steep Beşparmak Dağı cliffs
+            float strata_vis = smoothstep(0.12, 0.38, slope_raw) * synth_detail_w;
+            float strata_dh  = cos(elev_m * 0.42 + fbm.x * 1.8) * 0.16 * strata_vis;
+            dzdx += strata_dh;
+            dzdy += strata_dh;
+        }
+        world_nrm = normalize(float3(-dzdx, -dzdy, 1.0));
+    }
+
+    // Composite full-resolution committed ortho layers and live preview onto base tile imagery
+    if (ortho_coverage > 0.0) {
+        img_srgb.rgb = lerp(img_srgb.rgb, ortho_srgb, ortho_coverage);
+    }
+    if (preview_alpha > 0.0) {
+        img_srgb.rgb = lerp(img_srgb.rgb, preview_srgb, preview_alpha);
     }
 
     // Convert sRGB satellite color to linear light so VK_FORMAT_B8G8R8A8_SRGB
     // hardware encoding displays accurate, rich, unwashed satellite colors
     float3 sat_linear = srgb_to_linear(img_srgb.rgb);
 
-    // Modulate close-up rock & ground micro-albedo so zoomed-in surfaces look razor-sharp
-    float slope = saturate(1.0 - world_nrm.z);
-    float steep_mask = smoothstep(0.08, 0.34, slope);
-    float3 fbm_close = terrain_detail_fbm(input.world_pos.xy * 3.2, fw_m * 3.2);
-    float close_vis  = 1.0 - smoothstep(0.8, 14.0, fw_m);
-    float micro_mod  = 1.0 + fbm_close.x * (0.14 * close_vis + 0.16 * steep_mask);
-    sat_linear *= clamp(micro_mod, 0.78, 1.24);
+    // Modulate close-up rock & ground micro-albedo only on synthetic base tiles (never on real uploaded photos)
+    float close_vis = (1.0 - smoothstep(0.8, 14.0, fw_m)) * (1.0 - hi_res_photo_mask);
+    if (close_vis > 0.01) {
+        float slope = saturate(1.0 - world_nrm.z);
+        float steep_mask = smoothstep(0.08, 0.34, slope);
+        float3 fbm_close = terrain_detail_fbm(input.world_pos.xy * 3.2, fw_m * 3.2);
+        float micro_mod  = 1.0 + fbm_close.x * (0.14 * close_vis + 0.16 * steep_mask * close_vis);
+        sat_linear *= clamp(micro_mod, 0.78, 1.24);
+    }
 
     // World-space directional sunlight (warm Aegean sun from SW-W at 46 deg elevation)
     const float3 sun_dir  = normalize(float3(-0.50, -0.52, 0.69));
@@ -174,11 +278,14 @@ float4 main(FSInput input) : SV_Target0 {
     float fill = max(dot(world_nrm, fill_dir), 0.0);
     float ao   = lerp(0.72, 1.05, img_srgb.a);
 
-    // Balanced physically-inspired daylight illumination (sun + sky dome + warm canyon bounce)
+    // Balanced physically-inspired daylight illumination for base terrain,
+    // and true-color unshadowed fidelity for real uploaded aerial/satellite photographs
     float3 sun_light   = float3(1.06, 0.99, 0.92) * (0.68 * ndl);
     float3 sky_fill    = float3(0.42, 0.48, 0.56) * (0.44 + 0.22 * world_nrm.z + 0.18 * fill);
     float3 bounce_fill = float3(0.32, 0.28, 0.22) * (0.14 * saturate(1.0 - world_nrm.z));
-    float3 lit_color   = sat_linear * (sky_fill + sun_light + bounce_fill) * ao;
+    float3 synth_lit   = sat_linear * (sky_fill + sun_light + bounce_fill) * ao;
+    float3 photo_lit   = sat_linear * lerp(0.95, 1.05, ndl);
+    float3 lit_color   = lerp(synth_lit, photo_lit, hi_res_photo_mask);
 
     // Subtle aerial perspective haze at extreme view distances (> 12 km) in 3D oblique views
     float cam_dist_m = length(input.world_pos.xy - pc.view.cam.xy);
@@ -188,17 +295,71 @@ float4 main(FSInput input) : SV_Target0 {
     // Whisper-subtle metric grid squares (10m, 100m, 1km) projected onto the terrain
     float g_med    = grid_line_mask(input.world_pos.xy, max(pc.cell_med, 10.0), 0.55) * 0.04;
     float g_coarse = grid_line_mask(input.world_pos.xy, max(pc.coarse, 100.0), 0.85) * 0.08;
-    float g_weight = max(g_med, g_coarse);
+    float g_weight = max(g_med, g_coarse) * (1.0 - 0.85 * hi_res_photo_mask);
     lit_color = lerp(lit_color, lit_color + float3(0.24, 0.28, 0.32), g_weight);
 
-    // Interactive click survey beacon ring on the terrain (scaled in meters)
+    // Toggleable Topographic Elevation Contour Overlay (KEY_K / KEY_KP0 / contours 1):
+    // 20 m minor contour lines (warm amber-ochre) and 100 m major index contours (bright gold)
+    if ((pc.flags & 1u) != 0u) {
+        float c_minor = contour_line_mask(elev_m, 20.0, 0.75);
+        float c_major = contour_line_mask(elev_m, 100.0, 1.35);
+        lit_color = lerp(lit_color, float3(0.92, 0.64, 0.22), c_minor * 0.38);
+        lit_color = lerp(lit_color, float3(1.00, 0.84, 0.32), c_major * 0.72);
+    }
+
+    // Two-Point Geodesic Distance & Elevation Profile Line Segment (Point A -> Point B)
+    if (pc.marker_active > 0.5 && pc.marker_b_active > 0.5) {
+        float2 pa = float2(pc.marker_x, pc.marker_y);
+        float2 pb = float2(pc.marker_b_x, pc.marker_b_y);
+        float2 ab = pb - pa;
+        float  ab_len2 = dot(ab, ab);
+        if (ab_len2 > 1.0) {
+            float  ab_len = sqrt(ab_len2);
+            float  t_seg  = clamp(dot(input.world_pos.xy - pa, ab) / ab_len2, 0.0, 1.0);
+            float2 closest = pa + ab * t_seg;
+            float  d_line = length(input.world_pos.xy - closest);
+            float  line_w = clamp(fw_m * 2.2, 2.5, 28.0);
+            float  core   = 1.0 - smoothstep(line_w * 0.35, line_w * 0.95, d_line);
+            float  glow   = 1.0 - smoothstep(line_w * 0.80, line_w * 2.60, d_line);
+
+            // 100-meter geodesic tick marks along the profile line
+            float  along_m = t_seg * ab_len;
+            float  tick_d  = abs(slang_mod1(along_m + 50.0, 100.0) - 50.0);
+            float  tick    = (1.0 - smoothstep(fw_m * 0.8, fw_m * 1.8, tick_d)) *
+                             (1.0 - smoothstep(line_w * 1.2, line_w * 2.2, d_line));
+
+            float3 line_col = lerp(float3(1.0, 0.38, 0.08), float3(0.12, 0.88, 1.0), t_seg);
+            lit_color = lerp(lit_color, line_col, glow * 0.35);
+            lit_color = lerp(lit_color, float3(1.0, 0.96, 0.78), max(core * 0.88, tick * 0.75));
+        }
+    }
+
+    // Interactive click survey beacon A (orange-red) on the terrain (scaled in meters)
     if (pc.marker_active > 0.5) {
         float d = length(input.world_pos.xy - float2(pc.marker_x, pc.marker_y));
         float r_base = clamp(fw_m * 14.0, 18.0, 140.0);
         float ring = 1.0 - smoothstep(r_base * 0.12, r_base * 0.28, abs(d - r_base));
         float dot_center = 1.0 - smoothstep(0.0, r_base * 0.24, d);
         float beacon = max(ring, dot_center);
-        lit_color = lerp(lit_color, float3(1.0, 0.26, 0.06), beacon * 0.90);
+        lit_color = lerp(lit_color, float3(1.0, 0.26, 0.06), beacon * 0.92);
+    }
+
+    // Second survey beacon B (cyan-blue) for two-point geodesic profile measurement
+    if (pc.marker_b_active > 0.5) {
+        float d = length(input.world_pos.xy - float2(pc.marker_b_x, pc.marker_b_y));
+        float r_base = clamp(fw_m * 14.0, 18.0, 140.0);
+        float ring = 1.0 - smoothstep(r_base * 0.12, r_base * 0.28, abs(d - r_base));
+        float dot_center = 1.0 - smoothstep(0.0, r_base * 0.24, d);
+        float beacon = max(ring, dot_center);
+        lit_color = lerp(lit_color, float3(0.08, 0.82, 1.0), beacon * 0.92);
+    }
+
+    // Bird's-Eye Orthophoto Alignment Frame (emerald-cyan perimeter + warm gold corner brackets)
+    if (ov_border_mask > 0.01) {
+        lit_color = lerp(lit_color, float3(0.10, 0.95, 0.78), ov_border_mask * 0.82);
+    }
+    if (ov_corner_mask > 0.01) {
+        lit_color = lerp(lit_color, float3(1.00, 0.86, 0.18), ov_corner_mask * 0.95);
     }
 
     return float4(clamp(lit_color, float3(0.0), float3(1.0)), 1.0);

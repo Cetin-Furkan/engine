@@ -23,6 +23,10 @@ void ground_set_visible(bool visible) {
     s_on = visible;
 }
 
+bool ground_is_visible(void) {
+    return s_on;
+}
+
 void ground_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height) {
     if (!s_on) {
         return;

@@ -1,5 +1,6 @@
 #include "frame/hud.h"
 #include "frame/camera.h"
+#include "frame/frame.h"
 #include "frame/pass.h"
 #include "frame/world.h"
 #include "ring/ring.h"
@@ -43,7 +44,7 @@ static_assert(sizeof(HudPush) == 16u, "hud push");
 
 static VulkanContext *s_vk = nullptr;
 
-enum { k_hud_lines = 4, k_line_cap = 48 };
+enum { k_hud_lines = 5, k_line_cap = 48 };
 
 static const uint32_t k_flag_srgb = 1u;
 static const uint32_t k_flag_unorm = 0u;
@@ -90,6 +91,16 @@ static uint32_t         s_turn_intervals = 0;
 static uint32_t         s_turn_missed = 0;
 static uint32_t         s_turn_sum_ms = 0;
 static uint32_t         s_period_ms = 0;
+static bool             s_visible = false;
+static bool             s_logged = false;
+
+void hud_set_visible(bool visible) {
+    s_visible = visible;
+}
+
+bool hud_is_visible(void) {
+    return s_visible;
+}
 
 static void hud_fail(const char *what, VkResult res) {
     fprintf(stderr, "[Hud Error] %s: %s (%d)\n", what, vulkan_vkresult_to_str(res), (int)res);
@@ -134,15 +145,22 @@ int hud_init(VulkanContext *vk) {
         return -1;
     }
     s_vk = vk;
+    return 0;
+}
+
+static bool hud_ensure_ready(void) {
     if (s_layout != VK_NULL_HANDLE) {
-        return 0;
+        return true;
+    }
+    if (s_vk == nullptr || s_vk->device == VK_NULL_HANDLE || s_vk->physical_device == VK_NULL_HANDLE) {
+        return false;
     }
     VkPhysicalDeviceProperties props = {0};
-    vkGetPhysicalDeviceProperties(vk->physical_device, &props);
+    vkGetPhysicalDeviceProperties(s_vk->physical_device, &props);
     if (props.limits.maxPushConstantsSize < sizeof(HudPush)) {
         fprintf(stderr, "[Hud Error] Push constants are %u bytes, the readout needs %zu\n",
                 props.limits.maxPushConstantsSize, sizeof(HudPush));
-        return -1;
+        return false;
     }
     VkPushConstantRange push = {
         .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
@@ -154,20 +172,22 @@ int hud_init(VulkanContext *vk) {
         .pushConstantRangeCount = 1,
         .pPushConstantRanges    = &push,
     };
-    VkResult res = vkCreatePipelineLayout(vk->device, &layout_info, nullptr, &s_layout);
+    VkResult res = vkCreatePipelineLayout(s_vk->device, &layout_info, nullptr, &s_layout);
     if (res != VK_SUCCESS) {
         s_layout = VK_NULL_HANDLE;
         hud_fail("vkCreatePipelineLayout", res);
-        hud_shutdown(vk);
-        return -1;
+        return false;
     }
     arm_pair(VK_SAMPLE_COUNT_1_BIT, VK_FORMAT_UNDEFINED, &s_overlay_srgb, &s_overlay_unorm);
     arm_pair(pass_raster_samples(), pass_depth_format(), &s_scene_srgb, &s_scene_unorm);
     s_scene_depth = pass_depth_format();
     s_scene_samples = pass_raster_samples();
-    printf("[Hud] 8x8 readout on presented frames\n");
-    fflush(stdout);
-    return 0;
+    if (!s_logged) {
+        printf("[Hud] 8x8 readout on presented frames\n");
+        fflush(stdout);
+        s_logged = true;
+    }
+    return true;
 }
 
 void hud_note_cqe(void) {
@@ -274,6 +294,10 @@ void hud_prepare(uint32_t frame_ms, bool have_stamp, uint64_t modifier) {
     s_last_mono = now;
     s_have_mono = true;
 
+    if (!s_visible) {
+        return;
+    }
+
     uint32_t fps = 0;
     if (s_seq_open && s_turn_intervals > 0 && s_turn_sum_ms > 0) {
         fps = (uint32_t)((s_turn_intervals * 1000ull + s_turn_sum_ms / 2ull) / s_turn_sum_ms);
@@ -304,11 +328,18 @@ void hud_prepare(uint32_t frame_ms, bool have_stamp, uint64_t modifier) {
     uint32_t objects = 0;
     uint32_t verts = 0;
     world_stats(&objects, &verts);
+    uint32_t comp_us = 0;
+    uint32_t rend_us = 0;
+    frame_gpu_timings(&comp_us, &rend_us, nullptr);
+    BdaStats bda = {0};
+    bda_get_stats(&bda);
+    double bda_mib = (double)(bda.device_allocated + bda.staging_allocated) / (1024.0 * 1024.0);
     int wrote[k_hud_lines];
     wrote[0] = snprintf(s_line[0], sizeof s_line[0], "%u fps  %u us", fps, us);
     wrote[1] = snprintf(s_line[1], sizeof s_line[1], "miss %u  %u cq/s", s_turn_missed, cqe_rate());
     wrote[2] = snprintf(s_line[2], sizeof s_line[2], "obj %u  vert %u", objects, verts);
     wrote[3] = snprintf(s_line[3], sizeof s_line[3], "%s  zoom %s", kind, zoom_text);
+    wrote[4] = snprintf(s_line[4], sizeof s_line[4], "gpu %u+%u us  bda %.1fM", comp_us, rend_us, bda_mib);
     for (uint32_t row = 0; row < k_hud_lines; ++row) {
         if (wrote[row] < 0) {
             s_line[row][0] = '\0';
@@ -344,8 +375,8 @@ static VkPipeline pick_pipeline(VkFormat format, VkFormat depth_format,
 
 void hud_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height, VkFormat format,
               VkFormat depth_format, VkSampleCountFlagBits samples) {
-    if (cmd == VK_NULL_HANDLE || s_vk == nullptr || s_layout == VK_NULL_HANDLE ||
-        width < 80u || height < 64u) {
+    if (!s_visible || cmd == VK_NULL_HANDLE || s_vk == nullptr ||
+        width < 80u || height < 64u || !hud_ensure_ready()) {
         return;
     }
     VkPipeline pipeline = pick_pipeline(format, depth_format, samples);

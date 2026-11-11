@@ -144,6 +144,7 @@ typedef struct FrameState {
     bool     inotify_fixed;
     bool     inotify_stop;
     bool     inotify_warned;
+    bool     world_dirty;
     // One eventfd for the life of the process. DRM_IOCTL_SYNCOBJ_EVENTFD is
     // issued only while shutting down, for the point still on screen. The turn
     // does not sleep on it. Slots keep release_eventfd at -1 so a reap cannot
@@ -152,12 +153,14 @@ typedef struct FrameState {
     int      stuck_release_fd;
     int      inotify_fd;
     int      inotify_wd;
+    int      world_wd;
     int      sim_fd;
     uint32_t orphan_mask;
     uint32_t orphan_count;
     uint32_t orphan_gen[k_orphan_cap];
     RunRelay *relay;
     char     resize_tranche[16];
+    char     world_watch_path[256];
 
     // slot[front] is on screen. The other slot is the spare while the turn runs.
     FrameSlot slot[2];

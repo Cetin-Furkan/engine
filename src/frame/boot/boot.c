@@ -62,6 +62,9 @@ int frame_boot(void) {
     frame_state.release_fixed = false;
     frame_state.inotify_fd = -1;
     frame_state.inotify_wd = -1;
+    frame_state.world_wd = -1;
+    frame_state.world_dirty = false;
+    frame_state.world_watch_path[0] = '\0';
     frame_state.inotify_fixed = false;
     frame_state.inotify_stop = false;
     blank_frame(&frame_state.bar_slot[0]);

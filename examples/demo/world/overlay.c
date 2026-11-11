@@ -4,7 +4,7 @@
 #include "frame/policy.h"
 
 void overlay_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height) {
-    if (policy_allows(PERM_PLOT_CYCLE)) {
+    if (plot_is_visible()) {
         plot_draw(cmd, width, height);
     }
     if (policy_mode() != MODE_2D) {
@@ -13,7 +13,7 @@ void overlay_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height) {
 }
 
 bool overlay_busy(void) {
-    bool want_plot = policy_allows(PERM_PLOT_CYCLE) && plot_wants_frame();
+    bool want_plot = plot_wants_frame();
     if (policy_mode() == MODE_2D) {
         return want_plot;
     }
@@ -21,8 +21,6 @@ bool overlay_busy(void) {
 }
 
 void overlay_commit(void) {
-    if (policy_allows(PERM_PLOT_CYCLE)) {
-        plot_commit();
-    }
+    plot_commit();
     gimbal_commit();
 }

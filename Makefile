@@ -84,6 +84,7 @@ $(GEN_DIR)/gimbal.vert.spv: shaders/camera.slang
 $(GEN_DIR)/mesh.vert.spv: shaders/camera.slang shaders/material.slang
 $(GEN_DIR)/mesh.frag.spv: shaders/lighting.slang
 $(GEN_DIR)/terrain_filter.comp.spv: shaders/terrain_math.slang
+$(GEN_DIR)/terrain_cull.comp.spv: shaders/camera.slang shaders/terrain_math.slang
 $(GEN_DIR)/terrain.vert.spv: shaders/camera.slang shaders/terrain_math.slang
 $(GEN_DIR)/terrain.frag.spv: shaders/camera.slang shaders/terrain_math.slang shaders/lighting.slang
 
@@ -112,7 +113,7 @@ $(OBJ_DIR)/examples/demo/text/draw/draw.o: $(GEN_DIR)/text.vert.spv $(GEN_DIR)/t
 $(OBJ_DIR)/examples/demo/text/face/face.o: examples/demo/text/face/bundled/InterVariable.ttf
 $(OBJ_DIR)/src/chrome/gpu.o: $(GEN_DIR)/chrome.vert.spv $(GEN_DIR)/chrome.frag.spv
 $(OBJ_DIR)/src/input/page/page.o: $(GEN_DIR)/input.comp.spv
-$(OBJ_DIR)/src/backend/math/gpu/directory.o: $(GEN_DIR)/terrain_filter.comp.spv
+$(OBJ_DIR)/src/backend/math/gpu/directory.o: $(GEN_DIR)/terrain_filter.comp.spv $(GEN_DIR)/terrain_cull.comp.spv
 
 # Compiler & Preprocessor Flags
 CFLAGS ?= $(C23_FLAGS) -D_GNU_SOURCE -Wall -Wextra -Wunused-function -Werror=unused-function -Wmissing-declarations \
@@ -133,7 +134,7 @@ LDFLAGS += -lm
 
 # Text uses FreeType SDF, HarfBuzz, fontconfig, and libxkbcommon. The test
 # target links the libraries itself; these flags are for the engine binary.
-TEXT_PKGS   := freetype2 harfbuzz fontconfig xkbcommon
+TEXT_PKGS   := freetype2 harfbuzz fontconfig xkbcommon libpng
 TEXT_CFLAGS := $(shell pkg-config --cflags $(TEXT_PKGS))
 TEXT_LIBS   := $(shell pkg-config --libs $(TEXT_PKGS))
 CFLAGS      += $(TEXT_CFLAGS)
@@ -261,7 +262,8 @@ test: $(CONFIG_MK)
 	$(CC) $(CFLAGS) -o build/test_sheet tests/test_sheet.c examples/demo/world/sheet.c -lm
 	./build/test_sheet
 	$(CC) $(CFLAGS) -o build/test_text tests/test_text.c \
-		examples/demo/text/face/face.c examples/demo/text/shape/shape.c $(TEXT_LIBS) -lm
+		examples/demo/text/face/face.c examples/demo/text/shape/shape.c \
+		examples/demo/text/place/place.c $(TEXT_LIBS) -lm
 	./build/test_text
 	$(CC) $(CFLAGS) -o build/test_bda tests/test_bda.c -lvulkan
 	./build/test_bda
@@ -270,7 +272,11 @@ test: $(CONFIG_MK)
 		src/backend/core/cell/dispatch.c \
 		src/backend/terrain/storage/synth_besparmak.c \
 		src/backend/terrain/storage/pack_io.c \
-		src/backend/terrain/stream/lod_select.c -lm
+		src/backend/terrain/stream/lod_select.c \
+		src/backend/terrain/survey/camera_model.c \
+		src/backend/terrain/survey/mvs_fusion.c \
+		src/backend/terrain/survey/manifest_io.c \
+		-lpng16 -lm
 	./build/test_backend
 
 .PHONY: all debug release run run-release release-patch release-minor release-major info help clean clear recheck distclean test

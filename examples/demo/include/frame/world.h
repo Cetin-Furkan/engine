@@ -25,12 +25,22 @@
 // Each cube's colors crawl one hue turn per revolution on those same stamps,
 // then hold. The sweep does not arm a frame by itself.
 
-enum : uint32_t { k_world_preset_max = 8u };
+enum : uint32_t {
+    k_world_preset_max  = 9u,
+    k_world_custom_file = 10u,
+};
 
 void world_select(uint32_t world_id);
+bool world_select_file(const char *path);
+const char *world_custom_path(void);
+const char *world_source_path(void);
 uint32_t world_selected_id(void);
 const char *world_selected_title(void);
 void world_apply_policy(void);
+bool world_switch_to(uint32_t world_id);
+bool world_reload(void);
+void world_set_clear_color(float r, float g, float b, float a);
+void world_clear_color(float out_rgba[4]);
 
 void world_reset(void);
 
@@ -38,6 +48,9 @@ void world_reset(void);
 // otherwise opening.world. Call after mesh_init. The graphics pipelines
 // are created on the first draw, so this does not wait for one.
 [[nodiscard]] int world_load(void);
+
+// Parse and construct a world from an in-memory .world DSL document string.
+[[nodiscard]] int world_load_string(const char *doc, const char *source_label);
 
 // Write the live placement next to opening.world. The boot file is not
 // replaced. Click-built faces and the heat field are not stored.

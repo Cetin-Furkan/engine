@@ -293,12 +293,44 @@ static void test_spin_lifecycle(void) {
     CHECK(!s.spinning);
 }
 
+static void test_table_capacity_and_generation(void) {
+    table_reset();
+    CHECK(table_count() == 0);
+    CHECK(table_alive_count() == 0u);
+    CHECK(table_alive_vertices() == 0u);
+    CHECK(table_selected() == nullptr);
+
+    for (int i = 0; i < k_table_cap; ++i) {
+        int idx = table_add(&k_ops_a, nullptr, (Coord){ (float)i, 0.0f, 0.0f }, nullptr);
+        CHECK(idx == i);
+    }
+    CHECK(table_count() == k_table_cap);
+    CHECK(table_alive_count() == (uint32_t)k_table_cap);
+    CHECK(table_alive_vertices() == (uint32_t)k_table_cap * 111u);
+    // Overflow past k_table_cap is cleanly rejected
+    CHECK(table_add(&k_ops_a, nullptr, (Coord){ 0.0f, 0.0f, 0.0f }, nullptr) == -1);
+
+    // Selecting an object and then resetting invalidates the selection
+    table_select_quiet(0);
+    CHECK(table_selected() == table_at(0));
+    uint32_t gen0 = table_at(0)->generation;
+    table_reset();
+    CHECK(table_selected() == nullptr);
+    CHECK(table_count() == 0);
+    CHECK(table_alive_count() == 0u);
+    CHECK(table_add(&k_ops_b, nullptr, (Coord){ 0.0f, 0.0f, 0.0f }, nullptr) == 0);
+    CHECK(table_at(0)->generation > gen0);
+    CHECK(table_selected() == nullptr);
+    table_reset();
+}
+
 int main(void) {
     test_grid_math();
     test_table_stats();
     test_table_compute();
     test_kind_listen();
     test_spin_lifecycle();
+    test_table_capacity_and_generation();
     if (s_failures != 0) {
         fprintf(stderr, "%d check(s) failed\n", s_failures);
         return 1;

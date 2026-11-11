@@ -813,10 +813,17 @@ static const char *k_preset_sheets[8] = {
 };
 
 void sheet_select_world(uint32_t world_id) {
-    s_world_id = world_id <= 8u ? world_id : 0u;
+    s_world_id = world_id <= 9u ? world_id : 0u;
 }
 
 int sheet_load(void) {
+    if (s_world_id == 0u) {
+        s_sheet = (Sheet){0};
+        s_ready = true;
+        s_sel   = k_sel_none;
+        s_moved = false;
+        return 0;
+    }
     char path[1024];
     if (s_world_id >= 1u && s_world_id <= 8u) {
         char rel[64];
@@ -861,7 +868,7 @@ void sheet_hold_save(bool hold) {
 }
 
 int sheet_save(void) {
-    if (s_hold_save || s_world_id != 0u) {
+    if (s_hold_save || s_world_id != 9u) {
         return 0;
     }
     char path[1024];
@@ -873,6 +880,9 @@ int sheet_save(void) {
 }
 
 bool sheet_reload(void) {
+    if (s_world_id == 0u) {
+        return false;
+    }
     if (s_world_id >= 1u && s_world_id <= 8u) {
         return sheet_load() == 0;
     }

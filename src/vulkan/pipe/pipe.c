@@ -61,15 +61,15 @@ static void bank_drop_all(VulkanContext *vk);
 static void cache_path(char *dst, size_t cap) {
     const char *base = getenv("XDG_CACHE_HOME");
     if (base != nullptr && base[0] != '\0') {
-        snprintf(dst, cap, "%s/antigravity/engine.pipeline", base);
+        snprintf(dst, cap, "%s/engine-v2/engine.pipeline", base);
         return;
     }
     const char *home = getenv("HOME");
     if (home != nullptr && home[0] != '\0') {
-        snprintf(dst, cap, "%s/.cache/antigravity/engine.pipeline", home);
+        snprintf(dst, cap, "%s/.cache/engine-v2/engine.pipeline", home);
         return;
     }
-    snprintf(dst, cap, "/tmp/antigravity-engine.pipeline");
+    snprintf(dst, cap, "/tmp/engine-v2.pipeline");
 }
 
 static void cache_dir(char *dst, size_t cap) {

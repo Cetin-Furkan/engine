@@ -242,6 +242,7 @@ bool input_on_keyboard(WaylandContext *w, uint16_t opcode,
             return true;
         }
         if (route == ENGINE_KEY_TAP) {
+            held_add(key);
             if (s_key_n < k_key_cap) {
                 s_key_q[s_key_n++] = key;
             }

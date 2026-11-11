@@ -222,6 +222,14 @@ bool policy_grant(WorkspacePolicy *p, uint32_t perms) {
         return false;
     }
     p->active_perms |= perms;
+    if (p->lock_2d_quat && (p->active_perms & PERM_DRAW) != 0u) {
+        p->active_perms |= PERM_OBJ_SPIN | PERM_OBJ_MATERIAL;
+        (void)policy_rebind_key(p, KEY_F,   KEY_SHIFT_ANY, ACT_CLOSE_FACE);
+        (void)policy_rebind_key(p, KEY_KP9, KEY_SHIFT_ANY, ACT_TOGGLE_DRAW);
+        (void)policy_rebind_key(p, KEY_R,   KEY_SHIFT_ANY, ACT_TOGGLE_SPIN);
+        (void)policy_rebind_key(p, KEY_G,   KEY_SHIFT_ANY, ACT_TOGGLE_GLOW);
+        (void)policy_rebind_key(p, KEY_F5,  KEY_SHIFT_ANY, ACT_RESPIN);
+    }
     return true;
 }
 
@@ -348,14 +356,14 @@ static void log_mode(void) {
 }
 
 void policy_boot(void) {
-    if (s_booted) {
-        return;
-    }
+    bool first = !s_booted;
     fill_profiles();
     s_live = s_blender;
     s_which = MODE_3D;
     s_booted = true;
-    log_mode();
+    if (first) {
+        log_mode();
+    }
 }
 
 WorkspaceMode policy_mode(void) {
@@ -397,6 +405,32 @@ bool policy_switch(void) {
     return true;
 }
 
+bool policy_set_mode(WorkspaceMode mode) {
+    if (!s_booted) {
+        policy_boot();
+    }
+    if (s_live.sealed) {
+        return false;
+    }
+    uint32_t keep_mask = PERM_DRAW | PERM_MODE_SWITCH | PERM_PLOT_CYCLE;
+    uint32_t kept = s_live.active_perms & keep_mask;
+    if (mode == MODE_2D) {
+        s_live = s_flat;
+        s_which = MODE_2D;
+    } else if (mode == MODE_HYBRID) {
+        s_live = s_hybrid;
+        s_which = MODE_HYBRID;
+    } else {
+        s_live = s_blender;
+        s_which = MODE_3D;
+    }
+    s_live.active_perms = (s_live.active_perms & ~keep_mask) | kept;
+    if (s_live.lock_2d_quat && (s_live.active_perms & PERM_DRAW) != 0u) {
+        (void)policy_grant(&s_live, PERM_DRAW);
+    }
+    return true;
+}
+
 void policy_apply_world(WorkspaceMode mode, uint32_t grant_perms,
                         uint32_t revoke_perms, bool seal) {
     fill_profiles();
@@ -412,15 +446,13 @@ void policy_apply_world(WorkspaceMode mode, uint32_t grant_perms,
     }
     s_live.active_perms = (s_live.active_perms | grant_perms) & ~revoke_perms;
     if (mode == MODE_2D && (grant_perms & PERM_DRAW) != 0u) {
-        s_live.active_perms |= PERM_OBJ_SPIN | PERM_OBJ_MATERIAL;
-        (void)policy_rebind_key(&s_live, KEY_F,   KEY_SHIFT_ANY, ACT_CLOSE_FACE);
-        (void)policy_rebind_key(&s_live, KEY_KP9, KEY_SHIFT_ANY, ACT_TOGGLE_DRAW);
-        (void)policy_rebind_key(&s_live, KEY_R,   KEY_SHIFT_ANY, ACT_TOGGLE_SPIN);
-        (void)policy_rebind_key(&s_live, KEY_G,   KEY_SHIFT_ANY, ACT_TOGGLE_GLOW);
-        (void)policy_rebind_key(&s_live, KEY_F5,  KEY_SHIFT_ANY, ACT_RESPIN);
+        (void)policy_grant(&s_live, PERM_DRAW);
     }
     s_live.sealed = seal;
     s_booted = true;
+    if (seal && s_live.active_perms == PERM_NONE) {
+        return;
+    }
     const char *mode_str = (s_which == MODE_2D) ? "2D" : (s_which == MODE_HYBRID ? "Hybrid" : "3D");
     const bool can_switch = !s_live.sealed && (s_live.active_perms & PERM_MODE_SWITCH) != 0u;
     const bool can_draw = (s_live.active_perms & PERM_DRAW) != 0u;

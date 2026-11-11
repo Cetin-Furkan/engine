@@ -254,25 +254,34 @@ static void test_bda_free_list_grows(void) {
 static void test_bda_arena_returns_slice(void) {
     s_bda_sys = (BdaSystem){0};
     s_bda_sys.is_initialized = true;
+    s_bda_sys.device_pool.usage = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+                                  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                                  VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                                  VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                                  VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+                                  VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
     add_mock_block(&s_bda_sys.device_pool, 64 * 1024);
-    BdaSlice slab = alloc_from_pool(nullptr, &s_bda_sys.device_pool, 4096, 256);
+    add_mock_block(&s_bda_sys.staging_pool, 32 * 1024);
+    VulkanContext vk = { .device = (VkDevice)(uintptr_t)0x1 };
+
+    BdaArena arena = {0};
+    CHECK(bda_arena_init(&vk, &arena, 4096, false) == 0);
+    // UMA / ReBAR: device_pool block has non-null base_cpu, so arena.map is non-null
+    CHECK(arena.map != nullptr);
+    CHECK(arena.suballocated);
     BdaSlice keep = alloc_from_pool(nullptr, &s_bda_sys.device_pool, 256, 256);
-    CHECK(slab.offset == 0);
     CHECK(keep.offset == 4096);
-    BdaArena arena = {
-        .buffer         = slab.buffer,
-        .address        = slab.gpu,
-        .capacity       = (uint32_t)slab.bytes,
-        .slice_offset   = slab.offset,
-        .slice_bytes    = slab.bytes,
-        .suballocated   = true,
-    };
-    bda_arena_destroy(nullptr, &arena);
+
+    bda_arena_destroy(&vk, &arena);
     CHECK(s_bda_sys.device_pool.blocks->allocated == 4096 + 256);
     CHECK(range_found(s_bda_sys.device_pool.blocks, 0, 4096));
     CHECK(arena.buffer == VK_NULL_HANDLE);
+    BdaStats st = {0};
+    bda_get_stats(&st);
+    CHECK(st.device_allocated == 256);
 
     free_mock_pool(&s_bda_sys.device_pool);
+    free_mock_pool(&s_bda_sys.staging_pool);
     s_bda_sys = (BdaSystem){0};
 }
 
@@ -297,8 +306,11 @@ static void test_bda_usage_and_transient(void) {
     DaBuffer buf = {0};
     CHECK(da_buffer_create(&vk, 256, VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, false, &buf) == 0);
     CHECK(buf.is_suballocated);
+    CHECK(buf.map != nullptr);
     CHECK(buf.offset == 0);
     CHECK(s_bda_sys.device_pool.blocks->allocated == 256);
+    da_buffer_destroy(&vk, &buf);
+    CHECK(s_bda_sys.device_pool.blocks->allocated == 0);
 
     s_bda_sys.transient_ring.buffer = (VkBuffer)(uintptr_t)0x2;
     s_bda_sys.transient_ring.capacity = 2048;
@@ -343,6 +355,55 @@ static void test_da_buffer_write_bounds(void) {
     CHECK(da_buffer_write(&unmapped, 0, four, 4) != 0);
 }
 
+static void test_bda_stats(void) {
+    bda_get_stats(nullptr);
+
+    s_bda_sys = (BdaSystem){0};
+    BdaStats st = {0};
+    bda_get_stats(&st);
+    CHECK(st.device_capacity == 0);
+    CHECK(st.device_allocated == 0);
+    CHECK(st.device_blocks == 0);
+
+    s_bda_sys.is_initialized = true;
+    add_mock_block(&s_bda_sys.device_pool, 64 * 1024);
+    add_mock_block(&s_bda_sys.staging_pool, 32 * 1024);
+
+    BdaSlice d0 = alloc_from_pool(nullptr, &s_bda_sys.device_pool, 1024, 256);
+    BdaSlice d1 = alloc_from_pool(nullptr, &s_bda_sys.device_pool, 2048, 256);
+    BdaSlice d2 = alloc_from_pool(nullptr, &s_bda_sys.device_pool, 512, 256);
+    // Free middle slice d1 so free_list has a 2048-byte hole inside allocated=3584
+    return_to_pool(&s_bda_sys.device_pool, d1.buffer, d1.offset, d1.bytes);
+    (void)d0;
+    (void)d2;
+
+    BdaSlice s0 = alloc_from_pool(nullptr, &s_bda_sys.staging_pool, 4096, 256);
+    (void)s0;
+
+    s_bda_sys.transient_ring.buffer = (VkBuffer)(uintptr_t)0x2;
+    s_bda_sys.transient_ring.capacity = 8192;
+    s_bda_sys.transient_ring.base_cpu = malloc(8192);
+    s_bda_sys.transient_ring.base_gpu = 0x9000;
+    VulkanContext vk = { .device = (VkDevice)(uintptr_t)0x1 };
+    bda_transient_begin_frame(0);
+    (void)bda_alloc_transient(&vk, 512, 64);
+
+    bda_get_stats(&st);
+    CHECK(st.device_capacity == 64 * 1024);
+    CHECK(st.device_allocated == 1024 + 512);
+    CHECK(st.device_blocks == 1u);
+    CHECK(st.staging_capacity == 32 * 1024);
+    CHECK(st.staging_allocated == 4096);
+    CHECK(st.staging_blocks == 1u);
+    CHECK(st.transient_capacity == 8192);
+    CHECK(st.transient_used == 512);
+
+    free(s_bda_sys.transient_ring.base_cpu);
+    free_mock_pool(&s_bda_sys.device_pool);
+    free_mock_pool(&s_bda_sys.staging_pool);
+    s_bda_sys = (BdaSystem){0};
+}
+
 int main(void) {
     test_da_buffer_write_bounds();
     test_bda_alloc_and_free();
@@ -351,6 +412,7 @@ int main(void) {
     test_bda_free_list_grows();
     test_bda_arena_returns_slice();
     test_bda_usage_and_transient();
+    test_bda_stats();
     if (s_failures != 0) {
         fprintf(stderr, "%d check(s) failed\n", s_failures);
         return 1;
@@ -358,3 +420,4 @@ int main(void) {
     printf("test_bda: all checks passed\n");
     return 0;
 }
+

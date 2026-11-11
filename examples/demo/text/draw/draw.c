@@ -154,27 +154,26 @@ void text_shutdown(VulkanContext *vk) {
     text_face_shutdown();
 }
 
-int text_init(VulkanContext *vk) {
-    if (vk == nullptr || vk->device == VK_NULL_HANDLE || vk->physical_device == VK_NULL_HANDLE) {
-        return -1;
-    }
-    s_vk = vk;
+static int text_ensure_ready(void) {
     if (s_layout != VK_NULL_HANDLE) {
         return 0;
+    }
+    if (s_vk == nullptr || s_vk->device == VK_NULL_HANDLE || s_vk->physical_device == VK_NULL_HANDLE) {
+        return -1;
     }
     if (text_face_init() != 0) {
         return -1;
     }
-    if (text_atlas_init(vk) != 0) {
-        text_shutdown(vk);
+    if (text_atlas_init(s_vk) != 0) {
+        text_shutdown(s_vk);
         return -1;
     }
     VkPhysicalDeviceProperties props = {0};
-    vkGetPhysicalDeviceProperties(vk->physical_device, &props);
+    vkGetPhysicalDeviceProperties(s_vk->physical_device, &props);
     if (props.limits.maxPushConstantsSize < sizeof(TextPush)) {
         fprintf(stderr, "[Text Error] Push constants are %u bytes, text needs %zu\n",
                 props.limits.maxPushConstantsSize, sizeof(TextPush));
-        text_shutdown(vk);
+        text_shutdown(s_vk);
         return -1;
     }
     VkPushConstantRange push = {
@@ -187,15 +186,15 @@ int text_init(VulkanContext *vk) {
         .pushConstantRangeCount = 1,
         .pPushConstantRanges    = &push,
     };
-    VkResult res = vkCreatePipelineLayout(vk->device, &layout_info, nullptr, &s_layout);
+    VkResult res = vkCreatePipelineLayout(s_vk->device, &layout_info, nullptr, &s_layout);
     if (res != VK_SUCCESS) {
         s_layout = VK_NULL_HANDLE;
         text_fail("vkCreatePipelineLayout", res);
-        text_shutdown(vk);
+        text_shutdown(s_vk);
         return -1;
     }
-    if (vert_init(vk) != 0) {
-        text_shutdown(vk);
+    if (vert_init(s_vk) != 0) {
+        text_shutdown(s_vk);
         return -1;
     }
     arm_pair(VK_SAMPLE_COUNT_1_BIT, VK_FORMAT_UNDEFINED, &s_overlay_srgb, &s_overlay_unorm);
@@ -205,6 +204,14 @@ int text_init(VulkanContext *vk) {
     text_place_boot();
     printf("[Text] Hold T, click, click again, then type.\n");
     fflush(stdout);
+    return 0;
+}
+
+int text_init(VulkanContext *vk) {
+    if (vk == nullptr || vk->device == VK_NULL_HANDLE || vk->physical_device == VK_NULL_HANDLE) {
+        return -1;
+    }
+    s_vk = vk;
     return 0;
 }
 
@@ -231,7 +238,7 @@ static int claim_slice(VkSemaphore acquire, uint64_t signal_point) {
 
 void text_begin(VkSemaphore acquire, uint64_t signal_point) {
     s_active = -1;
-    if (s_map == nullptr || signal_point == 0u) {
+    if (!text_is_visible() || signal_point == 0u || text_ensure_ready() != 0 || s_map == nullptr) {
         return;
     }
     int slot = claim_slice(acquire, signal_point);
@@ -279,17 +286,17 @@ static VkPipeline pick_pipeline(VkFormat format, VkFormat depth_format,
 
 void text_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height, VkFormat format,
                VkFormat depth_format, VkSampleCountFlagBits samples) {
-    if (cmd == VK_NULL_HANDLE || s_layout == VK_NULL_HANDLE || s_active < 0 ||
+    if (!text_is_visible() || cmd == VK_NULL_HANDLE || s_layout == VK_NULL_HANDLE || s_active < 0 ||
         s_map == nullptr || width == 0u || height == 0u) {
-        return;
-    }
-    VkPipeline pipeline = pick_pipeline(format, depth_format, samples);
-    if (pipeline == VK_NULL_HANDLE) {
         return;
     }
     TextQuad *dst = (TextQuad *)(s_map + (size_t)s_active * k_slice_bytes);
     uint32_t quads = text_fill(dst, k_quad_cap, width, height);
     if (quads == 0u) {
+        return;
+    }
+    VkPipeline pipeline = pick_pipeline(format, depth_format, samples);
+    if (pipeline == VK_NULL_HANDLE) {
         return;
     }
     TextPush push = {

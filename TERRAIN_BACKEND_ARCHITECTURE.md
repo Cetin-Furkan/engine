@@ -179,13 +179,18 @@ src/backend/
     ├── storage/
     │   ├── pack_io.c                      # SSD .gmpack writer, verifier, and io_uring/pread loader
     │   └── synth_besparmak.c              # Calibrated Baklan + Beşparmak Dağı DEM/imagery generator
-    └── stream/
-        ├── lod_select.c                   # Camera zoom & focus -> adaptive quadtree LOD cut
-        └── uring_pager.c                  # Demand-paged SSD -> GPU BDA tile streaming on zoom
+    ├── stream/
+    │   ├── lod_select.c                   # Camera zoom & focus -> adaptive quadtree LOD cut + frustum culling
+    │   └── uring_pager.c                  # Demand-paged SSD -> GPU BDA tile streaming + live survey fusion
+    └── survey/
+        ├── camera_model.c                 # Sensor presets, Brown-Conrady lens model, ENU pose & N-ray 3D triangulation
+        ├── mvs_fusion.c                   # Multi-View Stereo Patch-ZNCC 3D DEM sweep, Wendland C2 RBF & ortho-blending
+        └── manifest_io.c                  # libpng/PPM image I/O, CSV point-cloud loader & .manifest parser
 
 shaders/
 ├── terrain_math.slang                     # Shared Slang 2026 module: RelPtr2D & Morton BDA addressing
 ├── terrain_filter.comp.slang              # Compute shader: bicubic gradient, slope & AO baking
+├── terrain_cull.comp.slang                # Compute shader: GPU frustum + elevation AABB indirect culling
 ├── terrain.vert.slang                     # Adaptive quadtree CDLOD vertex displacement + morphing
 └── terrain.frag.slang                     # Satellite imagery + metric grid + hypsometric contour shader
 
@@ -194,10 +199,14 @@ examples/demo/
 ├── render/terrain.c                       # Graphics & compute pipeline driver for Baklan/Beşparmak map
 ├── world/kind/terrain_kind.c              # WorldOps object integration (ray-pick elevation & click marker)
 └── maps/
-    └── baklan_besparmak.gmpack            # Real SRTM DEM + Satellite/Topo imagery SSD archive
+    ├── baklan_besparmak.gmpack            # Real SRTM DEM + Satellite/Topo imagery SSD archive
+    ├── besparmak_survey.manifest          # Live-watched photogrammetric & geodetic survey manifest
+    ├── survey_calib_nadir.png             # Stereo calibration nadir view over Beşparmak summit
+    └── survey_calib_oblique.png           # Stereo calibration oblique view over Beşparmak summit
 
 scripts/
-└── fetch_besparmak_map.py                 # Downloads AWS Terrarium DEM + Esri/Topo tiles -> .gmpack
+├── fetch_besparmak_map.py                 # Downloads AWS Terrarium DEM + Esri/Topo tiles -> .gmpack
+└── ingest_survey_photo.py                 # Extracts EXIF/XMP camera/GPS/gimbal tags & appends to manifest
 ```
 
 ---
@@ -205,32 +214,55 @@ scripts/
 ## 4. How Zoom-Driven Dynamic SSD Streaming & GPU Rendering Work
 
 1. **Camera Zoom & Focus Point Inspection (`lod_select.c`)**:
-   - Every frame, `backend_terrain_update_view(cam_x, cam_y, zoom)` transforms the camera's world focus point `(cam_x, cam_y)` and `zoom` factor into normalized map coordinates $(u, v) \in [0, 1]^2$ over the Baklan–Beşparmak Dağı bounding box ($\pm 720$ world units = $15.4\text{ km} \times 17.5\text{ km}$).
-   - Starting from `LOD 0` (the $1\times 1$ root tile covering the entire Baklan plain and Beşparmak massif), the quadtree evaluator computes the screen-space projected size of each tile:
-     $$\text{screen\_px} = \text{tile\_world\_span} \times \text{zoom}$$
-   - Whenever $\text{screen\_px} > 220\text{ px}$ and the tile overlaps or neighbors the camera's zoomed focus area, the node subdivides into its 4 child tiles via its self-relative `RelPtr2D` child pointer (`LOD 1` $\rightarrow$ `LOD 2` $\rightarrow$ `LOD 3`).
-2. **Demand-Paged SSD Streaming (`uring_pager.c`)**:
-   - If a selected high-resolution child tile (`LOD 1..3`) is not yet resident in the GPU BDA pool, the pager allocates a **64-Byte Stateful Function Cell (`GpuMathStreamCell`)**, resolves the tile's exact 4 KB-aligned SSD offset from its `RelPtr2D` without any lookup table, reads the 24 KiB tile block (`64x64` DEM + `64x64` satellite RGBA8) from `examples/demo/maps/baklan_besparmak.gmpack` on the SSD (using `io_uring` / `pread`), uploads it into the BDA tile slot, and triggers `terrain_filter.comp.spv` on the GPU to compute analytic surface normals and ambient occlusion.
-   - While a fine tile is being streamed or when zoomed out, the shader seamlessly falls back to the parent tile (`LOD 0` always stays pinned in slot 0) and applies continuous **CDLOD vertex morphing** so there are zero pops or cracks between adjacent LOD squares!
-3. **Interactive Inspection & World Integration (`--world=8` / `--world=map` / `--world=besparmak`)**:
-   - Launching `./build/release/bin/engine --world=8` (or `--world=map` / `--world=besparmak` / `--world=baklan`) boots directly into the **Baklan & Beşparmak Dağı 3D Measured Elevation & Satellite Map World**.
-   - **Zooming in (`Wheel` / `+` / `-`)** on Beşparmak Dağı or Baklan town dynamically streams higher-LOD tiles from the SSD (`LOD 0` $\rightarrow$ `LOD 1` $\rightarrow$ `LOD 2` $\rightarrow$ `LOD 3`), subdividing the terrain mesh and sharpening both the measured elevation ridges and the satellite/topographic imagery inside each grid square.
-   - **Clicking any point on the mountain or plain** raycasts against the live DEM heightfield and prints the exact **WGS84 Latitude/Longitude (`°N, °E`), Measured Elevation in meters (`m`), Slope angle (`°`), and Active Quadtree Tile LOD** to the terminal!
+   - Every frame, `backend_update_camera_zoom(cam_x, cam_y, zoom)` transforms the camera's world focus point `(cam_x, cam_y)` and `zoom` factor into normalized map coordinates $(u, v) \in [0, 1]^2$ over the Baklan–Beşparmak Dağı bounding box ($\pm 12,000\text{ m} = 24\text{ km} \times 24\text{ km}$).
+   - Starting from `LOD 0` (the $1\times 1$ root tile covering the entire Baklan plain and Beşparmak massif), the quadtree evaluator computes the screen-space projected size of each tile and subdivides into its 4 child tiles via its self-relative `RelPtr2D` child pointer (`LOD 0` $\rightarrow$ `LOD 4`, 341 tiles total).
+2. **Demand-Paged SSD Streaming & On-the-Fly Survey Fusion (`uring_pager.c`)**:
+   - If a selected high-resolution child tile (`LOD 1..4`) is not yet resident in the GPU BDA pool, the pager arms a batch of **64-Byte Stateful Function Cells (`GpuMathStreamCell`)**, resolves each tile's exact 4 KB-aligned SSD offset from its `RelPtr2D` without any lookup table, reads the $393,216\text{-byte}$ tile block ($256\times 256$ `u16` DEM + $256\times 256$ `RGBA8` imagery) from `examples/demo/maps/baklan_besparmak.gmpack` on SSD, fuses any active photogrammetric survey photos, Multi-View Stereo depth posts, and geodetic control points (`backend_survey_fuse_tile`), and dispatches `terrain_filter.comp.slang` on the GPU to recompute Sobel surface normals and slope/aspect octants.
 
 ---
 
-## 5. Step-by-Step Continuation Checklist (For Any Engineer or Model)
+## 5. Photogrammetric Camera Model, Multi-View Stereo (MVS) & Geodetic Survey Fusion (`src/backend/terrain/survey/`)
 
-If resuming or extending this subsystem from scratch:
-1. **Verify or Regenerate the SSD Map Archive**:
-   - Run `python3 scripts/fetch_besparmak_map.py` (which fetches real AWS Terrarium SRTM elevation + Esri World Imagery / OpenTopoMap tiles for Baklan & Beşparmak Dağı and writes `examples/demo/maps/baklan_besparmak.gmpack`).
-   - Even without network access, running the engine or `make test` automatically invokes `backend_terrain_ensure_pack()` in `src/backend/terrain/storage/synth_besparmak.c` to generate, save, and re-read the `.gmpack` file on SSD.
-2. **Verify `include/backend/` & `src/backend/` Compilation**:
-   - Ensure all 9 `.c` files across the 3-level hierarchy in `src/backend/{core,math,terrain}/...` have zero unused functions (enforced by the `Makefile` linker dead-section gate).
-3. **Verify Slang 2026 Shaders**:
-   - `shaders/terrain_math.slang` (shared `RelPtr2D` & Lilliput header decoding)
-   - `shaders/terrain_filter.comp.slang` (GPU compute pass for bicubic elevation filtering & slope/AO packing)
-   - `shaders/terrain.vert.slang` & `shaders/terrain.frag.slang` (adaptive quadtree CDLOD vertex displacement + satellite/topo imagery + metric grid overlay)
-4. **Run Unit Tests & Live Verification**:
-   - `make && make release && make test` (runs `tests/test_backend.c` verifying `RelPtr2D` arithmetic, 64-byte `GpuMathStreamCell` execution, `.gmpack` SSD write/re-read roundtrip, and zoom-based quadtree LOD cut selection).
-   - `./build/release/bin/engine --world=8` (or `--world=besparmak`).
+Users and map engineers can refine both the 3D `height_u16` DEM elevation and `imagery_rgba8` ortho-imagery of Baklan and Beşparmak Dağı using their own photographs (from smartphones, DJI/RTK drones, or full-frame survey cameras) and ground-truth survey data via [`include/backend/terrain/survey.h`](include/backend/terrain/survey.h):
+
+### 5.1 Physical Lens & Brown-Conrady Camera Model (`camera_model.c`)
+- **Built-in Phone/Drone Sensor Presets (`backend_survey_find_sensor_preset`)**: Includes calibrated physical sensor dimensions ($\text{mm} \times \text{mm}$), default physical focal lengths ($\text{mm}$), $35\text{ mm}$ full-frame equivalents, and radial distortion coefficients for `iPhone 16 Pro Main`, `iPhone 15 Pro Main`, `iPhone 15 Pro UltraWide`, `Samsung S24 Ultra Main`, `Xiaomi 14 Ultra 1-inch`, `Google Pixel 9 Pro Main`, `DJI Mavic 3 Enterprise`, `DJI Mini 4 Pro`, `DJI Air 3 Wide`, `DJI Phantom 4 RTK`, `Sony A7R V FullFrame`, and `Custom`.
+- **Intrinsic Matrix & FOV (`backend_survey_init_intrinsics`)**:
+  $$f_{x,\text{px}} = \frac{f_{\text{mm}}}{W_{\text{sensor,mm}}} W_{\text{px}}, \qquad f_{y,\text{px}} = \frac{f_{\text{mm}}}{H_{\text{sensor,mm}}} H_{\text{px}}, \qquad \text{HFOV} = 2\arctan\!\left(\frac{W_{\text{sensor,mm}}}{2 f_{\text{mm}}}\right)$$
+  If only the $35\text{ mm}$ equivalent focal length $f_{35}$ is supplied, $f_{\text{mm}}$ is derived automatically from the sensor diagonal relative to $\sqrt{36^2 + 24^2} = 43.2666\text{ mm}$.
+- **Extrinsic Gimbal Pose (`backend_survey_init_pose`)**: Converts WGS84 $(\phi, \lambda)$ or metric world $(X, Y)$, MSL altitude or AGL height, and gimbal Euler angles $(\text{yaw}, \text{pitch}, \text{roll})$ into an orthonormal East-North-Up (ENU) camera basis $(\mathbf{r}, \mathbf{u}, \mathbf{f})$ where $\text{yaw} = 0^\circ$ is North ($+Y$), $90^\circ$ is East ($+X$), and $\text{pitch} = -90^\circ$ is straight-down nadir ($-Z$).
+- **Brown-Conrady Forward Projection & Iterative Inverse Undistortion**:
+  - `backend_survey_project_world_to_pixel` projects any 3D world point $(X, Y, Z_{\text{elev}})$ into camera coordinates, applies radial ($k_1, k_2, k_3$) and tangential ($p_1, p_2$) distortion, and outputs sub-pixel coordinates $(u_{\text{px}}, v_{\text{px}})$ and depth.
+  - `backend_survey_pixel_to_world_ray` inverts the Brown-Conrady distortion via 10-step fixed-point Gauss-Newton iteration and transforms the undistorted camera ray into a unit 3D ENU world ray.
+
+### 5.2 Multi-View 3D Reconstruction & Geodetic Fusion (`mvs_fusion.c`)
+- **N-View 3D Least-Squares Ray Triangulation (`backend_survey_triangulate_rays`)**:
+  - Given $N \ge 2$ camera rays $(\mathbf{o}_i, \mathbf{d}_i)$ observing the same feature from different positions, heights, and gimbal angles, solves the $3\times 3$ normal system:
+    $$\left(\sum_{i=1}^N (\mathbf{I} - \mathbf{d}_i \mathbf{d}_i^\top)\right) \mathbf{P}^* = \sum_{i=1}^N (\mathbf{I} - \mathbf{d}_i \mathbf{d}_i^\top)\mathbf{o}_i$$
+    via Gaussian elimination with partial pivoting, enforcing minimum parallax angle ($\ge 0.5^\circ$) and reporting 3D RMSE in meters.
+- **Dense Multi-View Stereo (MVS) Patch-ZNCC Elevation Sweep**:
+  - When $\ge 2$ overlapping photos with `mvs=1` cover a DEM post $(X, Y)$, `backend_survey_fuse_tile` sweeps candidate elevations $h \in [h_{\text{prior}} - \Delta H, h_{\text{prior}} + \Delta H]$, projects a $3\times 3$ world tangent patch around $(X, Y, h)$ into each view, computes Zero-Mean Normalized Cross-Correlation (ZNCC), refines the correlation peak to sub-step precision via 3-point parabolic fitting, and blends the recovered 3D elevation into `height_u16` ($1/16\text{ m}$ precision).
+- **Geodetic Control Points (GCPs) & Breaklines**:
+  - Blends point elevations (`point_wgs84`, `point_world`, `survey_csv`) and linear ridge/fault breakline segments (`breakline_wgs84`, `breakline_world`) into the DEM using a $C^2$-continuous Wendland radial basis kernel $\phi(r) = (1 - r)^4 (4r + 1)$ combined with inverse-distance weighting.
+- **Occlusion-Aware Projective Ortho-Photo Rectification**:
+  - Projects every tile texel $(X, Y, h_{\text{refined}}(X, Y))$ into all overlapping cameras, performs a ray-march self-occlusion check against the DEM so hidden back-slopes are never painted with foreground ridge pixels, and blends bilinearly sampled RGBA8 texels weighted by incidence angle $\cos\theta$, ground sample distance (GSD), and smooth border feathering.
+
+### 5.3 Ingesting Photos & Surveys (`scripts/ingest_survey_photo.py` & `besparmak_survey.manifest`)
+```bash
+# List all built-in phone & drone camera sensor presets
+./scripts/ingest_survey_photo.py --list-presets
+
+# Ingest a smartphone or drone photo (auto-extracts EXIF/XMP GPS, focal length & DJI gimbal tags, or use CLI flags)
+./scripts/ingest_survey_photo.py \
+    --image my_ridge_photo.png \
+    --phone "iPhone 15 Pro Main" \
+    --focal-mm 6.765 \
+    --lat 37.90582 --lon 29.68415 --alt 1960 \
+    --yaw 45 --pitch -56 --roll 0
+
+# Add a map-engineer geodetic control point or CSV point cloud
+./scripts/ingest_survey_photo.py --point-wgs84 37.90582 29.68415 1697.5 140.0 0.95
+./scripts/ingest_survey_photo.py --survey-csv my_rtk_points.csv
+```
+Saving `examples/demo/maps/besparmak_survey.manifest` while World 8 is running immediately hot-reloads and re-fuses the 3D terrain in place via `io_uring` `inotify` (or press `L`).
+

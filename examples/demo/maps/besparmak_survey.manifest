@@ -1,0 +1,18 @@
+# ============================================================================
+# Baklan & Beşparmak Dağı — Photogrammetric & Geodetic Survey Manifest
+# ============================================================================
+# Editing this file while World 8 is open automatically hot-reloads the 3D
+# terrain via io_uring inotify (or press L at any time).
+#
+# Add your own georeferenced phone/drone photos, RTK-GNSS GCP lists, or
+# stereo tie-points below using:
+#   photo <file.png|jpg> preset="iPhone 15 Pro Main" lat=<deg> lon=<deg> alt=<m> yaw=<deg> pitch=<deg> roll=<deg> weight=0.90 mvs=1
+#   gcp_list <file.txt> [utm_zone=35] [north=1] [radius=25.0] [weight=0.95]
+#   point_wgs84 <lat> <lon> <elev_m> [radius_m] [weight]
+#   breakline_wgs84 <latA> <lonA> <elevA> <latB> <lonB> <elevB> [radius_m] [weight]
+#   ortho_overlay "<file.png|jpg>" wx=<m> wy=<m> hx=<m> hy=<m> weight=1.00
+
+mvs_config 18.0 0.40 0.55
+persist_gmpack 0
+
+ortho_overlay "images/Screenshot From 2026-11-08 03-12-20.png" wx=-139.61 wy=-4718.67 hx=256.75 hy=245.09 weight=1.00

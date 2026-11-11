@@ -1,5 +1,9 @@
 # World 5: Hybrid (3D + 2D) Click-to-Draw, Gravity & Multi-Elasticity
 # Capability mask: MODE_HYBRID, PERM_DRAW granted at boot, PERM_MODE_SWITCH open (Tab cycles modes).
+mode hybrid
+tab 1
+draw 1
+sheet 5
 ground z
 smooth 1
 solid Icosahedron -420 120 580 yaw 22000 spin 1 inf 1 glow 1 bounce 0.90

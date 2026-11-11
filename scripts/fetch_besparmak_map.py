@@ -6,14 +6,15 @@ Esri World Imagery (z=14 + z=15 + z=16 Ultra-HD) for the 24 km x 24 km region ar
   - Baklan, Denizli (https://maps.app.goo.gl/B18gGPZMEtULHfkw9 : 37.976748 N, 29.606909 E)
   - Beşparmak Dağı (37.960556 N, 29.636667 E, Summit ~1,691 m, West Peak ~1,307 m)
 
-Compiles the 149-node (5-level: LOD 0..4), 256x256-per-tile 4KB-aligned binary archive:
-  examples/demo/maps/baklan_besparmak.gmpack (58,601,472 bytes = 55.89 MiB)
-with 2D Self-Relative Pointers (RelPtr2D) and Lilliput 64-bit Unified Tile Headers.
+Compiles the complete 341-node (5-level: LOD 0..4, full 16x16 LOD 4), 256x256-per-tile
+4KB-aligned binary archive:
+  examples/demo/maps/baklan_besparmak.gmpack (134,111,232 bytes = 127.90 MiB)
+with a single unified 6144x6144 cosine-feathered & color-matched Master DEM + Satellite Mosaic,
+2D Self-Relative Pointers (RelPtr2D), and Lilliput 64-bit Unified Tile Headers.
 """
 
 import concurrent.futures
 import io
-import math
 import os
 import struct
 import sys
@@ -22,16 +23,16 @@ import numpy as np
 from PIL import Image, ImageEnhance, ImageFilter
 
 MAGIC_GMP2          = 0x32504D47  # "GMP2"
-VERSION_GMP2        = 4
+VERSION_GMP2        = 5
 LOD_COUNT           = 5
-NODE_COUNT          = 149         # 1 + 4 + 16 + 64 + 64
+NODE_COUNT          = 341         # 1 + 4 + 16 + 64 + 256 (complete 5-level quadtree)
 TILE_DIM            = 256
 TILE_SAMPLES        = TILE_DIM * TILE_DIM
 TILE_BYTES          = 393216      # 96 x 4KB blocks per tile (131,072B u16 + 262,144B RGBA8)
 TILE_BLOCKS_4K      = 96
-HEADER_BLOCKS_4K    = 3
-HEADER_BYTES        = 12288       # 3 x 4KB blocks
-TOTAL_BYTES         = HEADER_BYTES + NODE_COUNT * TILE_BYTES  # 58,601,472 bytes (55.89 MiB)
+HEADER_BLOCKS_4K    = 6
+HEADER_BYTES        = 24576       # 6 x 4KB blocks (256B dir + 341*64B nodes + 2496B pad)
+TOTAL_BYTES         = HEADER_BYTES + NODE_COUNT * TILE_BYTES  # 134,111,232 bytes (127.90 MiB)
 
 WORLD_HALF          = 12000.0     # 1.0 world unit = 1.0 real meter (24,000 m x 24,000 m)
 VERTICAL_SCALE      = 1.15
@@ -42,19 +43,21 @@ Z14_X0              = 9534
 Z14_Y0              = 6314
 Z14_GRID            = 12
 
-# Central 50% (LOD 4 8x8 core, u in [0.25, 0.75], v in [0.25, 0.75]):
-# In z=14: X in [9537..9542], Y in [6317..6322] (6x6 tiles)
-# In z=15: X in [19074..19085], Y in [12634..12645] (12x12 tiles = 3072 x 3072 px)
-Z15_X0              = 19074
-Z15_Y0              = 12634
-Z15_GRID            = 12
+# Extended 16x16 z=15 region covering [4/24 .. 20/24] = [0.1667 .. 0.8333] across the entire
+# Beşparmak Dağı mountain range (south of 37.89°N to north of Baklan at 38.03°N):
+# In z=15 (where full map is X in [19068..19091], Y in [12628..12651]):
+Z15_X0              = 19072       # offset 4 tiles from 19068 (px 1024..5120 in 6144x6144 master)
+Z15_Y0              = 12632       # offset 4 tiles from 12628 (px 1024..5120 in 6144x6144 master)
+Z15_GRID            = 16          # 16x16 tiles = 4096 x 4096 px
 
-# Ultra-HD z=16 focal patch over Baklan Town & Beşparmak Dağı Summit:
-# X16 in [38156..38165] (dx15 in [4..8]), Y16 in [25280..25289] (dy15 in [6..10])
-Z16_X0              = 38156
-Z16_Y0              = 25280
-Z16_W               = 10
-Z16_H               = 10
+# Extended 14x14 Ultra-HD z=16 focal patch over the entire Beşparmak Dağı massif & Baklan:
+# In z=16 (where full map is X in [38136..38183], Y in [25256..25303]):
+# X16 in [38152..38165] (offset 16..30 in z=16 -> px 2048..3840 in 6144x6144 master)
+# Y16 in [25278..25291] (offset 22..36 in z=16 -> px 2816..4608 in 6144x6144 master)
+Z16_X0              = 38152
+Z16_Y0              = 25278
+Z16_W               = 14
+Z16_H               = 14
 
 LAT_MIN             = 37.857507156252030
 LAT_MAX             = 38.065392351332490
@@ -104,14 +107,14 @@ def quadtree_node_index(lod: int, gx: int, gy: int) -> int:
     if lod == 3:
         return 21 + gy * 8 + gx
     if lod == 4:
-        return 85 + (gy - 4) * 8 + (gx - 4)
+        return 85 + gy * 16 + gx
     return 0
 
 
 def fetch_image_rgb(url: str) -> np.ndarray | None:
     req = urllib.request.Request(
         url,
-        headers={"User-Agent": "EngineV2-TerrainStreamer/4.0 (C23 Vulkan 1.4)"},
+        headers={"User-Agent": "EngineV2-TerrainStreamer/5.0 (C23 Vulkan 1.4)"},
     )
     for _ in range(3):
         try:
@@ -126,17 +129,59 @@ def fetch_image_rgb(url: str) -> np.ndarray | None:
     return None
 
 
+def make_cosine_feather_mask(h: int, w: int, border_px: int) -> np.ndarray:
+    """Builds a smooth 2D raised-cosine feather mask in [0.0, 1.0] that tapers to 0 at all 4 edges."""
+    ys = np.arange(h, dtype=np.float32)
+    xs = np.arange(w, dtype=np.float32)
+    dist_y = np.minimum(ys, (h - 1) - ys)
+    dist_x = np.minimum(xs, (w - 1) - xs)
+    ty = np.clip(dist_y / max(float(border_px), 1.0), 0.0, 1.0)
+    tx = np.clip(dist_x / max(float(border_px), 1.0), 0.0, 1.0)
+    wy = 0.5 - 0.5 * np.cos(np.pi * ty)
+    wx = 0.5 - 0.5 * np.cos(np.pi * tx)
+    return wy[:, None] * wx[None, :]
+
+
+def match_patch_radiometry(patch_u8: np.ndarray, base_u8: np.ndarray, blur_radius: int = 96) -> np.ndarray:
+    """
+    Matches the low-frequency color/luminance envelope of `patch_u8` to `base_u8` while
+    preserving 100% of `patch_u8`'s high-frequency crispness, eliminating multi-pass satellite
+    color jumps across zoom levels.
+    """
+    h, w, _ = patch_u8.shape
+    small_w = max(w // 8, 16)
+    small_h = max(h // 8, 16)
+    rad = max(blur_radius // 8, 4)
+
+    patch_low = np.asarray(
+        Image.fromarray(patch_u8, mode="RGB")
+        .resize((small_w, small_h), Image.Resampling.BILINEAR)
+        .filter(ImageFilter.GaussianBlur(radius=rad))
+        .resize((w, h), Image.Resampling.BILINEAR),
+        dtype=np.float32,
+    )
+    base_low = np.asarray(
+        Image.fromarray(base_u8, mode="RGB")
+        .resize((small_w, small_h), Image.Resampling.BILINEAR)
+        .filter(ImageFilter.GaussianBlur(radius=rad))
+        .resize((w, h), Image.Resampling.BILINEAR),
+        dtype=np.float32,
+    )
+    # High-frequency detail from high-res patch + low-frequency radiometry blended toward base
+    patch_f = patch_u8.astype(np.float32)
+    corrected = patch_f + (base_low - patch_low) * 0.85
+    return np.clip(corrected + 0.5, 0.0, 255.0).astype(np.uint8)
+
+
 def enhance_satellite_mosaic(rgb_u8: np.ndarray) -> np.ndarray:
-    # Convert to PIL Image for high-quality unsharp mask + contrast/color enhancement
     img = Image.fromarray(rgb_u8, mode="RGB")
-    img = img.filter(ImageFilter.UnsharpMask(radius=1.2, percent=135, threshold=2))
-    img = ImageEnhance.Color(img).enhance(1.18)
-    img = ImageEnhance.Contrast(img).enhance(1.08)
+    img = img.filter(ImageFilter.UnsharpMask(radius=1.1, percent=130, threshold=2))
+    img = ImageEnhance.Color(img).enhance(1.16)
+    img = ImageEnhance.Contrast(img).enhance(1.07)
     arr = np.asarray(img, dtype=np.float32) / 255.0
-    # Gentle atmospheric dehaze
-    arr[:, :, 0] = np.clip((arr[:, :, 0] - 0.020) / 0.955, 0.0, 1.0)
-    arr[:, :, 1] = np.clip((arr[:, :, 1] - 0.020) / 0.955, 0.0, 1.0)
-    arr[:, :, 2] = np.clip((arr[:, :, 2] - 0.028) / 0.955, 0.0, 1.0)
+    arr[:, :, 0] = np.clip((arr[:, :, 0] - 0.018) / 0.960, 0.0, 1.0)
+    arr[:, :, 1] = np.clip((arr[:, :, 1] - 0.018) / 0.960, 0.0, 1.0)
+    arr[:, :, 2] = np.clip((arr[:, :, 2] - 0.025) / 0.960, 0.0, 1.0)
     return (arr * 255.0 + 0.5).astype(np.uint8)
 
 
@@ -144,7 +189,7 @@ def build_pack(out_path: str) -> None:
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     print(
         "[MapFetch] Downloading multi-scale SRTM DEM (z=14..15) + Esri World Imagery (z=14..16 Ultra-HD) "
-        "for Baklan & Beşparmak Dağı (24km x 24km, 149 x 256x256 tiles)..."
+        "for Baklan & Beşparmak Dağı (24km x 24km, complete 341-node 256x256 quadtree)..."
     )
 
     tasks = []
@@ -155,14 +200,14 @@ def build_pack(out_path: str) -> None:
             tasks.append(("dem14", dx, dy, f"https://s3.amazonaws.com/elevation-tiles-prod/terrarium/14/{tx}/{ty}.png"))
             tasks.append(("sat14", dx, dy, f"https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/14/{ty}/{tx}"))
 
-    # 2. z=15 12x12 inner core (144 DEM + 144 Sat)
+    # 2. z=15 16x16 extended region covering entire Beşparmak Dağı & Baklan (256 DEM + 256 Sat)
     for dy in range(Z15_GRID):
         for dx in range(Z15_GRID):
             tx, ty = Z15_X0 + dx, Z15_Y0 + dy
             tasks.append(("dem15", dx, dy, f"https://s3.amazonaws.com/elevation-tiles-prod/terrarium/15/{tx}/{ty}.png"))
             tasks.append(("sat15", dx, dy, f"https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/15/{ty}/{tx}"))
 
-    # 3. z=16 10x10 ultra-HD focal patch over Baklan & Beşparmak Dağı (100 Sat)
+    # 3. z=16 14x14 ultra-HD focal patch over Baklan & Beşparmak Dağı (196 Sat)
     for dy in range(Z16_H):
         for dx in range(Z16_W):
             tx, ty = Z16_X0 + dx, Z16_Y0 + dy
@@ -174,20 +219,22 @@ def build_pack(out_path: str) -> None:
         kind, dx, dy, url = item
         return kind, dx, dy, fetch_image_rgb(url)
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=24) as ex:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=32) as ex:
         for kind, dx, dy, arr in ex.map(worker, tasks):
             if arr is not None:
                 results[kind][(dx, dy)] = arr
 
+    n_dem15 = Z15_GRID * Z15_GRID
+    n_sat16 = Z16_W * Z16_H
     print(
         f"[MapFetch] Downloaded z=14: {len(results['dem14'])}/144 DEM, {len(results['sat14'])}/144 Sat | "
-        f"z=15: {len(results['dem15'])}/144 DEM, {len(results['sat15'])}/144 Sat | "
-        f"z=16 Ultra-HD: {len(results['sat16'])}/100 Sat."
+        f"z=15: {len(results['dem15'])}/{n_dem15} DEM, {len(results['sat15'])}/{n_dem15} Sat | "
+        f"z=16 Ultra-HD: {len(results['sat16'])}/{n_sat16} Sat."
     )
     if len(results["dem14"]) < 144 or len(results["sat14"]) < 144:
         raise RuntimeError("Incomplete z=14 base download")
 
-    # Assemble 3072x3072 outer z=14 arrays (North at row 0 initially, then flip Y so row 0 is South/-Y)
+    # Assemble 3072x3072 outer z=14 arrays (North at row 0 initially)
     OUTER_PX = Z14_GRID * 256  # 3072
     dem14_rgb = np.zeros((OUTER_PX, OUTER_PX, 3), dtype=np.float32)
     sat14_rgb = np.zeros((OUTER_PX, OUTER_PX, 3), dtype=np.uint8)
@@ -199,78 +246,100 @@ def build_pack(out_path: str) -> None:
             sat14_rgb[y0:y1, x0:x1] = results["sat14"][(dx, dy)]
 
     outer_elev = (dem14_rgb[:, :, 0] * 256.0 + dem14_rgb[:, :, 1] + dem14_rgb[:, :, 2] / 256.0) - 32768.0
-    outer_elev = np.clip(outer_elev, 750.0, 2200.0)
-    sat14_rgb = enhance_satellite_mosaic(sat14_rgb)
+    outer_elev = np.clip(outer_elev, 750.0, 2200.0).astype(np.float32)
 
-    # Assemble 3072x3072 inner core z=15 arrays (covering u in [0.25, 0.75], v in [0.25, 0.75])
-    CORE_PX = Z15_GRID * 256  # 3072
-    have_core15 = len(results["dem15"]) == 144 and len(results["sat15"]) == 144
-    if have_core15:
-        dem15_rgb = np.zeros((CORE_PX, CORE_PX, 3), dtype=np.float32)
-        sat15_rgb = np.zeros((CORE_PX, CORE_PX, 3), dtype=np.uint8)
+    # Build Unified 6144x6144 Master Elevation & Master Satellite Canvas (covering 100% of 24km x 24km)
+    MASTER_PX = OUTER_PX * 2  # 6144 (exact z=15 resolution across the full 24x24 z=15 grid)
+    master_elev = np.asarray(
+        Image.fromarray(outer_elev, mode="F").resize((MASTER_PX, MASTER_PX), Image.Resampling.BICUBIC),
+        dtype=np.float32,
+    ).copy()
+    master_sat = np.asarray(
+        Image.fromarray(sat14_rgb, mode="RGB").resize((MASTER_PX, MASTER_PX), Image.Resampling.LANCZOS),
+        dtype=np.uint8,
+    ).copy()
+
+    # Blend 16x16 z=15 DEM + Satellite Mosaic into [1024:5120, 1024:5120] of the 6144x6144 Master Canvas
+    if len(results["dem15"]) == n_dem15 and len(results["sat15"]) == n_dem15:
+        CORE15_PX = Z15_GRID * 256  # 4096
+        dem15_rgb = np.zeros((CORE15_PX, CORE15_PX, 3), dtype=np.float32)
+        sat15_rgb = np.zeros((CORE15_PX, CORE15_PX, 3), dtype=np.uint8)
         for dy in range(Z15_GRID):
             for dx in range(Z15_GRID):
                 y0, y1 = dy * 256, (dy + 1) * 256
                 x0, x1 = dx * 256, (dx + 1) * 256
                 dem15_rgb[y0:y1, x0:x1] = results["dem15"][(dx, dy)]
                 sat15_rgb[y0:y1, x0:x1] = results["sat15"][(dx, dy)]
-        core_elev = (dem15_rgb[:, :, 0] * 256.0 + dem15_rgb[:, :, 1] + dem15_rgb[:, :, 2] / 256.0) - 32768.0
-        core_elev = np.clip(core_elev, 750.0, 2200.0)
+        core15_elev = (dem15_rgb[:, :, 0] * 256.0 + dem15_rgb[:, :, 1] + dem15_rgb[:, :, 2] / 256.0) - 32768.0
+        core15_elev = np.clip(core15_elev, 750.0, 2200.0).astype(np.float32)
 
-        # Upsample core_elev to 6144x6144 (z=16 resolution) with bicubic interpolation
-        # and fuse z=16 Ultra-HD satellite tiles directly into the focal region!
-        CORE16_PX = CORE_PX * 2  # 6144
-        sat16_full = np.asarray(
-            Image.fromarray(sat15_rgb, mode="RGB").resize((CORE16_PX, CORE16_PX), Image.Resampling.LANCZOS),
+        ox15 = (Z15_X0 - 2 * Z14_X0) * 256  # 1024
+        oy15 = (Z15_Y0 - 2 * Z14_Y0) * 256  # 1024
+        mask15 = make_cosine_feather_mask(CORE15_PX, CORE15_PX, border_px=384)
+
+        base_elev_sub = master_elev[oy15 : oy15 + CORE15_PX, ox15 : ox15 + CORE15_PX]
+        master_elev[oy15 : oy15 + CORE15_PX, ox15 : ox15 + CORE15_PX] = (
+            base_elev_sub * (1.0 - mask15) + core15_elev * mask15
+        )
+
+        base_sat_sub = master_sat[oy15 : oy15 + CORE15_PX, ox15 : ox15 + CORE15_PX]
+        sat15_matched = match_patch_radiometry(sat15_rgb, base_sat_sub, blur_radius=96)
+        blended15 = (
+            base_sat_sub.astype(np.float32) * (1.0 - mask15[:, :, None])
+            + sat15_matched.astype(np.float32) * mask15[:, :, None]
+        )
+        master_sat[oy15 : oy15 + CORE15_PX, ox15 : ox15 + CORE15_PX] = (blended15 + 0.5).astype(np.uint8)
+
+    # Blend 14x14 z=16 Ultra-HD Satellite Mosaic into the 6144x6144 Master Canvas
+    if len(results["sat16"]) == n_sat16:
+        RAW16_W = Z16_W * 256  # 3584
+        RAW16_H = Z16_H * 256  # 3584
+        sat16_raw = np.zeros((RAW16_H, RAW16_W, 3), dtype=np.uint8)
+        for dy in range(Z16_H):
+            for dx in range(Z16_W):
+                y0, y1 = dy * 256, (dy + 1) * 256
+                x0, x1 = dx * 256, (dx + 1) * 256
+                sat16_raw[y0:y1, x0:x1] = results["sat16"][(dx, dy)]
+
+        # In the 6144x6144 (z=15 scale) master canvas, each z=16 tile covers 128x128 master pixels
+        DST16_W = Z16_W * 128  # 1792
+        DST16_H = Z16_H * 128  # 1792
+        ox16 = (Z16_X0 - 4 * Z14_X0) * 128  # (38152 - 38136) * 128 = 2048
+        oy16 = (Z16_Y0 - 4 * Z14_Y0) * 128  # (25278 - 25256) * 128 = 2816
+        sat16_res = np.asarray(
+            Image.fromarray(sat16_raw, mode="RGB").resize((DST16_W, DST16_H), Image.Resampling.LANCZOS),
             dtype=np.uint8,
-        ).copy()
-        if len(results["sat16"]) == Z16_W * Z16_H:
-            # Z16_X0 = 38156 corresponds to (38156 - 2*Z15_X0) = 38156 - 38148 = 8 tiles offset in z=16
-            # Z16_Y0 = 25280 corresponds to (25280 - 2*Z15_Y0) = 25280 - 25268 = 12 tiles offset in z=16
-            ox16 = (Z16_X0 - 2 * Z15_X0) * 256
-            oy16 = (Z16_Y0 - 2 * Z15_Y0) * 256
-            for dy in range(Z16_H):
-                for dx in range(Z16_W):
-                    y0 = oy16 + dy * 256
-                    x0 = ox16 + dx * 256
-                    if 0 <= y0 and y0 + 256 <= CORE16_PX and 0 <= x0 and x0 + 256 <= CORE16_PX:
-                        sat16_full[y0 : y0 + 256, x0 : x0 + 256] = results["sat16"][(dx, dy)]
-        sat16_full = enhance_satellite_mosaic(sat16_full)
-    else:
-        core_elev = outer_elev
-        sat16_full = sat14_rgb
+        )
+        base16_sub = master_sat[oy16 : oy16 + DST16_H, ox16 : ox16 + DST16_W]
+        sat16_matched = match_patch_radiometry(sat16_res, base16_sub, blur_radius=80)
+        mask16 = make_cosine_feather_mask(DST16_H, DST16_W, border_px=256)
+        blended16 = (
+            base16_sub.astype(np.float32) * (1.0 - mask16[:, :, None])
+            + sat16_matched.astype(np.float32) * mask16[:, :, None]
+        )
+        master_sat[oy16 : oy16 + DST16_H, ox16 : ox16 + DST16_W] = (blended16 + 0.5).astype(np.uint8)
+
+    # Enhance the unified master satellite canvas once so tone and sharpness are 100% consistent everywhere
+    master_sat = enhance_satellite_mosaic(master_sat)
 
     # Flip Y axis so row 0 is South (lat_min, world_min_y) and row N-1 is North (lat_max, world_max_y)
-    outer_elev = np.flipud(outer_elev)
-    sat14_rgb  = np.flipud(sat14_rgb)
-    core_elev  = np.flipud(core_elev)
-    sat16_full = np.flipud(sat16_full)
+    master_elev = np.flipud(master_elev)
+    master_sat  = np.flipud(master_sat)
+    master_sat_f = master_sat.astype(np.float32)
 
-    global_min_e = float(np.min(outer_elev))
-    global_max_e = float(max(np.max(outer_elev), np.max(core_elev)))
+    global_min_e = float(np.min(master_elev))
+    global_max_e = float(np.max(master_elev))
     print(
-        f"[MapFetch] Measured SRTM elevation across 24km x 24km Baklan & Beşparmak Dağı region: "
-        f"{global_min_e:.1f} m .. {global_max_e:.1f} m"
+        f"[MapFetch] Unified 6144x6144 Master DEM & Imagery ready: "
+        f"{global_min_e:.1f} m .. {global_max_e:.1f} m across 341 quadtree nodes"
     )
 
     def extract_patch_elev_and_rgb(u0: float, u1: float, v0: float, v1: float) -> tuple[np.ndarray, np.ndarray]:
-        # Use high-res z=15/z=16 core whenever the tile lies inside [0.25, 0.75]^2
-        if have_core15 and u0 >= 0.2499 and u1 <= 0.7501 and v0 >= 0.2499 and v1 <= 0.7501:
-            cu0 = (u0 - 0.25) * 2.0
-            cu1 = (u1 - 0.25) * 2.0
-            cv0 = (v0 - 0.25) * 2.0
-            cv1 = (v1 - 0.25) * 2.0
-            src_elev = core_elev
-            src_sat  = sat16_full
-        else:
-            cu0, cu1, cv0, cv1 = u0, u1, v0, v1
-            src_elev = outer_elev
-            src_sat  = sat14_rgb
-
-        eh, ew = src_elev.shape
-        # Sample 256x256 elevation grid via bilinear interpolation on float32 numpy array
-        xs = np.linspace(cu0 * (ew - 1), cu1 * (ew - 1), TILE_DIM, dtype=np.float32)
-        ys = np.linspace(cv0 * (eh - 1), cv1 * (eh - 1), TILE_DIM, dtype=np.float32)
+        eh, ew = master_elev.shape
+        # Sample both 256x256 elevation and 256x256 RGB on the EXACT same continuous coordinate grid
+        # so adjacent tiles share bit-for-bit identical boundary posts (0 and 255) and texels!
+        xs = np.linspace(u0 * (ew - 1), u1 * (ew - 1), TILE_DIM, dtype=np.float32)
+        ys = np.linspace(v0 * (eh - 1), v1 * (eh - 1), TILE_DIM, dtype=np.float32)
         x0 = np.clip(np.floor(xs).astype(np.int32), 0, ew - 1)
         x1 = np.clip(x0 + 1, 0, ew - 1)
         y0 = np.clip(np.floor(ys).astype(np.int32), 0, eh - 1)
@@ -278,22 +347,20 @@ def build_pack(out_path: str) -> None:
         wx = (xs - x0)[None, :]
         wy = (ys - y0)[:, None]
 
-        h00 = src_elev[np.ix_(y0, x0)]
-        h10 = src_elev[np.ix_(y0, x1)]
-        h01 = src_elev[np.ix_(y1, x0)]
-        h11 = src_elev[np.ix_(y1, x1)]
+        h00 = master_elev[np.ix_(y0, x0)]
+        h10 = master_elev[np.ix_(y0, x1)]
+        h01 = master_elev[np.ix_(y1, x0)]
+        h11 = master_elev[np.ix_(y1, x1)]
         elev_patch = (h00 * (1.0 - wx) + h10 * wx) * (1.0 - wy) + (h01 * (1.0 - wx) + h11 * wx) * wy
 
-        # Crop and Lanczos-resample satellite imagery patch to 256x256
-        sh, sw, _ = src_sat.shape
-        sx0 = max(0, min(sw - 1, int(round(cu0 * sw))))
-        sx1 = max(sx0 + 1, min(sw, int(round(cu1 * sw))))
-        sy0 = max(0, min(sh - 1, int(round(cv0 * sh))))
-        sy1 = max(sy0 + 1, min(sh, int(round(cv1 * sh))))
-        crop = Image.fromarray(src_sat[sy0:sy1, sx0:sx1], mode="RGB")
-        if crop.size != (TILE_DIM, TILE_DIM):
-            crop = crop.resize((TILE_DIM, TILE_DIM), Image.Resampling.LANCZOS)
-        rgb_patch = np.asarray(crop, dtype=np.uint8)
+        wx3 = wx[:, :, None]
+        wy3 = wy[:, :, None]
+        c00 = master_sat_f[np.ix_(y0, x0)]
+        c10 = master_sat_f[np.ix_(y0, x1)]
+        c01 = master_sat_f[np.ix_(y1, x0)]
+        c11 = master_sat_f[np.ix_(y1, x1)]
+        rgb_f = (c00 * (1.0 - wx3) + c10 * wx3) * (1.0 - wy3) + (c01 * (1.0 - wx3) + c11 * wx3) * wy3
+        rgb_patch = np.clip(rgb_f + 0.5, 0.0, 255.0).astype(np.uint8)
         return elev_patch, rgb_patch
 
     archive = bytearray(TOTAL_BYTES)
@@ -332,11 +399,9 @@ def build_pack(out_path: str) -> None:
         grid_n = 1 << lod
         tile_span_world = (WORLD_HALF * 2.0) / grid_n
         sample_spacing_m = 24000.0 / (grid_n * (TILE_DIM - 1))
-        gx_range = range(4, 12) if lod == 4 else range(grid_n)
-        gy_range = range(4, 12) if lod == 4 else range(grid_n)
 
-        for gy in gy_range:
-            for gx in gx_range:
+        for gy in range(grid_n):
+            for gx in range(grid_n):
                 idx = quadtree_node_index(lod, gx, gy)
                 w_min_x = -WORLD_HALF + gx * tile_span_world
                 w_max_x = w_min_x + tile_span_world
@@ -372,7 +437,7 @@ def build_pack(out_path: str) -> None:
                 ssd_block_4k = HEADER_BLOCKS_4K + idx * TILE_BLOCKS_4K
                 morton = morton2d_encode(gx, gy)
                 parent_idx = quadtree_node_index(lod - 1, gx >> 1, gy >> 1) if lod > 0 else 0
-                has_children = (lod < 3) or (lod == 3 and 2 <= gx < 6 and 2 <= gy < 6)
+                has_children = lod + 1 < LOD_COUNT
                 if has_children:
                     first_child = quadtree_node_index(lod + 1, gx * 2, gy * 2)
                     child_rel = relptr2d_pack(first_child - idx, gx * 2, gy * 2, lod + 1, 1)

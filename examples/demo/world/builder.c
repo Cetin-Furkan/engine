@@ -1,6 +1,12 @@
 #include "world/world_int.h"
 #include "backend/backend.h"
 #include "frame/camera.h"
+#include "frame/gimbal.h"
+#include "frame/hud.h"
+#include "frame/plot.h"
+#include "frame/policy.h"
+#include "frame/terrain.h"
+#include "frame/text.h"
 #include <math.h>
 #include <stdio.h>
 
@@ -20,7 +26,95 @@ void world_builder_begin(WorldBuilder *wb, bool smooth_solids) {
         .failed            = false,
     };
     ground_set(2, 0.0f);
+    world_builder_set_gimbal(wb, true);
+    world_builder_set_hud(wb, true);
+    world_builder_set_plot(wb, false);
+    world_builder_set_text(wb, true);
+    world_builder_set_clear(wb, 0.08f, 0.24f, 0.48f);
     solid_kind_set_smooth(smooth_solids);
+}
+
+void world_builder_set_ground(WorldBuilder *wb, bool visible) {
+    (void)wb;
+    ground_set_visible(visible);
+}
+
+void world_builder_set_gimbal(WorldBuilder *wb, bool visible) {
+    (void)wb;
+    gimbal_set_visible(visible);
+}
+
+void world_builder_set_hud(WorldBuilder *wb, bool visible) {
+    (void)wb;
+    hud_set_visible(visible);
+}
+
+void world_builder_set_plot(WorldBuilder *wb, bool visible) {
+    (void)wb;
+    plot_set_visible(visible);
+    WorkspacePolicy *pol = policy_active();
+    if (visible) {
+        (void)policy_grant(pol, PERM_PLOT_CYCLE);
+    } else {
+        (void)policy_revoke(pol, PERM_PLOT_CYCLE);
+    }
+}
+
+void world_builder_set_text(WorldBuilder *wb, bool visible) {
+    (void)wb;
+    text_set_visible(visible);
+}
+
+void world_builder_set_clear(WorldBuilder *wb, float r, float g, float b) {
+    (void)wb;
+    world_set_clear_color(r, g, b, 1.0f);
+}
+
+void world_builder_set_camera(WorldBuilder *wb, float x, float y, float z,
+                              float yaw, float pitch, float zoom, bool turntable) {
+    (void)wb;
+    camera_set_turntable_mode(turntable);
+    camera_set_home_pose(x, y, z, yaw, pitch, zoom);
+}
+
+void world_builder_set_mode(WorldBuilder *wb, uint8_t mode) {
+    if (mode > (uint8_t)MODE_HYBRID) {
+        if (wb != nullptr) {
+            wb->failed = true;
+        }
+        return;
+    }
+    if (!policy_set_mode((WorkspaceMode)mode)) {
+        if (wb != nullptr) {
+            wb->failed = true;
+        }
+        return;
+    }
+    if ((WorkspaceMode)mode == MODE_2D) {
+        (void)camera_snap_front();
+        camera_commit();
+    }
+}
+
+void world_builder_set_draw(WorldBuilder *wb, bool enabled) {
+    WorkspacePolicy *pol = policy_active();
+    bool ok = enabled ? policy_grant(pol, PERM_DRAW) : policy_revoke(pol, PERM_DRAW);
+    if (!ok && wb != nullptr) {
+        wb->failed = true;
+    }
+}
+
+void world_builder_set_tab(WorldBuilder *wb, bool enabled) {
+    WorkspacePolicy *pol = policy_active();
+    bool ok = enabled ? policy_grant(pol, PERM_MODE_SWITCH) : policy_revoke(pol, PERM_MODE_SWITCH);
+    if (!ok && wb != nullptr) {
+        wb->failed = true;
+    }
+}
+
+void world_builder_set_contours(WorldBuilder *wb, bool enabled) {
+    (void)wb;
+    terrain_set_contours(enabled);
 }
 
 bool world_builder_add_blueprint(WorldBuilder *wb, WorldBlueprint bp) {
@@ -94,7 +188,8 @@ bool world_builder_add_solid(WorldBuilder *wb, uint32_t kind, Coord at, int32_t 
 
 bool world_builder_add_cube_ring(WorldBuilder *wb, Coord center, float radius,
                                  uint32_t count, float restitution, bool glow) {
-    if (count == 0u || count > 16u || !isfinite(radius) || radius < 80.0f) {
+    if (count == 0u || count > 16u || !isfinite(radius) || radius < 80.0f ||
+        !isfinite(restitution)) {
         if (wb != nullptr) {
             wb->failed = true;
         }
@@ -123,9 +218,45 @@ bool world_builder_add_cube_ring(WorldBuilder *wb, Coord center, float radius,
     return true;
 }
 
+bool world_builder_add_cube_grid(WorldBuilder *wb, Coord center, float step_x, float step_y,
+                                 uint32_t nx, uint32_t ny, float restitution, bool glow) {
+    if (nx == 0u || ny == 0u || nx > 16u || ny > 16u || nx * ny > 16u ||
+        !isfinite(step_x) || !isfinite(step_y) || step_x < 120.0f || step_y < 120.0f ||
+        !isfinite(restitution)) {
+        if (wb != nullptr) {
+            wb->failed = true;
+        }
+        return false;
+    }
+    uint32_t total = nx * ny;
+    float ox = center.x - 0.5f * (float)(nx - 1u) * step_x;
+    float oy = center.y - 0.5f * (float)(ny - 1u) * step_y;
+    uint32_t idx = 0u;
+    for (uint32_t iy = 0u; iy < ny; ++iy) {
+        for (uint32_t ix = 0u; ix < nx; ++ix) {
+            Coord pos = {
+                .x = ox + (float)ix * step_x,
+                .y = oy + (float)iy * step_y,
+                .z = center.z,
+            };
+            float t = total > 1u ? ((float)idx / (float)(total - 1u)) : 0.5f;
+            float item_bounce = restitution >= 0.0f ? restitution : (0.18f + 0.72f * t);
+            int32_t yaw_milli = (int32_t)(15000u + idx * 18000u);
+            bool item_glow = glow ? (((ix + iy) & 1u) == 0u) : false;
+            if (!world_builder_add_cube(wb, pos, yaw_milli, true, (idx % 3u) == 0u,
+                                        item_glow, item_bounce)) {
+                return false;
+            }
+            idx++;
+        }
+    }
+    return true;
+}
+
 bool world_builder_add_cube_tower(WorldBuilder *wb, Coord base, float step_z,
                                   uint32_t count, float restitution) {
-    if (count == 0u || count > 12u || !isfinite(step_z) || step_z < 120.0f) {
+    if (count == 0u || count > 12u || !isfinite(step_z) || step_z < 120.0f ||
+        !isfinite(restitution)) {
         if (wb != nullptr) {
             wb->failed = true;
         }
@@ -174,8 +305,67 @@ bool world_builder_add_solid_arc(WorldBuilder *wb, Coord center, float radius,
     return true;
 }
 
+bool world_builder_add_solid_ring(WorldBuilder *wb, Coord center, float radius,
+                                  float bounce_min, float bounce_max) {
+    if (!isfinite(radius) || radius < 80.0f || !isfinite(bounce_min) || !isfinite(bounce_max)) {
+        if (wb != nullptr) {
+            wb->failed = true;
+        }
+        return false;
+    }
+    for (uint32_t k = 0u; k < 6u; ++k) {
+        float u = (float)k / 5.0f;
+        float angle = ((float)k / 6.0f) * k_two_pi;
+        Coord pos = {
+            .x = center.x + cosf(angle) * radius,
+            .y = center.y + sinf(angle) * radius,
+            .z = center.z,
+        };
+        float b = bounce_min + (bounce_max - bounce_min) * u;
+        int32_t yaw_milli = (int32_t)lrintf(angle * k_rad_to_milli_deg);
+        bool inf = (k & 1u) != 0u;
+        bool glow = (k == 1u || k == 3u || k == 5u);
+        if (!world_builder_add_solid(wb, k, pos, yaw_milli, true, inf, glow, b)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool world_builder_add_helix(WorldBuilder *wb, Coord center, float radius,
+                             float step_z, uint32_t count, float restitution) {
+    if (count == 0u || count > 16u || !isfinite(radius) || radius < 60.0f ||
+        !isfinite(step_z) || !isfinite(restitution)) {
+        if (wb != nullptr) {
+            wb->failed = true;
+        }
+        return false;
+    }
+    for (uint32_t i = 0u; i < count; ++i) {
+        float angle = (float)i * (k_two_pi / 6.0f);
+        Coord pos = {
+            .x = center.x + cosf(angle) * radius,
+            .y = center.y + sinf(angle) * radius,
+            .z = center.z + (float)i * step_z,
+        };
+        int32_t yaw_milli = (int32_t)lrintf(angle * k_rad_to_milli_deg);
+        float b = restitution >= 0.0f ? restitution : (0.24f + 0.08f * (float)(i % 8u));
+        if (!world_builder_add_cube(wb, pos, yaw_milli, true, true, (i & 1u) == 0u, b)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 int world_builder_commit(const WorldBuilder *wb) {
     if (wb == nullptr || wb->failed) {
+        table_reset();
+        face_reset();
+        table_kinds_reset();
+        solid_kind_reset();
+        mesh_kind_reset();
+        terrain_kind_reset();
+        spin_clear();
         return -1;
     }
     table_publish();
@@ -185,6 +375,7 @@ int world_builder_commit(const WorldBuilder *wb) {
 int world_build_procedural_cathedral(void) {
     WorldBuilder wb;
     world_builder_begin(&wb, true);
+    world_builder_set_clear(&wb, 0.05f, 0.14f, 0.28f);
 
     // 1. Outer Ring of 8 ground colonnade cubes with graded restitution [0.18 .. 0.90]
     (void)world_builder_add_cube_ring(&wb, (Coord){ 0.0f, 0.0f, 0.0f }, 560.0f, 8u, -1.0f, true);
@@ -206,20 +397,24 @@ int world_build_procedural_cathedral(void) {
     return 0;
 }
 
+static bool spawn_terrain_blueprint(Coord at, void *data) {
+    (void)at;
+    (void)data;
+    return terrain_kind_spawn();
+}
+
 int world_build_besparmak_terrain(void) {
     WorldBuilder wb;
     world_builder_begin(&wb, true);
-    ground_set_visible(false);
-    if (!terrain_kind_spawn()) {
-        return -1;
-    }
+    world_builder_set_ground(&wb, false);
+    world_builder_set_clear(&wb, 0.06f, 0.12f, 0.22f);
+    (void)world_builder_add_blueprint(&wb, (WorldBlueprint){ .init_fn = spawn_terrain_blueprint });
     if (world_builder_commit(&wb) != 0) {
         return -1;
     }
     float focus_z = backend_sample_elevation_world_z(1595.0f, -650.0f);
-    camera_set_turntable_mode(true);
-    camera_set_home_pose(1595.0f, -650.0f, focus_z, -0.18f, 0.52f, 0.16f);
-    printf("[WorldBuilder] Constructed World 8: Baklan & Beşparmak Dağı 24x24 km Metric DEM + Ultra-HD Satellite Map (256x256 Tiles, LOD 0..4)\n");
+    world_builder_set_camera(&wb, 1595.0f, -650.0f, focus_z, -0.18f, 0.52f, 0.16f, true);
+    printf("[WorldBuilder] Constructed World 8: Baklan & Beşparmak Dağı SSD-Streamed DEM + Satellite Map (24x24 km, 256x256 Tiles, LOD 0..4)\n");
     fflush(stdout);
     return 0;
 }

@@ -419,13 +419,6 @@ void camera_reset(void) {
     s_turntable_z = false;
     s_kp5_front = false;
     check_identity();
-    if (!s_logged) {
-        printf("[Camera] Yaw and pitch on the view, exponential zoom, view-plane move. "
-               "Home restores the opening pose. The wheel zooms. "
-               "Right-drag orbits. Middle-drag pans.\n");
-        fflush(stdout);
-        s_logged = true;
-    }
 }
 
 void camera_bind(bool live) {
@@ -442,9 +435,50 @@ void camera_bound_xy(float *x, float *y) {
     }
 }
 
+void camera_map_basis(float *right_x, float *right_y, float *fwd_x, float *fwd_y, float *out_zoom) {
+    float cy = cosf(s_held_yaw);
+    float sy = sinf(s_held_yaw);
+    if (right_x != nullptr) {
+        *right_x = cy;
+    }
+    if (right_y != nullptr) {
+        *right_y = -sy;
+    }
+    if (fwd_x != nullptr) {
+        *fwd_x = sy;
+    }
+    if (fwd_y != nullptr) {
+        *fwd_y = cy;
+    }
+    if (out_zoom != nullptr) {
+        *out_zoom = fmaxf(s_live.zoom, k_camera_zoom_min);
+    }
+}
+
+bool camera_snap_birdseye(float focus_x, float focus_y) {
+    s_live.x     = clampf(focus_x, -k_terrain_world_half, k_terrain_world_half);
+    s_live.y     = clampf(focus_y, -k_terrain_world_half, k_terrain_world_half);
+    s_held_yaw   = 0.0f;
+    s_held_pitch = 0.0f;
+    store_yaw_pitch(&s_live, s_held_yaw, s_held_pitch);
+    sync_turntable_ground_z();
+    s_kp5_front = false;
+    printf("[Camera] Bird's-Eye top-down view centered at (%.1f, %.1f m).\n",
+           (double)s_live.x, (double)s_live.y);
+    fflush(stdout);
+    return true;
+}
+
 void view_push_fill(ViewPush *out, uint32_t mat_index) {
     if (out == nullptr) {
         return;
+    }
+    if (!s_logged) {
+        printf("[Camera] Yaw and pitch on the view, exponential zoom, view-plane move. "
+               "Home restores the opening pose. The wheel zooms. "
+               "Right-drag orbits. Middle-drag pans.\n");
+        fflush(stdout);
+        s_logged = true;
     }
     const Pose *p = bound_pose();
     *out = (ViewPush){

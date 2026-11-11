@@ -31,12 +31,6 @@ uint32_t backend_quadtree_node_index(uint8_t lod, uint8_t gx, uint8_t gy) {
     if (lod >= k_gmpack_lod_count) {
         return 0u;
     }
-    if (lod == 4u) {
-        if (gx < 4u || gx >= 12u || gy < 4u || gy >= 12u) {
-            return 0u;
-        }
-        return 85u + (uint32_t)(gy - 4u) * 8u + (uint32_t)(gx - 4u);
-    }
     uint32_t side = 1u << lod;
     if (gx >= side || gy >= side) {
         return 0u;
@@ -133,4 +127,45 @@ int backend_terrain_read_tile(const char *pack_path, uint32_t node_index, GpuMat
     int rc = pread_exact(fd, out_tile, sizeof(GpuMathTileBlock), (off_t)ssd_byte_offset);
     close(fd);
     return rc;
+}
+
+int backend_terrain_write_tile(const char *pack_path, uint32_t node_index, const GpuMathTileBlock *in_tile) {
+    if (pack_path == nullptr || in_tile == nullptr || node_index >= k_gmpack_node_count) {
+        return -1;
+    }
+    int fd = open(pack_path, O_RDWR | O_CLOEXEC);
+    if (fd < 0) {
+        return -1;
+    }
+    GpuMathQuadNode node = {0};
+    off_t node_off = (off_t)(sizeof(GpuMathPageDirectory) + node_index * sizeof(GpuMathQuadNode));
+    if (pread_exact(fd, &node, sizeof node, node_off) != 0) {
+        close(fd);
+        return -1;
+    }
+    uint64_t ssd_byte_offset = relptr2d_resolve_addr(0ull, node.rel_ssd_payload);
+    if (ssd_byte_offset < k_gmpack_header_bytes ||
+        ssd_byte_offset + k_gmpack_tile_bytes > k_gmpack_total_bytes) {
+        close(fd);
+        return -1;
+    }
+    const uint8_t *src = (const uint8_t *)in_tile;
+    size_t done = 0u;
+    while (done < sizeof(GpuMathTileBlock)) {
+        ssize_t n = pwrite(fd, src + done, sizeof(GpuMathTileBlock) - done, (off_t)(ssd_byte_offset + done));
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            close(fd);
+            return -1;
+        }
+        if (n == 0) {
+            close(fd);
+            return -1;
+        }
+        done += (size_t)n;
+    }
+    close(fd);
+    return 0;
 }

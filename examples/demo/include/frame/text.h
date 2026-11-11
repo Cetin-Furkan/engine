@@ -5,8 +5,7 @@
 #include "vulkan/types.h"
 #include <stdint.h>
 
-// Screen text. The sealed run is the embedded face and the word
-// "Antigravity"; dynamic.faces cannot retarget it. User runs are boxes
+// Screen text. User runs are boxes
 // in the same click space as the engine: center origin, +X right, +Y up.
 // Hold T and click twice to place one, then type. T is not a policy bind.
 
@@ -43,5 +42,7 @@ void text_arm_tick(bool t_down, bool have_xy, int32_t px, int32_t py);
 
 [[nodiscard]] bool text_busy(void);
 void text_commit(void);
+void text_set_visible(bool visible);
+[[nodiscard]] bool text_is_visible(void);
 
 #endif /* ENGINE_FRAME_TEXT_H */

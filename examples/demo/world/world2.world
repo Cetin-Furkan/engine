@@ -2,6 +2,10 @@
 # Capability mask: MODE_3D, PERM_MODE_SWITCH revoked.
 # Elevated non-cube solids and cubes drop under gravity with distinct restitution (0.08..0.90)
 # and volume-preserving squash-and-stretch deformation on impact. Click any solid/cube to launch it.
+mode 3d
+tab 0
+draw 0
+sheet 2
 ground z
 smooth 1
 solid Icosahedron -460 150 640 yaw 18000 spin 1 inf 1 glow 1 bounce 0.90

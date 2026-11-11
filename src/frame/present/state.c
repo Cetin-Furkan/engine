@@ -17,5 +17,6 @@ FrameState frame_state = {
     .release_fd = -1,
     .inotify_fd = -1,
     .inotify_wd = -1,
+    .world_wd = -1,
     .sim_fd = -1,
 };

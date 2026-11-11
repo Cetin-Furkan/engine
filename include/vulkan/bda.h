@@ -80,6 +80,17 @@ typedef struct BdaSystem {
     bool     is_initialized;
 } BdaSystem;
 
+typedef struct BdaStats {
+    VkDeviceSize device_allocated;
+    VkDeviceSize device_capacity;
+    VkDeviceSize staging_allocated;
+    VkDeviceSize staging_capacity;
+    VkDeviceSize transient_used;
+    VkDeviceSize transient_capacity;
+    uint32_t     device_blocks;
+    uint32_t     staging_blocks;
+} BdaStats;
+
 // 2026 Unified BDA Slab System API
 [[nodiscard]] int bda_system_init(VulkanContext *vk);
 void bda_system_shutdown(VulkanContext *vk);
@@ -87,6 +98,7 @@ void bda_system_shutdown(VulkanContext *vk);
 [[nodiscard]] BdaSlice bda_alloc_staging(VulkanContext *vk, VkDeviceSize size, VkDeviceSize align);
 [[nodiscard]] BdaSlice bda_alloc_transient(VulkanContext *vk, VkDeviceSize size, VkDeviceSize align);
 void bda_transient_reset(void);
+void bda_get_stats(BdaStats *out);
 
 // Rewind one half of the transient bump. signal_point & 1 selects the half.
 // Call it after that slot's previous acquire has retired. The other half

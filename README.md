@@ -1,8 +1,8 @@
-# engine-v2 (`v0.1.0`)
+# Engine (`v0.1.0`)
 
 **Pure ISO C23 (`-std=c23`) · Linux 7.1+ `io_uring` · Raw Wayland Wire · DRM Timeline Explicit Sync · Vulkan 1.4 Descriptorless BDA · Slang 2026 (SPIR-V 1.6)**
 
-`engine-v2` is a 3D, 2D, and geospatial simulation/graphics engine written from scratch in strict ISO C23 (~53,000 lines of C23 and Slang, compiling into a single `2.2 MiB` release binary with shaders and fonts embedded directly inside the executable via C23 `#embed`).
+`Engine` is a 3D, 2D, and geospatial simulation/graphics engine written from scratch in strict ISO C23 (~53,000 lines of C23 and Slang, compiling into a single `2.2 MiB` release binary with shaders and fonts embedded directly inside the executable via C23 `#embed`).
 
 It uses **no windowing libraries** (`SDL`, `GLFW`), **no protocol wrappers** (`libwayland-client`), **no ring wrappers** (`liburing`), **no Vulkan WSI swapchain** (`VK_KHR_swapchain`), and **no Vulkan descriptor sets** (`VkDescriptorSet`). Instead, a single thread talks straight to the Linux kernel over a registered `io_uring` instance, speaks the Wayland binary wire protocol over a Unix socket, presents exported `DMA-BUF` images synchronized with Linux DRM `drm_syncobj` timelines, and addresses all GPU buffers through raw 64-bit GPU pointers (`VK_KHR_buffer_device_address`).
 
@@ -17,7 +17,7 @@ This README gives a clear, human-readable tour of why the engine exists, what it
 | **[`doc/PLATFORM_AND_RENDER_INTERNALS.md`](doc/PLATFORM_AND_RENDER_INTERNALS.md)** | Low-level code walkthrough of `src/`: `io_uring` arena flags & side-CQE relays, raw Wayland wire framing, WSI-free `DMA-BUF` + DRM syncobj swapchain, cache-line layouts, Vulkan 1.4 BDA slab allocator, `#embed`ded Slang 2026 pipelines, and the linker dead-code gate. |
 | **[`doc/WORKFLOW_CONTROLS_AND_EXTENSIBILITY.md`](doc/WORKFLOW_CONTROLS_AND_EXTENSIBILITY.md)** | How `EngineApp` (`include/engine/app.h`) works, keyboard/mouse routing, capability masking (`PolicyMask` & sealing), `F1`–`F10` live world switching, `.world` / `sheet.world` / `.manifest` / `window.chrome` DSL grammars, the C23 `WorldBuilder` API, and copy-paste customization recipes. |
 | **[`TERRAIN_BACKEND_ARCHITECTURE.md`](TERRAIN_BACKEND_ARCHITECTURE.md)** | World 8's $24\times 24\text{ km}$ Baklan & Beşparmak Dağı `.gmpack` streaming backend, `RelPtr2D` 2D self-relative pointers, Lilliput 64-bit tile headers, 64-byte stateful cells, GPU `vkCmdDrawIndirectCount` culling, Brown-Conrady lens calibration, Multi-View Stereo (MVS), and WGS84 geodetic fusion. |
-| **[`doc/ARCHITECTURE_COMPARISON.md`](doc/ARCHITECTURE_COMPARISON.md)** | Concrete, layer-by-layer architectural comparison of `engine-v2` against Unreal/Unity/Godot, `SDL3`/`GLFW` + `VkSwapchainKHR` stacks, and `GDAL` + `Cesium` + offline photogrammetry pipelines—including honest trade-offs. |
+| **[`doc/ARCHITECTURE_COMPARISON.md`](doc/ARCHITECTURE_COMPARISON.md)** | Concrete, layer-by-layer architectural comparison of `Engine` against Unreal/Unity/Godot, `SDL3`/`GLFW` + `VkSwapchainKHR` stacks, and `GDAL` + `Cesium` + offline photogrammetry pipelines—including honest trade-offs. |
 | **[`pointers.md`](pointers.md)** | Research background behind the 2025–2026 pointer architectures implemented in `src/backend/` (`RelPtr2D`, Project Lilliput compact headers, 64-byte flat closures, CHERI-D inline lifetime IDs, and PULSE active windows). |
 | **[`doc/engineers_note.md`](doc/engineers_note.md)** | Build segregation (`build/debug` vs. `build/release`), semantic version tagging, and Vulkan/DRM runtime contracts. |
 
@@ -26,7 +26,7 @@ This README gives a clear, human-readable tour of why the engine exists, what it
 ## Table of Contents
 
 1. [Why We Rebuilt the Wheel from Scratch](#1-why-we-rebuilt-the-wheel-from-scratch)
-2. [How `engine-v2` Compares to Other Engines & Stacks](#2-how-engine-v2-compares-to-other-engines--stacks)
+2. [How `Engine` Compares to Other Engines & Stacks](#2-how-Engine-compares-to-other-engines--stacks)
 3. [How the Engine Works (Plain-English Architecture)](#3-how-the-engine-works-plain-english-architecture)
 4. [What `v0.1.0` Is Capable Of Today](#4-what-v010-is-capable-of-today)
 5. [Version `0.1.0` Is Only the Foundation: What Comes Next](#5-version-010-is-only-the-foundation-what-comes-next)
@@ -53,17 +53,17 @@ Each layer was written at a different time to hide old operating system quirks. 
 - **Descriptor bureaucracy**: Managing `VkDescriptorSetLayout`, pool sizes, and `vkUpdateDescriptorSets` burns CPU time when modern GPUs already have real 64-bit virtual memory pointers.
 - **Pointer serialization walls**: Standard 64-bit `void*` host pointers break the moment data touches an SSD or a GPU buffer, forcing engines to parse disk formats into temporary CPU heap allocations and copy reorganized structs to VRAM.
 
-With `engine-v2`, we made a deliberate engineering choice: **do not wrap legacy layers—build the foundation directly on Linux 7.1+ and Vulkan 1.4 first.**
+With `Engine`, we made a deliberate engineering choice: **do not wrap legacy layers—build the foundation directly on Linux 7.1+ and Vulkan 1.4 first.**
 
 Version `0.1.0` is that foundation. Instead of rushing to ship high-level game editors on top of leaky middleware, we built the hardest system layers cleanly from zero—so every higher-level tool added in `v0.2` and beyond inherits `0.0%` idle overhead, zero-copy SSD-to-GPU pointers, instant live world switching, and total control over every frame.
 
 ---
 
-## 2. How `engine-v2` Compares to Other Engines & Stacks
+## 2. How `Engine` Compares to Other Engines & Stacks
 
 For the full subsystem-by-subsystem breakdown (syscalls, cache lines, timelines, and honest trade-offs), see **[`doc/ARCHITECTURE_COMPARISON.md`](doc/ARCHITECTURE_COMPARISON.md)**. Here is the summary in plain numbers and mechanics:
 
-| Area | Typical Engine (`UE5` / `Unity` / `Godot`) | Custom Native (`SDL3`/`GLFW` + Vulkan WSI) | **`engine-v2` (`v0.1.0`)** |
+| Area | Typical Engine (`UE5` / `Unity` / `Godot`) | Custom Native (`SDL3`/`GLFW` + Vulkan WSI) | **`Engine` (`v0.1.0`)** |
 | :--- | :--- | :--- | :--- |
 | **Compiled Footprint** | `80 MiB` – `500+ MiB` + external shader/pak folders | `5 MiB` – `30 MiB` + wrapper `.so`s + external `.spv`s | **`2.2 MiB` single release ELF** (SPIR-V 1.6 & font `#embed`ded at compile time) |
 | **Idle Resource Usage** | Continuous tick loop (`60–240 Hz` CPU/GPU wakeups) | Poll loop or coarse event wait | **`0.0%` CPU & `0.0%` GPU**. Disarms `timerfd`, logs `Loop idle`, sleeps in kernel |

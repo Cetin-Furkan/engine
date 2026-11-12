@@ -70,8 +70,10 @@ int system_init(void) {
     fmt_str(&fb, ", BMI2=");
     fmt_str(&fb, s_sys_caps.cpu.has_bmi2 ? "yes" : "no");
     fmt_str(&fb, ") | RAM: ");
+    fmt_u64(&fb, s_sys_caps.mem.avail_ram_bytes / (1024ull * 1024ull));
+    fmt_putc(&fb, '/');
     fmt_u64(&fb, s_sys_caps.mem.total_ram_bytes / (1024ull * 1024ull));
-    fmt_str(&fb, " MiB | VMA-Name: ");
+    fmt_str(&fb, " MiB avail | VMA-Name: ");
     fmt_str(&fb, s_sys_caps.mem.has_vma_anon_name ? "yes" : "no");
     fmt_str(&fb, " | MADV_POPULATE: ");
     fmt_str(&fb, s_sys_caps.mem.has_madv_populate ? "yes" : "no");
@@ -89,4 +91,8 @@ void system_shutdown(void) {
         log_info_raw("[System] Shutdown complete.\n");
         s_sys_caps.is_initialized = false;
     }
+}
+
+const SystemCapabilities *system_get_capabilities(void) {
+    return &s_sys_caps;
 }

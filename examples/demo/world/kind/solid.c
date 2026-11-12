@@ -102,6 +102,7 @@ static bool solid_on_click(WorldObj *o, Coord hit) {
     s->vz += 520.0f + 460.0f * e;
     s->squash_vel -= 5.2f * (0.35f + e);
     s->awake = true;
+    world_note_motion_epoch();
     s_motion_drew = true;
     printf("[Solid] %s shoved (elasticity %.2f).\n", k_name[s->kind], (double)e);
     fflush(stdout);
@@ -196,6 +197,7 @@ static bool solid_remove(WorldObj *o) {
     s->shown_squash = 0.0f;
     s->spin.spinning = false;
     s->spin.infinite = false;
+    world_note_motion_epoch();
     material_set(k_mat_solid0 + s->kind, false);
     printf("[Engine] %s removed.\n", k_name[s->kind]);
     fflush(stdout);
@@ -236,6 +238,7 @@ void solid_kind_reset(void) {
     s_curved = false;
     s_shown_curved = false;
     s_motion_drew = false;
+    world_note_motion_epoch();
 }
 
 bool solid_kind_raise(uint32_t kind) {
@@ -309,6 +312,7 @@ bool solid_kind_place_elastic(uint32_t kind, Coord at, int32_t yaw_milli,
     if (spinning) {
         table_mark_spun();
     }
+    world_note_motion_epoch();
     return true;
 }
 
@@ -350,6 +354,15 @@ uint32_t solid_kind_gather_motion(MotionBody *out, WorldObj **objs, uint32_t cap
         n++;
     }
     return n;
+}
+
+void solid_kind_sync_awake(const MotionBody *bodies, WorldObj *const *objs, uint32_t n) {
+    for (uint32_t i = 0; i < n; ++i) {
+        SolidData *s = objs[i] != nullptr ? objs[i]->data : nullptr;
+        if (s != nullptr && bodies[i].awake) {
+            s->awake = true;
+        }
+    }
 }
 
 bool solid_kind_apply_motion(const MotionBody *bodies, WorldObj *const *objs, uint32_t n,

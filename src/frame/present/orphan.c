@@ -8,6 +8,8 @@
 
 static bool s_sync_destroy = false;
 
+static int insert_orphan(const FrameSlot *src);
+
 static void destroy_object_wire(WaylandContext *wl, uint32_t id) {
     if (wl == nullptr || !wl->is_initialized || wl->failed || id == 0) {
         return;
@@ -29,6 +31,7 @@ static void destroy_object_wire(WaylandContext *wl, uint32_t id) {
 }
 
 static void destroy_wl_buffer_now(WaylandContext *wl, uint32_t buffer_id) {
+    wayland_untrack_buffer(wl, buffer_id);
     destroy_object_wire(wl, buffer_id);
     if (wl != nullptr && wl->buffer_id == buffer_id) {
         wl->buffer_id = 0;
@@ -60,10 +63,10 @@ static bool release_held_elsewhere(const FrameSlot *frame) {
     if (&frame_state.resize_fresh != frame && same_release(frame, &frame_state.resize_fresh)) {
         return true;
     }
-    uint32_t mask = frame_state.orphan_mask;
-    while (mask != 0u) {
-        uint32_t i = (uint32_t)__builtin_ctz(mask);
-        mask &= mask - 1u;
+    uint64_t mask = frame_state.orphan_mask;
+    while (mask != 0ull) {
+        uint32_t i = (uint32_t)__builtin_ctzll(mask);
+        mask &= mask - 1ull;
         if (&frame_state.orphans[i] != frame && same_release(frame, &frame_state.orphans[i])) {
             return true;
         }
@@ -101,6 +104,18 @@ void reap_frame_resources(WaylandContext *wl, VulkanContext *vk, FrameSlot *fram
     }
     frame->release_timeline_id = 0;
     frame->release_handle = 0;
+    if (!s_sync_destroy && vk != nullptr && vk->device != VK_NULL_HANDLE &&
+        !acquire_point_retired(vk, frame->acquire_point)) {
+        FrameSlot gpu_only = *frame;
+        gpu_only.release_pending = false;
+        gpu_only.release_point = 0;
+        if (make_orphan_room(wl, vk) == 0 && insert_orphan(&gpu_only) >= 0) {
+            clear_pixels(frame);
+            frame->release_point = 0;
+            frame->release_pending = false;
+            return;
+        }
+    }
     destroy_frame_gpu(vk, frame);
     frame->release_point = 0;
     frame->release_pending = false;
@@ -114,16 +129,19 @@ static void reap_orphan_slot(WaylandContext *wl, VulkanContext *vk, uint32_t idx
         .generation      = 0,
         .release_eventfd = -1,
     };
-    frame_state.orphan_mask &= ~(1u << idx);
-    frame_state.orphan_count = (uint32_t)__builtin_popcount(frame_state.orphan_mask);
+    frame_state.orphan_mask &= ~(1ull << idx);
+    frame_state.orphan_count = (uint32_t)__builtin_popcountll(frame_state.orphan_mask);
 }
 
 static int insert_orphan(const FrameSlot *src) {
-    uint32_t free_mask = (~frame_state.orphan_mask) & ((1u << k_orphan_cap) - 1u);
-    if (free_mask == 0u) {
+    uint64_t cap_mask = (frame_state.orphan_cap >= 64u)
+        ? UINT64_MAX
+        : ((1ull << frame_state.orphan_cap) - 1ull);
+    uint64_t free_mask = (~frame_state.orphan_mask) & cap_mask;
+    if (free_mask == 0ull) {
         return -1;
     }
-    uint32_t idx = (uint32_t)__builtin_ctz(free_mask);
+    uint32_t idx = (uint32_t)__builtin_ctzll(free_mask);
     uint32_t gen = slot_next_generation(frame_state.orphan_gen[idx]);
     if (src->generation >= gen) {
         gen = slot_next_generation(src->generation);
@@ -131,18 +149,18 @@ static int insert_orphan(const FrameSlot *src) {
     frame_state.orphan_gen[idx] = gen;
     frame_state.orphans[idx] = *src;
     frame_state.orphans[idx].generation = gen;
-    frame_state.orphan_mask |= (1u << idx);
-    frame_state.orphan_count = (uint32_t)__builtin_popcount(frame_state.orphan_mask);
+    frame_state.orphan_mask |= (1ull << idx);
+    frame_state.orphan_count = (uint32_t)__builtin_popcountll(frame_state.orphan_mask);
     return (int)idx;
 }
 
 void sweep_ready_orphans(WaylandContext *wl, VulkanContext *vk, bool force_all) {
     bool previous = s_sync_destroy;
     s_sync_destroy = force_all;
-    uint32_t mask = frame_state.orphan_mask;
-    while (mask != 0u) {
-        uint32_t i = (uint32_t)__builtin_ctz(mask);
-        mask &= mask - 1u;
+    uint64_t mask = frame_state.orphan_mask;
+    while (mask != 0ull) {
+        uint32_t i = (uint32_t)__builtin_ctzll(mask);
+        mask &= mask - 1ull;
         // Resolve through the generation-tagged handle: if this orphan
         // was replaced since the sweep started, the ref is stale and
         // the entry must not be reaped under its new image.
@@ -150,17 +168,20 @@ void sweep_ready_orphans(WaylandContext *wl, VulkanContext *vk, bool force_all) 
         if (orb == nullptr) {
             continue;
         }
-        bool ready = poll_release_handle(orb->release_handle, orb->release_point);
-        if (!ready && force_all) {
+        bool rel_ready = !orb->release_pending || poll_slot_released(wl, orb);
+        if (!rel_ready && force_all) {
             (void)wait_own_release(orb, 3000000000ull);
-            ready = poll_release_handle(orb->release_handle, orb->release_point);
-            if (!ready) {
+            rel_ready = !orb->release_pending || poll_slot_released(wl, orb);
+            if (!rel_ready) {
                 fprintf(stderr,
                         "[Engine Error] Release point %llu was not signalled before shutdown\n",
                         (unsigned long long)orb->release_point);
             }
         }
-        if (ready) {
+        if (rel_ready && force_all) {
+            (void)wait_acquire_point(vk, orb->acquire_point);
+        }
+        if (rel_ready && acquire_point_retired(vk, orb->acquire_point)) {
             reap_orphan_slot(wl, vk, i);
         }
     }
@@ -169,32 +190,37 @@ void sweep_ready_orphans(WaylandContext *wl, VulkanContext *vk, bool force_all) 
 
 int make_orphan_room(WaylandContext *wl, VulkanContext *vk) {
     sweep_ready_orphans(wl, vk, false);
-    if (frame_state.orphan_count < k_orphan_cap) {
+    if (frame_state.orphan_count < frame_state.orphan_cap) {
         return 0;
     }
-    uint32_t mask = frame_state.orphan_mask;
-    if (mask == 0u) {
-        return 0;
-    }
-    uint32_t oldest_idx = (uint32_t)__builtin_ctz(mask);
-    FrameSlot *oldest = &frame_state.orphans[oldest_idx];
-    mask &= mask - 1u;
-    while (mask != 0u) {
-        uint32_t i = (uint32_t)__builtin_ctz(mask);
-        mask &= mask - 1u;
-        if (frame_state.orphans[i].acquire_point < oldest->acquire_point ||
-            (frame_state.orphans[i].acquire_point == oldest->acquire_point &&
-             frame_state.orphans[i].release_point < oldest->release_point)) {
-            oldest_idx = i;
-            oldest = &frame_state.orphans[i];
+    if (frame_state.orphan_cap < k_orphan_max_cap) {
+        uint32_t old_cap = frame_state.orphan_cap;
+        uint32_t new_cap = old_cap == 0u ? k_orphan_init_cap : (old_cap * 2u);
+        if (new_cap > k_orphan_max_cap) {
+            new_cap = k_orphan_max_cap;
+        }
+        FrameSlot *grown = aligned_alloc(64u, (size_t)new_cap * sizeof(FrameSlot));
+        if (grown != nullptr) {
+            if (frame_state.orphans != nullptr && old_cap > 0u) {
+                memcpy(grown, frame_state.orphans, (size_t)old_cap * sizeof(FrameSlot));
+            }
+            for (uint32_t i = old_cap; i < new_cap; ++i) {
+                grown[i] = (FrameSlot){
+                    .image           = { .dmabuf_fd = -1 },
+                    .generation      = 0,
+                    .release_eventfd = -1,
+                };
+            }
+            if (frame_state.orphans != nullptr &&
+                frame_state.orphans != frame_state.orphans_inline) {
+                free(frame_state.orphans);
+            }
+            frame_state.orphans = grown;
+            frame_state.orphan_cap = new_cap;
+            return 0;
         }
     }
-    (void)wait_own_release(oldest, 500000000ull);
-    if (!poll_release_handle(oldest->release_handle, oldest->release_point)) {
-        return -1;
-    }
-    reap_orphan_slot(wl, vk, oldest_idx);
-    return 0;
+    return -1;
 }
 
 static int stash_orphan(WaylandContext *wl, VulkanContext *vk, FrameSlot *frame) {
@@ -235,8 +261,10 @@ int retire_pixels(WaylandContext *wl, VulkanContext *vk, FrameSlot *frame) {
         return 0;
     }
 
-    bool held = pending &&
-                !poll_release_handle(frame->release_handle, old_point);
+    bool rel_held = pending &&
+                    !poll_slot_released(wl, frame);
+    bool gpu_held = !acquire_point_retired(vk, frame->acquire_point);
+    bool held = rel_held || gpu_held;
     if (held && make_orphan_room(wl, vk) != 0) {
         return -1;
     }
@@ -259,7 +287,14 @@ int retire_pixels(WaylandContext *wl, VulkanContext *vk, FrameSlot *frame) {
         return 0;
     }
 
-    pixels.release_point = old_point;
+    if (rel_held) {
+        pixels.release_pending = true;
+        pixels.release_point = old_point;
+    } else {
+        pixels.release_handle = 0;
+        pixels.release_timeline_id = 0;
+        pixels.release_point = 0;
+    }
     if (insert_orphan(&pixels) < 0) {
         return -1;
     }
@@ -270,12 +305,15 @@ void retire_spare(WaylandContext *wl, VulkanContext *vk) {
     if (!frame_state.spare_live) {
         return;
     }
-    bool held = spare()->release_pending &&
-                !poll_release_handle(spare()->release_handle, spare()->release_point);
-    if (held) {
+    bool rel_held = spare()->release_pending &&
+                    !poll_slot_released(wl, spare());
+    bool gpu_held = !acquire_point_retired(vk, spare()->acquire_point);
+    if (rel_held || gpu_held) {
+        spare()->release_pending = rel_held;
         if (stash_orphan(wl, vk, spare()) != 0) {
             fprintf(stderr,
-                    "[Engine Error] Spare image left alive. Eight release points are still held.\n");
+                    "[Engine Error] Spare image left alive. %u release points are still held.\n",
+                    frame_state.orphan_count);
             return;
         }
     } else {

@@ -203,6 +203,8 @@ void scene_shutdown(VulkanContext *vk);
 [[nodiscard]] int scene_update_mesh(uint32_t mesh_id, const SceneCorner *corners,
                                     uint32_t corner_count, float default_roughness);
 
+void scene_claim_frame(VkSemaphore acquire, uint64_t signal_point);
+void scene_abort_frame(uint64_t signal_point);
 void scene_begin_frame(uint32_t width, uint32_t height, const SceneViewParams *view);
 void scene_submit_instance(uint32_t mesh_id, float origin_x, float origin_y, float origin_z,
                            float uniform_scale, float pitch_rad, float yaw_rad,

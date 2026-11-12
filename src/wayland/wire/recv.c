@@ -28,7 +28,15 @@ bool wayland_take_parked_fd(WaylandContext *w, int *out_fd) {
 }
 
 
-static void park_fds(WaylandContext *w, const unsigned char *control, uint32_t controllen) {
+static constexpr uint32_t k_toplevel_constrained =
+    ENG_TOP_MAXIMIZED | ENG_TOP_FULLSCREEN |
+    ENG_TOP_TILED_LEFT | ENG_TOP_TILED_RIGHT |
+    ENG_TOP_TILED_TOP | ENG_TOP_TILED_BOTTOM;
+
+static void close_cmsg_fds(const unsigned char *control, uint32_t controllen) {
+    if (control == nullptr || controllen < sizeof(struct cmsghdr)) {
+        return;
+    }
     struct msghdr msg = {
         .msg_control    = (void *)control,
         .msg_controllen = controllen,
@@ -36,7 +44,38 @@ static void park_fds(WaylandContext *w, const unsigned char *control, uint32_t c
     for (struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg); cmsg != nullptr; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
         if (cmsg->cmsg_level != SOL_SOCKET || cmsg->cmsg_type != SCM_RIGHTS) continue;
         if (cmsg->cmsg_len < CMSG_LEN(0)) continue;
-        int n = (int)((cmsg->cmsg_len - CMSG_LEN(0)) / sizeof(int));
+        size_t avail = (size_t)((control + controllen) - (const unsigned char *)CMSG_DATA(cmsg));
+        size_t data_len = cmsg->cmsg_len - CMSG_LEN(0);
+        if (data_len > avail) {
+            data_len = avail;
+        }
+        int n = (int)(data_len / sizeof(int));
+        int *fds = (int *)CMSG_DATA(cmsg);
+        for (int i = 0; i < n; ++i) {
+            if (fds[i] >= 0) {
+                close(fds[i]);
+            }
+        }
+    }
+}
+
+static void park_fds(WaylandContext *w, const unsigned char *control, uint32_t controllen) {
+    if (control == nullptr || controllen < sizeof(struct cmsghdr)) {
+        return;
+    }
+    struct msghdr msg = {
+        .msg_control    = (void *)control,
+        .msg_controllen = controllen,
+    };
+    for (struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg); cmsg != nullptr; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
+        if (cmsg->cmsg_level != SOL_SOCKET || cmsg->cmsg_type != SCM_RIGHTS) continue;
+        if (cmsg->cmsg_len < CMSG_LEN(0)) continue;
+        size_t avail = (size_t)((control + controllen) - (const unsigned char *)CMSG_DATA(cmsg));
+        size_t data_len = cmsg->cmsg_len - CMSG_LEN(0);
+        if (data_len > avail) {
+            data_len = avail;
+        }
+        int n = (int)(data_len / sizeof(int));
         int *fds = (int *)CMSG_DATA(cmsg);
         for (int i = 0; i < n; ++i) {
             if (w->nparked >= ENG_FD_PARK) {
@@ -83,6 +122,27 @@ static void note_key_global(WaylandContext *w, uint32_t name, const char *iface,
     } else if (strcmp(iface, "zxdg_decoration_manager_v1") == 0 && w->decoration_global_name == 0) {
         w->decoration_global_name = name;
         w->decoration_version     = version;
+    } else if (strcmp(iface, "wp_fractional_scale_manager_v1") == 0 && w->fractional_scale_global_name == 0) {
+        w->fractional_scale_global_name = name;
+        w->fractional_scale_version     = version;
+    } else if (strcmp(iface, "wp_fifo_manager_v1") == 0 && w->fifo_global_name == 0) {
+        w->fifo_global_name = name;
+        w->fifo_version     = version;
+    } else if (strcmp(iface, "wp_commit_timing_manager_v1") == 0 && w->commit_timing_global_name == 0) {
+        w->commit_timing_global_name = name;
+        w->commit_timing_version     = version;
+    } else if (strcmp(iface, "wp_presentation") == 0 && w->presentation_global_name == 0) {
+        w->presentation_global_name = name;
+        w->presentation_version     = version;
+    } else if (strcmp(iface, "zwp_relative_pointer_manager_v1") == 0 && w->relative_pointer_global_name == 0) {
+        w->relative_pointer_global_name = name;
+        w->relative_pointer_version     = version;
+    } else if (strcmp(iface, "zwp_pointer_constraints_v1") == 0 && w->pointer_constraints_global_name == 0) {
+        w->pointer_constraints_global_name = name;
+        w->pointer_constraints_version     = version;
+    } else if (strcmp(iface, "wl_data_device_manager") == 0 && w->data_device_manager_global_name == 0) {
+        w->data_device_manager_global_name = name;
+        w->data_device_manager_version     = version;
     }
 }
 
@@ -166,14 +226,47 @@ static void handle_xdg_toplevel_msg(WaylandContext *w, uint16_t opcode,
             sp += 4;
             left -= 4u;
         }
-        w->toplevel_states     = states;
-        w->configure_resizing  = (states & ENG_TOP_RESIZING) != 0;
-        w->configure_width     = (width > 0) ? (uint32_t)width : 0u;
-        w->configure_height    = (height > 0) ? (uint32_t)height : 0u;
-        w->toplevel_configured = true;
+        w->staged_states       = states;
+        w->staged_width        = (width > 0) ? (uint32_t)width : 0u;
+        w->staged_height       = (height > 0) ? (uint32_t)height : 0u;
+        w->has_staged_toplevel = true;
     } else if (opcode == 1u) {
         // The client owns the exit. Close is not a protocol failure.
         w->toplevel_closed = true;
+    } else if (opcode == 2u) {
+        // xdg_toplevel.configure_bounds (v4+)
+        int32_t bw = 0, bh = 0;
+        if (!wl_take_i32(&p, end, &bw) || !wl_take_i32(&p, end, &bh)) {
+            wl_fail(w, "truncated xdg_toplevel.configure_bounds");
+            return;
+        }
+        w->configure_bounds_w = (bw > 0) ? (uint32_t)bw : 0u;
+        w->configure_bounds_h = (bh > 0) ? (uint32_t)bh : 0u;
+    } else if (opcode == 3u) {
+        // xdg_toplevel.wm_capabilities (v5+)
+        uint32_t cap_len = 0;
+        if (!wl_take_u32(&p, end, &cap_len)) {
+            wl_fail(w, "truncated xdg_toplevel.wm_capabilities");
+            return;
+        }
+        uint32_t pad = (4u - (cap_len & 3u)) & 3u;
+        if ((size_t)(end - p) < (size_t)cap_len + pad) {
+            wl_fail(w, "xdg_toplevel.wm_capabilities array out of bounds");
+            return;
+        }
+        uint32_t caps = 0u;
+        uint32_t left = cap_len;
+        const unsigned char *cp = p;
+        while (left >= 4u) {
+            uint32_t cap = 0;
+            memcpy(&cap, cp, 4);
+            if (cap < 31u) {
+                caps |= 1u << cap;
+            }
+            cp += 4;
+            left -= 4u;
+        }
+        w->wm_capabilities = caps;
     }
 }
 
@@ -243,15 +336,120 @@ static uint32_t parse_span(WaylandContext *w, const unsigned char *data, uint32_
                 wl_fail(w, "truncated xdg_surface.configure");
                 break;
             }
+            if (w->has_staged_toplevel) {
+                bool was_constrained = (w->toplevel_states & k_toplevel_constrained) != 0u;
+                bool now_constrained = (w->staged_states & k_toplevel_constrained) != 0u;
+                if (!was_constrained && w->configure_width > 0u && w->configure_height > 0u) {
+                    w->floating_width  = w->configure_width;
+                    w->floating_height = w->configure_height;
+                }
+                if (w->staged_width > 0u && w->staged_height > 0u) {
+                    w->configure_width  = w->staged_width;
+                    w->configure_height = w->staged_height;
+                    if (!now_constrained) {
+                        w->floating_width  = w->staged_width;
+                        w->floating_height = w->staged_height;
+                    }
+                } else if (was_constrained && !now_constrained &&
+                           w->floating_width > 0u && w->floating_height > 0u) {
+                    w->configure_width  = w->floating_width;
+                    w->configure_height = w->floating_height;
+                } else {
+                    w->configure_width  = 0u;
+                    w->configure_height = 0u;
+                }
+                w->toplevel_states     = w->staged_states;
+                w->configure_resizing  = (w->staged_states & ENG_TOP_RESIZING) != 0u;
+                w->has_staged_toplevel = false;
+            }
+            w->toplevel_configured    = true;
             w->configure_serial       = serial;
             w->xdg_surface_configured = true;
         } else if (w->feedback_id != 0 && object == w->feedback_id) {
             wl_handle_dmabuf_feedback(w, opcode, size, p, end);
+        } else if (w->retired_feedback_id != 0 && object == w->retired_feedback_id) {
+            if (opcode == 1u) {
+                int stale_fd = -1;
+                if (wayland_take_parked_fd(w, &stale_fd) && stale_fd >= 0) {
+                    close(stale_fd);
+                }
+            }
         } else if (w->buffer_params_id != 0 && object == w->buffer_params_id && opcode == 1u) {
             wl_fail(w, "zwp_linux_buffer_params_v1.failed received from compositor");
             break;
-        } else if (w->buffer_id != 0 && object == w->buffer_id && opcode == 0u) {
-            w->buffer_released = true;
+        } else if (opcode == 0u && size == 8u &&
+                   (wayland_mark_buffer_released(w, object) ||
+                    (w->buffer_id != 0u && object == w->buffer_id))) {
+            if (object == w->buffer_id) {
+                w->buffer_released = true;
+            }
+        } else if (w->fractional_scale_id != 0 && object == w->fractional_scale_id && opcode == 0u) {
+            uint32_t next_scale = 0u;
+            if (!wl_take_u32(&p, end, &next_scale)) {
+                wl_fail(w, "truncated wp_fractional_scale_v1.preferred_scale");
+                break;
+            }
+            if (next_scale >= 60u && next_scale <= 960u && next_scale != w->scale_120) {
+                bool after_cfg = w->xdg_surface_configured;
+                w->scale_120 = next_scale;
+                if (after_cfg && w->viewporter_id != 0u) {
+                    w->scale_changed = true;
+                }
+            }
+        } else if (w->surface_id != 0 && object == w->surface_id) {
+            if (opcode == 2u && w->fractional_scale_id == 0u) {
+                int32_t factor = 1;
+                if (!wl_take_i32(&p, end, &factor)) {
+                    wl_fail(w, "truncated wl_surface.preferred_buffer_scale");
+                    break;
+                }
+                if (factor >= 1 && factor <= 8) {
+                    uint32_t next_scale = (uint32_t)factor * 120u;
+                    if (next_scale != w->scale_120) {
+                        bool after_cfg = w->xdg_surface_configured;
+                        w->scale_120 = next_scale;
+                        if (after_cfg && w->viewporter_id != 0u) {
+                            w->scale_changed = true;
+                        }
+                    }
+                }
+            }
+        } else if (w->presentation_id != 0 && object == w->presentation_id && opcode == 0u) {
+            uint32_t clk_id = 0u;
+            if (!wl_take_u32(&p, end, &clk_id)) {
+                wl_fail(w, "truncated wp_presentation.clock_id");
+                break;
+            }
+            w->presentation_clk_id  = clk_id;
+            w->has_presentation_clk = true;
+        } else if (w->presentation_fb_id != 0 && object == w->presentation_fb_id) {
+            if (opcode == 1u) {
+                uint32_t tv_sec_hi = 0u, tv_sec_lo = 0u, tv_nsec = 0u;
+                uint32_t refresh_ns = 0u, seq_hi = 0u, seq_lo = 0u, flags = 0u;
+                if (!wl_take_u32(&p, end, &tv_sec_hi) || !wl_take_u32(&p, end, &tv_sec_lo) ||
+                    !wl_take_u32(&p, end, &tv_nsec) || !wl_take_u32(&p, end, &refresh_ns) ||
+                    !wl_take_u32(&p, end, &seq_hi) || !wl_take_u32(&p, end, &seq_lo) ||
+                    !wl_take_u32(&p, end, &flags)) {
+                    wl_fail(w, "truncated wp_presentation_feedback.presented");
+                    break;
+                }
+                (void)seq_hi;
+                (void)seq_lo;
+                uint64_t sec = ((uint64_t)tv_sec_hi << 32u) | (uint64_t)tv_sec_lo;
+                w->last_present_ns    = sec * 1000000000ull + (uint64_t)tv_nsec;
+                w->last_refresh_ns    = refresh_ns;
+                w->last_present_flags = flags;
+                w->presented_frames++;
+                if ((flags & ENG_PRESENTATION_ZERO_COPY) != 0u) {
+                    w->zero_copy_scanout_frames++;
+                }
+                // presented is a destructor event; server sends wl_display.delete_id.
+                w->presentation_fb_id = 0u;
+            } else if (opcode == 2u) {
+                w->discarded_frames++;
+                // discarded is a destructor event; server sends wl_display.delete_id.
+                w->presentation_fb_id = 0u;
+            }
         } else {
             (void)pointer_dispatch(w, object, opcode, msg_start + 8, (uint16_t)(size - 8u));
         }
@@ -288,59 +486,48 @@ void wayland_on_cqe(WaylandContext *w, const struct io_uring_cqe *cqe) {
         w->noted_pager_res[idx] = cqe->res;
         return;
     }
-    if (cqe->user_data == ENG_UD_SIM_TIMER) {
-        // Recycle the provided buffer here. A blocking wait can see several
-        // ticks before the idle loop applies the note, and each tick owns a
-        // distinct buffer.
-        uint64_t n = 0;
-        bool have = ring_take_sim_count(w->ring, cqe, &n);
-        if (!w->noted_sim) {
-            w->noted_sim = true;
-            w->noted_sim_res = cqe->res;
-            w->noted_sim_alive = (cqe->flags & IORING_CQE_F_MORE) != 0;
-            w->noted_sim_exp = have ? n : 0;
-        } else {
-            if (have) {
-                w->noted_sim_exp += n;
-            }
-            if (cqe->res < 0) {
-                w->noted_sim_res = cqe->res;
-            }
-            if ((cqe->flags & IORING_CQE_F_MORE) == 0) {
-                w->noted_sim_alive = false;
-            }
+    if (cqe->user_data == ENG_UD_SIM_CANCEL) {
+        w->noted_sim_cancels++;
+        return;
+    }
+    if (cqe->user_data == ENG_UD_TIMER_UPDATE) {
+        return;
+    }
+    if (cqe->user_data == ENG_UD_CLIP_READ ||
+        cqe->user_data == ENG_UD_CLIP_WRITE ||
+        cqe->user_data == ENG_UD_CLIP_CLOSE ||
+        cqe->user_data == ENG_UD_CLIP_CANCEL) {
+        pointer_on_clip_cqe(w, cqe);
+        return;
+    }
+    if (ring_ud_tag(cqe->user_data) == (uint16_t)ENG_UD_SIM_TIMER) {
+        if ((cqe->flags & IORING_CQE_F_MORE) == 0) {
+            w->noted_sim_retired++;
+        }
+        w->noted_sim         = true;
+        w->noted_sim_last_ud = cqe->user_data;
+        w->noted_sim_res     = cqe->res;
+        w->noted_sim_alive   = (cqe->flags & IORING_CQE_F_MORE) != 0;
+        if (cqe->res == -ETIME) {
+            w->noted_sim_exp++;
         }
         return;
     }
     if (cqe->user_data == ENG_UD_WL_SEND) {
-        w->send_queued = false;
+        w->tx_inflight_tag = 0u;
+        w->send_queued     = false;
         if (!w->noted_send) {
-            w->noted_send = true;
+            w->noted_send     = true;
             w->noted_send_res = cqe->res;
         }
         return;
     }
     if (cqe->user_data == ENG_UD_WL_PONG) {
-        w->pong_in_flight = false;
-        uint32_t left = (w->pong_off < 12u) ? (12u - w->pong_off) : 0u;
-        if (cqe->res == -EAGAIN || cqe->res == -EINTR || cqe->res == 0) {
-            if (wl_arm_pong(w) != 0) {
-                wl_fail(w, "SQ full while retrying xdg_wm_base.pong");
-            }
-            return;
+        w->tx_inflight_tag = 0u;
+        w->pong_in_flight  = false;
+        if (wl_tx_step_head(w, cqe->res) >= 0) {
+            (void)wl_tx_kick(w);
         }
-        if (cqe->res < 0 || (uint32_t)cqe->res > left) {
-            wl_fail_err(w, "xdg_wm_base.pong send", cqe->res);
-            return;
-        }
-        w->pong_off += (uint32_t)cqe->res;
-        if (w->pong_off < 12u) {
-            if (wl_arm_pong(w) != 0) {
-                wl_fail(w, "SQ full while retrying xdg_wm_base.pong");
-            }
-            return;
-        }
-        w->pong_off = 0;
         return;
     }
     if (cqe->user_data != ENG_UD_WL_RECV) {
@@ -366,7 +553,7 @@ void wayland_on_cqe(WaylandContext *w, const struct io_uring_cqe *cqe) {
     uint16_t bid = (uint16_t)(cqe->flags >> IORING_CQE_BUFFER_SHIFT);
     uint8_t *buf = ring_pbuf_chunk(w->ring, bid, (uint32_t)cqe->res);
     if (buf == nullptr) {
-        ring_pbuf_finish(w->ring, bid);
+        ring_pbuf_finish(w->ring, bid, cqe->flags, cqe->res);
         wl_fail(w, "recvmsg buffer ID out of range");
         return;
     }
@@ -374,17 +561,35 @@ void wayland_on_cqe(WaylandContext *w, const struct io_uring_cqe *cqe) {
     const struct io_uring_recvmsg_out *out = (const struct io_uring_recvmsg_out *)buf;
     uint32_t hdr = (uint32_t)sizeof(*out) + w->control_reserve;
     if ((uint32_t)cqe->res < hdr || (out->flags & (MSG_CTRUNC | MSG_TRUNC)) != 0) {
-        ring_pbuf_finish(w->ring, bid);
+        if ((uint32_t)cqe->res > sizeof(*out) && out->controllen > 0) {
+            uint32_t avail_ctl = (uint32_t)cqe->res - (uint32_t)sizeof(*out);
+            if (avail_ctl > w->control_reserve) {
+                avail_ctl = w->control_reserve;
+            }
+            if (avail_ctl > out->controllen) {
+                avail_ctl = out->controllen;
+            }
+            close_cmsg_fds(buf + sizeof(*out), avail_ctl);
+        }
+        ring_pbuf_finish(w->ring, bid, cqe->flags, cqe->res);
+        w->recv_armed = false;
         wl_fail(w, "recvmsg truncated");
         return;
     }
 
     uint32_t copied = (uint32_t)cqe->res - hdr;
+    if (copied == 0u && out->controllen == 0u) {
+        ring_pbuf_finish(w->ring, bid, cqe->flags, cqe->res);
+        w->recv_armed = false;
+        wl_fail(w, "wayland compositor closed socket (EOF)");
+        return;
+    }
     if (out->controllen > 0) {
-        park_fds(w, buf + sizeof(*out), out->controllen);
+        uint32_t ctl_len = out->controllen <= w->control_reserve ? out->controllen : w->control_reserve;
+        park_fds(w, buf + sizeof(*out), ctl_len);
     }
     if (w->failed) {
-        ring_pbuf_finish(w->ring, bid);
+        ring_pbuf_finish(w->ring, bid, cqe->flags, cqe->res);
         return;
     }
     const unsigned char *payload = buf + hdr;
@@ -435,7 +640,7 @@ void wayland_on_cqe(WaylandContext *w, const struct io_uring_cqe *cqe) {
             }
         }
     }
-    ring_pbuf_finish(w->ring, bid);
+    ring_pbuf_finish(w->ring, bid, cqe->flags, cqe->res);
 
     if (!w->failed) {
         (void)wayland_ensure_recv(w);

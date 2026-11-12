@@ -135,11 +135,14 @@ void face_draw_chain(VkCommandBuffer cmd, uint32_t width, uint32_t height, bool 
 uint32_t face_chain_count(void);
 const WorldOps *face_ops(void);
 
+struct PhysicsSolvedStep;
 bool cube_kind_spawn(Coord at);
 bool cube_kind_spawn_pose(Coord at, int32_t yaw_milli, bool spinning, bool infinite, bool glow);
 bool cube_kind_spawn_elastic(Coord at, int32_t yaw_milli, bool spinning, bool infinite, bool glow, float restitution);
 float cube_kind_restitution(const WorldObj *o);
+void world_note_motion_epoch(void);
 void world_step_motion(uint32_t time_ms, uint32_t sim_dt_ms);
+bool world_apply_gpu_motion(const struct PhysicsSolvedStep *step);
 const WorldOps *cube_ops(void);
 
 struct MotionBody;
@@ -151,6 +154,7 @@ bool solid_kind_place(uint32_t kind, Coord at, int32_t yaw_milli, bool spinning,
 bool solid_kind_place_elastic(uint32_t kind, Coord at, int32_t yaw_milli, bool spinning, bool infinite, bool glow, float restitution);
 float solid_kind_restitution(const WorldObj *o);
 uint32_t solid_kind_gather_motion(struct MotionBody *out, WorldObj **objs, uint32_t cap);
+void solid_kind_sync_awake(const struct MotionBody *bodies, WorldObj *const *objs, uint32_t n);
 bool solid_kind_apply_motion(const struct MotionBody *bodies, WorldObj *const *objs, uint32_t n, float dt_s, bool *any_awake);
 const WorldOps *solid_ops(void);
 bool solid_kind_toggle_smooth(void);

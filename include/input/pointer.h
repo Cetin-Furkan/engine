@@ -84,8 +84,17 @@ bool pointer_client_xy(int32_t *x, int32_t *y);
 // Repeat does not queue the evdev key again. The clock is CLOCK_MONOTONIC.
 void pointer_pump_text(void);
 
-// One UTF-8 string from a tap or a repeat. `n` is the byte count, not
-// including the NUL that is written when cap allows it. False when empty.
+// Next CLOCK_MONOTONIC deadline (ns) for an active key repeat, or 0 when idle.
+[[nodiscard]] uint64_t pointer_next_repeat_deadline_ns(void);
+
+// One UTF-8 string from a tap, repeat, or clipboard paste. `n` is the byte
+// count, not including the NUL that is written when cap allows it. False when empty.
 bool pointer_take_text(char *utf8, uint32_t cap, uint32_t *n);
+
+// Updates the UTF-8 buffer exported when Ctrl+C claims the Wayland selection.
+void pointer_set_clipboard_text(const char *utf8, uint32_t len);
+
+// Handles async io_uring ENG_UD_CLIP_READ / WRITE / CLOSE completions.
+void pointer_on_clip_cqe(WaylandContext *w, const struct io_uring_cqe *cqe);
 
 #endif /* ENGINE_INPUT_POINTER_H */

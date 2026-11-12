@@ -18,5 +18,6 @@ FrameState frame_state = {
     .inotify_fd = -1,
     .inotify_wd = -1,
     .world_wd = -1,
-    .sim_fd = -1,
+    .orphan_cap = k_orphan_init_cap,
+    .orphans = frame_state.orphans_inline,
 };

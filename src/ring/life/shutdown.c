@@ -9,15 +9,10 @@ void ring_release_registered_mem(RingContext *r) {
         if (rc < 0) {
             fprintf(stderr, "[Ring Error] IORING_UNREGISTER_BUFFERS: %s\n", strerror((int)-rc));
         }
-        r->fixed_on = false;
-    }
-    if (r->sim_pbuf_on) {
-        struct io_uring_buf_reg unreg = { .bgid = ENG_SIM_BGID };
-        long rc = ring_register(r, IORING_UNREGISTER_PBUF_RING, (long)&unreg, 1);
-        if (rc < 0) {
-            fprintf(stderr, "[Ring Error] unregister sim buffers: %s\n", strerror((int)-rc));
-        }
-        r->sim_pbuf_on = false;
+        r->fixed_on           = false;
+        r->uma_buf_registered = false;
+        r->uma_buf_base       = nullptr;
+        r->uma_buf_len        = 0u;
     }
     if (r->pbuf_on) {
         struct io_uring_buf_reg unreg = { .bgid = ENG_PBUF_BGID };
@@ -25,7 +20,8 @@ void ring_release_registered_mem(RingContext *r) {
         if (rc < 0) {
             fprintf(stderr, "[Ring Error] unregister recv buffers: %s\n", strerror((int)-rc));
         }
-        r->pbuf_on = false;
+        r->pbuf_on     = false;
+        r->pbuf_inc_on = false;
     }
 }
 

@@ -29,28 +29,48 @@ int wayland_create_toplevel_and_configure(
     if (wl_flush_pending(w) < 0) {
         return -EIO;
     }
-    w->surface_id             = wayland_alloc_id(w);
-    w->xdg_surface_id         = wayland_alloc_id(w);
-    w->xdg_toplevel_id        = wayland_alloc_id(w);
+    uint32_t mark       = w->send_len;
+    uint32_t surface_id = wayland_alloc_id(w);
+    uint32_t xdg_surf   = wayland_alloc_id(w);
+    uint32_t xdg_top    = wayland_alloc_id(w);
+    if (surface_id == 0 || xdg_surf == 0 || xdg_top == 0) {
+        wl_release_unsent(w, xdg_top);
+        wl_release_unsent(w, xdg_surf);
+        wl_release_unsent(w, surface_id);
+        return -EIO;
+    }
+    w->surface_id             = surface_id;
+    w->xdg_surface_id         = xdg_surf;
+    w->xdg_toplevel_id        = xdg_top;
     w->toplevel_configured    = false;
     w->xdg_surface_configured = false;
+    w->has_staged_toplevel    = false;
     w->configure_width        = 0;
     w->configure_height       = 0;
     w->configure_serial       = 0;
+    w->configure_bounds_w     = 0;
+    w->configure_bounds_h     = 0;
+    w->scene_vp_w             = -1;
+    w->scene_vp_h             = -1;
 
-    // 1. wl_compositor.create_surface (request 0)
-    (void)wayland_put_raw(w, w->compositor_id, 0u, &w->surface_id, sizeof(w->surface_id));
-
-    // 2. xdg_wm_base.get_xdg_surface (request 2)
+    // 1-4. create_surface, get_xdg_surface, get_toplevel, set_title, set_app_id
     uint32_t get_xdg_payload[2] = { w->xdg_surface_id, w->surface_id };
-    (void)wayland_put_raw(w, w->xdg_wm_base_id, 2u, get_xdg_payload, sizeof(get_xdg_payload));
-
-    // 3. xdg_surface.get_toplevel (request 1)
-    (void)wayland_put_raw(w, w->xdg_surface_id, 1u, &w->xdg_toplevel_id, sizeof(w->xdg_toplevel_id));
-
-    // 4. xdg_toplevel.set_title (request 2) and set_app_id (request 3)
-    (void)wl_append_string(w, w->xdg_toplevel_id, 2u, title != nullptr ? title : "Engine");
-    (void)wl_append_string(w, w->xdg_toplevel_id, 3u, app_id != nullptr ? app_id : "engine");
+    bool ok = wayland_put_raw(w, w->compositor_id, 0u, &w->surface_id, sizeof(w->surface_id)) &&
+              wayland_put_raw(w, w->xdg_wm_base_id, 2u, get_xdg_payload, sizeof(get_xdg_payload)) &&
+              wayland_put_raw(w, w->xdg_surface_id, 1u, &w->xdg_toplevel_id, sizeof(w->xdg_toplevel_id)) &&
+              wl_append_string(w, w->xdg_toplevel_id, 2u, title != nullptr ? title : "Engine") &&
+              wl_append_string(w, w->xdg_toplevel_id, 3u, app_id != nullptr ? app_id : "engine");
+    if (!ok) {
+        wayland_rewind_send(w, mark);
+        wl_release_unsent(w, xdg_top);
+        wl_release_unsent(w, xdg_surf);
+        wl_release_unsent(w, surface_id);
+        w->xdg_toplevel_id = 0;
+        w->xdg_surface_id  = 0;
+        w->surface_id      = 0;
+        fprintf(stderr, "[Wayland Error] Toplevel creation encode failed: %s\n", w->err);
+        return -EIO;
+    }
 
     if (w->viewporter_id != 0) {
         uint32_t viewport = wayland_alloc_id(w);
@@ -62,6 +82,45 @@ int wayland_create_toplevel_and_configure(
             w->viewport_id = 0;
         } else {
             w->viewport_id = viewport;
+        }
+    }
+
+    if (w->fractional_scale_manager_id != 0) {
+        uint32_t fs_id = wayland_alloc_id(w);
+        uint32_t fs_payload[2] = { fs_id, w->surface_id };
+        // wp_fractional_scale_manager_v1.get_fractional_scale is request 1.
+        if (fs_id == 0 ||
+            !wayland_put_raw(w, w->fractional_scale_manager_id, 1u, fs_payload, sizeof fs_payload)) {
+            wl_release_unsent(w, fs_id);
+            w->fractional_scale_id = 0;
+        } else {
+            w->fractional_scale_id = fs_id;
+        }
+    }
+
+    if (w->fifo_manager_id != 0) {
+        uint32_t fifo_id = wayland_alloc_id(w);
+        uint32_t fifo_payload[2] = { fifo_id, w->surface_id };
+        // wp_fifo_manager_v1.get_fifo is request 1.
+        if (fifo_id == 0 ||
+            !wayland_put_raw(w, w->fifo_manager_id, 1u, fifo_payload, sizeof fifo_payload)) {
+            wl_release_unsent(w, fifo_id);
+            w->fifo_id = 0;
+        } else {
+            w->fifo_id = fifo_id;
+        }
+    }
+
+    if (w->commit_timing_manager_id != 0) {
+        uint32_t timer_id = wayland_alloc_id(w);
+        uint32_t timer_payload[2] = { timer_id, w->surface_id };
+        // wp_commit_timing_manager_v1.get_timer is request 1.
+        if (timer_id == 0 ||
+            !wayland_put_raw(w, w->commit_timing_manager_id, 1u, timer_payload, sizeof timer_payload)) {
+            wl_release_unsent(w, timer_id);
+            w->commit_timer_id = 0;
+        } else {
+            w->commit_timer_id = timer_id;
         }
     }
 
@@ -79,7 +138,10 @@ int wayland_create_toplevel_and_configure(
     }
 
     // 5. wl_surface.commit (request 6) with empty body
-    (void)wayland_put_raw(w, w->surface_id, 6u, nullptr, 0u);
+    if (!wayland_put_raw(w, w->surface_id, 6u, nullptr, 0u)) {
+        fprintf(stderr, "[Wayland Error] Initial toplevel commit encode failed: %s\n", w->err);
+        return -EIO;
+    }
 
     if (wl_send_batch(w) < 0) {
         fprintf(stderr, "[Wayland Error] Failed to send toplevel creation batch: %s\n", w->err);
@@ -117,8 +179,29 @@ int wayland_create_toplevel_and_configure(
         (void)ring_enter(w->ring, n, 0, -1);
     }
 
-    *out_width  = (w->configure_width > 0 && w->configure_height > 0) ? w->configure_width  : 1280u;
-    *out_height = (w->configure_width > 0 && w->configure_height > 0) ? w->configure_height : 720u;
+    uint32_t def_w = 1280u;
+    uint32_t def_h = 720u;
+    if (w->configure_bounds_w > 0u && def_w > w->configure_bounds_w) {
+        def_w = w->configure_bounds_w;
+    }
+    if (w->configure_bounds_h > 0u && def_h > w->configure_bounds_h) {
+        def_h = w->configure_bounds_h;
+    }
+    w->floating_width  = def_w;
+    w->floating_height = def_h;
+
+    uint32_t chosen_w = (w->configure_width > 0u && w->configure_height > 0u) ? w->configure_width  : def_w;
+    uint32_t chosen_h = (w->configure_width > 0u && w->configure_height > 0u) ? w->configure_height : def_h;
+    constexpr uint32_t k_constrained =
+        ENG_TOP_MAXIMIZED | ENG_TOP_FULLSCREEN |
+        ENG_TOP_TILED_LEFT | ENG_TOP_TILED_RIGHT |
+        ENG_TOP_TILED_TOP | ENG_TOP_TILED_BOTTOM;
+    if ((w->toplevel_states & k_constrained) == 0u) {
+        w->floating_width  = chosen_w;
+        w->floating_height = chosen_h;
+    }
+    *out_width  = chosen_w;
+    *out_height = chosen_h;
     *out_serial = w->configure_serial;
     return 0;
 }
@@ -163,10 +246,11 @@ int wayland_queue_configure_ack(
         w->surface_id == 0 || w->xdg_surface_id == 0 || width == 0 || height == 0) {
         return -EINVAL;
     }
-    if (w->send_len != 0) {
+    if (w->send_len != 0 || wl_send_blocked(w)) {
         return -EBUSY;
     }
-    uint32_t mark = w->send_len;
+    uint32_t mark               = w->send_len;
+    uint32_t prepended_destroys = wl_encode_deferred_destroys(w);
     int32_t geom[4];
     wl_geom_box(w, width, height, geom);
     if (!wayland_put_raw(w, w->xdg_surface_id, 4u, &serial, sizeof serial) ||
@@ -185,6 +269,16 @@ int wayland_queue_configure_ack(
         wayland_rewind_send(w, mark);
         return -EIO;
     }
-    return wayland_queue_send(w, true);
+    int queued = wayland_queue_send(w, true);
+    if (queued == 0) {
+        wl_consume_deferred_destroys(w, prepended_destroys);
+        if (w->viewport_id != 0 && viewport_mode == ENG_VIEWPORT_UNSET) {
+            w->scene_vp_w = -1;
+            w->scene_vp_h = -1;
+        }
+    } else {
+        wayland_rewind_send(w, mark);
+    }
+    return queued;
 }
 

@@ -1,0 +1,118 @@
+# Engine v0.3.0 — Measured Loop Idle & Quiescence Verification Log
+# Hardware: Intel(R) Iris(R) Xe Graphics (TGL GT2) | 11th Gen Intel(R) Core(TM) i7-1165G7
+# Kernel: Linux 7.3.0-rc6-2-cachyos-rc | Mesa 26.2.6 (Vulkan 1.4.354)
+
+=== build/release/bin/minimal ===
+MESA: warning: Support for this platform is experimental with Xe KMD, bug reports may be ignored.
+[C23 Engine] Version: 0.3.0 (release mode, C standard: 202311)
+[System] Kernel: Linux 7.3.0-rc6-2-cachyos-rc | MEMLOCK: 8 MiB (kernel cap, wanted 64) | io_uring opcodes: 65 | NO_IOWAIT: yes | BUNDLE: yes | MIN_TIMEOUT: yes
+[System] CPU: 11th Gen Intel(R) Core(TM) i7-1165G7 @ 2.80GHz (8 threads, line=64B, L1d=48K, L2=1280K, L3=12M, AVX2=yes, FMA=yes, BMI2=yes) | RAM: 4166/7576 MiB avail | VMA-Name: yes | MADV_POPULATE: yes | TimerSlack: 1ns
+[Ring] Initialized 'primary' (registered index 0, SQ=64, CQ=256, PBUF=32x8192B [INC=on], FixedBuf=19/19, FixedFiles=16 [Alloc=8..15:on], NO_MMAP+REGISTERED_FD_ONLY+DEFER_TASKRUN)
+[Pointer] seat=7 pointer=18 keyboard=21 cursor-shape=19 rel-ptr=20 ptr-lock=yes data-dev=22 shm_argb=no
+[Wayland] Wire connected (fixed slot 0: /run/user/1000/wayland-0) | Globals: 43
+[Wayland] Bound Object IDs: wl_compositor=3, xdg_wm_base=4, linux_dmabuf=5, drm_syncobj=6, decoration=0
+[Wayland] Input Object IDs: wl_seat=7, wl_shm=0, cursor_shape=8, viewporter=9, rel_ptr=15, ptr_lock=16, data_mgr=17
+[Wayland] Surface Pacing & Scale IDs: frac_scale=11, fifo=12, commit_timing=13, presentation=14 (clk=ok:1)
+[Vulkan Probe] Enumerated 1 physical device(s) on host:
+  [0] Intel(R) Iris(R) Xe Graphics (TGL GT2) (Integrated GPU | Vendor: Intel [0x8086] | DeviceID: 0x9a49)
+      Driver: v26.2.6 | Vulkan API: v1.4.354 | Device-local heap: 5.55 GiB | Dedicated VRAM: 0.00 GiB
+      Queues: Graphics=family 0 x1, Compute=shared family 0 x1, Transfer=shared family 0 x1
+      Shader: ExpectAssume=yes, FloatControls2=yes, SubgroupRotate=yes, RotateClustered=yes, Demote=yes, DrawParams=yes
+      Features: DynRender=yes, LocalRead=yes, Sync2=yes, BDA=yes, ScalarLayout=yes, Timeline=yes, Anisotropy=yes, Maint5=yes, Maint6=yes, PushDesc=yes, HostImageCopy=yes, MultiDrawIndirect=yes, DrawIndirectCount=yes, Int16=yes, Int64=yes, Storage16=yes, Float16=yes
+      Extensions: external-memory-fd=yes, DMA-BUF=yes, DRM-Modifiers=yes, Syncobj=yes, ForeignQueue=yes, UnifiedLayouts=no, PageableVRAM=no, RayQuery=no, DRM-Node=render 226:128
+      Evaluation: [1;32mELIGIBLE[0m | Score: 44500
+[Vulkan Device] Selected GPU [0]: Intel(R) Iris(R) Xe Graphics (TGL GT2) (Integrated GPU, Score: 44500)
+[Vulkan] Hardware: Intel(R) Iris(R) Xe Graphics (TGL GT2) (Driver v26.2.6, API v1.4.354)
+[Vulkan] Execution Profile: UMA_IGPU (Zero-Copy Shared LLC/BDA) | TrueUMA=yes (LLC-Cached=yes) | Defaults: MSAA=2x, BDA-Slab=40MiB, TerrainWindow=96 slots
+[Vulkan] Queues: Graphics=family 0 index 0, Compute=family 0 index 0 (aliased), Transfer=family 0 index 0 (aliased)
+[Vulkan Warn] Two roles share one VkQueue. Concurrent submits on those roles must be externally synchronized.
+[Vulkan] Shader 1.4: ExpectAssume=yes, FloatControls2=yes, SubgroupRotate=yes, RotateClustered=yes, Demote=yes, DrawParams=yes
+[Vulkan] Capabilities: DMA-BUF=yes, DRM-Modifiers=yes, ForeignQueue=yes, Syncobj=yes, BDA=yes, ScalarLayout=yes, Anisotropy=yes, DynRender=yes, LocalRead=yes, Sync2=yes, Timeline=yes, Maint5=yes, Maint6=yes, PushDesc=yes, HostImageCopy=yes, MultiDrawIndirect=yes, DrawIndirectCount=yes, RayQuery=no, Int16=yes, Int64=yes, Storage16=yes, Float16=yes
+[Vulkan] Telemetry & Residency: HostQueryReset=yes, MemoryBudget=yes, MemoryPriority=no, PageableVRAM=no, UnifiedLayouts=no, DeviceFault=no
+[Vulkan] DRM Device Nodes: Primary=yes (226:0), Render=yes (226:128)
+hello init from vulkan (device & command pool active, validation: disabled)
+[Chrome] Spec chrome/window.chrome | layers=1 controls=1 resize=on band=6 cursor=1
+[Engine] Toplevel minimum 32x32
+[Wayland] Decoration manager is absent. Server chrome is not negotiated.
+[DMA-BUF] Compositor main device 226:128, render 226:128, primary 226:0. Producer tranches 1 (6 ARGB/XRGB: 6 XRGB8888, 6 ARGB8888, 10 10bpc), main-device tranches 0 (0 mods), other tranches 0.
+[Vulkan] Compute pipeline created
+[Chrome] Bar, close, and X are drawn by a fragment shader
+[Vulkan] Graphics pipeline created (color 50, depth 0)
+[Vulkan] Graphics pipeline created (color 50, depth 0)
+[Chrome] Box tree: 4 nodes, client 1280x688 at 0,32
+[Chrome] GPU bar and X into 1280x32 (1 layer)
+[Chrome] Bar surface 1280x32, scene buffer excludes it.
+[Engine] Presented 1 visible frame: window=1280x720 scene=1280x688 scale=1.00x (serial=3119), fourcc=0x34325258 (XRGB8888), modifier=0x100000000000002 (general tranche), stride=5120, offset=0, fd=14, explicit-sync acquire=1 release=1 timeline=37
+hello init from engine
+[C23 Engine] All active subsystems initialized successfully.
+[Engine] Window 1280x720, scene 1280x688 is up. 
+[Engine] Loop idle. 6 frames, 0 missed, 0 stalls, 7 submits, sim_timer=0 (GPU avg: 279 us total, 1 us compute, 278 us render).
+[Engine] Idle ended (signal 15, submits=7, sim_timer=0)
+[Engine] GPU release point signalled (io_uring fixed read)
+[Pointer] GPU read input page seq 20
+goodbye from engine
+goodbye from vulkan (command pool, device & instance destroyed)
+[Wayland] Presentation telemetry: presented=2, zero_copy_scanout=0, discarded=0
+goodbye from wayland
+goodbye from ring
+[System] Shutdown complete.
+[Exit Code: 0]
+
+=== build/release/bin/engine --world=0 ===
+MESA: warning: Support for this platform is experimental with Xe KMD, bug reports may be ignored.
+[C23 Engine] Version: 0.3.0 (release mode, C standard: 202311)
+[System] Kernel: Linux 7.3.0-rc6-2-cachyos-rc | MEMLOCK: 8 MiB (kernel cap, wanted 64) | io_uring opcodes: 65 | NO_IOWAIT: yes | BUNDLE: yes | MIN_TIMEOUT: yes
+[System] CPU: 11th Gen Intel(R) Core(TM) i7-1165G7 @ 2.80GHz (8 threads, line=64B, L1d=48K, L2=1280K, L3=12M, AVX2=yes, FMA=yes, BMI2=yes) | RAM: 4129/7576 MiB avail | VMA-Name: yes | MADV_POPULATE: yes | TimerSlack: 1ns
+[Ring] Initialized 'primary' (registered index 0, SQ=64, CQ=256, PBUF=32x8192B [INC=on], FixedBuf=19/19, FixedFiles=16 [Alloc=8..15:on], NO_MMAP+REGISTERED_FD_ONLY+DEFER_TASKRUN)
+[Pointer] seat=7 pointer=18 keyboard=21 cursor-shape=19 rel-ptr=20 ptr-lock=yes data-dev=22 shm_argb=no
+[Wayland] Wire connected (fixed slot 0: /run/user/1000/wayland-0) | Globals: 43
+[Wayland] Bound Object IDs: wl_compositor=3, xdg_wm_base=4, linux_dmabuf=5, drm_syncobj=6, decoration=0
+[Wayland] Input Object IDs: wl_seat=7, wl_shm=0, cursor_shape=8, viewporter=9, rel_ptr=15, ptr_lock=16, data_mgr=17
+[Wayland] Surface Pacing & Scale IDs: frac_scale=11, fifo=12, commit_timing=13, presentation=14 (clk=ok:1)
+[Vulkan Probe] Enumerated 1 physical device(s) on host:
+  [0] Intel(R) Iris(R) Xe Graphics (TGL GT2) (Integrated GPU | Vendor: Intel [0x8086] | DeviceID: 0x9a49)
+      Driver: v26.2.6 | Vulkan API: v1.4.354 | Device-local heap: 5.55 GiB | Dedicated VRAM: 0.00 GiB
+      Queues: Graphics=family 0 x1, Compute=shared family 0 x1, Transfer=shared family 0 x1
+      Shader: ExpectAssume=yes, FloatControls2=yes, SubgroupRotate=yes, RotateClustered=yes, Demote=yes, DrawParams=yes
+      Features: DynRender=yes, LocalRead=yes, Sync2=yes, BDA=yes, ScalarLayout=yes, Timeline=yes, Anisotropy=yes, Maint5=yes, Maint6=yes, PushDesc=yes, HostImageCopy=yes, MultiDrawIndirect=yes, DrawIndirectCount=yes, Int16=yes, Int64=yes, Storage16=yes, Float16=yes
+      Extensions: external-memory-fd=yes, DMA-BUF=yes, DRM-Modifiers=yes, Syncobj=yes, ForeignQueue=yes, UnifiedLayouts=no, PageableVRAM=no, RayQuery=no, DRM-Node=render 226:128
+      Evaluation: [1;32mELIGIBLE[0m | Score: 44500
+[Vulkan Device] Selected GPU [0]: Intel(R) Iris(R) Xe Graphics (TGL GT2) (Integrated GPU, Score: 44500)
+[Vulkan] Hardware: Intel(R) Iris(R) Xe Graphics (TGL GT2) (Driver v26.2.6, API v1.4.354)
+[Vulkan] Execution Profile: UMA_IGPU (Zero-Copy Shared LLC/BDA) | TrueUMA=yes (LLC-Cached=yes) | Defaults: MSAA=2x, BDA-Slab=40MiB, TerrainWindow=96 slots
+[Vulkan] Queues: Graphics=family 0 index 0, Compute=family 0 index 0 (aliased), Transfer=family 0 index 0 (aliased)
+[Vulkan Warn] Two roles share one VkQueue. Concurrent submits on those roles must be externally synchronized.
+[Vulkan] Shader 1.4: ExpectAssume=yes, FloatControls2=yes, SubgroupRotate=yes, RotateClustered=yes, Demote=yes, DrawParams=yes
+[Vulkan] Capabilities: DMA-BUF=yes, DRM-Modifiers=yes, ForeignQueue=yes, Syncobj=yes, BDA=yes, ScalarLayout=yes, Anisotropy=yes, DynRender=yes, LocalRead=yes, Sync2=yes, Timeline=yes, Maint5=yes, Maint6=yes, PushDesc=yes, HostImageCopy=yes, MultiDrawIndirect=yes, DrawIndirectCount=yes, RayQuery=no, Int16=yes, Int64=yes, Storage16=yes, Float16=yes
+[Vulkan] Telemetry & Residency: HostQueryReset=yes, MemoryBudget=yes, MemoryPriority=no, PageableVRAM=no, UnifiedLayouts=no, DeviceFault=no
+[Vulkan] DRM Device Nodes: Primary=yes (226:0), Render=yes (226:128)
+hello init from vulkan (device & command pool active, validation: disabled)
+[Chrome] Spec chrome/window.chrome | layers=1 controls=1 resize=on band=6 cursor=1
+[Engine] Toplevel minimum 32x32
+[Wayland] Decoration manager is absent. Server chrome is not negotiated.
+[DMA-BUF] Compositor main device 226:128, render 226:128, primary 226:0. Producer tranches 1 (6 ARGB/XRGB: 6 XRGB8888, 6 ARGB8888, 10 10bpc), main-device tranches 0 (0 mods), other tranches 0.
+[Vulkan] Compute pipeline created
+[Chrome] Bar, close, and X are drawn by a fragment shader
+[Lighting] Core GI kernel armed (SSILVB + HRC, GI=on, RayQuery=analytical)
+[Physics] Core AVBD kernel armed (LDL^T 3x3 + Graph Color SLM, owner=gpu, profile_iters=4)
+[World] Pure Engine booted with literally nothing (0 objects, 0 overlays). Pass --world=1..9 to construct a world.
+[Vulkan] Graphics pipeline created (color 50, depth 0)
+[Chrome] Box tree: 4 nodes, client 1280x688 at 0,32
+[Chrome] GPU bar and X into 1280x32 (1 layer)
+[Chrome] Bar surface 1280x32, scene buffer excludes it.
+[Engine] Presented 1 visible frame: window=1280x720 scene=1280x688 scale=1.00x (serial=3124), fourcc=0x34325258 (XRGB8888), modifier=0x100000000000002 (general tranche), stride=5120, offset=0, fd=14, explicit-sync acquire=1 release=1 timeline=37
+hello init from engine
+[C23 Engine] All active subsystems initialized successfully.
+[Engine] Window 1280x720, scene 1280x688 is up. One turn, then io_uring idle. Points stay off until numpad 9. Empty clicks then place points, and F closes them into a face that stays. R spins until R again. F5 turns the selection again. F1-F9 switch worlds 1-9, F10 or 0 switches to Pure Engine (World 0). K or numpad 0 toggles topographic elevation contours in World 8. Y toggles R32_UINT Visibility Buffer deferred shading. H toggles 2026 SSILVB + Split Radiance Cascade Global Illumination. 7 toggles Oriented 2D Gaussian Splatting (2DGS) geodetic surfels in World 8. 8 toggles GPU Augmented Vertex Block Descent (AVBD) physics compute. A click on a mesh selects it. A cube click plants heat for five seconds and shoves the cube. It stops on the ground and against other cubes, and that place is saved. It can be selected while other meshes are up. Its colors sweep on that clock, then hold. Keys 1-6 raise a tetrahedron, octahedron, icosahedron, cylinder, cone, and torus. S smooths edges. G opens or closes glow. Esc clears. Backspace, Delete, or X removes. Z puts the last removed cube, solid, or mesh back. M cycles the math plot. L reloads the active .world scene, CSV chart, and OBJ mesh. In 2D and Hybrid, L also reads sheet.world again. Numpad 8, 2, 4, 6, and 5 set top, bottom, left, right, and front. Numpad 5 again sets the back. Home or numpad 1 restores the opening camera, including zoom and position. Numpad 7 shows or hides the view ball. The wheel and the touchpad zoom. Right-drag orbits. Middle-drag pans. Arrows move on the screen axes. Q and E yaw, C and V pitch. Minus zooms out. Plus is numpad plus, shift+4, or equals. Tab cycles 3D, 2D, and Hybrid. 2D is a flat sheet of rigid boxes, a soft patch, and shapes from sheet.world. It does not step the fillets or the lattice. Hybrid draws the 3D scene and that sheet. Hold T and click twice to place a text box, then type. Escape leaves it. Edits are written to examples/demo/world/live.world. Faces and heat stay unsaved.
+[Engine] Loop idle. 2 frames, 0 missed, 0 stalls, 3 submits, sim_timer=0 (GPU avg: 458 us total, 98 us compute, 360 us render).
+[Engine] Idle ended (signal 15, submits=3, sim_timer=0)
+[Engine] GPU release point signalled (io_uring fixed read)
+[Pointer] GPU read input page seq 4
+goodbye from engine
+goodbye from vulkan (command pool, device & instance destroyed)
+[Wayland] Presentation telemetry: presented=1, zero_copy_scanout=0, discarded=0
+goodbye from wayland
+goodbye from ring
+[System] Shutdown complete.
+[Exit Code: 0]
+

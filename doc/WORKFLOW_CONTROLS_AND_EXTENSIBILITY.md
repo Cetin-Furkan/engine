@@ -18,7 +18,9 @@ This guide explains how a hosted program (`examples/demo/`) plugs into the platf
 
 ## 1. The `EngineApp` Seam & Callback Execution Order
 
-Every binary links exactly one implementation of `const EngineApp *engine_app(void)` (implemented for the demo in [`examples/demo/demo.c`](../examples/demo/demo.c)). All hooks run on the single `io_uring` thread and must remain non-blocking.
+Every binary links exactly one implementation of `const EngineApp *engine_app(void)`—implemented for the full 10-world showcase in [`examples/demo/demo.c`](../examples/demo/demo.c) (`build/<mode>/bin/engine`) and for the minimal pure-platform verification program in [`examples/minimal/minimal.c`](../examples/minimal/minimal.c) (`build/<mode>/bin/minimal`). All hooks run on the single `io_uring` thread and must remain non-blocking.
+
+As documented in [`include/engine/app.h`](../include/engine/app.h), **7 `[REQUIRED]` hooks** (`init`, `shutdown`, `draw`, `advance`, `busy`, `click`, `key`) suffice to author a complete standalone interactive application; all remaining **24 `[OPTIONAL]` hooks** are null-safe with deterministic platform defaults (1-sample `VK_FORMAT_B8G8R8A8_SRGB` color-only pass, automatic 4-slice `bda_transient_begin_frame` / `bda_transient_abort_frame`, built-in tap/hold key routing, and platform `Loop idle` turn counters).
 
 ### Lifecycle & Per-Frame Hook Order
 ```text
@@ -83,7 +85,7 @@ so `(0, 0)` is the center of the viewport, `+X` points right (East), and `+Y` po
 
 ### Hold vs. Tap Classification (`route_key`)
 In [`examples/demo/include/frame/policy.h`](../examples/demo/include/frame/policy.h), `EngineAction` places all continuous camera actions in one contiguous enum block (`ACT_PAN_LEFT` through `ACT_PITCH_DOWN`, verified by `static_assert`).
-- When a bound key maps to `ACT_PAN_LEFT .. ACT_PITCH_DOWN` and its permission bit is set, `policy_route()` returns `KEY_ROUTE_HOLD` (`ENGINE_KEY_HOLD`). Pressing that key keeps `app->camera_active()` returning `true`, which keeps the `8 ms` simulation `timerfd` armed so `policy_held_axis()` smoothly integrates camera velocity every tick.
+- When a bound key maps to `ACT_PAN_LEFT .. ACT_PITCH_DOWN` and its permission bit is set, `policy_route()` returns `KEY_ROUTE_HOLD` (`ENGINE_KEY_HOLD`). Pressing that key keeps `app->camera_active()` returning `true`, which keeps the `8 ms` native multishot `IORING_OP_TIMEOUT` armed so `policy_held_axis()` smoothly integrates camera velocity every tick.
 - Any permitted action after `ACT_PITCH_DOWN` returns `KEY_ROUTE_TAP` (`ENGINE_KEY_TAP`), invoking `demo_key()` once on key-down.
 - Any unbound key—or any action whose permission bit is currently `0`—returns `KEY_ROUTE_IGNORE` (`0`) right at the input gate, so an ignored press never even wakes a sleeping scene.
 

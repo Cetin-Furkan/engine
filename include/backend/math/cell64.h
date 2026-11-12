@@ -6,7 +6,7 @@
 #include <stdint.h>
 
 // ============================================================================
-// 64-Byte Stateful Function Cell (Flat Closure + CHERI-D Inline Lifetime ID)
+// 64-Byte Host Closure (GpuMathStreamCell + Inline 1-Byte Epoch Generation Tag)
 // ============================================================================
 // Co-locates the 8-byte execution function pointer and 56 bytes of captured
 // streaming/compute state inside a single 64-byte L1 cache line (alignas(64)).
@@ -34,8 +34,8 @@ struct GpuMathStreamCell {
     uint32_t      generation;      // Bytes 48..51: Temporal safety generation counter
     uint8_t       lod;             // Byte  52:     Quadtree LOD level (0..3)
     uint8_t       state;           // Byte  53:     k_cell_state_*
-    uint8_t       epoch;           // Byte  54:     Expected allocation lifetime ID
-    uint8_t       inline_id;       // Byte  55:     CHERI-D in-cache-line lifetime ID tag
+    uint8_t       epoch;           // Byte  54:     Expected slot epoch tag
+    uint8_t       inline_id;       // Byte  55:     In-cache-line 1-byte epoch tag
     uint64_t      user_tag;        // Bytes 56..63: Correlation / completion stamp
 };
 

@@ -35,8 +35,19 @@ int frame_stop(void) {
     if (frame_state.stuck_release_fd >= 0) {
         fprintf(stderr, "[Engine Error] GPU release read could not be removed\n");
         release_rc = 1;
+    } else if (shown()->release_pending && frame_state.implicit_dmabuf_sync) {
+        bool released_now = poll_slot_released(wl, shown());
+        if (!released_now) {
+            (void)wait_own_release(shown(), 3000000000ull);
+            released_now = poll_slot_released(wl, shown());
+        }
+        if (released_now) {
+            printf("[Engine] GPU release point signalled (dma-buf implicit sync + wl_buffer.release)\n");
+        } else {
+            release_rc = 1;
+        }
     } else if (shown()->release_pending) {
-        bool released_now = poll_release_handle(shown()->release_handle, shown()->release_point);
+        bool released_now = poll_slot_released(wl, shown());
         bool armed = false;
         if (!released_now &&
             ensure_release_fd(ring) == 0 &&
@@ -60,7 +71,7 @@ int frame_stop(void) {
                     frame_state.stuck_release_fd = frame_state.release_fd;
                     frame_state.release_fd = -1;
                     frame_state.release_fixed = false;
-                } else if (late || poll_release_handle(shown()->release_handle, shown()->release_point)) {
+                } else if (late || poll_slot_released(wl, shown())) {
                     printf("[Engine] GPU release point signalled (io_uring fixed read)\n");
                     release_rc = 0;
                 }
@@ -73,7 +84,7 @@ int frame_stop(void) {
     sweep_ready_orphans(wl, vk, true);
 
     bool release_held = shown()->release_pending &&
-        !poll_release_handle(shown()->release_handle, shown()->release_point);
+        !poll_slot_released(wl, shown());
     bool acquire_held = false;
     if (vk != nullptr && vk->device != VK_NULL_HANDLE &&
         !wait_acquire_point(vk, shown()->acquire_point)) {
@@ -84,8 +95,32 @@ int frame_stop(void) {
     }
     uint32_t left_alive = frame_state.orphan_count + (release_held ? 1u : 0u);
     if (left_alive > 0u) {
-        fprintf(stderr, "[Engine Error] %u compositor-held image(s) were left alive\n", left_alive);
+        fprintf(stderr, "[Engine Error] %u compositor-held image(s) timed out on shutdown; reclaiming GPU handles\n",
+                left_alive);
     }
+    if (frame_state.orphan_mask != 0ull) {
+        uint64_t rem = frame_state.orphan_mask;
+        while (rem != 0ull) {
+            uint32_t idx = (uint32_t)__builtin_ctzll(rem);
+            rem &= rem - 1ull;
+            FrameSlot *orb = &frame_state.orphans[idx];
+            if (orb->release_eventfd >= 0) {
+                close(orb->release_eventfd);
+                orb->release_eventfd = -1;
+            }
+            (void)wait_acquire_point(vk, orb->acquire_point);
+            destroy_frame_gpu(vk, orb);
+            *orb = (FrameSlot){ .image = { .dmabuf_fd = -1 }, .release_eventfd = -1 };
+        }
+        frame_state.orphan_mask  = 0ull;
+        frame_state.orphan_count = 0u;
+    }
+    if (frame_state.orphans != nullptr &&
+        frame_state.orphans != frame_state.orphans_inline) {
+        free(frame_state.orphans);
+    }
+    frame_state.orphans    = frame_state.orphans_inline;
+    frame_state.orphan_cap = k_orphan_init_cap;
 
     bar_shutdown(wl, vk);
     if (wl != nullptr && wl->is_initialized) {
@@ -105,6 +140,9 @@ int frame_stop(void) {
     }
 
     if (vk != nullptr && vk->device != VK_NULL_HANDLE) {
+        if (acquire_held) {
+            (void)vkDeviceWaitIdle(vk->device);
+        }
         input_page_harvest();
         uint32_t seen = input_page_seen();
         if (seen != 0u) {
@@ -112,46 +150,50 @@ int frame_stop(void) {
         }
         gpu_timer_shutdown(vk);
         input_gpu_shutdown(vk);
-        bool destroy_shown = !release_held && !acquire_held;
-        if (!acquire_held && frame_state.prime_acquire_sync != VK_NULL_HANDLE) {
+        if (frame_state.prime_acquire_sync != VK_NULL_HANDLE) {
             vkDestroySemaphore(vk->device, frame_state.prime_acquire_sync, nullptr);
             frame_state.prime_acquire_sync = VK_NULL_HANDLE;
         }
-        if (!acquire_held && frame_state.prime_ready_sem != VK_NULL_HANDLE) {
+        if (frame_state.prime_ready_sem != VK_NULL_HANDLE) {
             vkDestroySemaphore(vk->device, frame_state.prime_ready_sem, nullptr);
             frame_state.prime_ready_sem = VK_NULL_HANDLE;
         }
-        if (!acquire_held && frame_state.acquire_sync != VK_NULL_HANDLE) {
+        if (frame_state.acquire_sync != VK_NULL_HANDLE) {
             vkDestroySemaphore(vk->device, frame_state.acquire_sync, nullptr);
             frame_state.acquire_sync = VK_NULL_HANDLE;
         }
-        if (!acquire_held && frame_state.acquire != VK_NULL_HANDLE) {
+        if (frame_state.acquire != VK_NULL_HANDLE) {
             vkDestroySemaphore(vk->device, frame_state.acquire, nullptr);
             frame_state.acquire = VK_NULL_HANDLE;
         }
-        if (!acquire_held) {
-            destroy_prime_color(vk, shown());
+        destroy_prime_color(vk, shown());
+        if (shown()->cmd_buf != VK_NULL_HANDLE && vk->cmd_pool != VK_NULL_HANDLE) {
+            vkFreeCommandBuffers(vk->device, vk->cmd_pool, 1, &shown()->cmd_buf);
+            shown()->cmd_buf = VK_NULL_HANDLE;
         }
-        if (destroy_shown) {
-            if (shown()->cmd_buf != VK_NULL_HANDLE && vk->cmd_pool != VK_NULL_HANDLE) {
-                vkFreeCommandBuffers(vk->device, vk->cmd_pool, 1, &shown()->cmd_buf);
-                shown()->cmd_buf = VK_NULL_HANDLE;
-            }
-            if (shown()->transfer_cmd_buf != VK_NULL_HANDLE && vk->transfer_cmd_pool != VK_NULL_HANDLE) {
-                vkFreeCommandBuffers(vk->device, vk->transfer_cmd_pool, 1, &shown()->transfer_cmd_buf);
-                shown()->transfer_cmd_buf = VK_NULL_HANDLE;
-            }
-            if (shown()->image_view != VK_NULL_HANDLE) {
-                vkDestroyImageView(vk->device, shown()->image_view, nullptr);
-                shown()->image_view = VK_NULL_HANDLE;
-            }
-            vulkan_destroy_exportable_image(vk, &shown()->image);
+        if (shown()->transfer_cmd_buf != VK_NULL_HANDLE && vk->transfer_cmd_pool != VK_NULL_HANDLE) {
+            vkFreeCommandBuffers(vk->device, vk->transfer_cmd_pool, 1, &shown()->transfer_cmd_buf);
+            shown()->transfer_cmd_buf = VK_NULL_HANDLE;
+        }
+        if (shown()->image_view != VK_NULL_HANDLE) {
+            vkDestroyImageView(vk->device, shown()->image_view, nullptr);
+            shown()->image_view = VK_NULL_HANDLE;
+        }
+        vulkan_destroy_exportable_image(vk, &shown()->image);
+        if (engine_app() != nullptr && engine_app()->destroy_targets != nullptr) {
             engine_app()->destroy_targets(vk, &shown()->targets);
+        } else {
+            shown()->targets = (EngineTargets){0};
         }
         chrome_gpu_shutdown(vk);
-        engine_app()->shutdown(vk);
+        if (engine_app() != nullptr && engine_app()->shutdown != nullptr) {
+            engine_app()->shutdown(vk);
+        }
     }
 
+    if (ring != nullptr) {
+        ring_set_dispatcher(ring, nullptr, nullptr);
+    }
     frame_state.presented = false;
     shown()->release_pending = false;
     printf("goodbye from engine\n");

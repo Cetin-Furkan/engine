@@ -181,8 +181,10 @@ static int pool_acquire(VulkanContext *vk, PoolSlot *pool, const VkMemoryRequire
     if (cap < reqs->size) {
         cap = reqs->size;
     }
+    VkMemoryPriorityAllocateInfoEXT prio_info = {0};
     VkMemoryAllocateInfo alloc = {
         .sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .pNext           = vulkan_chain_memory_priority(vk, &prio_info, 1.0f, nullptr),
         .allocationSize  = cap,
         .memoryTypeIndex = type_index,
     };

@@ -10,6 +10,18 @@ int ring_register_files(RingContext *r) {
     return (rc < 0) ? (int)rc : 0;
 }
 
+int ring_register_file_alloc_range(RingContext *r) {
+    struct io_uring_file_index_range rng = {
+        .off = ENG_FILE_ALLOC_OFF,
+        .len = ENG_FILE_ALLOC_LEN,
+    };
+    long rc = ring_register(r, IORING_REGISTER_FILE_ALLOC_RANGE, (long)&rng, 0);
+    if (rc == 0) {
+        r->file_alloc_range_on = true;
+    }
+    return (rc < 0) ? (int)rc : 0;
+}
+
 int ring_update_file(RingContext *r, uint32_t slot, int fd) {
     if (r == nullptr || !r->is_initialized || slot >= ENG_FIXED_FILES) {
         return -EINVAL;

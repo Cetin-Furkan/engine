@@ -7,11 +7,13 @@
 #include <stdio.h>
 #include <string.h>
 
-// Two lines. The seat publishes the first. The scene dispatch writes the
-// second with the sequence it loaded, and frame_stop reads that after the
-// device idle. Word 0 is the sequence: odd while the fields are in flux.
+// Lock-free 4-slot published-index input ring + 2 per-frame GPU readback slots.
+// Line 0: head_tag = (seq << 2) | slot_idx, stored with __ATOMIC_RELEASE after
+// the CPU finishes populating slots[slot_idx]. Lines 1..4: 4 immutable-while-live
+// 64-byte input snapshots. Line 5: 2 alternating 32-byte GPU readback slots so
+// double-buffered frames in flight never race writing the same readback words.
 
-typedef struct InputPage {
+typedef struct InputSlot {
     alignas(64) uint32_t seq;
     float                x;
     float                y;
@@ -30,25 +32,39 @@ typedef struct InputPage {
     // Low 16: shape on the wire (inflight, else last, else wanted).
     // High 16: xdg resize edge of the latch encode just sent or is holding.
     uint32_t             commit;
-    uint32_t             gpu_seq;
-    uint32_t             gpu_time_ms;
-    uint32_t             gpu_flags;
-    uint32_t             gpu_mono_lo;
-    uint32_t             gpu_mono_hi;
-    uint32_t             gpu_pad[11];
-} InputPage;
+} InputSlot;
 
-static_assert(sizeof(InputPage) == 128u, "input page is two cache lines");
-static_assert(offsetof(InputPage, time_ms) == 28u, "time word");
-static_assert(offsetof(InputPage, flags) == 32u, "flags word");
-static_assert(offsetof(InputPage, mono_lo) == 44u, "mono word");
-static_assert(offsetof(InputPage, commit) == 60u, "commit word");
-static_assert(offsetof(InputPage, gpu_seq) == 64u, "gpu line");
-static_assert(_Alignof(InputPage) >= 64u, "page align");
+typedef struct InputReadback {
+    uint32_t gpu_seq;
+    uint32_t gpu_time_ms;
+    uint32_t gpu_flags;
+    uint32_t gpu_mono_lo;
+    uint32_t gpu_mono_hi;
+    uint32_t gpu_commit;
+    uint32_t gpu_pad[2];
+} InputReadback;
+
+typedef struct InputPageRing {
+    alignas(64) uint32_t head_tag;
+    uint32_t             ctrl_pad[15];
+    InputSlot            slots[4];
+    alignas(64) InputReadback readback[2];
+} InputPageRing;
+
+static_assert(sizeof(InputSlot) == 64u, "input slot is one cache line");
+static_assert(sizeof(InputReadback) == 32u, "input readback is half a cache line");
+static_assert(sizeof(InputPageRing) == 384u, "input ring is six cache lines");
+static_assert(offsetof(InputSlot, time_ms) == 28u, "time word");
+static_assert(offsetof(InputSlot, flags) == 32u, "flags word");
+static_assert(offsetof(InputSlot, mono_lo) == 44u, "mono word");
+static_assert(offsetof(InputSlot, commit) == 60u, "commit word");
+static_assert(offsetof(InputPageRing, slots) == 64u, "slots offset");
+static_assert(offsetof(InputPageRing, readback) == 320u, "readback offset");
+static_assert(_Alignof(InputPageRing) >= 64u, "page ring align");
 
 typedef struct InputPush {
     uint64_t page;
-    uint32_t pad0;
+    uint32_t readback_slot;
     uint32_t pad1;
 } InputPush;
 
@@ -69,24 +85,29 @@ enum : uint32_t {
     k_flag_inflight = 1u << 6,
 };
 
-static DaBuffer   s_buf;
-static InputPage *s_page;
+static DaBuffer         s_buf;
+static InputPageRing   *s_ring;
 static VkPipelineLayout s_layout = VK_NULL_HANDLE;
 static VkPipeline       s_pipe   = VK_NULL_HANDLE;
+static uint32_t         s_pub_seq;
+static uint32_t         s_rb_cursor;
 static uint32_t         s_seen;
 
 void input_page_publish(void) {
-    InputPage *page = s_page;
-    if (page == nullptr) {
+    InputPageRing *ring = s_ring;
+    if (ring == nullptr) {
         return;
     }
-    uint32_t seq = __atomic_load_n(&page->seq, __ATOMIC_RELAXED);
-    uint32_t odd = seq + 1u;
-    if ((odd & 1u) == 0u) {
-        odd += 1u;
+    // Keep even non-zero sequence numbers in [2, 0x3ffffffe] so (seq << 2) | slot
+    // fits in 32 bits and preserves the existing even-sequence telemetry contract.
+    uint32_t seq = (s_pub_seq + 2u) & 0x3ffffffeu;
+    if (seq == 0u) {
+        seq = 2u;
     }
-    __atomic_store_n(&page->seq, odd, __ATOMIC_RELAXED);
-    __atomic_thread_fence(__ATOMIC_RELEASE);
+    s_pub_seq = seq;
+    uint32_t slot_idx = (seq >> 1u) & 3u;
+    InputSlot *slot = &ring->slots[slot_idx];
+
     float x = s_ptr.x;
     float y = s_ptr.y;
     float drag_x = s_drag_dx;
@@ -99,13 +120,14 @@ void input_page_publish(void) {
     uint32_t drag_buttons = s_drag_buttons;
     double scroll = s_scroll;
     bool key_focus = s_key_focus;
-    page->x = x;
-    page->y = y;
-    page->drag_x = drag_x;
-    page->drag_y = drag_y;
-    page->buttons = buttons;
-    page->focus = focus;
-    page->time_ms = sample_ms;
+
+    slot->x = x;
+    slot->y = y;
+    slot->drag_x = drag_x;
+    slot->drag_y = drag_y;
+    slot->buttons = buttons;
+    slot->focus = focus;
+    slot->time_ms = sample_ms;
     uint32_t flags = 0;
     if (focus != 0u) {
         flags |= k_flag_pointer;
@@ -128,26 +150,25 @@ void input_page_publish(void) {
     if (s_ptr.cursor_inflight) {
         flags |= k_flag_inflight;
     }
-    page->flags = flags;
-    page->held_n = held_n;
-    page->held0 = held0;
+    slot->flags = flags;
+    slot->held_n = held_n;
+    slot->held0 = held0;
     uint64_t mono = ring_mono_ns();
-    page->mono_lo = (uint32_t)mono;
-    page->mono_hi = (uint32_t)(mono >> 32);
-    page->scroll = (float)(-scroll / 10.0);
-    page->drag_buttons = drag_buttons;
+    slot->mono_lo = (uint32_t)mono;
+    slot->mono_hi = (uint32_t)(mono >> 32);
+    slot->scroll = (float)(-scroll / 10.0);
+    slot->drag_buttons = drag_buttons;
     uint32_t shape = s_ptr.cursor_inflight ? s_ptr.inflight_shape
                    : (s_ptr.have_last ? s_ptr.last_shape : s_ptr.wanted_shape);
-    page->commit = ((s_ptr.resize_edge & 0xffffu) << 16) | (shape & 0xffffu);
-    __atomic_store_n(&page->seq, odd + 1u, __ATOMIC_RELEASE);
+    slot->commit = ((s_ptr.resize_edge & 0xffffu) << 16) | (shape & 0xffffu);
+    __atomic_store_n(&slot->seq, seq, __ATOMIC_RELEASE);
+    __atomic_store_n(&ring->head_tag, (seq << 2u) | slot_idx, __ATOMIC_RELEASE);
 }
 
 void input_page_record(VkCommandBuffer cmd) {
-    if (cmd == VK_NULL_HANDLE || s_pipe == VK_NULL_HANDLE || s_page == nullptr || s_buf.address == 0) {
+    if (cmd == VK_NULL_HANDLE || s_pipe == VK_NULL_HANDLE || s_ring == nullptr || s_buf.address == 0) {
         return;
     }
-    // Host writes landed before this submit. The second barrier publishes
-    // the dispatch's store to the host for the idle harvest.
     VkMemoryBarrier2 host_to_shader = {
         .sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
         .srcStageMask  = VK_PIPELINE_STAGE_2_HOST_BIT,
@@ -162,7 +183,12 @@ void input_page_record(VkCommandBuffer cmd) {
     };
     vkCmdPipelineBarrier2(cmd, &before);
 
-    InputPush push = { .page = s_buf.address };
+    uint32_t rb_slot = s_rb_cursor++ & 1u;
+    InputPush push = {
+        .page          = s_buf.address,
+        .readback_slot = rb_slot,
+        .pad1          = 0u,
+    };
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_pipe);
     vulkan_cmd_push(cmd, s_layout, VK_SHADER_STAGE_COMPUTE_BIT, sizeof push, &push);
     vkCmdDispatch(cmd, 1, 1, 1);
@@ -183,10 +209,12 @@ void input_page_record(VkCommandBuffer cmd) {
 }
 
 void input_page_harvest(void) {
-    if (s_page == nullptr) {
+    if (s_ring == nullptr) {
         return;
     }
-    s_seen = __atomic_load_n(&s_page->gpu_seq, __ATOMIC_ACQUIRE);
+    uint32_t s0 = __atomic_load_n(&s_ring->readback[0].gpu_seq, __ATOMIC_ACQUIRE);
+    uint32_t s1 = __atomic_load_n(&s_ring->readback[1].gpu_seq, __ATOMIC_ACQUIRE);
+    s_seen = (s1 > s0) ? s1 : s0;
 }
 
 uint32_t input_page_seen(void) {
@@ -210,7 +238,9 @@ static void destroy_pipe(VulkanContext *vk) {
 }
 
 int input_gpu_init(VulkanContext *vk) {
-    s_page = nullptr;
+    s_ring = nullptr;
+    s_pub_seq = 0;
+    s_rb_cursor = 0;
     s_seen = 0;
     s_buf = (DaBuffer){0};
     s_pipe = VK_NULL_HANDLE;
@@ -220,7 +250,7 @@ int input_gpu_init(VulkanContext *vk) {
     }
     VkBufferUsageFlags usage = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
                                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-    if (da_buffer_create(vk, sizeof(InputPage), usage, true, &s_buf) != 0 ||
+    if (da_buffer_create(vk, sizeof(InputPageRing), usage, true, &s_buf) != 0 ||
         s_buf.map == nullptr || s_buf.address == 0) {
         fprintf(stderr, "[Pointer Error] Input page was not allocated\n");
         da_buffer_destroy(vk, &s_buf);
@@ -231,8 +261,8 @@ int input_gpu_init(VulkanContext *vk) {
         da_buffer_destroy(vk, &s_buf);
         return -1;
     }
-    memset(s_buf.map, 0, sizeof(InputPage));
-    s_page = s_buf.map;
+    memset(s_buf.map, 0, sizeof(InputPageRing));
+    s_ring = s_buf.map;
 
     VkPushConstantRange range = {
         .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
@@ -249,14 +279,14 @@ int input_gpu_init(VulkanContext *vk) {
         fprintf(stderr, "[Pointer Error] Input pipeline layout failed: %s (%d)\n",
                 vulkan_vkresult_to_str(res), (int)res);
         da_buffer_destroy(vk, &s_buf);
-        s_page = nullptr;
+        s_ring = nullptr;
         return -1;
     }
     s_pipe = vulkan_compute_pipeline(vk, k_input_spv, sizeof k_input_spv, s_layout);
     if (s_pipe == VK_NULL_HANDLE) {
         destroy_pipe(vk);
         da_buffer_destroy(vk, &s_buf);
-        s_page = nullptr;
+        s_ring = nullptr;
         return -1;
     }
     input_page_publish();
@@ -264,7 +294,7 @@ int input_gpu_init(VulkanContext *vk) {
 }
 
 void input_gpu_shutdown(VulkanContext *vk) {
-    s_page = nullptr;
+    s_ring = nullptr;
     destroy_pipe(vk);
     da_buffer_destroy(vk, &s_buf);
 }

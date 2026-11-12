@@ -12,7 +12,8 @@ static void da_fail(const char *what, VkResult res) {
 }
 
 static int create_raw_block(VulkanContext *vk, VkDeviceSize size, VkBufferUsageFlags usage,
-                            VkMemoryPropertyFlags req_flags, bool host_map, BdaBlock *out) {
+                            VkMemoryPropertyFlags req_flags, float priority,
+                            bool host_map, BdaBlock *out) {
     if (vk == nullptr || vk->device == VK_NULL_HANDLE || out == nullptr || size == 0) {
         return -1;
     }
@@ -73,8 +74,10 @@ static int create_raw_block(VulkanContext *vk, VkDeviceSize size, VkBufferUsageF
         return -1;
     }
 
+    VkMemoryPriorityAllocateInfoEXT prio_info = {0};
     VkMemoryAllocateFlagsInfo alloc_flags = {
         .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO,
+        .pNext = vulkan_chain_memory_priority(vk, &prio_info, priority, nullptr),
         .flags = (usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) != 0
                      ? VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT
                      : 0,
@@ -86,6 +89,24 @@ static int create_raw_block(VulkanContext *vk, VkDeviceSize size, VkBufferUsageF
         .memoryTypeIndex = type_index,
     };
     res = vkAllocateMemory(vk->device, &alloc, nullptr, &out->memory);
+    if (res == VK_ERROR_OUT_OF_DEVICE_MEMORY &&
+        (req_flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0 &&
+        (req_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0) {
+        // Fallback when 256 MiB PCIe BAR is exhausted: retry in cached/coherent system RAM.
+        VkMemoryPropertyFlags sys_flags =
+            (req_flags & ~VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+        uint32_t alt_type = 0;
+        VulkanResult alt_res = vulkan_find_memory_type(vk, reqs.memoryTypeBits, sys_flags, &alt_type);
+        if (alt_res != VULKAN_SUCCESS) {
+            alt_res = vulkan_find_memory_type(
+                vk, reqs.memoryTypeBits, sys_flags & ~VK_MEMORY_PROPERTY_HOST_CACHED_BIT, &alt_type);
+        }
+        if (alt_res == VULKAN_SUCCESS && alt_type != type_index) {
+            type_index = alt_type;
+            alloc.memoryTypeIndex = type_index;
+            res = vkAllocateMemory(vk->device, &alloc, nullptr, &out->memory);
+        }
+    }
     if (res != VK_SUCCESS) {
         da_fail("vkAllocateMemory (raw slab)", res);
         vkDestroyBuffer(vk->device, out->buffer, nullptr);
@@ -143,6 +164,7 @@ static int create_raw_block(VulkanContext *vk, VkDeviceSize size, VkBufferUsageF
     out->capacity  = size;
     out->allocated = 0;
     out->next      = nullptr;
+    s_bda_sys.vk_alloc_count++;
     return 0;
 }
 
@@ -162,6 +184,9 @@ static void destroy_raw_block(VulkanContext *vk, BdaBlock *block) {
     }
     if (block->memory != VK_NULL_HANDLE) {
         vkFreeMemory(vk->device, block->memory, nullptr);
+        if (s_bda_sys.vk_alloc_count > 0u) {
+            s_bda_sys.vk_alloc_count--;
+        }
     }
     free(block->free_extra);
     *block = (BdaBlock){0};
@@ -250,7 +275,12 @@ static BdaSlice alloc_from_pool(VulkanContext *vk, BdaPool *pool, VkDeviceSize s
             }
         }
         VkDeviceSize cur = (b->allocated + align - 1u) & ~(align - 1u);
-        if (cur + alloc_size <= b->capacity) {
+        if (cur >= b->allocated && cur + alloc_size <= b->capacity) {
+            if (cur > b->allocated) {
+                if (!free_push(b, (BdaRange){ b->allocated, cur - b->allocated })) {
+                    continue;
+                }
+            }
             BdaSlice slice = {
                 .cpu    = b->base_cpu != nullptr ? b->base_cpu + cur : nullptr,
                 .gpu    = b->base_gpu != 0 ? b->base_gpu + cur : 0,
@@ -269,10 +299,13 @@ static BdaSlice alloc_from_pool(VulkanContext *vk, BdaPool *pool, VkDeviceSize s
     if (new_block == nullptr) {
         return (BdaSlice){0};
     }
-    if (create_raw_block(vk, slab_cap, pool->usage, pool->mem_flags, pool->is_host_mapped, new_block) != 0) {
+    if (create_raw_block(vk, slab_cap, pool->usage, pool->mem_flags, pool->priority,
+                         pool->is_host_mapped, new_block) != 0) {
         free(new_block);
         return (BdaSlice){0};
     }
+    vulkan_name_object(vk, VK_OBJECT_TYPE_BUFFER, (uint64_t)new_block->buffer,
+                       pool == &s_bda_sys.staging_pool ? "BDA:StagingSlab" : "BDA:DeviceSlab");
 
     new_block->next = pool->blocks;
     pool->blocks = new_block;
@@ -301,6 +334,7 @@ int bda_system_init(VulkanContext *vk) {
     const VkDeviceSize slab_size = vk->device_info.recommended_bda_slab_mib > 0u
         ? ((VkDeviceSize)vk->device_info.recommended_bda_slab_mib * 1024ull * 1024ull)
         : BDA_DEFAULT_SLAB_SIZE;
+    s_bda_sys.vk          = vk;
     s_bda_sys.unified_uma = uma;
 
     // Device-local high-speed VRAM slab pool (or unified zero-staging LLC pool on UMA iGPUs)
@@ -310,6 +344,7 @@ int bda_system_init(VulkanContext *vk) {
                           VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                           VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                           VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                          VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
                           VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
                           VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
         .mem_flags      = uma ? (VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
@@ -317,6 +352,7 @@ int bda_system_init(VulkanContext *vk) {
                                  VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
                                  VK_MEMORY_PROPERTY_HOST_CACHED_BIT)
                               : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+        .priority       = 0.75f,
         .is_host_mapped = uma,
     };
 
@@ -326,25 +362,39 @@ int bda_system_init(VulkanContext *vk) {
         .usage          = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
                           VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                           VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                          VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
                           VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
                           VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |
                           VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         .mem_flags      = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                           VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
                           VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+        .priority       = 0.25f,
         .is_host_mapped = true,
     };
 
-    // Per-frame transient bump ring (4 MiB on UMA iGPUs, 16 MiB on discrete GPUs).
-    VkDeviceSize transient_bytes = uma ? (4ull * 1024ull * 1024ull) : (16ull * 1024ull * 1024ull);
+    // Per-frame 4-slice transient bump ring (8 MiB on UMA iGPUs = 2 MiB/slice,
+    // 16 MiB on discrete GPUs = 4 MiB/slice).
+    VkDeviceSize transient_bytes = uma ? (8ull * 1024ull * 1024ull) : (16ull * 1024ull * 1024ull);
     VkBufferUsageFlags transient_usage = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
-                                         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+                                         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                                         VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
+                                         VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+                                         VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
     VkMemoryPropertyFlags transient_mem = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
                                           VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                                           VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
                                           (uma ? VK_MEMORY_PROPERTY_HOST_CACHED_BIT : 0u);
     (void)create_raw_block(vk, transient_bytes, transient_usage,
-                           transient_mem, true, &s_bda_sys.transient_ring);
+                           transient_mem, 0.75f, true, &s_bda_sys.transient_ring);
+    vulkan_name_object(vk, VK_OBJECT_TYPE_BUFFER, (uint64_t)s_bda_sys.transient_ring.buffer,
+                       "BDA:TransientRing");
+    if (s_bda_sys.transient_ring.capacity >= BDA_TRANSIENT_SLICES) {
+        VkDeviceSize slice_cap = s_bda_sys.transient_ring.capacity / BDA_TRANSIENT_SLICES;
+        for (uint32_t i = 0; i < BDA_TRANSIENT_SLICES; ++i) {
+            s_bda_sys.transient_at[i] = slice_cap * (VkDeviceSize)i;
+        }
+    }
 
     s_bda_sys.is_initialized = true;
     return 0;
@@ -396,24 +446,35 @@ BdaSlice bda_alloc_transient(VulkanContext *vk, VkDeviceSize size, VkDeviceSize 
             return (BdaSlice){0};
         }
     }
+    if (size == 0u || s_bda_sys.transient_slice_busy) {
+        return (BdaSlice){0};
+    }
     if (align == 0) {
         align = BDA_CACHE_LINE_ALIGN;
     }
     BdaBlock *ring = &s_bda_sys.transient_ring;
-    if (ring->buffer == VK_NULL_HANDLE || ring->capacity < 2u) {
-        return bda_alloc_staging(vk, size, align);
+    if (ring->buffer == VK_NULL_HANDLE || ring->capacity < BDA_TRANSIENT_SLICES) {
+        fprintf(stderr, "[BDA Error] Transient ring unavailable for %llu byte request\n",
+                (unsigned long long)size);
+        return (BdaSlice){0};
     }
-    uint32_t slot = s_bda_sys.transient_slot & 1u;
-    VkDeviceSize half = ring->capacity / 2u;
-    VkDeviceSize base = half * (VkDeviceSize)slot;
-    VkDeviceSize end = base + half;
-    VkDeviceSize at = s_bda_sys.transient_at[slot];
+    uint32_t slot = s_bda_sys.transient_slot & (BDA_TRANSIENT_SLICES - 1u);
+    VkDeviceSize slice_cap = ring->capacity / BDA_TRANSIENT_SLICES;
+    VkDeviceSize base = slice_cap * (VkDeviceSize)slot;
+    VkDeviceSize end  = base + slice_cap;
+    VkDeviceSize at   = s_bda_sys.transient_at[slot];
     if (at < base) {
         at = base;
     }
     VkDeviceSize cur = (at + align - 1u) & ~(align - 1u);
-    if (cur < at || cur + size > end || size > half) {
-        return bda_alloc_staging(vk, size, align);
+    if (cur < at || size > slice_cap || cur + size > end) {
+        fprintf(stderr,
+                "[BDA Error] Transient slice %u overflow (%llu requested, %llu/%llu used)\n",
+                slot,
+                (unsigned long long)size,
+                (unsigned long long)(at - base),
+                (unsigned long long)slice_cap);
+        return (BdaSlice){0};
     }
     BdaSlice slice = {
         .cpu    = ring->base_cpu != nullptr ? ring->base_cpu + cur : nullptr,
@@ -431,18 +492,45 @@ void bda_transient_reset(void) {
         return;
     }
     s_bda_sys.transient_slot = 0;
-    s_bda_sys.transient_at[0] = 0;
-    s_bda_sys.transient_at[1] = 0;
+    s_bda_sys.transient_slice_busy = false;
+    VkDeviceSize slice_cap = s_bda_sys.transient_ring.capacity / BDA_TRANSIENT_SLICES;
+    for (uint32_t i = 0; i < BDA_TRANSIENT_SLICES; ++i) {
+        s_bda_sys.transient_at[i]    = slice_cap * (VkDeviceSize)i;
+        s_bda_sys.transient_point[i] = 0u;
+    }
 }
 
-void bda_transient_begin_frame(uint64_t signal_point) {
+void bda_transient_begin_frame(VkSemaphore acquire, uint64_t signal_point) {
     if (!s_bda_sys.is_initialized) {
         return;
     }
-    uint32_t slot = (uint32_t)(signal_point & 1ull);
+    uint32_t slot = (uint32_t)(signal_point & (BDA_TRANSIENT_SLICES - 1u));
     s_bda_sys.transient_slot = slot;
-    VkDeviceSize half = s_bda_sys.transient_ring.capacity / 2u;
-    s_bda_sys.transient_at[slot] = half * (VkDeviceSize)slot;
+    uint64_t prev_pt = s_bda_sys.transient_point[slot];
+    if (acquire != VK_NULL_HANDLE && prev_pt != 0u &&
+        s_bda_sys.vk != nullptr && s_bda_sys.vk->device != VK_NULL_HANDLE) {
+        uint64_t done = 0u;
+        VkResult r = vkGetSemaphoreCounterValue(s_bda_sys.vk->device, acquire, &done);
+        if (r != VK_SUCCESS || done < prev_pt) {
+            s_bda_sys.transient_slice_busy = true;
+            return;
+        }
+    }
+    s_bda_sys.transient_slice_busy = false;
+    VkDeviceSize slice_cap = s_bda_sys.transient_ring.capacity / BDA_TRANSIENT_SLICES;
+    s_bda_sys.transient_at[slot]    = slice_cap * (VkDeviceSize)slot;
+    s_bda_sys.transient_point[slot] = signal_point;
+}
+
+void bda_transient_abort_frame(uint64_t signal_point) {
+    if (!s_bda_sys.is_initialized || signal_point == 0u) {
+        return;
+    }
+    uint32_t slot = (uint32_t)(signal_point & (BDA_TRANSIENT_SLICES - 1u));
+    if (s_bda_sys.transient_point[slot] == signal_point) {
+        s_bda_sys.transient_point[slot] = 0u;
+    }
+    s_bda_sys.transient_slice_busy = false;
 }
 
 static VkDeviceSize pool_allocated_bytes(const BdaPool *pool) {
@@ -468,18 +556,49 @@ void bda_get_stats(BdaStats *out) {
     if (!s_bda_sys.is_initialized) {
         return;
     }
-    out->device_allocated   = pool_allocated_bytes(&s_bda_sys.device_pool);
-    out->device_capacity    = s_bda_sys.device_pool.total_bytes;
-    out->device_blocks      = s_bda_sys.device_pool.block_count;
-    out->staging_allocated  = pool_allocated_bytes(&s_bda_sys.staging_pool);
-    out->staging_capacity   = s_bda_sys.staging_pool.total_bytes;
-    out->staging_blocks     = s_bda_sys.staging_pool.block_count;
-    out->transient_capacity = s_bda_sys.transient_ring.capacity;
-    if (s_bda_sys.transient_ring.capacity >= 2u) {
-        VkDeviceSize half = s_bda_sys.transient_ring.capacity / 2u;
-        VkDeviceSize u0 = s_bda_sys.transient_at[0] <= half ? s_bda_sys.transient_at[0] : half;
-        VkDeviceSize u1 = s_bda_sys.transient_at[1] >= half ? (s_bda_sys.transient_at[1] - half) : 0;
-        out->transient_used = u0 + u1;
+    out->device_allocated     = pool_allocated_bytes(&s_bda_sys.device_pool);
+    out->device_capacity      = s_bda_sys.device_pool.total_bytes;
+    out->device_blocks        = s_bda_sys.device_pool.block_count;
+    out->staging_allocated    = pool_allocated_bytes(&s_bda_sys.staging_pool);
+    out->staging_capacity     = s_bda_sys.staging_pool.total_bytes;
+    out->staging_blocks       = s_bda_sys.staging_pool.block_count;
+    out->transient_capacity   = s_bda_sys.transient_ring.capacity;
+    out->standalone_allocated = s_bda_sys.standalone_bytes;
+    out->standalone_blocks    = s_bda_sys.standalone_count;
+    out->vk_alloc_count       = s_bda_sys.vk_alloc_count;
+    if (s_bda_sys.transient_ring.capacity >= BDA_TRANSIENT_SLICES) {
+        VkDeviceSize slice_cap = s_bda_sys.transient_ring.capacity / BDA_TRANSIENT_SLICES;
+        VkDeviceSize used = 0;
+        for (uint32_t i = 0; i < BDA_TRANSIENT_SLICES; ++i) {
+            VkDeviceSize base = slice_cap * (VkDeviceSize)i;
+            if (s_bda_sys.transient_at[i] > base) {
+                VkDeviceSize u = s_bda_sys.transient_at[i] - base;
+                used += u <= slice_cap ? u : slice_cap;
+            }
+        }
+        out->transient_used = used;
+    }
+    if (s_bda_sys.vk != nullptr &&
+        s_bda_sys.vk->physical_device != VK_NULL_HANDLE &&
+        s_bda_sys.vk->device_info.supports_memory_budget) {
+        VkPhysicalDeviceMemoryBudgetPropertiesEXT budget = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT,
+        };
+        VkPhysicalDeviceMemoryProperties2 mem2 = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2,
+            .pNext = &budget,
+        };
+        vkGetPhysicalDeviceMemoryProperties2(s_bda_sys.vk->physical_device, &mem2);
+        VkDeviceSize heap_usage  = 0u;
+        VkDeviceSize heap_budget = 0u;
+        for (uint32_t h = 0u; h < mem2.memoryProperties.memoryHeapCount; ++h) {
+            if ((mem2.memoryProperties.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0) {
+                heap_usage  += budget.heapUsage[h];
+                heap_budget += budget.heapBudget[h];
+            }
+        }
+        out->device_heap_usage  = heap_usage;
+        out->device_heap_budget = heap_budget;
     }
 }
 
@@ -523,16 +642,27 @@ int da_buffer_create(VulkanContext *vk, VkDeviceSize size, VkBufferUsageFlags us
 
     // Dedicated fallback allocation
     BdaBlock block = {0};
-    const bool want_mapped = host || vk->device_info.is_true_uma;
-    VkMemoryPropertyFlags flags = want_mapped
-        ? (VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
-           VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-           VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
-           VK_MEMORY_PROPERTY_HOST_CACHED_BIT)
-        : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
-    if (create_raw_block(vk, size, usage, flags, host, &block) != 0) {
+    const bool uma = vk->device_info.is_true_uma;
+    VkMemoryPropertyFlags flags;
+    if (uma) {
+        flags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+                VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+    } else if (host) {
+        // Prefer cached host RAM (GTT) on discrete GPUs so large dedicated host
+        // staging buffers do not exhaust a scarce 256 MiB uncached PCIe BAR.
+        flags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+                VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+    } else {
+        flags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+    }
+    float standalone_prio = (host && !uma) ? 0.25f : 0.75f;
+    if (create_raw_block(vk, size, usage, flags, standalone_prio, host, &block) != 0) {
         return -1;
     }
+    vulkan_name_object(vk, VK_OBJECT_TYPE_BUFFER, (uint64_t)block.buffer, "BDA:StandaloneBuffer");
     out->buffer          = block.buffer;
     out->memory          = block.memory;
     out->map             = block.base_cpu;
@@ -540,6 +670,8 @@ int da_buffer_create(VulkanContext *vk, VkDeviceSize size, VkBufferUsageFlags us
     out->bytes           = size;
     out->offset          = 0;
     out->is_suballocated = false;
+    s_bda_sys.standalone_bytes += size;
+    s_bda_sys.standalone_count++;
     return 0;
 }
 
@@ -624,6 +756,16 @@ void da_buffer_destroy(VulkanContext *vk, DaBuffer *buf) {
             (void)return_to_pool(&s_bda_sys.staging_pool, buf->buffer, buf->offset, buf->bytes);
         }
     } else if (vk != nullptr && vk->device != VK_NULL_HANDLE) {
+        if (buf->buffer != VK_NULL_HANDLE || buf->memory != VK_NULL_HANDLE) {
+            if (s_bda_sys.standalone_bytes >= buf->bytes) {
+                s_bda_sys.standalone_bytes -= buf->bytes;
+            } else {
+                s_bda_sys.standalone_bytes = 0u;
+            }
+            if (s_bda_sys.standalone_count > 0u) {
+                s_bda_sys.standalone_count--;
+            }
+        }
         BdaBlock block = {
             .buffer   = buf->buffer,
             .memory   = buf->memory,

@@ -20,17 +20,17 @@ Rather than marketing claims, every section below compares **what actually happe
 
 ## 1. At-a-Glance Comparison Matrix
 
-| Subsystem / Metric | Commercial Engines (UE5 / Unity / Godot) | Standard Native Stack (`SDL3`/`GLFW` + Vulkan WSI) | **`Engine` (`v0.1.0`)** |
+| Subsystem / Metric | Commercial Engines (UE5 / Unity / Godot) | Standard Native Stack (`SDL3`/`GLFW` + Vulkan WSI) | **`Engine` (`v0.3.0`)** |
 | :--- | :--- | :--- | :--- |
-| **Release Binary Size** | `80 MiB` – `500+ MiB` (+ external `.pak`/shader dirs) | `5 MiB` – `30 MiB` + dynamic `.so` wrappers + `.spv` files | **`2.2 MiB` single ELF** (shaders & font `#embed`ded via ISO C23) |
-| **Windowing & IPC** | SDL / custom wrapper $\to$ `libwayland-client` + X11 fallback | `SDL3` / `GLFW` $\to$ `libwayland-client` (`pthread` locks + proxy heap) | **Zero `libwayland`**. Hand-rolled binary wire codec directly on `io_uring` socket |
+| **Release Binary Size** | `80 MiB` – `500+ MiB` (+ external `.pak`/shader dirs) | `5 MiB` – `30 MiB` + dynamic `.so` wrappers + `.spv` files | **`3.02 MiB` demo ELF** (`42` `#embed`ded SPIR-V 1.6 modules) · **`0.42 MiB` `minimal` ELF** |
+| **Windowing & IPC** | SDL / custom wrapper $\to$ `libwayland-client` + X11 fallback | `SDL3` / `GLFW` $\to$ `libwayland-client` (`pthread` locks + proxy heap) | **Zero `libwayland`**. Hand-rolled binary wire codec directly on `io_uring` socket (`16 KiB` packet ring) |
 | **Kernel I/O & Polling** | Multi-thread job system + `epoll`/`poll` + `futex` wakes | `poll()`/`epoll_wait()` per frame + blocking `read()` on files | **Single-issuer `io_uring`** (`NO_MMAP`, `DEFER_TASKRUN`, `REGISTERED_FD_ONLY`, `NO_IOWAIT`, `1 ns` timer slack) |
-| **Idle Scene Behavior** | Continuous `60–240 Hz` tick & present loop (measurable CPU/GPU watts) | Usually continuous `while (!quit)` loop or coarse `WaitEvents` | **True `0.0%` CPU & `0.0%` GPU**. Disarms `timerfd`, logs `Loop idle`, sleeps in kernel until input/inotify arrives |
-| **Presentation & Sync** | `VkSwapchainKHR` (`vkAcquireNextImageKHR` + `vkWaitForFences`) | `VkSwapchainKHR` (driver-hidden buffer queue & implicit sync) | **WSI-free**. Exported `DMA-BUF` + `wp_linux_drm_syncobj_v1` timeline syncobjs; **never calls `vkWaitForFences`** on present |
+| **Idle Scene Behavior** | Continuous `60–240 Hz` tick & present loop (measurable CPU/GPU watts) | Usually continuous `while (!quit)` loop or coarse `WaitEvents` | **True `0.0%` CPU & `0.0%` GPU**. Cancels multishot `IORING_OP_TIMEOUT`, logs `Loop idle`, sleeps in kernel |
+| **Presentation & Sync** | `VkSwapchainKHR` (`vkAcquireNextImageKHR` + `vkWaitForFences`) | `VkSwapchainKHR` (driver-hidden buffer queue & implicit sync) | **WSI-free**. Exported `DMA-BUF` + `wp_linux_drm_syncobj_v1` timeline syncobjs; **zero blocking waits on success path** |
 | **Window Titlebar** | OS / XWayland / `libdecor` (`wl_shm` CPU software buffer) | `libdecor` / compositor SSD / `wl_shm` | **Dedicated Vulkan `DMA-BUF` on desynced `wl_subsurface`** with independent DRM release timeline |
-| **GPU Resource Binding** | Descriptor pools, `VkDescriptorSet` tables, or bindless index heaps | `VkDescriptorSetLayout` + `vkUpdateDescriptorSets` | **Zero `VkDescriptorSet`s**. Pure Vulkan 1.4 64-bit `VK_KHR_buffer_device_address` pointers in push constants |
-| **Spatial Data Pointers** | 64-bit host `void*` + JSON/custom deserialization & pointer fixup | `void*` / array indices; separate CPU and GPU struct layouts | **`RelPtr2D` (64-bit 2D self-relative block pointers)** + Lilliput 64b headers; identical bytes on SSD, CPU, and GPU |
-| **Simulation Timing** | Coupled to frame `deltaTime` or multi-thread fixed accumulator | Often tied to `vsync` / frame time (`dt` jitter affects physics) | **Strict `8 ms` (`125 Hz`) `timerfd` quanta**, completely decoupled from `wl_surface.frame` display refresh |
+| **GPU Resource Binding** | Descriptor pools, `VkDescriptorSet` tables, or bindless index heaps | `VkDescriptorSetLayout` + `vkUpdateDescriptorSets` | **Zero `VkDescriptorSet`s**. 64-bit `VkDeviceAddress` (`BDA`) + 1 `PUSH_DESCRIPTOR_BIT` layout (`vkCmdPushDescriptorSet`) |
+| **Spatial Data Pointers** | 64-bit host `void*` + JSON/custom deserialization & pointer fixup | `void*` / array indices; separate CPU and GPU struct layouts | **`RelPtr2D` (packed 64-bit tile-relative offset)** + 64b tile headers; identical bytes on SSD, CPU, and GPU |
+| **Simulation Timing** | Coupled to frame `deltaTime` or multi-thread fixed accumulator | Often tied to `vsync` / frame time (`dt` jitter affects physics) | **Strict `8 ms` (`125 Hz`) multishot `IORING_OP_TIMEOUT` quanta** (`max 5` steps/wake), decoupled from `wl_surface.frame` |
 | **Dead-Code Tolerance** | Millions of lines of unused runtime branches linked in | Unused helper functions stay unless LTO strips silently | **Hard build failure**: linker `--print-gc-sections` aborts build if *any* function in `src/` is unreferenced |
 
 ---
@@ -44,11 +44,11 @@ A typical Linux Vulkan app using `SDL3` or `GLFW` plus `libwayland-client` runs 
 3. Even when nothing in the viewport is moving, most game loops continue waking `60`–`240` times per second, running empty scene traversal and re-submitting identical swapchain frames.
 
 ### How `Engine` Does It
-All I/O—Wayland socket traffic, `8 ms` physics `timerfd` ticks, compositor `DMA-BUF` release `eventfd`s, `inotify` live file reloads, `signalfd`, and asynchronous SSD tile reads—shares **one single-issuer `io_uring` instance** on one thread ([`src/ring/`](../src/ring/), [`src/frame/loop/run.c`](../src/frame/loop/run.c)):
-- **Zero `fdget`/`fdput` syscall tax**: Every persistent FD (`0..5`) and even the ring FD itself (`IORING_FEAT_REG_REG_RING`) is registered in kernel slots (`IORING_SETUP_REGISTERED_FD_ONLY`).
-- **Zero per-packet re-arm syscalls**: Multishot reads (`IORING_OP_READ_MULTISHOT`) pop buffers automatically from application-allocated, hugepage-backed provided-buffer rings (`PBUF` for Wayland wire bursts, `SIM` for timer ticks).
+All I/O—Wayland socket traffic, `8 ms` native multishot `IORING_OP_TIMEOUT` physics ticks, compositor `DMA-BUF` release `eventfd`s, `inotify` live file reloads, `signalfd`, and asynchronous SSD tile reads—shares **one single-issuer `io_uring` instance** on one thread ([`src/ring/`](../src/ring/), [`src/frame/loop/run.c`](../src/frame/loop/run.c)):
+- **Zero `fdget`/`fdput` syscall tax**: Every persistent FD (`0..7`) and even the ring FD itself (`IORING_FEAT_REG_REG_RING`) is registered in kernel slots (`IORING_SETUP_REGISTERED_FD_ONLY`).
+- **Zero per-packet re-arm syscalls**: Multishot socket receives (`IORING_OP_RECV_MULTISHOT` + `IORING_RECVSEND_BUNDLE`) pop buffers automatically from an application-allocated, hugepage-backed provided-buffer ring (`PBUF` with `IORING_PBUF_RING_INC`).
 - **Deferred taskwork (`IORING_SETUP_DEFER_TASKRUN`)**: Hardware/socket interrupts never preempt user-space simulation math to run kernel completion work; completions batch cleanly until `io_uring_enter2`.
-- **`1 ns` wakeup precision + `0.0%` idle draw**: `prctl(PR_SET_TIMERSLACK, 1UL)` eliminates Linux's default `50 µs` timer fuzz while active. Once physics settle and keys are released, the `timerfd` disarms completely—zero syscalls/sec, zero GPU submits/sec, instant sub-millisecond wakeup on the next mouse move or keypress.
+- **`1 ns` wakeup precision + `0.0%` idle draw**: `prctl(PR_SET_TIMERSLACK, 1UL)` eliminates Linux's default `50 µs` timer fuzz while active. Once physics settle and keys are released, the multishot `IORING_OP_TIMEOUT` cancels completely—zero syscalls/sec, zero GPU submits/sec, instant sub-millisecond wakeup on the next mouse move or keypress.
 
 ---
 
@@ -89,10 +89,10 @@ In `Engine` ([`src/wayland/`](../src/wayland/), [`src/frame/present/`](../src/fr
 ### Evolution of GPU Binding Models
 1. **Classic Binding (OpenGL / Vulkan 1.0 `VkDescriptorSet`)**: Every material, mesh, or uniform buffer requires creating layouts, sizing pools, allocating sets, and calling `vkUpdateDescriptorSets` + `vkCmdBindDescriptorSets` across draw calls. High CPU driver overhead; rigid pipeline layouts.
 2. **Bindless Descriptor Arrays (UE5 / Modern DX12 / `VK_EXT_descriptor_indexing`)**: Stores everything in giant global descriptor arrays (`ResourceDescriptorHeap[index]`). Much better than per-draw binding, *but* still maintains a parallel shadow table of descriptors, slot allocators, and indirect array lookups before reaching actual buffer memory.
-3. **Pure Descriptorless 64-Bit BDA (`Engine` on Vulkan 1.4)**:
-   - **Zero descriptor sets, zero descriptor pools, zero descriptor heaps.**
-   - Every GPU buffer has a real 64-bit virtual address (`VkDeviceAddress`), identical in spirit to a C pointer.
-   - The CPU pushes a tiny struct of 64-bit addresses (`vkCmdPushConstants2`, `16–64 bytes`), and Slang 2026 shaders dereference typed pointers (`MaterialTable*`, `GpuMathPageDirectory*`, `SoftVertexState*`) straight through the GPU's L1/L2 cache hierarchy.
+3. **Descriptor-Pool-Free 64-Bit BDA + Push Descriptors (`Engine` on Vulkan 1.4)**:
+   - **Zero `VkDescriptorPool`s, zero allocated `VkDescriptorSet`s.**
+   - Every GPU buffer has a real 64-bit virtual address (`VkDeviceAddress`), identical in spirit to a C pointer, while sampled image views (`Hi-Z` pyramid and `R32_UINT` Visibility Buffer) bind inline through a single `VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT` layout and `vkCmdPushDescriptorSet`.
+   - The CPU pushes a tiny struct of 64-bit addresses (`vkCmdPushConstants`, `16–64 bytes`), and Slang 2026 shaders dereference typed pointers (`MaterialTable*`, `GpuMathPageDirectory*`, `AvbdVertexGpu*`) straight through the GPU's L1/L2 cache hierarchy.
    - Combined with `VK_KHR_maintenance5` (no `VkShaderModule` wrapper objects) and C23 `#embed` (no external `.spv` file I/O at boot), pipeline bring-up is flat, fast, and immune to missing-asset path bugs.
 
 ---
@@ -107,7 +107,7 @@ Most C/C++ engines treat pointers the same way C did in 1989: 64-bit absolute vi
 | :--- | :--- | :--- |
 | **`RelPtr2D` (64-Bit 2D Self-Relative Spatial Block Pointer)** | [`include/backend/math/relptr2d.h`](../include/backend/math/relptr2d.h), [`shaders/terrain_math.slang`](../shaders/terrain_math.slang) | Encodes a signed 20-bit `4 KB` block offset ($\pm 2\text{ GiB}$), inline 16-bit `(dX, dY)` grid coordinates, 4-bit `LOD`, and an 8-bit `epoch ^ 0xA5` tag in one `uint64_t`. Resolves via `self + (delta << 12)` identically on SSD, in CPU RAM, and in GPU VRAM—**zero pointer swizzling or deserialization**. |
 | **Lilliput-Style 64-Bit Unified Tile Header** | [`include/backend/math/relptr2d.h`](../include/backend/math/relptr2d.h) | Packs `20b` block index + `16b` Morton Z-curve key + `4b` LOD + `4b` flags + quantized `10b` min/max elevation (`0..2047 m`) into **8 bytes**. GPU frustum culling (`terrain_cull.comp.slang`) rejects out-of-view tiles before touching a single height sample. |
-| **`alignas(64) GpuMathStreamCell` (64B Stateful Function Cell)** | [`include/backend/math/cell64.h`](../include/backend/math/cell64.h), [`src/backend/core/cell/dispatch.c`](../src/backend/core/cell/dispatch.c) | Co-locates the `8-byte` completion function pointer and `56 bytes` of `io_uring`/BDA state + CHERI-D `epoch`/`inline_id` lifetime tags inside **one exact L1 cache line**. Zero heap closure indirection, zero false sharing, $O(1)$ stale-cell rejection. |
+| **`alignas(64) GpuMathStreamCell` (64B Host Closure)** | [`include/backend/math/cell64.h`](../include/backend/math/cell64.h), [`src/backend/core/cell/dispatch.c`](../src/backend/core/cell/dispatch.c) | Co-locates the `8-byte` completion function pointer and `56 bytes` of `io_uring`/BDA state + inline 1-byte `epoch`/`inline_id` tags inside **one exact L1 cache line**. Zero heap closure indirection, zero false sharing, $O(1)$ stale-cell rejection. |
 | **Cache-Line Split `FrameState` & `FrameClock`** | [`include/frame/clock.h`](../include/frame/clock.h), [`include/frame/internal.h`](../include/frame/internal.h) | Compile-time `static_assert`s enforce that hot wake flags occupy bytes `0..63`, `FrameClock` occupies bytes `64..127`, and `FrameSlot` release gates sit separate from `VkImage` descriptors—eliminating accidental cache-line pollution on wakeups. |
 
 ---
@@ -121,7 +121,7 @@ In traditional GIS and simulation workflows, building an interactive georeferenc
 4. **Runtime Renderer** (Cesium Native / Unreal / WebGL) — parsing JSON/glTF on worker threads and uploading thousands of separate vertex buffers and textures.
 
 In `Engine` (`World 8`, [`src/backend/terrain/`](../src/backend/terrain/)):
-- **One Binary, Live In-Place Fusion**: `baklan_besparmak.gmpack` (`127.90 MiB`, 5 LOD levels `0..4`, `341` quadtree nodes, `256×256` `1/16 m` DEM + Esri satellite imagery across `24 km × 24 km` at `1:1` metric scale) streams directly from SSD into a GPU BDA arena via `io_uring`—and can even **self-synthesize from scratch in pure C23** (`synth_besparmak.c`) on an air-gapped machine if the file is missing.
+- **One Binary, Live In-Place Fusion**: Committed `baklan_besparmak.gmpack` (`55.89 MiB` / `58,601,472 B`, transcoded to `33.32 MiB` `.epack` v1, 5 LOD levels `0..4`, `341` quadtree nodes across `24 km × 24 km` at `1:1` metric scale) streams directly from SSD into a GPU BDA arena via `io_uring`—and can even **self-synthesize from scratch in pure C23** (`synth_besparmak.c`) on an air-gapped machine if the file is missing.
 - **Live Camera Calibration, MVS & Geodetic RBF**: Saving `besparmak_survey.manifest` wakes `inotify` on `io_uring`, runs Brown-Conrady lens undistortion (`k1..k3, p1, p2`), solves least-squares N-view 3D ray triangulation, sweeps candidate elevations with **Multi-View Stereo Patch-ZNCC** + parabolic sub-step refinement, warps RTK-GNSS control points and ridge breaklines with **$C^2$ Wendland radial basis functions**, performs occlusion-checked ortho-rectification, re-uploads affected BDA tile slots, and dispatches `terrain_filter.comp.slang` + `terrain_cull.comp.slang` (`vkCmdDrawIndirectCount`) **live while the camera stays interactive**.
 
 ---

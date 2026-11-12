@@ -15,7 +15,9 @@ void frame_apply_layout(WaylandContext *wl, uint32_t window_w, uint32_t window_h
                         uint32_t *content_w, uint32_t *content_h) {
     uint32_t top = 0;
     uint32_t bottom = 0;
-    chrome_band_thickness(&top, &bottom);
+    if (wl == nullptr || wl->decoration_mode != ENG_DECOR_SERVER) {
+        chrome_band_thickness(&top, &bottom);
+    }
     if (bottom > 0) {
         static bool noted = false;
         if (!noted) {
@@ -32,14 +34,28 @@ void frame_apply_layout(WaylandContext *wl, uint32_t window_w, uint32_t window_h
     frame_state.window_w = window_w;
     frame_state.window_h = window_h;
     frame_state.bar_px = top;
+    uint32_t s120        = wayland_effective_scale_120(wl);
+    uint32_t scene_log_w = window_w;
+    uint32_t scene_log_h = window_h - top;
+    uint32_t phys_win_w  = wayland_phys_px(scene_log_w, s120);
+    uint32_t phys_scn_h  = wayland_phys_px(scene_log_h, s120);
+    uint32_t phys_bar_h  = (top > 0u) ? wayland_phys_px(top, s120) : 0u;
     if (content_w != nullptr) {
-        *content_w = window_w;
+        *content_w = phys_win_w;
     }
     if (content_h != nullptr) {
-        *content_h = window_h - top;
+        *content_h = phys_scn_h;
     }
     int32_t gy = top > 0 ? -(int32_t)top : 0;
     if (wl != nullptr) {
+        wl->scene_logical_w = scene_log_w;
+        wl->scene_logical_h = scene_log_h;
+        wl->scene_phys_w    = phys_win_w;
+        wl->scene_phys_h    = phys_scn_h;
+        wl->bar_logical_w   = (top > 0u) ? window_w : 0u;
+        wl->bar_logical_h   = top;
+        wl->bar_phys_w      = (top > 0u) ? phys_win_w : 0u;
+        wl->bar_phys_h      = phys_bar_h;
         wayland_set_window_geom(wl, 0, gy, window_w, window_h);
     }
     chrome_set_buffer_size(window_w, window_h);
@@ -133,18 +149,30 @@ static int record_bar(VulkanContext *vk, FrameSlot *frame, uint64_t signal_point
         return -1;
     }
 
+    const bool unified_color = vk->device_info.supports_unified_image_layouts &&
+                               (frame->prime_image != VK_NULL_HANDLE);
     VkImage color_image = frame->prime_image != VK_NULL_HANDLE ? frame->prime_image : frame->image.image;
     VkImageMemoryBarrier2 to_color;
-    frame_fill_discard_color(&to_color, color_image);
+    frame_fill_discard_color(&to_color, color_image, unified_color);
     frame_cmd_barriers(frame->cmd_buf, &to_color, 1);
 
+    const bool srgb_view = (frame->view_format == VK_FORMAT_B8G8R8A8_SRGB);
     VkRenderingAttachmentInfo color = {
         .sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
         .imageView   = frame->image_view,
-        .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        .imageLayout = unified_color ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
         .loadOp      = VK_ATTACHMENT_LOAD_OP_CLEAR,
         .storeOp     = VK_ATTACHMENT_STORE_OP_STORE,
-        .clearValue  = { .color = { .float32 = { 0.110f, 0.118f, 0.133f, 1.0f } } },
+        .clearValue  = {
+            .color = {
+                .float32 = {
+                    srgb_view ? 0.0116f : 0.110f,
+                    srgb_view ? 0.0130f : 0.118f,
+                    srgb_view ? 0.0160f : 0.133f,
+                    1.0f,
+                },
+            },
+        },
     };
     VkRenderingInfo rendering = {
         .sType                = VK_STRUCTURE_TYPE_RENDERING_INFO,
@@ -193,8 +221,8 @@ static int record_bar(VulkanContext *vk, FrameSlot *frame, uint64_t signal_point
     frame->acquire_point = signal_point;
     frame_state.sync_point = signal_point;
     frame->foreign_owned = true;
-    VkSemaphore sync_sem = async_prime ? frame_state.prime_acquire_sync : frame_state.acquire_sync;
-    if (publish_acquire_point_from(vk, sync_sem, signal_point) < 0) {
+    VkSemaphore *sync_sem = async_prime ? &frame_state.prime_acquire_sync : &frame_state.acquire_sync;
+    if (publish_acquire_point_from(vk, sync_sem, signal_point, frame->image.dmabuf_fd) < 0) {
         (void)wait_acquire_point(vk, signal_point);
         return -1;
     }
@@ -202,8 +230,9 @@ static int record_bar(VulkanContext *vk, FrameSlot *frame, uint64_t signal_point
 }
 
 static int import_bar_buffer(WaylandContext *wl, FrameSlot *frame) {
-    uint32_t saved = wl->buffer_id;
+    uint32_t saved  = wl->buffer_id;
     uint32_t buffer = 0;
+    uint32_t fourcc = wayland_drm_fourcc_for_modifier(wl, frame->image.drm_format_modifier, false);
     int imported = wayland_import_dmabuf_immed(
         wl,
         frame->image.dmabuf_fd,
@@ -211,7 +240,7 @@ static int import_bar_buffer(WaylandContext *wl, FrameSlot *frame) {
         frame->image.height,
         (uint32_t)frame->image.row_pitch,
         (uint32_t)frame->image.offset,
-        ENG_DRM_FORMAT_ARGB8888,
+        fourcc,
         frame->image.drm_format_modifier,
         &buffer);
     wl->buffer_id = saved;
@@ -236,17 +265,21 @@ int bar_record_first(WaylandContext *wl, VulkanContext *vk) {
     if (create_release_timeline(wl, bar) != 0) {
         return -1;
     }
+    uint32_t bw = (wl->bar_phys_w != 0u) ? wl->bar_phys_w : frame_state.window_w;
+    uint32_t bh = (wl->bar_phys_h != 0u) ? wl->bar_phys_h : frame_state.bar_px;
     const char *tranche = "general";
-    if (alloc_content_image(vk, wl, frame_state.window_w, frame_state.bar_px,
+    if (alloc_content_image(vk, wl, bw, bh,
                             &bar->image, &tranche) != 0) {
         return -1;
     }
     uint64_t next = frame_state.sync_point + 1u;
     if (record_bar(vk, bar, next) != 0) {
+        (void)wait_acquire_point(vk, bar->acquire_point);
         reap_frame_resources(wl, vk, bar);
         return -1;
     }
     if (import_bar_buffer(wl, bar) != 0) {
+        (void)wait_acquire_point(vk, bar->acquire_point);
         reap_frame_resources(wl, vk, bar);
         return -1;
     }
@@ -266,13 +299,18 @@ void bar_note_presented(void) {
 }
 
 int bar_prepare(WaylandContext *wl, VulkanContext *vk, bool force) {
-    if (wl == nullptr || vk == nullptr || frame_state.bar_px == 0 || wl->bar_surface_id == 0) {
+    if (wl == nullptr || vk == nullptr || frame_state.bar_px == 0) {
         return 0;
     }
+    if (wl->bar_surface_id == 0 && bar_open_surface(wl) != 0) {
+        return -1;
+    }
+    uint32_t bw = (wl->bar_phys_w != 0u) ? wl->bar_phys_w : frame_state.window_w;
+    uint32_t bh = (wl->bar_phys_h != 0u) ? wl->bar_phys_h : frame_state.bar_px;
     FrameSlot *shown = bar_shown();
     bool size_changed = !frame_state.bar_live ||
-                        shown->image.width != frame_state.window_w ||
-                        shown->image.height != frame_state.bar_px;
+                        shown->image.width != bw ||
+                        shown->image.height != bh;
     if (!force && !size_changed && !frame_state.bar_dirty) {
         return 0;
     }
@@ -281,11 +319,15 @@ int bar_prepare(WaylandContext *wl, VulkanContext *vk, bool force) {
     }
     FrameSlot *dst = bar_spare();
     // Resetting the command buffer while its submit is pending is invalid.
-    // The release poll only says the compositor dropped the buffer.
-    bool ready = acquire_point_retired(vk, dst->acquire_point) &&
-                 (!dst->release_pending ||
-                  poll_release_handle(dst->release_handle, dst->release_point));
-    if (!ready) {
+    // On a resize, retire_pixels can orphan a compositor-held bar buffer as
+    // soon as the GPU acquire point has retired.
+    if (!acquire_point_retired(vk, dst->acquire_point)) {
+        frame_state.bar_dirty = true;
+        return -EAGAIN;
+    }
+    bool released = !dst->release_pending ||
+                    poll_slot_released(wl, dst);
+    if (!released && !size_changed) {
         frame_state.bar_dirty = true;
         return -EAGAIN;
     }
@@ -294,11 +336,15 @@ int bar_prepare(WaylandContext *wl, VulkanContext *vk, bool force) {
             return -1;
         }
     }
-    if (dst->release_handle == 0 && create_release_timeline(wl, dst) != 0) {
+    if (!frame_state.implicit_dmabuf_sync &&
+        dst->release_handle == 0 && create_release_timeline(wl, dst) != 0) {
         return -1;
     }
+    if (frame_state.implicit_dmabuf_sync && dst->release_point == 0u) {
+        dst->release_point = 1u;
+    }
     const char *tranche = "general";
-    if (alloc_content_image(vk, wl, frame_state.window_w, frame_state.bar_px,
+    if (alloc_content_image(vk, wl, bw, bh,
                             &dst->image, &tranche) != 0) {
         return -1;
     }
@@ -349,12 +395,25 @@ void bar_shutdown(WaylandContext *wl, VulkanContext *vk) {
     for (int i = 0; i < 2; ++i) {
         FrameSlot *slot = &frame_state.bar_slot[i];
         bool held = slot->release_pending &&
-                    !poll_release_handle(slot->release_handle, slot->release_point);
+                    !poll_slot_released(wl, slot);
         if (held) {
-            fprintf(stderr, "[Chrome] Bar image left alive. Release point %llu is still pending.\n",
+            (void)wait_own_release(slot, 1000000000ull);
+            held = !poll_slot_released(wl, slot);
+        }
+        if (held) {
+            fprintf(stderr,
+                    "[Chrome] Bar release point %llu timed out on shutdown; reclaiming GPU handles.\n",
                     (unsigned long long)slot->release_point);
+            if (slot->release_eventfd >= 0) {
+                close(slot->release_eventfd);
+                slot->release_eventfd = -1;
+            }
+            (void)wait_acquire_point(vk, slot->acquire_point);
+            destroy_frame_gpu(vk, slot);
+            slot->release_pending = false;
             continue;
         }
+        (void)wait_acquire_point(vk, slot->acquire_point);
         reap_frame_resources(wl, vk, slot);
     }
 }

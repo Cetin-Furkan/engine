@@ -115,4 +115,4 @@ All measurements below were captured back-to-back on the exact same release bina
 | `AVBD` `1000:1` Mass-Ratio Rigid Stack (`1000 kg` on `1 kg` in `8` iterations, `test_physics`) | **Zero collapse (`< 2 mm` residual compression, unconditional stability)** |
 | `AVBD` CSR Graph Coloring & Soft-Body Convergence (`8x8` cloth, `306` constraints, `test_physics`) | **`7` conflict-free colors (`0` adjacent conflicts), Rockafellar-Wets $\lambda \le 0$ exact** |
 | `2DGS` Duff-Frisvad Basis & $0^\circ$ vs $78^\circ$ Grazing Ray-Plane Invariance (`test_backend` Sec. 13) | **Orthonormal (`< 1e-4`), identical $(u, v, \alpha)$ (`< 1e-3`, zero affine EWA warp)** |
-| Stripped + LTO Release ELF (`build/release/bin/engine`, all **37** SPIR-V 1.6 shaders & font `#embed`ded) | **`3,050,216 B` (`2.91 MiB`)** |
+| Stripped + LTO Release ELF (`v0.2-M5` snapshot / current `v0.3.0` `build/release/bin/engine` with **42** SPIR-V 1.6 modules & `build/release/bin/minimal`) | `3,050,216 B` (`2.91 MiB`) @ M5 / **`3,163,432 B` (`3.02 MiB`)** + **`438,192 B` (`0.42 MiB`)** @ `v0.3.0` |

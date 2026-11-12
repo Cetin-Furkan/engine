@@ -27,11 +27,10 @@ int frame_loop_finish(RingContext *ring, WaylandContext *wl, VulkanContext *vk,
         }
     }
 
-    bool sim_cancel = false;
-    if (frame_state.sim_mshot_armed &&
-        prep_cancel_fd(ring, frame_state.sim_fd, ENG_SIM_FD_SLOT, frame_state.sim_fixed,
-                       k_ud_sim_cancel) == 0) {
-        sim_cancel = true;
+    if (frame_state.sim_mshot_armed && !frame_state.sim_cancel_sent &&
+        ring_remove_timeout(ring, frame_state.sim_active_ud, ENG_UD_SIM_CANCEL, false) == 0) {
+        frame_state.sim_cancel_sent = true;
+        frame_state.sim_cancel_inflight++;
     }
     if (lane->signal_poll_armed &&
         prep_cancel_fd(ring, lane->signal_fd, ENG_SIGNAL_FD_SLOT, lane->signal_fixed, k_ud_signal_cancel) == 0) {
@@ -52,7 +51,7 @@ int frame_loop_finish(RingContext *ring, WaylandContext *wl, VulkanContext *vk,
     while ((lane->send_in_flight || lane->resend_wire || wl->pong_in_flight ||
             lane->signal_poll_armed || cancel_in_flight ||
             lane->inotify_armed || inotify_cancel ||
-            frame_state.sim_mshot_armed || sim_cancel ||
+            frame_state.sim_inflight_count > 0u || frame_state.sim_cancel_inflight > 0u ||
             frame_state.timer_armed || timer_cancel) &&
            !wl->failed) {
         if (ring_mono_ns() > drain_deadline) {
@@ -85,7 +84,9 @@ int frame_loop_finish(RingContext *ring, WaylandContext *wl, VulkanContext *vk,
             }
             continue;
         }
-        engine_app()->note_cqe();
+        if (engine_app() != nullptr && engine_app()->note_cqe != nullptr) {
+            engine_app()->note_cqe();
+        }
         if (cqe.user_data == ENG_UD_WL_SEND) {
             int noted = finish_idle_send(wl, vk, &cqe, lane->pending_serial);
             if (noted < 0) {
@@ -110,12 +111,12 @@ int frame_loop_finish(RingContext *ring, WaylandContext *wl, VulkanContext *vk,
                 lane->why = "signal";
             }
         } else if (cqe.user_data == ENG_UD_FRAME_TIMER) {
-            frame_state.timer_armed = false;
+            frame_state.timer_armed       = false;
+            frame_state.timer_deadline_ns = 0ull;
         } else if (cqe.user_data == k_ud_timer_cancel) {
             timer_cancel = false;
-        } else if (frame_note_sim_cqe(ring, &cqe, false)) {
-        } else if (cqe.user_data == k_ud_sim_cancel) {
-            sim_cancel = false;
+        } else if (cqe.user_data == ENG_UD_TIMER_UPDATE) {
+        } else if (frame_note_sim_cqe(ring, &cqe, false, nullptr)) {
         } else if (cqe.user_data == k_ud_signal_cancel) {
             cancel_in_flight = false;
         } else if (cqe.user_data == ENG_UD_INOTIFY) {
@@ -137,14 +138,6 @@ int frame_loop_finish(RingContext *ring, WaylandContext *wl, VulkanContext *vk,
         (void)ring_update_file(ring, ENG_SIGNAL_FD_SLOT, -1);
     }
     close(lane->signal_fd);
-    if (frame_state.sim_fixed) {
-        (void)ring_update_file(ring, ENG_SIM_FD_SLOT, -1);
-        frame_state.sim_fixed = false;
-    }
-    if (frame_state.sim_fd >= 0) {
-        close(frame_state.sim_fd);
-        frame_state.sim_fd = -1;
-    }
     if (frame_state.inotify_fixed) {
         (void)ring_update_file(ring, ENG_INOTIFY_FD_SLOT, -1);
         frame_state.inotify_fixed = false;
@@ -154,14 +147,24 @@ int frame_loop_finish(RingContext *ring, WaylandContext *wl, VulkanContext *vk,
         frame_state.inotify_fd = -1;
         frame_state.inotify_wd = -1;
         frame_state.world_wd = -1;
+        frame_state.chrome_watch_base[0] = '\0';
         frame_state.world_watch_path[0] = '\0';
+        frame_state.world_watch_dir[0] = '\0';
+        frame_state.world_watch_base[0] = '\0';
     }
+    ring_set_dispatcher(ring, nullptr, nullptr);
     (void)sigprocmask(SIG_SETMASK, old_mask, nullptr);
 
     if (lane->got_signal && lane->signo != 0) {
-        printf("[Engine] Idle ended (signal %d)\n", lane->signo);
+        printf("[Engine] Idle ended (signal %d, submits=%llu, sim_timer=%u)\n",
+               lane->signo,
+               (unsigned long long)frame_state.gpu_submits,
+               (frame_state.sim_timer_on || frame_state.sim_mshot_armed) ? 1u : 0u);
     } else {
-        printf("[Engine] Idle ended (%s)\n", lane->why);
+        printf("[Engine] Idle ended (%s, submits=%llu, sim_timer=%u)\n",
+               lane->why,
+               (unsigned long long)frame_state.gpu_submits,
+               (frame_state.sim_timer_on || frame_state.sim_mshot_armed) ? 1u : 0u);
     }
     fflush(stdout);
     return lane->run_rc;

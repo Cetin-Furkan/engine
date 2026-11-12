@@ -44,7 +44,10 @@ compile_commands.json
 # Documentation temporary files
 doc/*.tmp
 
-# Workspace text dumps & extraction scripts
+# Workspace text dumps, local screenshots & extraction scripts
 wayplot_part_*.txt
 ALL_WAYPLOT_CODE.txt
+for_*_codes.md
+for_grok_to_read.md
+images/
 copy.py

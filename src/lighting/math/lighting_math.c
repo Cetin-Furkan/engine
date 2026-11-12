@@ -634,5 +634,78 @@ bool lighting_self_check(void) {
         return false;
     }
 
+    // 7. 1280x720 HRC ray budget invariant check (UMA=107,520, Discrete=431,360)
+    if (lighting_compute_hrc_rays(1280u, 720u, LIGHTING_ORACLE_ANALYTICAL_UMA,
+                                  nullptr, nullptr, nullptr, nullptr, nullptr) != 107520u ||
+        lighting_compute_hrc_rays(1280u, 720u, LIGHTING_ORACLE_DISCRETE_HIGH,
+                                  nullptr, nullptr, nullptr, nullptr, nullptr) != 431360u) {
+        return false;
+    }
+
     return true;
+}
+
+static uint32_t clamp_u32_math(uint32_t v, uint32_t lo, uint32_t hi) {
+    if (v < lo) {
+        return lo;
+    }
+    if (v > hi) {
+        return hi;
+    }
+    return v;
+}
+
+uint32_t lighting_compute_hrc_rays(uint32_t width, uint32_t height,
+                                   uint32_t oracle_mode,
+                                   uint32_t *out_gi_w, uint32_t *out_gi_h,
+                                   uint32_t *out_hrc_w0, uint32_t *out_hrc_h0,
+                                   uint32_t out_offsets[K_LIGHTING_MAX_CASCADES]) {
+    if (width == 0u || height == 0u) {
+        if (out_gi_w != nullptr) *out_gi_w = 0u;
+        if (out_gi_h != nullptr) *out_gi_h = 0u;
+        if (out_hrc_w0 != nullptr) *out_hrc_w0 = 0u;
+        if (out_hrc_h0 != nullptr) *out_hrc_h0 = 0u;
+        if (out_offsets != nullptr) {
+            for (uint32_t c = 0u; c < K_LIGHTING_MAX_CASCADES; ++c) {
+                out_offsets[c] = 0u;
+            }
+        }
+        return 0u;
+    }
+
+    uint32_t target_gi_w  = 0u;
+    uint32_t target_gi_h  = 0u;
+    uint32_t target_hrc_w = 0u;
+    uint32_t target_hrc_h = 0u;
+
+    if (oracle_mode == LIGHTING_ORACLE_DISCRETE_HIGH) {
+        target_gi_w  = clamp_u32_math((width  * 3u + 3u) / 4u, 64u, 1440u);
+        target_gi_h  = clamp_u32_math((height * 3u + 3u) / 4u, 64u, 810u);
+        target_hrc_w = clamp_u32_math((width  + 3u) / 4u,      16u, 360u);
+        target_hrc_h = clamp_u32_math((height + 3u) / 4u,      16u, 204u);
+    } else {
+        target_gi_w  = clamp_u32_math((width  + 1u) / 2u,      64u, 960u);
+        target_gi_h  = clamp_u32_math((height + 1u) / 2u,      64u, 540u);
+        target_hrc_w = clamp_u32_math((width  + 7u) / 8u,      16u, 240u);
+        target_hrc_h = clamp_u32_math((height + 7u) / 8u,      16u, 136u);
+    }
+
+    uint32_t ray_off = 0u;
+    for (uint32_t c = 0u; c < K_LIGHTING_MAX_CASCADES; ++c) {
+        uint32_t cw    = target_hrc_w >> c;
+        uint32_t ch    = target_hrc_h >> c;
+        if (cw == 0u) cw = 1u;
+        if (ch == 0u) ch = 1u;
+        uint32_t m_cnt = 4u << c;
+        if (out_offsets != nullptr) {
+            out_offsets[c] = ray_off;
+        }
+        ray_off += cw * ch * m_cnt;
+    }
+
+    if (out_gi_w != nullptr) *out_gi_w = target_gi_w;
+    if (out_gi_h != nullptr) *out_gi_h = target_gi_h;
+    if (out_hrc_w0 != nullptr) *out_hrc_w0 = target_hrc_w;
+    if (out_hrc_h0 != nullptr) *out_hrc_h0 = target_hrc_h;
+    return ray_off;
 }

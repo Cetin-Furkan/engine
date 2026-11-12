@@ -17,3 +17,11 @@ void ring_shutdown(void) {
 RingContext *ring_get_context(void) {
     return &s_primary_ring;
 }
+
+void ring_set_dispatcher(RingContext *r, RingCqeFn fn, void *user) {
+    if (r == nullptr) {
+        return;
+    }
+    r->default_cqe_fn   = fn;
+    r->default_cqe_user = user;
+}

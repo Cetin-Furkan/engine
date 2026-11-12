@@ -179,9 +179,24 @@ float avbd_solve_step(AvbdVertex     *verts,
                       const float     gravity[3],
                       uint32_t        iterations);
 
-// Solves a 2D deformable soft-body mass-spring patch (cols x rows, structural +
-// shear + 2-hop flexion constraints) via graph-colored 3x3 AVBD.
-// Optionally outputs generated AvbdVertex / AvbdConstraint arrays for GPU BDA submission.
+// Builds the 2D deformable soft-body mass-spring system (cols x rows, structural +
+// shear + 2-hop flexion constraints) into out_verts / out_cons without integrating
+// io_x / io_y / io_vx / io_vy on the CPU (used when GPU AVBD owns the pose).
+void avbd_prepare_soft_grid_2d(const float    *in_x,
+                               const float    *in_y,
+                               const float    *in_vx,
+                               const float    *in_vy,
+                               uint32_t        cols,
+                               uint32_t        rows,
+                               float           spacing,
+                               float           spring_stiff,
+                               AvbdVertex     *out_verts,
+                               uint32_t       *out_vert_count,
+                               AvbdConstraint *out_cons,
+                               uint32_t       *out_con_count);
+
+// Solves a 2D deformable soft-body mass-spring patch on the CPU (CPU-only fallback
+// and unit tests). Optionally outputs the pre-solve AvbdVertex / AvbdConstraint arrays.
 void avbd_step_soft_grid_2d(float          *io_x,
                             float          *io_y,
                             float          *io_vx,
@@ -206,6 +221,21 @@ void avbd_step_soft_grid_2d(float          *io_x,
 // Vulkan 1.4 BDA GPU Physics Runtime (Fused Workgroup SLM Compute Kernel)
 // ----------------------------------------------------------------------------
 
+enum : uint32_t {
+    PHYSICS_CHAN_3D_BODIES    = 0u,
+    PHYSICS_CHAN_2D_SOFT_BASE = 1u,
+};
+
+typedef struct PhysicsSolvedStep {
+    uint32_t              channel_id;
+    uint32_t              epoch;
+    uint32_t              vert_count;
+    uint32_t              con_count;
+    float                 dt;
+    const AvbdVertex     *verts;
+    const AvbdConstraint *cons;
+} PhysicsSolvedStep;
+
 [[nodiscard]] int physics_init(VulkanContext *vk);
 void physics_shutdown(VulkanContext *vk);
 void physics_reset(void);
@@ -214,16 +244,33 @@ void physics_reset(void);
 uint32_t physics_recommended_iterations(void);
 
 // Queues a pre-step AVBD system into the lazy 256 KiB BDA ring slab for GPU compute execution.
-void physics_submit_step(const AvbdVertex     *verts,
-                         uint32_t              vert_count,
-                         const AvbdConstraint *cons,
-                         uint32_t              con_count,
-                         float                 dt,
-                         const float           gravity[3],
-                         float                 damp_keep);
+// Returns true when queued onto the GPU ring (GPU owns the pose for this step).
+[[nodiscard]] bool physics_submit_step(uint32_t              channel_id,
+                                       uint32_t              epoch,
+                                       const AvbdVertex     *verts,
+                                       uint32_t              vert_count,
+                                       const AvbdConstraint *cons,
+                                       uint32_t              con_count,
+                                       float                 dt,
+                                       const float           gravity[3],
+                                       float                 damp_keep);
 
 // Records pending fused SLM AVBD dispatches into the frame compute command buffer.
 void physics_record_compute(VkCommandBuffer cmd);
+
+// Binds the frame acquire timeline semaphore and stamps signal_point onto any
+// AVBD ring slot recorded during this frame's physics_record_compute.
+void physics_claim_frame(VkSemaphore acquire, uint64_t signal_point);
+void physics_abort_frame(uint64_t signal_point);
+
+// Non-blocking (timeout = 0) harvest of solved GPU AVBD steps whose frame
+// acquire timeline point has retired.
+[[nodiscard]] bool physics_poll_solved_step(PhysicsSolvedStep *out_step);
+
+[[nodiscard]] bool physics_gpu_pose_owner(void);
+[[nodiscard]] bool physics_channel_busy(uint32_t channel_id, uint32_t epoch);
+[[nodiscard]] bool physics_has_unrecorded_steps(void);
+[[nodiscard]] bool physics_any_inflight(void);
 
 bool physics_gpu_active(void);
 bool physics_toggle_gpu(void);

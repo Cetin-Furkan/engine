@@ -13,6 +13,7 @@ $(CONFIG_MK): scripts/check_env.sh
 
 # Fallbacks if config.mk has not been created yet
 CC        ?= gcc
+AR        ?= $(if $(findstring gcc,$(CC)),gcc-ar,ar)
 C23_FLAGS ?= -std=c23
 
 # Versioning & Git Metadata
@@ -40,15 +41,18 @@ else
 endif
 
 # Build Output Directories (segregated by mode)
-BUILD_DIR := build/$(MODE)
-OBJ_DIR   := $(BUILD_DIR)/obj
-DEP_DIR   := $(BUILD_DIR)/deps
-BIN_DIR   := $(BUILD_DIR)/bin
-TARGET    := $(BIN_DIR)/engine
+BUILD_DIR      ?= build/$(MODE)
+OBJ_DIR        := $(BUILD_DIR)/obj
+DEP_DIR        := $(BUILD_DIR)/deps
+BIN_DIR        := $(BUILD_DIR)/bin
+LIB_ENGINE     := $(BUILD_DIR)/libengine.a
+TARGET         := $(BIN_DIR)/engine
+MINIMAL_TARGET := $(BIN_DIR)/minimal
 
-# Clean include paths and preprocessor flags
-GEN_DIR  := $(BUILD_DIR)/gen
-INCLUDES := -Iinclude -Isrc -Iexamples/demo/include -Iexamples/demo -I$(GEN_DIR)
+# Clean include paths and preprocessor flags (demo headers are scoped to examples/demo)
+GEN_DIR         := $(BUILD_DIR)/gen
+MINIMAL_GEN_DIR := $(BUILD_DIR)/gen_minimal
+INCLUDES        := -Iinclude -Isrc
 ifneq ($(VULKAN_INCLUDE_DIR),)
     INCLUDES += -I$(VULKAN_INCLUDE_DIR)
 endif
@@ -130,8 +134,22 @@ $(GEN_DIR)/text.frag.spv: examples/demo/text/draw/text.frag.slang
 	@mkdir -p $(dir $@)
 	$(SLANGC) -target spirv -profile spirv_1_6 -stage fragment -entry main -fvk-use-entrypoint-name -depfile "$(GEN_DIR)/text.frag.d" -Ishaders -o "$@" "$<"
 
+$(MINIMAL_GEN_DIR)/%.spv: examples/minimal/%.slang
+	@mkdir -p $(dir $@)
+	@set -e; \
+	case "$<" in \
+		*.vert.slang) stage=vertex ;; \
+		*.frag.slang) stage=fragment ;; \
+		*.comp.slang) stage=compute ;; \
+		*) echo "unknown shader stage: $<" >&2; exit 1 ;; \
+	esac; \
+	$(SLANGC) -target spirv -profile spirv_1_6 -stage "$$stage" -entry main -fvk-use-entrypoint-name -depfile "$(MINIMAL_GEN_DIR)/$*.d" -o "$@" "$<"
+
+-include $(wildcard $(MINIMAL_GEN_DIR)/*.d)
+
 $(OBJ_DIR)/examples/demo/text/draw/draw.o: $(GEN_DIR)/text.vert.spv $(GEN_DIR)/text.frag.spv
 $(OBJ_DIR)/examples/demo/text/face/face.o: examples/demo/text/face/bundled/InterVariable.ttf
+$(OBJ_DIR)/examples/minimal/minimal.o: $(MINIMAL_GEN_DIR)/minimal.vert.spv $(MINIMAL_GEN_DIR)/minimal.frag.spv
 $(OBJ_DIR)/src/chrome/gpu.o: $(GEN_DIR)/chrome.vert.spv $(GEN_DIR)/chrome.frag.spv
 $(OBJ_DIR)/src/input/page/page.o: $(GEN_DIR)/input.comp.spv
 $(OBJ_DIR)/src/backend/math/gpu/directory.o: $(GEN_DIR)/terrain_filter.comp.spv $(GEN_DIR)/terrain_cull.comp.spv
@@ -140,40 +158,69 @@ $(OBJ_DIR)/src/scene/gpu/scene_gpu.o: $(GEN_DIR)/scene_cull.comp.spv $(GEN_DIR)/
 $(OBJ_DIR)/src/lighting/gpu/lighting_gpu.o: $(GEN_DIR)/lighting_gbuf.comp.spv $(GEN_DIR)/lighting_hrc.comp.spv $(GEN_DIR)/lighting_ssilvb.comp.spv
 $(OBJ_DIR)/src/physics/gpu/avbd_gpu.o: $(GEN_DIR)/physics_avbd.comp.spv
 
+# Scoped Platform vs Hosted-Program Dependencies
+XKB_CFLAGS    := $(shell pkg-config --cflags xkbcommon)
+XKB_LIBS      := $(shell pkg-config --libs xkbcommon)
+PNG_CFLAGS    := $(shell pkg-config --cflags libpng)
+DEMO_PKGS     := freetype2 harfbuzz fontconfig libpng
+DEMO_INCLUDES := -Iexamples/demo/include -Iexamples/demo
+DEMO_CFLAGS   := $(DEMO_INCLUDES) $(shell pkg-config --cflags $(DEMO_PKGS))
+DEMO_LIBS     := $(shell pkg-config --libs $(DEMO_PKGS))
+TEXT_LIBS     := $(DEMO_LIBS) $(XKB_LIBS)
+
+EMBED_DIR    := $(GEN_DIR)
+EXTRA_CFLAGS :=
+
 # Compiler & Preprocessor Flags
 CFLAGS ?= $(C23_FLAGS) -D_GNU_SOURCE -Wall -Wextra -Wunused-function -Werror=unused-function -Wmissing-declarations \
-          $(OPT_FLAGS) $(INCLUDES) --embed-dir=$(GEN_DIR) \
+          $(OPT_FLAGS) $(INCLUDES) $(XKB_CFLAGS) \
           -ffunction-sections -fdata-sections \
           -DENGINE_VERSION_STR=\"$(FULL_VERSION)\" \
           -DENGINE_BUILD_MODE=\"$(MODE)\"
+
+$(OBJ_DIR)/src/backend/%.o: EXTRA_CFLAGS := $(PNG_CFLAGS)
+$(OBJ_DIR)/examples/demo/%.o: EXTRA_CFLAGS := $(DEMO_CFLAGS)
+$(OBJ_DIR)/examples/minimal/%.o: EMBED_DIR := $(MINIMAL_GEN_DIR)
 
 # Linker Flags
 LDFLAGS ?= -Wl,--gc-sections
 ifeq ($(MODE),release)
     LDFLAGS += -flto=auto
 endif
+
+PLATFORM_LIBS :=
 ifneq ($(VULKAN_LIB),)
-    LDFLAGS += -lvulkan
+    PLATFORM_LIBS += -lvulkan
+else
+    PLATFORM_LIBS += -lvulkan
 endif
-LDFLAGS += -lm
+PLATFORM_LIBS += $(XKB_LIBS) -lm
 
-# Text uses FreeType SDF, HarfBuzz, fontconfig, and libxkbcommon. The test
-# target links the libraries itself; these flags are for the engine binary.
-TEXT_PKGS   := freetype2 harfbuzz fontconfig xkbcommon libpng
-TEXT_CFLAGS := $(shell pkg-config --cflags $(TEXT_PKGS))
-TEXT_LIBS   := $(shell pkg-config --libs $(TEXT_PKGS))
-CFLAGS      += $(TEXT_CFLAGS)
-LDFLAGS     += $(TEXT_LIBS)
+MAIN_SRC     := main.c
+ENGINE_SRCS  := $(shell find src -name '*.c')
+DEMO_SRCS    := $(shell find examples/demo -name '*.c')
+MINIMAL_SRCS := $(shell find examples/minimal -name '*.c')
 
-SRCS := main.c $(shell find src examples/demo -name '*.c')
-OBJS := $(SRCS:%.c=$(OBJ_DIR)/%.o)
-DEPS := $(SRCS:%.c=$(DEP_DIR)/%.d)
+MAIN_OBJ     := $(MAIN_SRC:%.c=$(OBJ_DIR)/%.o)
+ENGINE_OBJS  := $(ENGINE_SRCS:%.c=$(OBJ_DIR)/%.o)
+DEMO_OBJS    := $(DEMO_SRCS:%.c=$(OBJ_DIR)/%.o)
+MINIMAL_OBJS := $(MINIMAL_SRCS:%.c=$(OBJ_DIR)/%.o)
+OBJS         := $(MAIN_OBJ) $(ENGINE_OBJS) $(DEMO_OBJS)
+ALL_SRCS     := $(MAIN_SRC) $(ENGINE_SRCS) $(DEMO_SRCS) $(MINIMAL_SRCS)
+DEPS         := $(ALL_SRCS:%.c=$(DEP_DIR)/%.d)
 
-all: $(TARGET)
+all: $(TARGET) $(MINIMAL_TARGET)
+
+minimal: $(MINIMAL_TARGET)
+
+$(LIB_ENGINE): $(ENGINE_OBJS)
+	@mkdir -p $(dir $@)
+	@rm -f $@
+	$(AR) rcs $@ $(ENGINE_OBJS)
 
 $(TARGET): $(OBJS)
 	@mkdir -p $(BIN_DIR)
-	@if ! $(CC) $(CFLAGS) -o $@ $(OBJS) $(LDFLAGS) -Wl,--print-gc-sections > $(BUILD_DIR)/link.log 2>&1; then \
+	@if ! $(CC) $(CFLAGS) -o $@ $(OBJS) $(LDFLAGS) $(PLATFORM_LIBS) $(DEMO_LIBS) -Wl,--print-gc-sections > $(BUILD_DIR)/link.log 2>&1; then \
 		cat $(BUILD_DIR)/link.log >&2; \
 		exit 1; \
 	fi
@@ -186,9 +233,16 @@ ifneq ($(NATIVE),1)
 	objcopy --remove-section .note.gnu.property $@
 endif
 
+$(MINIMAL_TARGET): $(MAIN_OBJ) $(MINIMAL_OBJS) $(LIB_ENGINE)
+	@mkdir -p $(BIN_DIR)
+	$(CC) $(CFLAGS) -o $@ $(MAIN_OBJ) $(MINIMAL_OBJS) $(LIB_ENGINE) $(LDFLAGS) $(PLATFORM_LIBS)
+ifneq ($(NATIVE),1)
+	objcopy --remove-section .note.gnu.property $@
+endif
+
 $(OBJ_DIR)/%.o: %.c $(CONFIG_MK) VERSION
 	@mkdir -p $(dir $@) $(dir $(DEP_DIR)/$*.d)
-	$(CC) $(CFLAGS) -MMD -MP -MF $(DEP_DIR)/$*.d -c $< -o $@
+	$(CC) $(CFLAGS) $(EXTRA_CFLAGS) --embed-dir=$(EMBED_DIR) -I$(EMBED_DIR) -MMD -MP -MF $(DEP_DIR)/$*.d -c $< -o $@
 
 -include $(DEPS)
 
@@ -205,6 +259,10 @@ run: debug
 run-release: release
 	@echo -e "\033[0;32m==> Running Release Engine...\033[0m"
 	@./build/release/bin/engine
+
+run-minimal: debug
+	@echo -e "\033[0;32m==> Running Debug Minimal App...\033[0m"
+	@./build/debug/bin/minimal
 
 release-patch:
 	@./scripts/bump_version.sh patch
@@ -241,8 +299,11 @@ help:
 	@echo "    make release                 Portable release binary (-O3 -flto=auto -DNDEBUG, baseline x86-64)"
 	@echo "    make release NATIVE=1        Same, with -march=native (do not copy this binary to other PCs)"
 	@echo "    make release ARCH=x86-64-v3  Same, with an explicit -march"
+	@echo "    make minimal                 Build standalone minimal EngineApp binary against libengine.a"
 	@echo "    make run                     Build and execute debug binary"
+	@echo "    make run-minimal             Build and execute debug minimal binary"
 	@echo "    make run-release             Build and execute release binary"
+	@echo "    make test                    Build and run all 16 automated unit, failure, and truth tests"
 	@echo ""
 	@echo -e "  \033[1mCleanup & Cache:\033[0m"
 	@echo "    make clean                   Remove build/ directory (preserves prerequisite cache)"
@@ -274,25 +335,26 @@ distclean: clean
 	rm -rf $(DEPS_CACHE_DIR)
 
 test: $(CONFIG_MK)
+	@mkdir -p build
 	$(CC) $(CFLAGS) -o build/test_handles tests/test_handles.c
 	./build/test_handles
 	$(CC) $(CFLAGS) -o build/test_clock tests/test_clock.c src/frame/clock/clock.c
 	./build/test_clock
-	$(CC) $(CFLAGS) -o build/test_world tests/test_world.c examples/demo/world/table.c examples/demo/world/spin.c -lm
+	$(CC) $(CFLAGS) $(DEMO_CFLAGS) -o build/test_world tests/test_world.c examples/demo/world/table.c examples/demo/world/spin.c -lm
 	./build/test_world
-	$(CC) $(CFLAGS) -o build/test_motion tests/test_motion.c examples/demo/world/motion.c examples/demo/world/fillet.c src/physics/math/avbd_math.c -lm
+	$(CC) $(CFLAGS) $(DEMO_CFLAGS) -o build/test_motion tests/test_motion.c examples/demo/world/motion.c examples/demo/world/fillet.c src/physics/math/avbd_math.c -lm
 	./build/test_motion
-	$(CC) $(CFLAGS) -o build/test_policy tests/test_policy.c examples/demo/world/policy.c
+	$(CC) $(CFLAGS) $(DEMO_CFLAGS) -o build/test_policy tests/test_policy.c examples/demo/world/policy.c
 	./build/test_policy
-	$(CC) $(CFLAGS) -o build/test_sheet tests/test_sheet.c examples/demo/world/sheet.c src/physics/math/avbd_math.c -lm
+	$(CC) $(CFLAGS) $(DEMO_CFLAGS) -o build/test_sheet tests/test_sheet.c examples/demo/world/sheet.c src/physics/math/avbd_math.c -lm
 	./build/test_sheet
-	$(CC) $(CFLAGS) -o build/test_text tests/test_text.c \
+	$(CC) $(CFLAGS) $(DEMO_CFLAGS) -o build/test_text tests/test_text.c \
 		examples/demo/text/face/face.c examples/demo/text/shape/shape.c \
 		examples/demo/text/place/place.c $(TEXT_LIBS) -lm
 	./build/test_text
 	$(CC) $(CFLAGS) -o build/test_bda tests/test_bda.c -lvulkan
 	./build/test_bda
-	$(CC) $(CFLAGS) -o build/test_backend tests/test_backend.c \
+	$(CC) $(CFLAGS) $(PNG_CFLAGS) -o build/test_backend tests/test_backend.c \
 		$(shell find src/ring src/system -name '*.c') \
 		src/backend/math/pointer/relptr2d.c \
 		src/backend/core/cell/dispatch.c \
@@ -318,8 +380,23 @@ test: $(CONFIG_MK)
 		src/physics/math/avbd_math.c \
 		-lm
 	./build/test_physics
+	$(CC) $(CFLAGS) -o build/test_ring_dispatch tests/test_ring_dispatch.c \
+		$(shell find src/ring src/system -name '*.c')
+	./build/test_ring_dispatch
+	$(CC) $(CFLAGS) -o build/test_wayland_wire tests/test_wayland_wire.c \
+		$(shell find src/wayland src/ring src/system -name '*.c')
+	./build/test_wayland_wire
+	$(CC) $(CFLAGS) -o build/test_failure_paths tests/test_failure_paths.c \
+		src/vulkan/core/types.c \
+		src/vulkan/device/device.c \
+		$(LDFLAGS) -lvulkan
+	./build/test_failure_paths
+	$(CC) $(CFLAGS) -o build/test_platform_truth tests/test_platform_truth.c \
+		src/lighting/math/lighting_math.c \
+		$(LDFLAGS) -lm
+	./build/test_platform_truth
 
 bench:
 	./scripts/run_benchmark.sh benchmarks/latest
 
-.PHONY: all debug release run run-release release-patch release-minor release-major info help clean clear recheck distclean test bench
+.PHONY: all minimal debug release run run-release run-minimal release-patch release-minor release-major info help clean clear recheck distclean test bench

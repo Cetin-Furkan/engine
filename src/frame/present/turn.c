@@ -14,7 +14,9 @@ void commit_turn_swap(WaylandContext *wl) {
     spare()->release_point = frame_state.pending_release;
     spare()->release_pending = true;
     swap_front_spare();
-    engine_app()->commit();
+    if (engine_app() != nullptr && engine_app()->commit != nullptr) {
+        engine_app()->commit();
+    }
     if (wl != nullptr) {
         wl->buffer_id = shown()->wl_buffer_id;
         wl->release_timeline_id = shown()->release_timeline_id;
@@ -30,7 +32,7 @@ static int queue_frame_only(WaylandContext *wl, bool *queued) {
     return q;
 }
 
-static bool spare_ready(VulkanContext *vk) {
+static bool spare_ready(const WaylandContext *wl, VulkanContext *vk) {
     if (!acquire_point_retired(vk, spare()->acquire_point)) {
         return false;
     }
@@ -38,7 +40,7 @@ static bool spare_ready(VulkanContext *vk) {
     // Read them before this slot is recorded again.
     gpu_timer_harvest(vk, spare());
     return !spare()->release_pending ||
-           poll_release_handle(spare()->release_handle, spare()->release_point);
+           poll_slot_released(wl, spare());
 }
 
 static bool present_chain_wanted(void) {
@@ -110,9 +112,10 @@ int frame_watchdog(WaylandContext *wl, VulkanContext *vk, bool *queued) {
 // Record the spare and commit it. again arms wl_surface.frame on that same
 // commit when the simulation still owes frames.
 static int present_spare(WaylandContext *wl, VulkanContext *vk, bool *queued) {
+    const EngineApp *app = engine_app();
     frame_state.loop_was_busy = true;
     frame_state.scene_dirty = false;
-    if (engine_app()->record_poke_pending()) {
+    if (app != nullptr && app->record_poke_pending != nullptr && app->record_poke_pending()) {
         frame_state.sim_hot = true;
     }
 
@@ -133,8 +136,24 @@ static int present_spare(WaylandContext *wl, VulkanContext *vk, bool *queued) {
         frame_state.pending_sim_stamp = sim_stamp;
         return -1;
     }
-    engine_app()->simulation_commit(sim_stamp, heat_dt);
+    if (app != nullptr && app->simulation_commit != nullptr) {
+        app->simulation_commit(sim_stamp, heat_dt);
+    }
     bool again = !frame_state.bench_uncapped && present_chain_wanted();
+    wl->uncapped_commits = frame_state.bench_uncapped;
+    if (!frame_state.bench_uncapped &&
+        wl->commit_timer_id != 0u &&
+        wl->has_presentation_clk && wl->presentation_clk_id == 1u &&
+        wl->last_present_ns != 0ull && wl->last_refresh_ns >= 1000000u) {
+        uint64_t now_ns = ring_mono_ns();
+        // Half-refresh slop margin: strictly after VBlank N so the update cannot
+        // tear or double-latch early, while comfortably ahead of VBlank N+1's latch.
+        uint64_t not_before = wl->last_present_ns + (uint64_t)(wl->last_refresh_ns / 2u);
+        uint64_t stale_cut  = wl->last_present_ns + (uint64_t)wl->last_refresh_ns;
+        wl->target_present_ns = (now_ns < stale_cut && not_before > now_ns) ? not_before : 0ull;
+    } else {
+        wl->target_present_ns = 0ull;
+    }
     int q = wayland_queue_turn_commit(
         wl,
         spare()->wl_buffer_id,
@@ -156,6 +175,7 @@ static int present_spare(WaylandContext *wl, VulkanContext *vk, bool *queued) {
     }
     frame_state.pending_release = rel;
     frame_state.turn_swap_pending = true;
+    frame_state.turn_frames++;
     *queued = true;
     return 0;
 }
@@ -178,7 +198,7 @@ int turn_step(WaylandContext *wl, VulkanContext *vk, bool *queued) {
         frame_state.turn_phase = k_turn_run;
     }
     if (wl->frame_stamp_valid) {
-        if (!spare_ready(vk)) {
+        if (!spare_ready(wl, vk)) {
             // The stamp stays. Replacing it with a frameless callback never
             // attaches a buffer, so the held image is never released.
             return 0;
@@ -204,7 +224,7 @@ int turn_step(WaylandContext *wl, VulkanContext *vk, bool *queued) {
     if (!frame_state.scene_dirty || wl->frame_cb_id != 0) {
         return 0;
     }
-    if (!spare_ready(vk)) {
+    if (!spare_ready(wl, vk)) {
         return 0;
     }
     frame_state.last_stamp_mono_ns = ring_mono_ns();

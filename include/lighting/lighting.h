@@ -211,6 +211,14 @@ void lighting_proxy_fill(LightingProxy *out, uint32_t kind,
                          float pitch_rad, float yaw_rad, float roughness,
                          const float albedo[3], const float emissive[3]);
 
+// Exact GI resolution, C0 HRC probe grid, cascade offsets, and total HRC ray count
+// used by ensure_gi_slab() for a given viewport (width, height) and oracle_mode.
+uint32_t lighting_compute_hrc_rays(uint32_t width, uint32_t height,
+                                   uint32_t oracle_mode,
+                                   uint32_t *out_gi_w, uint32_t *out_gi_h,
+                                   uint32_t *out_hrc_w0, uint32_t *out_hrc_h0,
+                                   uint32_t out_offsets[K_LIGHTING_MAX_CASCADES]);
+
 [[nodiscard]] bool lighting_self_check(void);
 
 // ----------------------------------------------------------------------------

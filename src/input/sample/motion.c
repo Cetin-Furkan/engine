@@ -71,10 +71,13 @@ bool input_on_pointer(WaylandContext *w, uint16_t opcode,
         s_ptr.frame_pending_retarget = false;
         s_ptr.frame_entering = false;
         s_ptr.close_hit = false;
+        s_ptr.close_pressed = false;
         s_ptr.title_hit = false;
         s_ptr.edge = 0;
         s_ptr.left_client_down = false;
         s_ptr.left_dragged = false;
+        s_ptr.rel_frame_seen = false;
+        s_ptr.lock_wanted = false;
         return true;
     }
     if (opcode == 2u) {
@@ -94,28 +97,37 @@ bool input_on_pointer(WaylandContext *w, uint16_t opcode,
         float ny = fixed_to_px(fy);
         float dx = nx - s_ptr.x;
         float dy = ny - s_ptr.y;
+        uint32_t prior_drag = s_ptr.buttons & (ENG_BUTTON_RIGHT | ENG_BUTTON_MIDDLE);
         if (s_ptr.left_client_down && !s_ptr.left_dragged && (s_ptr.buttons & ENG_BUTTON_LEFT) != 0u) {
             float ldx = nx - s_ptr.left_down_x;
             float ldy = ny - s_ptr.left_down_y;
             if (ldx * ldx + ldy * ldy >= 16.0f) {
                 s_ptr.left_dragged = true;
-                dx = ldx;
-                dy = ldy;
+                // Only back-fill the initial 4 px deadzone when right/middle drag was not already accumulating.
+                if (prior_drag == 0u) {
+                    dx = ldx;
+                    dy = ldy;
+                }
             }
         }
-        uint32_t drag = s_ptr.buttons & (ENG_BUTTON_RIGHT | ENG_BUTTON_MIDDLE);
+        uint32_t drag = prior_drag;
         if (s_ptr.left_dragged && (s_ptr.buttons & ENG_BUTTON_LEFT) != 0u) {
             drag |= ENG_BUTTON_LEFT;
         }
-        if (s_ptr.focus == w->surface_id && drag != 0 && (dx != 0.0f || dy != 0.0f)) {
-            s_drag_dx += dx;
-            s_drag_dy += dy;
+        if (s_ptr.focus == w->surface_id && drag != 0 && (dx != 0.0f || dy != 0.0f) &&
+            !(s_ptr.rel_frame_seen && drag == ENG_BUTTON_RIGHT)) {
+            float scale = wayland_scale_factor(w);
+            s_drag_dx += dx * scale;
+            s_drag_dy += dy * scale;
             s_drag_buttons |= drag;
         }
         s_ptr.x = nx;
         s_ptr.y = ny;
         s_ptr.frame_pending_retarget = true;
         retarget(w, false);
+        if (w->seat_bound_version < 5u) {
+            s_ptr.rel_frame_seen = false;
+        }
         return true;
     }
     if (opcode == 3u) {
@@ -135,6 +147,9 @@ bool input_on_pointer(WaylandContext *w, uint16_t opcode,
                 s_ptr.buttons &= ~bit;
             }
         }
+        s_ptr.lock_wanted = (s_ptr.focus != 0u && s_ptr.focus == w->surface_id) &&
+                            ((s_ptr.buttons & ENG_BUTTON_RIGHT) != 0u) &&
+                            ((s_ptr.buttons & (ENG_BUTTON_MIDDLE | ENG_BUTTON_LEFT)) == 0u);
         if (button == BTN_LEFT) {
             if (state == 1u) {
                 if (s_ptr.frame_pending_retarget && s_ptr.focus != 0) {
@@ -143,13 +158,14 @@ bool input_on_pointer(WaylandContext *w, uint16_t opcode,
                     s_ptr.frame_entering = false;
                 }
                 if (s_ptr.close_hit) {
-                    // The idle loop treats this as a clean exit.
+                    // Latch on press; trigger clean exit only if released while still inside [X].
+                    s_ptr.close_pressed = true;
                     s_ptr.resize_pending = false;
                     s_ptr.move_pending = false;
                     s_ptr.left_client_down = false;
                     s_ptr.left_dragged = false;
-                    w->toplevel_closed = true;
                 } else if (s_ptr.edge != 0 && w->xdg_toplevel_id != 0) {
+                    s_ptr.close_pressed = false;
                     s_ptr.move_pending = false;
                     s_ptr.resize_pending = true;
                     s_ptr.resize_serial = serial;
@@ -157,22 +173,35 @@ bool input_on_pointer(WaylandContext *w, uint16_t opcode,
                     s_ptr.left_client_down = false;
                     s_ptr.left_dragged = false;
                 } else if (s_ptr.title_hit && w->xdg_toplevel_id != 0) {
+                    s_ptr.close_pressed = false;
                     s_ptr.resize_pending = false;
                     s_ptr.move_pending = true;
                     s_ptr.move_serial = serial;
                     s_ptr.left_client_down = false;
                     s_ptr.left_dragged = false;
                 } else if (s_ptr.focus == w->surface_id) {
+                    s_ptr.close_pressed = false;
                     s_ptr.left_client_down = true;
                     s_ptr.left_dragged = false;
                     s_ptr.left_down_x = s_ptr.x;
                     s_ptr.left_down_y = s_ptr.y;
                 }
             } else {
-                if (s_ptr.left_client_down && !s_ptr.left_dragged &&
-                    s_ptr.focus == w->surface_id && s_spawn_n < k_spawn_cap) {
-                    s_spawn[s_spawn_n].x = px_floor_i32(s_ptr.left_down_x);
-                    s_spawn[s_spawn_n].y = px_floor_i32(s_ptr.left_down_y);
+                if (s_ptr.close_pressed) {
+                    if (s_ptr.frame_pending_retarget && s_ptr.focus != 0) {
+                        retarget(w, s_ptr.frame_entering);
+                        s_ptr.frame_pending_retarget = false;
+                        s_ptr.frame_entering = false;
+                    }
+                    s_ptr.close_pressed = false;
+                    if (s_ptr.focus != 0 && s_ptr.close_hit) {
+                        w->toplevel_closed = true;
+                    }
+                } else if (s_ptr.left_client_down && !s_ptr.left_dragged &&
+                           s_ptr.focus == w->surface_id && s_spawn_n < k_spawn_cap) {
+                    float scale = wayland_scale_factor(w);
+                    s_spawn[s_spawn_n].x = px_floor_i32(s_ptr.left_down_x * scale);
+                    s_spawn[s_spawn_n].y = px_floor_i32(s_ptr.left_down_y * scale);
                     s_spawn_n++;
                 }
                 s_ptr.left_client_down = false;
@@ -207,7 +236,43 @@ bool input_on_pointer(WaylandContext *w, uint16_t opcode,
         }
         s_ptr.frame_pending_retarget = false;
         s_ptr.frame_entering = false;
+        s_ptr.rel_frame_seen = false;
         return true;
+    }
+    return true;
+}
+
+bool input_on_relative_pointer(WaylandContext *w, uint16_t opcode,
+                               const unsigned char *payload, uint16_t len) {
+    if (opcode != 0u) {
+        return true;
+    }
+    // zwp_relative_pointer_v1.relative_motion: utime_hi, utime_lo, dx, dy, dx_unaccel, dy_unaccel
+    const unsigned char *p   = payload;
+    const unsigned char *end = payload + len;
+    uint32_t ut_hi = 0, ut_lo = 0;
+    int32_t  dx = 0, dy = 0, dx_unaccel = 0, dy_unaccel = 0;
+    if (!input_take_u32(&p, end, &ut_hi) || !input_take_u32(&p, end, &ut_lo) ||
+        !input_take_i32(&p, end, &dx) || !input_take_i32(&p, end, &dy) ||
+        !input_take_i32(&p, end, &dx_unaccel) || !input_take_i32(&p, end, &dy_unaccel)) {
+        wayland_fail(w, "truncated zwp_relative_pointer_v1.relative_motion");
+        return true;
+    }
+    (void)ut_hi;
+    (void)ut_lo;
+    (void)dx;
+    (void)dy;
+    if (s_ptr.focus == w->surface_id &&
+        (s_ptr.buttons & ENG_BUTTON_RIGHT) != 0u &&
+        (s_ptr.buttons & (ENG_BUTTON_MIDDLE | ENG_BUTTON_LEFT)) == 0u) {
+        float rdx = fixed_to_px(dx_unaccel);
+        float rdy = fixed_to_px(dy_unaccel);
+        if (rdx != 0.0f || rdy != 0.0f) {
+            s_drag_dx += rdx;
+            s_drag_dy += rdy;
+            s_drag_buttons |= ENG_BUTTON_RIGHT;
+        }
+        s_ptr.rel_frame_seen = true;
     }
     return true;
 }
@@ -257,12 +322,13 @@ bool pointer_client_xy(int32_t *x, int32_t *y) {
         return false;
     }
     const WaylandContext *w = wayland_get_context();
-    int32_t px = px_floor_i32(s_ptr.x);
-    int32_t py = px_floor_i32(s_ptr.y);
+    float lx = s_ptr.x;
+    float ly = s_ptr.y;
     if (w != nullptr && w->bar_surface_id != 0 && s_ptr.focus == w->bar_surface_id) {
-        py -= (int32_t)w->bar_px;
+        ly -= (float)w->bar_px;
     }
-    *x = px;
-    *y = py;
+    float scale = wayland_scale_factor(w);
+    *x = px_floor_i32(lx * scale);
+    *y = px_floor_i32(ly * scale);
     return true;
 }

@@ -2,7 +2,7 @@
 
 > [!IMPORTANT]
 > **Purpose of This Document**
-> This document is the authoritative architectural specification and self-contained implementation blueprint for the **GPU-Math & Dynamic Map/Terrain Streaming Backend** (`include/backend/`, `src/backend/`, `shaders/terrain_*.slang`, and `examples/demo/world/kind/terrain.c`). It is written so that any engineer or AI model can immediately understand the exact geographic data, binary on-disk layout, next-generation pointer math (`RelPtr2D` + Lilliput 64-bit Block Headers + 64-Byte Stateful Cells + 256-Byte PULSE Active GPU Windows), `io_uring` SSD streaming pipeline, and Slang 2026 GPU shaders without needing prior conversation history.
+> This document is the authoritative architectural specification and self-contained implementation blueprint for the **GPU-Math & Dynamic Map/Terrain Streaming Backend** (`include/backend/`, `src/backend/`, `shaders/terrain_*.slang`, and `examples/demo/world/kind/terrain.c`). It is written so that any engineer or AI model can immediately understand the exact geographic data, binary on-disk layout, packed tile-offset pointer math (`RelPtr2D` + 64-bit Block Headers + 64-Byte `GpuMathStreamCell` Host Closures + 256-Byte Directory Headers), `io_uring` SSD streaming pipeline, and Slang 2026 GPU shaders without needing prior conversation history.
 
 ---
 
@@ -46,9 +46,9 @@ The $24.0\text{ km} \times 24.0\text{ km}$ region is mapped onto a **5-Level Com
 2. **True-Color Satellite Ortho-Imagery (`srgb_to_linear` + 16-Tap Bicubic)**:
    - Fetched directly from **Esri World Imagery** (`https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}`) with zero cartographic overlay tint, gently dehazed to remove high-altitude atmospheric veil, and decoded in Slang (`shaders/terrain_math.slang`) with **16-tap Catmull-Rom bicubic interpolation** and exact **IEC 61966-2-1 `srgb_to_linear()`** conversion so the `VK_FORMAT_B8G8R8A8_SRGB` framebuffer preserves rich, authentic Aegean ground, forest, field, and dolomite rock colors.
 3. **Self-Contained C23 Synthesis & Persistence Guarantee**:
-   - The binary archive is stored on SSD at `examples/demo/maps/baklan_besparmak.gmpack`.
+   - The committed binary archive in `HEAD` is stored at `examples/demo/maps/baklan_besparmak.gmpack` (`58,601,472 B` / `55.89 MiB`, 59 MB decimal) and transcodes on first load into `examples/demo/maps/baklan_besparmak.epack` (`34,942,976 B` / `33.32 MiB`, `341` tiles $\times$ `100 KiB` `.epack` v1 blocks; an uncompressed 341-tile raw `.gmpack` spans `134,111,232 B` / `127.90 MiB`).
    - `scripts/fetch_besparmak_map.py` downloads the real AWS Terrarium SRTM elevation tiles + Esri/OpenTopoMap imagery for Baklan and Beşparmak Dağı and compiles `examples/demo/maps/baklan_besparmak.gmpack`.
-   - Furthermore, if the engine boots on an air-gapped machine where `baklan_besparmak.gmpack` is absent, `src/backend/terrain/storage/synth_besparmak.c` deterministically synthesizes the complete 341-tile Baklan + Beşparmak Dağı multi-peak ridge model (calibrated to the exact WGS84 coordinates and 810 m–1,691 m elevation profile), **writes the `.gmpack` archive to SSD**, and **re-reads its tiles dynamically on demand via `io_uring`** as the user zooms and pans.
+   - Furthermore, if the engine boots on an air-gapped machine where `baklan_besparmak.gmpack` is absent, `src/backend/terrain/storage/synth_besparmak.c` deterministically synthesizes the complete 341-tile Baklan + Beşparmak Dağı multi-peak ridge model (calibrated to the exact WGS84 coordinates and 810 m–1,691 m elevation profile), **writes the `.epack`/`.gmpack` archive to SSD**, and **re-reads its tiles dynamically on demand via `io_uring`** as the user zooms and pans.
 
 ---
 
@@ -98,7 +98,7 @@ Every link between the directory header, quadtree nodes, parent/child tiles, and
 2. **Inline 2D Coordinate Transform (`dX`, `dY`, `LOD`)**:
    - Bits `[31:16]` (`dX`) and `[15:0]` (`dY`) store the signed 16-bit local grid coordinates (in Q8.8 fixed-point or integer tile units) of the target tile relative to the quadtree root.
    - A GPU vertex or compute shader scanning a `RelPtr2D` computes both the memory address of the tile *and* its 2D world bounding box in a single register read without touching a second cache line.
-3. **CHERI-D / LIPPEN-Inspired Epoch & Canonical Integrity Tag (`bits [63:56]`)**:
+3. **Epoch Seal Tag (`bits [63:56]`)**:
    - Bits `[63:56]` store an 8-bit `epoch ^ 0xA5` seal tag. If a tile slot in the GPU cache is evicted and reincarnated for a newer zoom region, its epoch increments; any stale `RelPtr2D` immediately fails tag verification in $O(1)$ time.
 
 ### 2.2 Project Lilliput-Style 64-Bit Unified Tile Header (`GpuMathTileHeader`)
@@ -116,9 +116,9 @@ Inspired by **JDK 25 Project Lilliput (JEP 519)** from [`pointers.md`](pointers.
 - **16-Bit Morton ($Z$-Order) Spatial Key**: Interleaves the 8-bit tile $X$ and 8-bit tile $Y$ coordinates ($\text{morton\_encode2d}(x, y)$) so spatially adjacent 2D tiles on Beşparmak Dağı lie adjacent in 1D SSD file order and GPU L2 cache lines.
 - **Inline Elevation Bounds (`MinElev`, `MaxElev`)**: Quantizes the tile's minimum and maximum elevation in meters ($[0, 2047]\text{ m}$, covering Baklan's $810\text{ m}$ floor through Beşparmak Dağı's $1,691\text{ m}$ peak) so GPU frustum/ray culling and hypsometric shading know the exact vertical bounds before reading a single elevation sample.
 
-### 2.3 64-Byte Stateful Function Cell (`GpuMathStreamCell`, `alignas(64)`)
+### 2.3 64-Byte Host Closure (`GpuMathStreamCell`, `alignas(64)`)
 
-Inspired by **Clef / TVM FFI 64-Byte Stateful Function Cells** in [`pointers.md`](pointers.md), every asynchronous SSD $\rightarrow$ GPU streaming operation in `src/backend/core/cell/dispatch.c` is represented as a single L1-cache-line-aligned **Flat Closure Cell**:
+Documented in [`pointers.md`](pointers.md), every asynchronous SSD $\rightarrow$ GPU streaming operation in `src/backend/core/cell/dispatch.c` is represented as a single L1-cache-line-aligned **64-Byte Host Closure**:
 
 ```c
 typedef struct GpuMathStreamCell GpuMathStreamCell;
@@ -126,21 +126,21 @@ typedef int (*GpuMathCellFn)(GpuMathStreamCell *cell, void *ctx);
 
 struct alignas(64) GpuMathStreamCell {
     GpuMathCellFn     fn;              // Bytes 0..7:   Target execution / completion code pointer
-    RelPtr2D          rel_tile;        // Bytes 8..15:  2D Self-Relative pointer to SSD tile block
+    RelPtr2D          rel_tile;        // Bytes 8..15:  Packed tile-relative offset to SSD tile block
     uint64_t          gpu_bda_dst;     // Bytes 16..23: Target Vulkan BDA address in resident pool
-    uint64_t          ssd_file_offset; // Bytes 24..31: Exact byte offset in .gmpack archive
+    uint64_t          ssd_file_offset; // Bytes 24..31: Exact byte offset in .epack/.gmpack archive
     uint32_t          tile_id;         // Bytes 32..35: Quadtree node index (0..340)
     uint32_t          morton_key;      // Bytes 36..39: 2D Morton Z-order key + LOD
-    uint32_t          bytes;           // Bytes 40..43: Payload size (393,216 bytes = 96 x 4KB blocks)
+    uint32_t          bytes;           // Bytes 40..43: Payload size (102,400 B = 25 x 4KB .epack blocks)
     uint32_t          slot_index;      // Bytes 44..47: Resident GPU cache slot index
     uint32_t          generation;      // Bytes 48..51: Temporal safety generation counter
     uint8_t           lod;             // Byte  52:     Quadtree LOD (0..4)
     uint8_t           state;           // Byte  53:     CELL_IDLE, CELL_ARMED, CELL_READY, CELL_POISON
-    uint8_t           epoch;           // Byte  54:     CHERI-D inline 1-byte lifetime ID
-    uint8_t           inline_id;       // Byte  55:     Cache-line tail verification byte
+    uint8_t           epoch;           // Byte  54:     Expected slot epoch tag
+    uint8_t           inline_id;       // Byte  55:     In-cache-line 1-byte epoch tag
     uint64_t          user_tag;        // Bytes 56..63: io_uring / timeline correlation stamp
 };
-static_assert(sizeof(GpuMathStreamCell) == 64u, "Stateful Function Cell must be exactly 1 L1 cache line");
+static_assert(sizeof(GpuMathStreamCell) == 64u, "GpuMathStreamCell must be 1 L1 cache line (64B)");
 ```
 
 ### 2.4 256-Byte PULSE Active GPU Window (`GpuMathPageDirectory`, `alignas(256)`)

@@ -79,46 +79,136 @@ static bool tranche_is_producer(const WaylandContext *w) {
 // main_device is the GPU the compositor samples with when it cannot scan out
 // directly. On a muxless laptop that is the iGPU, not the Vulkan device.
 static bool tranche_is_consumer(const WaylandContext *w) {
-    if (!w->feedback_has_main_dev || tranche_is_producer(w)) {
+    if (tranche_is_producer(w)) {
         return false;
     }
-    return tranche_matches(w, w->feedback_main_major, w->feedback_main_minor);
+    if (w->staging_has_main_dev) {
+        return tranche_matches(w, w->staging_main_major, w->staging_main_minor);
+    }
+    if (w->feedback_has_main_dev) {
+        return tranche_matches(w, w->feedback_main_major, w->feedback_main_minor);
+    }
+    return false;
+}
+
+static void begin_feedback_staging(WaylandContext *w) {
+    w->feedback_round_open   = true;
+    w->staging_has_main_dev  = w->feedback_has_main_dev;
+    w->staging_main_major    = w->feedback_main_major;
+    w->staging_main_minor    = w->feedback_main_minor;
+    w->staging_scanout_count     = 0u;
+    w->staging_all_count         = 0u;
+    w->staging_prime_count       = 0u;
+    w->staging_xrgb_count        = 0u;
+    w->staging_argb_count        = 0u;
+    w->staging_xbgr2101010_count = 0u;
+    w->staging_prod_tranches     = 0u;
+    w->staging_cons_tranches = 0u;
+    w->staging_other_tranches = 0u;
+    w->tranche_has_dev       = false;
+    w->tranche_major         = 0;
+    w->tranche_minor         = 0;
+    w->tranche_flags         = 0u;
+    w->tranche_index_count   = 0u;
 }
 
 static void reset_feedback_round(WaylandContext *w) {
     w->feedback_done              = false;
+    w->feedback_updated           = false;
     w->feedback_round_sealed      = false;
     w->feedback_cross_device      = false;
-    w->scanout_modifier_count     = 0;
-    w->all_modifier_count         = 0;
-    w->prime_modifier_count       = 0;
-    w->feedback_producer_mods     = 0;
-    w->feedback_consumer_mods     = 0;
-    w->feedback_producer_tranches = 0;
-    w->feedback_consumer_tranches = 0;
-    w->feedback_other_tranches    = 0;
-    w->tranche_has_dev            = false;
-    w->tranche_flags              = 0;
-    w->tranche_index_count        = 0;
+    w->scanout_modifier_count     = 0u;
+    w->all_modifier_count         = 0u;
+    w->prime_modifier_count       = 0u;
+    w->xrgb_modifier_count        = 0u;
+    w->argb_modifier_count        = 0u;
+    w->feedback_xbgr2101010_mods  = 0u;
+    w->feedback_producer_mods     = 0u;
+    w->feedback_consumer_mods     = 0u;
+    w->feedback_producer_tranches = 0u;
+    w->feedback_consumer_tranches = 0u;
+    w->feedback_other_tranches    = 0u;
+    begin_feedback_staging(w);
+}
+
+static bool mod_lists_equal(const uint64_t *a, uint32_t na, const uint64_t *b, uint32_t nb) {
+    if (na != nb) {
+        return false;
+    }
+    if (na == 0u) {
+        return true;
+    }
+    return memcmp(a, b, (size_t)na * sizeof(uint64_t)) == 0;
 }
 
 static void finish_feedback_round(WaylandContext *w) {
-    if (w->feedback_round_sealed) {
+    if (!w->feedback_round_open && w->feedback_round_sealed) {
         return;
     }
-    w->feedback_round_sealed = true;
-    w->feedback_producer_mods = w->all_modifier_count;
-    w->feedback_consumer_mods = w->prime_modifier_count;
-    if (w->all_modifier_count == 0 && w->prime_modifier_count > 0) {
-        uint32_t n = w->prime_modifier_count;
-        if (n > ENG_WL_MAX_MODIFIERS) {
-            n = ENG_WL_MAX_MODIFIERS;
+
+    uint64_t next_all[ENG_WL_MAX_MODIFIERS];
+    uint32_t next_all_count = w->staging_all_count;
+    bool     next_cross     = false;
+
+    if (next_all_count > 0u) {
+        memcpy(next_all, w->staging_all_mods, (size_t)next_all_count * sizeof(uint64_t));
+    } else if (w->staging_prime_count > 0u) {
+        next_all_count = w->staging_prime_count;
+        if (next_all_count > ENG_WL_MAX_MODIFIERS) {
+            next_all_count = ENG_WL_MAX_MODIFIERS;
         }
-        memcpy(w->all_modifiers, w->prime_modifiers, n * sizeof(uint64_t));
-        w->all_modifier_count = n;
-        w->feedback_cross_device = true;
-    } else {
-        w->feedback_cross_device = false;
+        memcpy(next_all, w->staging_prime_mods, (size_t)next_all_count * sizeof(uint64_t));
+        next_cross = true;
+    }
+
+    bool was_done = w->feedback_done;
+    bool changed  = (next_cross != w->feedback_cross_device) ||
+                    !mod_lists_equal(w->staging_scanout_mods, w->staging_scanout_count,
+                                     w->scanout_modifiers, w->scanout_modifier_count) ||
+                    !mod_lists_equal(next_all, next_all_count,
+                                     w->all_modifiers, w->all_modifier_count);
+
+    w->feedback_has_main_dev      = w->staging_has_main_dev;
+    w->feedback_main_major        = w->staging_main_major;
+    w->feedback_main_minor        = w->staging_main_minor;
+    w->feedback_producer_tranches = w->staging_prod_tranches;
+    w->feedback_consumer_tranches = w->staging_cons_tranches;
+    w->feedback_other_tranches    = w->staging_other_tranches;
+    w->feedback_producer_mods     = w->staging_all_count;
+    w->feedback_consumer_mods     = w->staging_prime_count;
+    w->feedback_cross_device      = next_cross;
+
+    w->scanout_modifier_count = w->staging_scanout_count;
+    if (w->staging_scanout_count > 0u) {
+        memcpy(w->scanout_modifiers, w->staging_scanout_mods,
+               (size_t)w->staging_scanout_count * sizeof(uint64_t));
+    }
+    w->prime_modifier_count = w->staging_prime_count;
+    if (w->staging_prime_count > 0u) {
+        memcpy(w->prime_modifiers, w->staging_prime_mods,
+               (size_t)w->staging_prime_count * sizeof(uint64_t));
+    }
+    w->all_modifier_count = next_all_count;
+    if (next_all_count > 0u) {
+        memcpy(w->all_modifiers, next_all, (size_t)next_all_count * sizeof(uint64_t));
+    }
+    w->xrgb_modifier_count = w->staging_xrgb_count;
+    if (w->staging_xrgb_count > 0u) {
+        memcpy(w->xrgb_modifiers, w->staging_xrgb_mods,
+               (size_t)w->staging_xrgb_count * sizeof(uint64_t));
+    }
+    w->argb_modifier_count = w->staging_argb_count;
+    if (w->staging_argb_count > 0u) {
+        memcpy(w->argb_modifiers, w->staging_argb_mods,
+               (size_t)w->staging_argb_count * sizeof(uint64_t));
+    }
+    w->feedback_xbgr2101010_mods = w->staging_xbgr2101010_count;
+
+    w->feedback_round_open   = false;
+    w->feedback_round_sealed = true;
+    w->feedback_done         = true;
+    if (was_done && changed && next_all_count > 0u) {
+        w->feedback_updated = true;
     }
 }
 
@@ -126,11 +216,11 @@ static void commit_feedback_tranche(WaylandContext *w) {
     const bool producer = tranche_is_producer(w);
     const bool consumer = tranche_is_consumer(w);
     if (producer) {
-        w->feedback_producer_tranches += 1;
+        w->staging_prod_tranches += 1u;
     } else if (consumer) {
-        w->feedback_consumer_tranches += 1;
+        w->staging_cons_tranches += 1u;
     } else if (w->tranche_has_dev) {
-        w->feedback_other_tranches += 1;
+        w->staging_other_tranches += 1u;
     }
     if ((producer || consumer) && w->feedback_table != nullptr) {
         const bool is_scanout = producer && (w->tranche_flags & 1u) != 0u;
@@ -140,19 +230,36 @@ static void commit_feedback_tranche(WaylandContext *w) {
                 continue;
             }
             const WaylandFormatTableEntry *entry = &w->feedback_table[idx];
-            if (entry->format != ENG_DRM_FORMAT_ARGB8888 ||
-                entry->modifier == k_drm_format_mod_invalid) {
+            if (entry->modifier == k_drm_format_mod_invalid) {
                 continue;
+            }
+            if (entry->format == ENG_DRM_FORMAT_XBGR2101010 ||
+                entry->format == ENG_DRM_FORMAT_ABGR2101010) {
+                w->staging_xbgr2101010_count += 1u;
+                continue;
+            }
+            const bool is_argb = (entry->format == ENG_DRM_FORMAT_ARGB8888);
+            const bool is_xrgb = (entry->format == ENG_DRM_FORMAT_XRGB8888);
+            if (!is_argb && !is_xrgb) {
+                continue;
+            }
+            if (is_xrgb) {
+                push_unique_modifier(w->staging_xrgb_mods, &w->staging_xrgb_count,
+                                     ENG_WL_MAX_MODIFIERS, entry->modifier);
+            }
+            if (is_argb) {
+                push_unique_modifier(w->staging_argb_mods, &w->staging_argb_count,
+                                     ENG_WL_MAX_MODIFIERS, entry->modifier);
             }
             if (producer) {
                 if (is_scanout) {
-                    push_unique_modifier(w->scanout_modifiers, &w->scanout_modifier_count,
+                    push_unique_modifier(w->staging_scanout_mods, &w->staging_scanout_count,
                                          ENG_WL_MAX_MODIFIERS, entry->modifier);
                 }
-                push_unique_modifier(w->all_modifiers, &w->all_modifier_count,
+                push_unique_modifier(w->staging_all_mods, &w->staging_all_count,
                                      ENG_WL_MAX_MODIFIERS, entry->modifier);
             } else {
-                push_unique_modifier(w->prime_modifiers, &w->prime_modifier_count,
+                push_unique_modifier(w->staging_prime_mods, &w->staging_prime_count,
                                      ENG_WL_MAX_MODIFIERS, entry->modifier);
             }
         }
@@ -169,19 +276,23 @@ void wl_handle_dmabuf_feedback(WaylandContext *w, uint16_t opcode, uint16_t size
                                const unsigned char *p, const unsigned char *end) {
     if (opcode == 0u) {
         finish_feedback_round(w);
-        w->feedback_done = true;
         return;
     }
-    // If a previous feedback round already completed, a new event starts a
-    // fresh compositor tranche update (e.g. direct-scanout or monitor change).
-    if (w->feedback_done) {
-        reset_feedback_round(w);
+    // Incoming tranches populate staging_* while keeping live modifier arrays intact
+    // until opcode 0 (done) arrives.
+    if (!w->feedback_round_open) {
+        begin_feedback_staging(w);
     }
     if (opcode == 1u) {
-        // format_table is an fd plus a uint byte length. The fd is not in the body.
-        uint32_t table_size = 0;
+        // format_table is an fd plus a uint byte length. Pop the parked fd unconditionally
+        // first so a malformed payload cannot poison the SCM_RIGHTS FIFO.
         int fd = -1;
-        if (size < 12u || !wl_take_u32(&p, end, &table_size) || !wayland_take_parked_fd(w, &fd)) {
+        bool have_fd = wayland_take_parked_fd(w, &fd);
+        uint32_t table_size = 0;
+        if (size < 12u || !wl_take_u32(&p, end, &table_size) || !have_fd || fd < 0) {
+            if (have_fd && fd >= 0) {
+                close(fd);
+            }
             wl_fail(w, "zwp_linux_dmabuf_feedback_v1.format_table missing size or fd");
             return;
         }
@@ -217,8 +328,8 @@ void wl_handle_dmabuf_feedback(WaylandContext *w, uint16_t opcode, uint16_t size
             wl_fail(w, "truncated zwp_linux_dmabuf_feedback_v1.main_device");
             return;
         }
-        if (decode_dev_array(p, arr_len, &w->feedback_main_major, &w->feedback_main_minor)) {
-            w->feedback_has_main_dev = true;
+        if (decode_dev_array(p, arr_len, &w->staging_main_major, &w->staging_main_minor)) {
+            w->staging_has_main_dev = true;
         }
     } else if (opcode == 3u) {
         commit_feedback_tranche(w);
@@ -281,7 +392,8 @@ int wayland_query_surface_dmabuf_feedback(
             wayland_rewind_send(w, mark);
             return -EIO;
         }
-        w->feedback_id = 0;
+        w->retired_feedback_id = w->feedback_id;
+        w->feedback_id         = 0;
     }
     wl_close_feedback_table(w);
 
@@ -308,10 +420,6 @@ int wayland_query_surface_dmabuf_feedback(
     }
 
     if (wl_send_batch(w) < 0) {
-        if (!w->failed && w->send_off == 0) {
-            wayland_rewind_send(w, mark);
-            wl_release_unsent(w, fb_id);
-        }
         fprintf(stderr, "[Wayland Error] get_surface_feedback send failed: %s\n", w->err);
         return -EIO;
     }
@@ -329,7 +437,8 @@ int wayland_query_surface_dmabuf_feedback(
     if (w->failed || !w->feedback_done) {
         if (!w->failed && w->feedback_id != 0) {
             (void)wayland_put_raw(w, w->feedback_id, 0u, nullptr, 0u);
-            w->feedback_id = 0;
+            w->retired_feedback_id = w->feedback_id;
+            w->feedback_id         = 0;
             (void)wl_send_batch(w);
         }
         wl_close_feedback_table(w);
@@ -354,8 +463,9 @@ int wayland_query_surface_dmabuf_feedback(
     if (has_alt) {
         printf(", primary %lld:%lld", (long long)alt_major, (long long)alt_minor);
     }
-    printf(". Producer tranches %u (%u ARGB8888), main-device tranches %u (%u ARGB8888), other tranches %u.\n",
+    printf(". Producer tranches %u (%u ARGB/XRGB: %u XRGB8888, %u ARGB8888, %u 10bpc), main-device tranches %u (%u mods), other tranches %u.\n",
            w->feedback_producer_tranches, producer_mods,
+           w->xrgb_modifier_count, w->argb_modifier_count, w->feedback_xbgr2101010_mods,
            w->feedback_consumer_tranches, consumer_mods,
            w->feedback_other_tranches);
     if (w->feedback_cross_device) {
@@ -450,6 +560,83 @@ int wayland_import_dmabuf_immed(
         return -EIO;
     }
 
+    wayland_track_buffer(w, buffer_id);
     *out_buffer_id = buffer_id;
     return 0;
+}
+
+void wayland_track_buffer(WaylandContext *w, uint32_t buffer_id) {
+    if (w == nullptr || buffer_id == 0u) {
+        return;
+    }
+    for (uint32_t i = 0u; i < ENG_WL_TRACKED_BUFS; ++i) {
+        if (w->tracked_buf_ids[i] == buffer_id) {
+            w->tracked_buf_released[i] = 1u;
+            return;
+        }
+    }
+    for (uint32_t i = 0u; i < ENG_WL_TRACKED_BUFS; ++i) {
+        if (w->tracked_buf_ids[i] == 0u) {
+            w->tracked_buf_ids[i]      = buffer_id;
+            w->tracked_buf_released[i] = 1u;
+            return;
+        }
+    }
+}
+
+void wayland_mark_buffer_busy(WaylandContext *w, uint32_t buffer_id) {
+    if (w == nullptr || buffer_id == 0u) {
+        return;
+    }
+    for (uint32_t i = 0u; i < ENG_WL_TRACKED_BUFS; ++i) {
+        if (w->tracked_buf_ids[i] == buffer_id) {
+            w->tracked_buf_released[i] = 0u;
+            return;
+        }
+    }
+    for (uint32_t i = 0u; i < ENG_WL_TRACKED_BUFS; ++i) {
+        if (w->tracked_buf_ids[i] == 0u) {
+            w->tracked_buf_ids[i]      = buffer_id;
+            w->tracked_buf_released[i] = 0u;
+            return;
+        }
+    }
+}
+
+bool wayland_mark_buffer_released(WaylandContext *w, uint32_t buffer_id) {
+    if (w == nullptr || buffer_id == 0u) {
+        return false;
+    }
+    for (uint32_t i = 0u; i < ENG_WL_TRACKED_BUFS; ++i) {
+        if (w->tracked_buf_ids[i] == buffer_id) {
+            w->tracked_buf_released[i] = 1u;
+            return true;
+        }
+    }
+    return false;
+}
+
+void wayland_untrack_buffer(WaylandContext *w, uint32_t buffer_id) {
+    if (w == nullptr || buffer_id == 0u) {
+        return;
+    }
+    for (uint32_t i = 0u; i < ENG_WL_TRACKED_BUFS; ++i) {
+        if (w->tracked_buf_ids[i] == buffer_id) {
+            w->tracked_buf_ids[i]      = 0u;
+            w->tracked_buf_released[i] = 0u;
+            return;
+        }
+    }
+}
+
+bool wayland_buffer_is_released(const WaylandContext *w, uint32_t buffer_id) {
+    if (w == nullptr || buffer_id == 0u) {
+        return true;
+    }
+    for (uint32_t i = 0u; i < ENG_WL_TRACKED_BUFS; ++i) {
+        if (w->tracked_buf_ids[i] == buffer_id) {
+            return w->tracked_buf_released[i] != 0u;
+        }
+    }
+    return true;
 }

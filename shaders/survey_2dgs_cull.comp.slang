@@ -35,8 +35,6 @@ struct TerrainSurfel2DGSGpu {
 };
 
 groupshared uint s_wave_counts[32];
-groupshared uint s_wave_offsets[32];
-groupshared uint s_running_total;
 
 float3 unpack_surfel_oct_snorm8(uint packed16) {
     int    qx = (int(packed16 << 24u)) >> 24;
@@ -116,20 +114,17 @@ void main(uint3 gtid : SV_GroupThreadID) {
         return;
     }
 
-    if (tid == 0u) {
-        s_running_total = 0u;
-    }
     if (tid < 32u) {
-        s_wave_counts[tid]  = 0u;
-        s_wave_offsets[tid] = 0u;
+        s_wave_counts[tid] = 0u;
     }
     GroupMemoryBarrierWithGroupSync();
 
     TerrainSurfel2DGSGpu *surfels = (TerrainSurfel2DGSGpu *)pc.surfels_bda;
-    uint wave_size = max(WaveGetLaneCount(), 1u);
-    uint wave_id   = tid / wave_size;
-    uint num_waves = (256u + wave_size - 1u) / wave_size;
-    uint total_cap = pc.surfel_count;
+    uint wave_size     = max(WaveGetLaneCount(), 1u);
+    uint wave_id       = tid / wave_size;
+    uint num_waves     = (256u + wave_size - 1u) / wave_size;
+    uint total_cap     = pc.surfel_count;
+    uint running_total = 0u;
 
     for (uint base = 0u; base < total_cap; base += 256u) {
         uint idx = base + tid;
@@ -142,18 +137,19 @@ void main(uint3 gtid : SV_GroupThreadID) {
         }
         GroupMemoryBarrierWithGroupSync();
 
-        if (tid == 0u) {
-            uint prefix = s_running_total;
-            for (uint w = 0u; w < num_waves; ++w) {
-                s_wave_offsets[w] = prefix;
-                prefix += s_wave_counts[w];
+        uint wave_base   = running_total;
+        uint batch_count = 0u;
+        for (uint w = 0u; w < num_waves; ++w) {
+            uint wc = s_wave_counts[w];
+            if (w < wave_id) {
+                wave_base += wc;
             }
-            s_running_total = prefix;
+            batch_count += wc;
         }
-        GroupMemoryBarrierWithGroupSync();
+        running_total += batch_count;
 
         if (vis) {
-            uint dst_slot = s_wave_offsets[wave_id] + lane_off;
+            uint dst_slot = wave_base + lane_off;
             // visible_indices[] starts at byte offset 64 (word 16)
             ind_words[16u + dst_slot] = idx;
         }
@@ -161,7 +157,7 @@ void main(uint3 gtid : SV_GroupThreadID) {
     }
 
     if (tid == 0u) {
-        uint vis_total = s_running_total;
+        uint vis_total = running_total;
         ind_words[0u] = vis_total;
         ind_words[1u] = total_cap - vis_total;
         ind_words[2u] = total_cap;

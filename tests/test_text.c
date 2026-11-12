@@ -1,3 +1,4 @@
+#include "input/pointer.h"
 #include "text/atlas/atlas.h"
 #include "text/face/face.h"
 #include "text/shape/shape.h"
@@ -35,6 +36,11 @@ bool text_atlas_pack(uint32_t face, uint32_t epoch, uint32_t glyph,
     (void)rows;
     (void)out;
     return false;
+}
+
+void pointer_set_clipboard_text(const char *utf8, uint32_t len) {
+    (void)utf8;
+    (void)len;
 }
 
 int main(void) {

@@ -26,8 +26,6 @@ struct SceneCullPush {
 
 groupshared uint s_wave_draws[64];
 groupshared uint s_wave_rejs[64];
-groupshared uint s_total_draws;
-groupshared uint s_total_rejs;
 groupshared uint s_stat_cone;
 groupshared uint s_stat_frustum;
 groupshared uint s_stat_hiz;
@@ -175,8 +173,6 @@ void main(uint3 gtid : SV_GroupThreadID) {
         : min(hdr_words[2], k_scene_max_draws); // hdr_words[2] == rejected_count from Phase 0
 
     if (tid == 0u) {
-        s_total_draws  = 0u;
-        s_total_rejs   = 0u;
         s_stat_cone    = 0u;
         s_stat_frustum = 0u;
         s_stat_hiz     = 0u;
@@ -193,9 +189,11 @@ void main(uint3 gtid : SV_GroupThreadID) {
     }
     GroupMemoryBarrierWithGroupSync();
 
-    uint wave_id   = tid / max(WaveGetLaneCount(), 1u);
-    uint num_waves = (256u + max(WaveGetLaneCount(), 1u) - 1u) / max(WaveGetLaneCount(), 1u);
-    float4 q_cam   = float4(pc.qx, pc.qy, pc.qz, pc.qw);
+    uint   wave_id     = tid / max(WaveGetLaneCount(), 1u);
+    uint   num_waves   = (256u + max(WaveGetLaneCount(), 1u) - 1u) / max(WaveGetLaneCount(), 1u);
+    float4 q_cam       = float4(pc.qx, pc.qy, pc.qz, pc.qw);
+    uint   total_draws = 0u;
+    uint   total_rejs  = 0u;
 
     for (uint base = 0u; base < total_items; base += 256u) {
         uint idx = base + tid;
@@ -259,12 +257,22 @@ void main(uint3 gtid : SV_GroupThreadID) {
         }
         GroupMemoryBarrierWithGroupSync();
 
-        uint wg_draw_base = s_total_draws;
-        uint wg_rej_base  = s_total_rejs;
-        for (uint w = 0u; w < wave_id; ++w) {
-            wg_draw_base += s_wave_draws[w];
-            wg_rej_base  += s_wave_rejs[w];
+        uint wg_draw_base = total_draws;
+        uint wg_rej_base  = total_rejs;
+        uint batch_draws  = 0u;
+        uint batch_rejs   = 0u;
+        for (uint w = 0u; w < num_waves; ++w) {
+            uint wd = s_wave_draws[w];
+            uint wr = s_wave_rejs[w];
+            if (w < wave_id) {
+                wg_draw_base += wd;
+                wg_rej_base  += wr;
+            }
+            batch_draws += wd;
+            batch_rejs  += wr;
         }
+        total_draws += batch_draws;
+        total_rejs  += batch_rejs;
 
         if (emit_draw) {
             uint slot = wg_draw_base + wave_draw_prefix;
@@ -280,42 +288,30 @@ void main(uint3 gtid : SV_GroupThreadID) {
             rejected_pairs[slot] = pair;
         }
         GroupMemoryBarrierWithGroupSync();
-
-        if (tid == 0u) {
-            uint batch_draws = 0u;
-            uint batch_rejs  = 0u;
-            for (uint w = 0u; w < num_waves; ++w) {
-                batch_draws += s_wave_draws[w];
-                batch_rejs  += s_wave_rejs[w];
-            }
-            s_total_draws += batch_draws;
-            s_total_rejs  += batch_rejs;
-        }
-        GroupMemoryBarrierWithGroupSync();
     }
 
     if (tid == 0u) {
         if (pc.phase == 0u) {
-            hdr_words[0] = s_total_draws;
-            hdr_words[2] = s_total_rejs;
+            hdr_words[0] = total_draws;
+            hdr_words[2] = total_rejs;
             hdr_words[4] = s_stat_cone;
             hdr_words[5] = s_stat_frustum;
 
             SceneDrawIndirectCmd *single1 = (SceneDrawIndirectCmd *)(pc.cull_slot_bda + k_slot_off_single1);
             SceneDrawIndirectCmd sc;
             sc.vertexCount   = s_max_verts;
-            sc.instanceCount = s_total_draws;
+            sc.instanceCount = total_draws;
             sc.firstVertex   = 0u;
             sc.firstInstance = 0u;
             single1[0]       = sc;
         } else {
-            hdr_words[1] = s_total_draws;
+            hdr_words[1] = total_draws;
             hdr_words[6] = s_stat_hiz;
 
             SceneDrawIndirectCmd *single2 = (SceneDrawIndirectCmd *)(pc.cull_slot_bda + k_slot_off_single2);
             SceneDrawIndirectCmd sc;
             sc.vertexCount   = s_max_verts;
-            sc.instanceCount = s_total_draws;
+            sc.instanceCount = total_draws;
             sc.firstVertex   = 0u;
             sc.firstInstance = 0u;
             single2[0]       = sc;

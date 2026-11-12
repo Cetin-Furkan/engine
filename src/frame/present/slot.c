@@ -8,18 +8,27 @@ int ensure_prime_color(VulkanContext *vk, FrameSlot *frame) {
     if (frame->prime_view != VK_NULL_HANDLE) {
         return 0;
     }
+    const uint32_t qf_indices[2] = {
+        vk->queues.graphics_family_index,
+        vk->queues.transfer_family_index,
+    };
+    const bool concurrent_prime =
+        vk->queues.has_dedicated_transfer &&
+        vk->queues.transfer_family_index != vk->queues.graphics_family_index;
     VkImageCreateInfo image_info = {
-        .sType         = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
-        .imageType     = VK_IMAGE_TYPE_2D,
-        .format        = VK_FORMAT_B8G8R8A8_SRGB,
-        .extent        = { .width = frame->image.width, .height = frame->image.height, .depth = 1 },
-        .mipLevels     = 1,
-        .arrayLayers   = 1,
-        .samples       = VK_SAMPLE_COUNT_1_BIT,
-        .tiling        = VK_IMAGE_TILING_OPTIMAL,
-        .usage         = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
-        .sharingMode   = VK_SHARING_MODE_EXCLUSIVE,
-        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+        .sType                 = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        .imageType             = VK_IMAGE_TYPE_2D,
+        .format                = VK_FORMAT_B8G8R8A8_SRGB,
+        .extent                = { .width = frame->image.width, .height = frame->image.height, .depth = 1 },
+        .mipLevels             = 1,
+        .arrayLayers           = 1,
+        .samples               = VK_SAMPLE_COUNT_1_BIT,
+        .tiling                = VK_IMAGE_TILING_OPTIMAL,
+        .usage                 = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+        .sharingMode           = concurrent_prime ? VK_SHARING_MODE_CONCURRENT : VK_SHARING_MODE_EXCLUSIVE,
+        .queueFamilyIndexCount = concurrent_prime ? 2u : 0u,
+        .pQueueFamilyIndices   = concurrent_prime ? qf_indices : nullptr,
+        .initialLayout         = VK_IMAGE_LAYOUT_UNDEFINED,
     };
     VkImage image = VK_NULL_HANDLE;
     VkResult res = vkCreateImage(vk->device, &image_info, nullptr, &image);
@@ -43,8 +52,10 @@ int ensure_prime_color(VulkanContext *vk, FrameSlot *frame) {
         vkDestroyImage(vk->device, image, nullptr);
         return -1;
     }
+    VkMemoryPriorityAllocateInfoEXT prio_info = {0};
     VkMemoryAllocateInfo alloc = {
         .sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .pNext           = vulkan_chain_memory_priority(vk, &prio_info, 1.0f, nullptr),
         .allocationSize  = reqs2.memoryRequirements.size,
         .memoryTypeIndex = type_index,
     };
@@ -124,15 +135,20 @@ int ensure_frame_targets(VulkanContext *vk, FrameSlot *frame) {
     if (frame->image_view != VK_NULL_HANDLE) {
         return 0;
     }
+    const EngineApp *app = engine_app();
     if (frame->image.prime_copy) {
         if (ensure_prime_color(vk, frame) != 0) {
             return -1;
         }
         frame->image_view = frame->prime_view;
         frame->view_format = VK_FORMAT_B8G8R8A8_SRGB;
-        if (engine_app()->create_targets(vk, &frame->targets,
-                                         frame->image.width, frame->image.height) != 0) {
-            return -1;
+        if (app != nullptr && app->create_targets != nullptr) {
+            if (app->create_targets(vk, &frame->targets,
+                                    frame->image.width, frame->image.height) != 0) {
+                return -1;
+            }
+        } else {
+            frame->targets = (EngineTargets){0};
         }
         return 0;
     }
@@ -181,10 +197,15 @@ int ensure_frame_targets(VulkanContext *vk, FrameSlot *frame) {
         return -1;
     }
     frame->view_format = view_info.format;
-    if (view_info.format == VK_FORMAT_B8G8R8A8_SRGB &&
-        engine_app()->create_targets(vk, &frame->targets,
-                                     frame->image.width, frame->image.height) != 0) {
-        return -1;
+    if (view_info.format == VK_FORMAT_B8G8R8A8_SRGB) {
+        if (app != nullptr && app->create_targets != nullptr) {
+            if (app->create_targets(vk, &frame->targets,
+                                    frame->image.width, frame->image.height) != 0) {
+                return -1;
+            }
+        } else {
+            frame->targets = (EngineTargets){0};
+        }
     }
     return 0;
 }
@@ -194,7 +215,7 @@ void destroy_frame_gpu(VulkanContext *vk, FrameSlot *frame) {
         return;
     }
     if (vk != nullptr && vk->device != VK_NULL_HANDLE) {
-        if (!wait_acquire_point(vk, frame->acquire_point)) {
+        if (!acquire_point_retired(vk, frame->acquire_point)) {
             fprintf(stderr,
                     "[Engine Error] Image left alive. Acquire point %llu is still pending.\n",
                     (unsigned long long)frame->acquire_point);
@@ -210,7 +231,11 @@ void destroy_frame_gpu(VulkanContext *vk, FrameSlot *frame) {
         if (frame->image_view != VK_NULL_HANDLE) {
             vkDestroyImageView(vk->device, frame->image_view, nullptr);
         }
-        engine_app()->destroy_targets(vk, &frame->targets);
+        if (engine_app() != nullptr && engine_app()->destroy_targets != nullptr) {
+            engine_app()->destroy_targets(vk, &frame->targets);
+        } else {
+            frame->targets = (EngineTargets){0};
+        }
         vulkan_destroy_exportable_image(vk, &frame->image);
     } else if (frame->image.dmabuf_fd >= 0) {
         close(frame->image.dmabuf_fd);
@@ -225,12 +250,22 @@ void destroy_frame_gpu(VulkanContext *vk, FrameSlot *frame) {
     frame->prime_view = VK_NULL_HANDLE;
     frame->acquire_point = 0;
     frame->ts_armed = false;
+    frame->ts_xfer_armed = false;
 }
 
 
 int create_release_timeline(WaylandContext *wl, FrameSlot *frame) {
+    if (frame == nullptr) {
+        return -EINVAL;
+    }
+    if (frame_state.implicit_dmabuf_sync) {
+        frame->release_handle      = 0u;
+        frame->release_timeline_id = 0u;
+        frame->release_point       = 1u;
+        return 0;
+    }
     struct drm_syncobj_create release_create = {0};
-    if (frame_state.drm_fd < 0 || frame == nullptr) {
+    if (frame_state.drm_fd < 0) {
         return -EINVAL;
     }
     if (ioctl(frame_state.drm_fd, DRM_IOCTL_SYNCOBJ_CREATE, &release_create) != 0) {
@@ -270,12 +305,14 @@ void clear_pixels(FrameSlot *frame) {
     frame->targets          = (EngineTargets){0};
     frame->cmd_buf          = VK_NULL_HANDLE;
     frame->transfer_cmd_buf = VK_NULL_HANDLE;
-    frame->surface_damage   = (FrameRect){0};
-    frame->copy_damage      = (FrameRect){0};
-    frame->acquire_point    = 0;
-    frame->wl_buffer_id     = 0;
-    frame->foreign_owned    = false;
-    frame->ts_armed         = false;
+    frame->surface_damage    = (FrameRect){0};
+    frame->copy_damage       = (FrameRect){0};
+    frame->stale_rect        = (FrameRect){0};
+    frame->has_valid_history = false;
+    frame->acquire_point     = 0;
+    frame->wl_buffer_id      = 0;
+    frame->foreign_owned     = false;
+    frame->ts_armed          = false;
 }
 
 bool slot_has_pixels(const FrameSlot *frame) {
@@ -484,10 +521,10 @@ SlotRef slot_ref(const FrameSlot *slot) {
             return slot_ref_pack(slot->generation, (uint32_t)(i + 1));
         }
     }
-    uint32_t mask = frame_state.orphan_mask;
-    while (mask != 0u) {
-        uint32_t i = (uint32_t)__builtin_ctz(mask);
-        mask &= mask - 1u;
+    uint64_t mask = frame_state.orphan_mask;
+    while (mask != 0ull) {
+        uint32_t i = (uint32_t)__builtin_ctzll(mask);
+        mask &= mask - 1ull;
         if (&frame_state.orphans[i] == slot) {
             return slot_ref_pack(slot->generation, i + 3u);
         }
@@ -496,7 +533,7 @@ SlotRef slot_ref(const FrameSlot *slot) {
 }
 
 FrameSlot *slot_from_ref(SlotRef ref) {
-    return slot_resolve(ref, frame_state.slot, frame_state.orphans, k_orphan_cap);
+    return slot_resolve(ref, frame_state.slot, frame_state.orphans, frame_state.orphan_cap);
 }
 
 
@@ -513,7 +550,9 @@ int alloc_spare(WaylandContext *wl, VulkanContext *vk) {
         return 0;
     }
 
-    const bool keep_timeline = spare()->release_timeline_id != 0;
+    const bool keep_timeline = frame_state.implicit_dmabuf_sync
+        ? frame_state.spare_live
+        : (spare()->release_timeline_id != 0);
     if (!keep_timeline) {
         blank_frame(spare());
     } else if (slot_has_pixels(spare())) {
@@ -541,6 +580,7 @@ int alloc_spare(WaylandContext *wl, VulkanContext *vk) {
     }
     uint32_t front_buffer = wl->buffer_id;
     uint32_t spare_buffer = 0;
+    uint32_t fourcc = wayland_drm_fourcc_for_modifier(wl, spare()->image.drm_format_modifier, true);
     int imported = wayland_import_dmabuf_immed(
         wl,
         spare()->image.dmabuf_fd,
@@ -548,7 +588,7 @@ int alloc_spare(WaylandContext *wl, VulkanContext *vk) {
         spare()->image.height,
         (uint32_t)spare()->image.row_pitch,
         (uint32_t)spare()->image.offset,
-        ENG_DRM_FORMAT_ARGB8888,
+        fourcc,
         spare()->image.drm_format_modifier,
         &spare_buffer);
     wl->buffer_id = front_buffer;

@@ -1,5 +1,6 @@
 #include "text/text_int.h"
 
+#include "input/pointer.h"
 #include "text/atlas/atlas.h"
 #include "text/shape/shape.h"
 #include <linux/input-event-codes.h>
@@ -270,6 +271,9 @@ static void begin_edit(uint32_t slot) {
     s_edit = slot;
     s_live[slot].caret = s_live[slot].nbytes;
     s_live[slot].cache_ok = false;
+    if (!s_live[slot].sealed && s_live[slot].nbytes > 0u) {
+        pointer_set_clipboard_text(s_live[slot].utf8, s_live[slot].nbytes);
+    }
 }
 
 bool text_click(float x, float y, bool t_down) {
@@ -407,6 +411,7 @@ bool text_insert(const char *utf8, uint32_t bytes) {
     run->utf8[run->nbytes] = '\0';
     run->hash = hash_bytes(run->utf8, run->nbytes);
     run->cache_ok = false;
+    pointer_set_clipboard_text(run->utf8, run->nbytes);
     return true;
 }
 
@@ -433,6 +438,7 @@ bool text_on_key(uint32_t key) {
         run->caret = prev;
         run->hash = hash_bytes(run->utf8, run->nbytes);
         run->cache_ok = false;
+        pointer_set_clipboard_text(run->utf8, run->nbytes);
         return true;
     }
     if (key == KEY_DELETE) {
@@ -444,6 +450,7 @@ bool text_on_key(uint32_t key) {
         run->nbytes -= next - run->caret;
         run->hash = hash_bytes(run->utf8, run->nbytes);
         run->cache_ok = false;
+        pointer_set_clipboard_text(run->utf8, run->nbytes);
         return true;
     }
     if (key == KEY_LEFT) {

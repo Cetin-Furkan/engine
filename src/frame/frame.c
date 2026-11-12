@@ -48,8 +48,10 @@ void frame_set_bench_mode(bool enabled) {
 }
 
 void frame_note_damage_rect(int32_t x, int32_t y, uint32_t width, uint32_t height) {
-    frame_state.scene_dirty = true;
-    if (engine_app()->record_poke_pending != nullptr &&
+    frame_state.scene_dirty   = true;
+    frame_state.loop_was_busy = true;
+    if (engine_app() != nullptr &&
+        engine_app()->record_poke_pending != nullptr &&
         engine_app()->record_poke_pending()) {
         frame_state.sim_hot = true;
     }

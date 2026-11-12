@@ -1,4 +1,5 @@
 #include "frame/internal.h"
+#include "vulkan/device.h"
 
 // Sync2 barriers for a DMA-BUF that is cleared and then handed to the
 // compositor. oldLayout UNDEFINED has nothing to make available, so the
@@ -16,7 +17,7 @@ static VkImageSubresourceRange one_level(VkImageAspectFlags aspect) {
     };
 }
 
-void frame_fill_discard_color(VkImageMemoryBarrier2 *out, VkImage image) {
+void frame_fill_discard_color(VkImageMemoryBarrier2 *out, VkImage image, bool unified) {
     *out = (VkImageMemoryBarrier2){
         .sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
         .srcStageMask        = VK_PIPELINE_STAGE_2_NONE,
@@ -24,7 +25,7 @@ void frame_fill_discard_color(VkImageMemoryBarrier2 *out, VkImage image) {
         .dstStageMask        = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
         .dstAccessMask       = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
         .oldLayout           = VK_IMAGE_LAYOUT_UNDEFINED,
-        .newLayout           = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        .newLayout           = unified ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
         .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
         .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
         .image               = image,
@@ -32,7 +33,7 @@ void frame_fill_discard_color(VkImageMemoryBarrier2 *out, VkImage image) {
     };
 }
 
-void frame_fill_discard_depth(VkImageMemoryBarrier2 *out, VkImage image) {
+void frame_fill_discard_depth(VkImageMemoryBarrier2 *out, VkImage image, bool unified) {
     *out = (VkImageMemoryBarrier2){
         .sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
         .srcStageMask        = VK_PIPELINE_STAGE_2_NONE,
@@ -40,7 +41,7 @@ void frame_fill_discard_depth(VkImageMemoryBarrier2 *out, VkImage image) {
         .dstStageMask        = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT,
         .dstAccessMask       = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
         .oldLayout           = VK_IMAGE_LAYOUT_UNDEFINED,
-        .newLayout           = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+        .newLayout           = unified ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
         .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
         .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
         .image               = image,
@@ -110,15 +111,15 @@ static FrameRect clamp_slot_copy_rect(const FrameSlot *frame) {
     };
 }
 
-static void fill_color_to_copy(VkImageMemoryBarrier2 *out, VkImage image) {
+static void fill_color_to_copy(VkImageMemoryBarrier2 *out, VkImage image, bool unified) {
     *out = (VkImageMemoryBarrier2){
         .sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
         .srcStageMask        = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
         .srcAccessMask       = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
         .dstStageMask        = VK_PIPELINE_STAGE_2_COPY_BIT,
         .dstAccessMask       = VK_ACCESS_2_TRANSFER_READ_BIT,
-        .oldLayout           = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-        .newLayout           = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        .oldLayout           = unified ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        .newLayout           = unified ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
         .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
         .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
         .image               = image,
@@ -160,7 +161,8 @@ static void fill_release_from_copy(VkImageMemoryBarrier2 *out, const VulkanConte
     };
 }
 
-static void cmd_prime_copy_region(VkCommandBuffer cmd, const FrameSlot *frame, FrameRect rect) {
+static void cmd_prime_copy_region(VkCommandBuffer cmd, const FrameSlot *frame,
+                                  FrameRect rect, bool unified_src) {
     VkImageCopy2 region = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_COPY_2,
         .srcSubresource = {
@@ -186,7 +188,7 @@ static void cmd_prime_copy_region(VkCommandBuffer cmd, const FrameSlot *frame, F
     VkCopyImageInfo2 copy = {
         .sType          = VK_STRUCTURE_TYPE_COPY_IMAGE_INFO_2,
         .srcImage       = frame->prime_image,
-        .srcImageLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        .srcImageLayout = unified_src ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
         .dstImage       = frame->image.image,
         .dstImageLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
         .regionCount    = 1,
@@ -196,22 +198,25 @@ static void cmd_prime_copy_region(VkCommandBuffer cmd, const FrameSlot *frame, F
 }
 
 void frame_cmd_finish_present(VkCommandBuffer cmd, const VulkanContext *vk, const FrameSlot *frame) {
+    const bool unified_prime = vk->device_info.supports_unified_image_layouts;
     if (frame_use_async_prime_transfer(vk, frame)) {
-        // Release device-local color target from graphics queue to dedicated DMA transfer queue.
-        VkImageMemoryBarrier2 qfot_release = {
+        // Transition CONCURRENT device-local color target to TRANSFER_SRC_OPTIMAL
+        // (or keep GENERAL when VK_KHR_unified_image_layouts is active);
+        // the prime_ready_sem signal publishes visibility to the DMA transfer queue.
+        VkImageMemoryBarrier2 to_copy_src = {
             .sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
             .srcStageMask        = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
             .srcAccessMask       = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
             .dstStageMask        = VK_PIPELINE_STAGE_2_NONE,
             .dstAccessMask       = VK_ACCESS_2_NONE,
-            .oldLayout           = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-            .newLayout           = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-            .srcQueueFamilyIndex = vk->queues.graphics_family_index,
-            .dstQueueFamilyIndex = vk->queues.transfer_family_index,
+            .oldLayout           = unified_prime ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            .newLayout           = unified_prime ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
             .image               = frame->prime_image,
             .subresourceRange    = one_level(VK_IMAGE_ASPECT_COLOR_BIT),
         };
-        frame_cmd_barriers(cmd, &qfot_release, 1);
+        frame_cmd_barriers(cmd, &to_copy_src, 1);
         return;
     }
 
@@ -221,12 +226,12 @@ void frame_cmd_finish_present(VkCommandBuffer cmd, const VulkanContext *vk, cons
             (rect.x != 0 || rect.y != 0 ||
              rect.width != frame->image.width || rect.height != frame->image.height);
         VkImageMemoryBarrier2 prepare[2];
-        fill_color_to_copy(&prepare[0], frame->prime_image);
+        fill_color_to_copy(&prepare[0], frame->prime_image, unified_prime);
         fill_export_as_copy_dst(&prepare[1], vk, frame->image.image,
                                 vk->queues.graphics_family_index, partial);
         frame_cmd_barriers(cmd, prepare, 2);
 
-        cmd_prime_copy_region(cmd, frame, rect);
+        cmd_prime_copy_region(cmd, frame, rect, unified_prime);
 
         VkImageMemoryBarrier2 release;
         fill_release_from_copy(&release, vk, frame->image.image, vk->queues.graphics_family_index);
@@ -274,37 +279,32 @@ static int record_prime_transfer_cmd(VulkanContext *vk, FrameSlot *frame) {
         return -1;
     }
 
+    gpu_timer_begin_transfer(vk, frame->transfer_cmd_buf, frame);
+
     FrameRect rect = clamp_slot_copy_rect(frame);
     bool partial = frame->foreign_owned &&
         (rect.x != 0 || rect.y != 0 ||
          rect.width != frame->image.width || rect.height != frame->image.height);
 
-    VkImageMemoryBarrier2 prepare[2];
-    prepare[0] = (VkImageMemoryBarrier2){
-        .sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
-        .srcStageMask        = VK_PIPELINE_STAGE_2_NONE,
-        .srcAccessMask       = VK_ACCESS_2_NONE,
-        .dstStageMask        = VK_PIPELINE_STAGE_2_COPY_BIT,
-        .dstAccessMask       = VK_ACCESS_2_TRANSFER_READ_BIT,
-        .oldLayout           = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-        .newLayout           = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-        .srcQueueFamilyIndex = vk->queues.graphics_family_index,
-        .dstQueueFamilyIndex = vk->queues.transfer_family_index,
-        .image               = frame->prime_image,
-        .subresourceRange    = one_level(VK_IMAGE_ASPECT_COLOR_BIT),
-    };
-    fill_export_as_copy_dst(&prepare[1], vk, frame->image.image,
+    // prime_image uses VK_SHARING_MODE_CONCURRENT across graphics + transfer and
+    // was transitioned to TRANSFER_SRC_OPTIMAL before prime_ready_sem signalled.
+    VkImageMemoryBarrier2 prepare_dst;
+    fill_export_as_copy_dst(&prepare_dst, vk, frame->image.image,
                             vk->queues.transfer_family_index, partial);
-    frame_cmd_barriers(frame->transfer_cmd_buf, prepare, 2);
+    frame_cmd_barriers(frame->transfer_cmd_buf, &prepare_dst, 1);
 
-    cmd_prime_copy_region(frame->transfer_cmd_buf, frame, rect);
+    cmd_prime_copy_region(frame->transfer_cmd_buf, frame, rect,
+                          vk->device_info.supports_unified_image_layouts);
 
     VkImageMemoryBarrier2 release;
     fill_release_from_copy(&release, vk, frame->image.image, vk->queues.transfer_family_index);
     frame_cmd_barriers(frame->transfer_cmd_buf, &release, 1);
 
+    gpu_timer_end_transfer(frame->transfer_cmd_buf, frame);
+
     res = vkEndCommandBuffer(frame->transfer_cmd_buf);
     if (res != VK_SUCCESS) {
+        frame->ts_xfer_armed = false;
         fprintf(stderr, "[Engine Error] vkEndCommandBuffer (transfer) failed: %s (%d)\n",
                 vulkan_vkresult_to_str(res), (int)res);
         return -1;
@@ -348,6 +348,10 @@ int frame_submit_slot_commands(VulkanContext *vk, FrameSlot *frame, VkSemaphore 
         };
         VkResult res = vkQueueSubmit2(vk->queues.graphics_queue, 1u, &gfx_submit, VK_NULL_HANDLE);
         if (res != VK_SUCCESS) {
+            frame->ts_xfer_armed = false;
+            if (res == VK_ERROR_DEVICE_LOST) {
+                vulkan_report_device_fault(vk, "vkQueueSubmit2 (graphics->prime)");
+            }
             fprintf(stderr, "[Engine Error] vkQueueSubmit2 (graphics->prime) failed: %s (%d)\n",
                     vulkan_vkresult_to_str(res), (int)res);
             return -1;
@@ -358,12 +362,24 @@ int frame_submit_slot_commands(VulkanContext *vk, FrameSlot *frame, VkSemaphore 
             .sType         = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
             .commandBuffer = frame->transfer_cmd_buf,
         };
-        VkSemaphoreSubmitInfo xfer_wait = {
+        VkSemaphoreSubmitInfo xfer_waits[2];
+        uint32_t xfer_wait_count = 0u;
+        xfer_waits[xfer_wait_count++] = (VkSemaphoreSubmitInfo){
             .sType     = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
             .semaphore = frame_state.prime_ready_sem,
             .value     = prime_pt,
             .stageMask = VK_PIPELINE_STAGE_2_COPY_BIT,
         };
+        if (frame_state.last_acquire_signal_point != 0u &&
+            frame_state.last_acquire_signal_point < signal_point &&
+            frame_state.last_acquire_signal_queue != vk->queues.transfer_queue) {
+            xfer_waits[xfer_wait_count++] = (VkSemaphoreSubmitInfo){
+                .sType     = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+                .semaphore = acquire,
+                .value     = frame_state.last_acquire_signal_point,
+                .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+            };
+        }
         VkSemaphoreSubmitInfo xfer_sigs[2] = {
             {
                 .sType     = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
@@ -380,8 +396,8 @@ int frame_submit_slot_commands(VulkanContext *vk, FrameSlot *frame, VkSemaphore 
         };
         VkSubmitInfo2 xfer_submit = {
             .sType                    = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
-            .waitSemaphoreInfoCount   = 1u,
-            .pWaitSemaphoreInfos      = &xfer_wait,
+            .waitSemaphoreInfoCount   = xfer_wait_count,
+            .pWaitSemaphoreInfos      = xfer_waits,
             .commandBufferInfoCount   = 1u,
             .pCommandBufferInfos      = &xfer_cmd,
             .signalSemaphoreInfoCount = 2u,
@@ -389,6 +405,10 @@ int frame_submit_slot_commands(VulkanContext *vk, FrameSlot *frame, VkSemaphore 
         };
         res = vkQueueSubmit2(vk->queues.transfer_queue, 1u, &xfer_submit, VK_NULL_HANDLE);
         if (res != VK_SUCCESS) {
+            frame->ts_xfer_armed = false;
+            if (res == VK_ERROR_DEVICE_LOST) {
+                vulkan_report_device_fault(vk, "vkQueueSubmit2 (transfer DMA)");
+            }
             VkSemaphoreWaitInfo drain = {
                 .sType          = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
                 .semaphoreCount = 1u,
@@ -400,7 +420,9 @@ int frame_submit_slot_commands(VulkanContext *vk, FrameSlot *frame, VkSemaphore 
                     vulkan_vkresult_to_str(res), (int)res);
             return -1;
         }
-        frame_state.last_transfer_acquire_point = signal_point;
+        frame_state.last_acquire_signal_point = signal_point;
+        frame_state.last_acquire_signal_queue = vk->queues.transfer_queue;
+        frame_state.gpu_submits++;
         return 0;
     }
 
@@ -418,14 +440,15 @@ int frame_submit_slot_commands(VulkanContext *vk, FrameSlot *frame, VkSemaphore 
             .stageMask = wait_stage,
         };
     }
-    if (frame_state.last_transfer_acquire_point != 0u &&
-        frame_state.last_transfer_acquire_point < signal_point &&
-        (!has_wait || frame_state.last_transfer_acquire_point > wait_point)) {
+    if (frame_state.last_acquire_signal_point != 0u &&
+        frame_state.last_acquire_signal_point < signal_point &&
+        frame_state.last_acquire_signal_queue != vk->queues.graphics_queue &&
+        (!has_wait || frame_state.last_acquire_signal_point > wait_point)) {
         waits[wait_count++] = (VkSemaphoreSubmitInfo){
             .sType     = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
             .semaphore = acquire,
-            .value     = frame_state.last_transfer_acquire_point,
-            .stageMask = VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT,
+            .value     = frame_state.last_acquire_signal_point,
+            .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
         };
     }
     VkSemaphoreSubmitInfo signal_infos[2] = {
@@ -453,9 +476,15 @@ int frame_submit_slot_commands(VulkanContext *vk, FrameSlot *frame, VkSemaphore 
     };
     VkResult res = vkQueueSubmit2(vk->queues.graphics_queue, 1u, &submit_info, VK_NULL_HANDLE);
     if (res != VK_SUCCESS) {
+        if (res == VK_ERROR_DEVICE_LOST) {
+            vulkan_report_device_fault(vk, "vkQueueSubmit2 (graphics)");
+        }
         fprintf(stderr, "[Engine Error] vkQueueSubmit2 failed: %s (%d)\n",
                 vulkan_vkresult_to_str(res), (int)res);
         return -1;
     }
+    frame_state.last_acquire_signal_point = signal_point;
+    frame_state.last_acquire_signal_queue = vk->queues.graphics_queue;
+    frame_state.gpu_submits++;
     return 0;
 }

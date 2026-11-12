@@ -91,42 +91,51 @@ static int install_resize(WaylandContext *wl, VulkanContext *vk) {
 
     if (retire_pixels(wl, vk, shown()) != 0) {
         fprintf(stderr,
-                "[Engine Error] Resize installed over a held image. Old Vulkan handles were left alive.\n");
-        clear_pixels(shown());
+                "[Engine Error] Resize orphan table full (%u held); dropping replacement frame.\n",
+                frame_state.orphan_count);
+        reap_frame_resources(wl, vk, &fresh);
+        return -1;
     }
 
-    shown()->image           = fresh.image;
-    shown()->image_view      = fresh.image_view;
-    shown()->prime_image     = fresh.prime_image;
-    shown()->prime_memory    = fresh.prime_memory;
-    shown()->prime_view      = fresh.prime_view;
-    shown()->view_format      = fresh.view_format;
-    shown()->targets          = fresh.targets;
-    shown()->cmd_buf          = fresh.cmd_buf;
-    shown()->transfer_cmd_buf = fresh.transfer_cmd_buf;
-    shown()->surface_damage   = fresh.surface_damage;
-    shown()->copy_damage      = fresh.copy_damage;
-    shown()->acquire_point    = fresh.acquire_point;
-    shown()->wl_buffer_id    = fresh.wl_buffer_id;
-    shown()->foreign_owned   = fresh.foreign_owned;
-    shown()->release_pending = true;
-    shown()->release_point   = rel;
+    shown()->image             = fresh.image;
+    shown()->image_view        = fresh.image_view;
+    shown()->prime_image       = fresh.prime_image;
+    shown()->prime_memory      = fresh.prime_memory;
+    shown()->prime_view        = fresh.prime_view;
+    shown()->view_format       = fresh.view_format;
+    shown()->targets           = fresh.targets;
+    shown()->cmd_buf           = fresh.cmd_buf;
+    shown()->transfer_cmd_buf  = fresh.transfer_cmd_buf;
+    shown()->surface_damage    = fresh.surface_damage;
+    shown()->copy_damage       = fresh.copy_damage;
+    shown()->stale_rect        = fresh.stale_rect;
+    shown()->has_valid_history = fresh.has_valid_history;
+    shown()->acquire_point     = fresh.acquire_point;
+    shown()->wl_buffer_id      = fresh.wl_buffer_id;
+    shown()->foreign_owned     = fresh.foreign_owned;
+    shown()->release_pending   = true;
+    shown()->release_point     = rel;
     if (wl != nullptr) {
         wl->release_timeline_id = shown()->release_timeline_id;
         wl->buffer_id           = fresh.wl_buffer_id;
+        if ((wl->toplevel_states & (ENG_TOP_MAXIMIZED | ENG_TOP_FULLSCREEN | ENG_TOP_TILED_MASK)) == 0u) {
+            wl->floating_width  = frame_state.window_w;
+            wl->floating_height = frame_state.window_h;
+        }
     }
 
     if (frame_state.same_repaint) {
         frame_state.same_repaint = false;
         printf("[Chrome] Repainted %ux%u\n", shown()->image.width, shown()->image.height);
     } else {
-        printf("[Engine] Resized buffer to %ux%u (serial=%u), modifier=0x%llx (%s tranche), stride=%zu, explicit-sync acquire=%llu release=%llu timeline=%u\n",
+        printf("[Engine] Resized buffer to %ux%u (serial=%u), modifier=0x%llx (%s tranche), stride=%zu, %s acquire=%llu release=%llu timeline=%u\n",
                shown()->image.width,
                shown()->image.height,
                serial,
                (unsigned long long)shown()->image.drm_format_modifier,
                tranche[0] != '\0' ? tranche : "general",
                (size_t)shown()->image.row_pitch,
+               frame_state.implicit_dmabuf_sync ? "implicit-dmabuf-sync" : "explicit-sync",
                (unsigned long long)frame_state.sync_point,
                (unsigned long long)shown()->release_point,
                shown()->release_timeline_id);
@@ -172,13 +181,17 @@ static int queue_replacement(WaylandContext *wl, VulkanContext *vk, uint32_t wid
     if (frame_state.resize_pending || width == 0 || height == 0 ||
         frame_state.acquire == VK_NULL_HANDLE ||
         frame_state.acquire_sync == VK_NULL_HANDLE ||
-        frame_state.acquire_handle == 0 ||
-        shown()->release_timeline_id == 0 ||
-        shown()->release_handle == 0) {
+        (!frame_state.implicit_dmabuf_sync &&
+         (frame_state.acquire_handle == 0 ||
+          shown()->release_timeline_id == 0 ||
+          shown()->release_handle == 0))) {
         return -EINVAL;
     }
-    if (make_orphan_room(wl, vk) != 0) {
-        fprintf(stderr, "[Engine Error] Resize refused. Eight release points are still held.\n");
+    if (make_orphan_room(wl, vk) != 0 ||
+        (frame_state.orphan_cap >= k_orphan_max_cap &&
+         frame_state.orphan_count + 2u > k_orphan_max_cap)) {
+        fprintf(stderr, "[Engine Error] Resize refused. %u release points are still held.\n",
+                frame_state.orphan_count);
         return -1;
     }
 
@@ -214,6 +227,7 @@ static int queue_replacement(WaylandContext *wl, VulkanContext *vk, uint32_t wid
 
     const uint32_t previous_buffer = shown()->wl_buffer_id;
     uint32_t new_buffer = 0;
+    uint32_t fourcc = wayland_drm_fourcc_for_modifier(wl, fresh.image.drm_format_modifier, true);
     int imported = wayland_import_dmabuf_immed(
         wl,
         fresh.image.dmabuf_fd,
@@ -221,7 +235,7 @@ static int queue_replacement(WaylandContext *wl, VulkanContext *vk, uint32_t wid
         fresh.image.height,
         (uint32_t)fresh.image.row_pitch,
         (uint32_t)fresh.image.offset,
-        ENG_DRM_FORMAT_ARGB8888,
+        fourcc,
         fresh.image.drm_format_modifier,
         &new_buffer);
     wl->buffer_id = previous_buffer;
@@ -271,6 +285,8 @@ static int queue_replacement(WaylandContext *wl, VulkanContext *vk, uint32_t wid
     snprintf(frame_state.resize_tranche, sizeof frame_state.resize_tranche, "%s", tranche_kind != nullptr ? tranche_kind : "general");
     frame_state.same_repaint = same_repaint;
     frame_state.resize_pending = true;
+    frame_state.loop_was_busy = true;
+    frame_state.turn_frames++;
     return 0;
 }
 
@@ -284,10 +300,15 @@ int queue_resize_frame(WaylandContext *wl, VulkanContext *vk) {
 int queue_chrome_repaint(WaylandContext *wl, VulkanContext *vk) {
     uint32_t top = 0;
     uint32_t bottom = 0;
-    chrome_band_thickness(&top, &bottom);
+    if (wl == nullptr || wl->decoration_mode != ENG_DECOR_SERVER) {
+        chrome_band_thickness(&top, &bottom);
+    }
     (void)bottom;
-    uint32_t content_h = frame_state.window_h > top ? frame_state.window_h - top : 1u;
-    if (shown()->image.width != frame_state.window_w || shown()->image.height != content_h ||
+    uint32_t s120          = wayland_effective_scale_120(wl);
+    uint32_t log_content_h = frame_state.window_h > top ? frame_state.window_h - top : 1u;
+    uint32_t phys_w        = wayland_phys_px(frame_state.window_w, s120);
+    uint32_t phys_h        = wayland_phys_px(log_content_h, s120);
+    if (shown()->image.width != phys_w || shown()->image.height != phys_h ||
         top != frame_state.bar_px) {
         return queue_replacement(wl, vk, frame_state.window_w, frame_state.window_h, false, 0, true);
     }
@@ -299,4 +320,14 @@ int queue_chrome_repaint(WaylandContext *wl, VulkanContext *vk) {
         return -EAGAIN;
     }
     return prepared;
+}
+
+int queue_feedback_realloc(WaylandContext *wl, VulkanContext *vk) {
+    if (wl == nullptr || vk == nullptr ||
+        frame_state.window_w == 0 || frame_state.window_h == 0) {
+        return -EINVAL;
+    }
+    retire_spare(wl, vk);
+    return queue_replacement(wl, vk, frame_state.window_w, frame_state.window_h,
+                             false, 0u, true);
 }

@@ -86,16 +86,6 @@ static float            s_elev_base_m    = 0.0f;
 static float            s_vert_scale     = 1.0f;
 static uint64_t         s_scene_hiz_bda  = 0ull;
 
-static uint32_t clamp_u32(uint32_t v, uint32_t lo, uint32_t hi) {
-    if (v < lo) {
-        return lo;
-    }
-    if (v > hi) {
-        return hi;
-    }
-    return v;
-}
-
 static VkDeviceSize align_up_size(VkDeviceSize v, VkDeviceSize a) {
     return (v + (a - 1u)) & ~(a - 1u);
 }
@@ -199,18 +189,11 @@ static bool ensure_gi_slab(uint32_t width, uint32_t height) {
     uint32_t target_gi_h  = 0u;
     uint32_t target_hrc_w = 0u;
     uint32_t target_hrc_h = 0u;
-
-    if (s_oracle_mode == LIGHTING_ORACLE_DISCRETE_HIGH) {
-        target_gi_w  = clamp_u32((width  * 3u + 3u) / 4u, 64u, 1440u);
-        target_gi_h  = clamp_u32((height * 3u + 3u) / 4u, 64u, 810u);
-        target_hrc_w = clamp_u32((width  + 3u) / 4u,      16u, 360u);
-        target_hrc_h = clamp_u32((height + 3u) / 4u,      16u, 204u);
-    } else {
-        target_gi_w  = clamp_u32((width  + 1u) / 2u,      64u, 960u);
-        target_gi_h  = clamp_u32((height + 1u) / 2u,      64u, 540u);
-        target_hrc_w = clamp_u32((width  + 7u) / 8u,      16u, 240u);
-        target_hrc_h = clamp_u32((height + 7u) / 8u,      16u, 136u);
-    }
+    uint32_t hrc_offsets[K_LIGHTING_MAX_CASCADES] = {0};
+    const uint32_t ray_off = lighting_compute_hrc_rays(width, height, s_oracle_mode,
+                                                       &target_gi_w, &target_gi_h,
+                                                       &target_hrc_w, &target_hrc_h,
+                                                       hrc_offsets);
 
     if (s_gi_slab.buffer != VK_NULL_HANDLE &&
         s_full_w == width && s_full_h == height &&
@@ -219,15 +202,8 @@ static bool ensure_gi_slab(uint32_t width, uint32_t height) {
         return true;
     }
 
-    uint32_t ray_off = 0u;
     for (uint32_t c = 0u; c < K_LIGHTING_MAX_CASCADES; ++c) {
-        uint32_t cw    = target_hrc_w >> c;
-        uint32_t ch    = target_hrc_h >> c;
-        if (cw == 0u) cw = 1u;
-        if (ch == 0u) ch = 1u;
-        uint32_t m_cnt = 4u << c;
-        s_hrc_offsets[c] = ray_off;
-        ray_off += cw * ch * m_cnt;
+        s_hrc_offsets[c] = hrc_offsets[c];
     }
 
     const VkDeviceSize gbuf_bytes = (VkDeviceSize)target_gi_w * target_gi_h * sizeof(LightingGbufTexel);

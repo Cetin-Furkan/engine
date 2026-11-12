@@ -25,6 +25,9 @@ extern "C" {
 // Prints the queues, features, and DRM nodes of the device that is open.
 void vulkan_device_log(const VulkanContext *ctx);
 
+// Queries VK_EXT_device_fault and BDA slab/heap telemetry after VK_ERROR_DEVICE_LOST.
+void vulkan_report_device_fault(const VulkanContext *ctx, const char *where);
+
 /**
  * @brief Safely destroys the Vulkan logical device.
  *

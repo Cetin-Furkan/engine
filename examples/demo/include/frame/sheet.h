@@ -7,6 +7,8 @@
 #include <stdint.h>
 
 typedef struct SheetGpuStep {
+    uint32_t              soft_index;
+    uint32_t              epoch;
     const AvbdVertex     *verts;
     uint32_t              vert_count;
     const AvbdConstraint *cons;
@@ -69,6 +71,14 @@ void sheet_soft_pos(uint32_t index, uint32_t point, float *x, float *y);
 void sheet_soft_layout(uint32_t index, uint32_t *cols, uint32_t *rows, float *spacing);
 
 void sheet_set_avbd_iterations(uint32_t iterations);
+void sheet_set_gpu_pose_owner(bool gpu_owns);
 bool sheet_pop_gpu_step(SheetGpuStep *out);
+void sheet_cancel_gpu_soft_step(uint32_t soft_index, uint32_t epoch);
+bool sheet_apply_gpu_soft_step(uint32_t          soft_index,
+                               uint32_t          epoch,
+                               const AvbdVertex *verts,
+                               uint32_t          vert_count,
+                               float             dt);
+bool sheet_has_pending_gpu_steps(void);
 
 #endif /* ENGINE_FRAME_SHEET_H */

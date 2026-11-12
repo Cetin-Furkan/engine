@@ -114,6 +114,7 @@ float3 solve_sym3x3_ldlt(float3 h_diag, float3 h_off, float3 rhs) {
 
 void accum_constraint_slm(
     uint              vid,
+    float3            p_self,
     AvbdConstraintGpu con,
     inout float3      h_diag,
     inout float3      h_off,
@@ -125,9 +126,10 @@ void accum_constraint_slm(
     }
 
     if (con.kind == k_con_spring_3d) {
-        float  sgn = (vid == con.vert_b) ? 1.0 : -1.0;
-        float3 d   = s_pos[con.vert_b] - s_pos[con.vert_a];
-        float  len = length(d);
+        bool   is_b = (vid == con.vert_b);
+        float  sgn  = is_b ? 1.0 : -1.0;
+        float3 d    = is_b ? (p_self - s_pos[con.vert_a]) : (s_pos[con.vert_b] - p_self);
+        float  len  = length(d);
         if (len < 1.0e-6) {
             return;
         }
@@ -143,12 +145,12 @@ void accum_constraint_slm(
         h_off  += k_dir * float3(u.x * u.y, u.x * u.z, u.y * u.z);
     } else if (con.kind == k_con_anchor_3d) {
         float3 target = float3(con.nx, con.ny, con.nz);
-        float3 r      = s_pos[vid] - target;
+        float3 r      = p_self - target;
         grad   += k * r + float3(con.lambda0, con.lambda1, con.lambda2);
         h_diag += float3(k);
     } else if (con.kind == k_con_contact_plane) {
         float3 n    = float3(con.nx, con.ny, con.nz);
-        float  gap  = dot(n, s_pos[vid]) - con.rest_or_offset;
+        float  gap  = dot(n, p_self) - con.rest_or_offset;
         float  fhat = k * gap + con.lambda0;
         if (fhat < 0.0) {
             grad   += n * fhat;
@@ -156,9 +158,10 @@ void accum_constraint_slm(
             h_off  += k * float3(n.x * n.y, n.x * n.z, n.y * n.z);
         }
     } else if (con.kind == k_con_contact_pair) {
-        float  sgn  = (vid == con.vert_b) ? 1.0 : -1.0;
+        bool   is_b = (vid == con.vert_b);
+        float  sgn  = is_b ? 1.0 : -1.0;
         float3 n    = float3(con.nx, con.ny, con.nz);
-        float3 d    = s_pos[con.vert_b] - s_pos[con.vert_a];
+        float3 d    = is_b ? (p_self - s_pos[con.vert_a]) : (s_pos[con.vert_b] - p_self);
         float  gap  = dot(n, d) - con.rest_or_offset;
         float  fhat = k * gap + con.lambda0;
         if (fhat < 0.0) {
@@ -232,26 +235,33 @@ void main(uint3 gtid : SV_GroupThreadID) {
     // 2. Fused SLM Primal-Dual Augmented Vertex Block Descent sweeps
     for (uint iter = 0u; iter < iters; ++iter) {
         for (uint col = 0u; col < num_colors; ++col) {
-            uint c_start = hdr->color_start[col];
-            uint c_count = hdr->color_count[col];
+            uint   c_start = hdr->color_start[col];
+            uint   c_count = hdr->color_count[col];
+            uint   vid     = 0u;
+            float3 p_next  = float3(0.0);
             if (tid < c_count) {
-                uint   vid    = color_verts[c_start + tid];
+                vid           = color_verts[c_start + tid];
+                float3 p_self = s_pos[vid];
                 float  alpha  = 1.0 / (s_inv_m[vid] * dt2 + 1.0e-20);
                 float3 h_diag = float3(alpha);
                 float3 h_off  = float3(0.0);
-                float3 grad   = alpha * (s_pos[vid] - s_inert_y[vid]);
+                float3 grad   = alpha * (p_self - s_inert_y[vid]);
 
                 uint e_beg = csr_row[vid];
                 uint e_end = csr_row[vid + 1u];
                 for (uint e = e_beg; e < e_end; ++e) {
                     uint cid = csr_col[e];
                     if (cid < con_count) {
-                        accum_constraint_slm(vid, cons[cid], h_diag, h_off, grad);
+                        accum_constraint_slm(vid, p_self, cons[cid], h_diag, h_off, grad);
                     }
                 }
 
-                float3 dx   = solve_sym3x3_ldlt(h_diag, h_off, -grad);
-                s_pos[vid] += dx;
+                float3 dx = solve_sym3x3_ldlt(h_diag, h_off, -grad);
+                p_next    = p_self + dx;
+            }
+            GroupMemoryBarrierWithGroupSync();
+            if (tid < c_count) {
+                s_pos[vid] = p_next;
             }
             GroupMemoryBarrierWithGroupSync();
         }

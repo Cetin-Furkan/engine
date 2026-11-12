@@ -121,6 +121,24 @@ static bool    s_drew  = false;
 static int     s_sel   = k_sel_none;
 static uint32_t s_sel_i = 0;
 
+static bool     s_gpu_pose_owner = false;
+static uint32_t s_sheet_epoch    = 1u;
+static uint32_t s_gpu_busy_mask  = 0u;
+static float    s_soft_def_dt[k_soft_cap];
+static uint32_t s_gpu_queued     = 0u;
+static uint32_t s_gpu_read       = 0u;
+
+static void bump_sheet_epoch_all(void) {
+    s_sheet_epoch++;
+    if (s_sheet_epoch == 0u) {
+        s_sheet_epoch = 1u;
+    }
+    s_gpu_busy_mask = 0u;
+    s_gpu_queued    = 0u;
+    s_gpu_read      = 0u;
+    memset(s_soft_def_dt, 0, sizeof s_soft_def_dt);
+}
+
 static void mark_moved(void) {
     s_moved = true;
     s_drew = true;
@@ -534,6 +552,7 @@ int sheet_load_memory(const char *text, size_t n) {
     s_ready = true;
     s_sel = k_sel_none;
     s_moved = false;
+    bump_sheet_epoch_all();
     return 0;
 }
 
@@ -580,6 +599,7 @@ int sheet_load_path(const char *path) {
     s_ready = true;
     s_sel = k_sel_none;
     s_moved = false;
+    bump_sheet_epoch_all();
     note_loaded(path);
     return 0;
 }
@@ -821,6 +841,7 @@ int sheet_load(void) {
         s_ready = true;
         s_sel   = k_sel_none;
         s_moved = false;
+        bump_sheet_epoch_all();
         return 0;
     }
     char path[1024];
@@ -1108,7 +1129,9 @@ static void cap_speed(float *vx, float *vy) {
     }
 }
 
-static uint32_t s_avbd_iters = 4u;
+static uint32_t       s_avbd_iters = 4u;
+static uint32_t       s_gpu_soft_idx[k_soft_cap];
+static uint32_t       s_gpu_epoch[k_soft_cap];
 static AvbdVertex     s_gpu_verts[k_soft_cap][K_AVBD_MAX_VERTS];
 static AvbdConstraint s_gpu_cons[k_soft_cap][K_AVBD_MAX_CONS];
 static uint32_t       s_gpu_vn[k_soft_cap];
@@ -1117,11 +1140,20 @@ static float          s_gpu_dt[k_soft_cap];
 static float          s_gpu_gx[k_soft_cap];
 static float          s_gpu_gy[k_soft_cap];
 static float          s_gpu_keep[k_soft_cap];
-static uint32_t       s_gpu_queued = 0u;
-static uint32_t       s_gpu_read   = 0u;
 
 void sheet_set_avbd_iterations(uint32_t iterations) {
     s_avbd_iters = (iterations >= 1u && iterations <= 32u) ? iterations : 4u;
+}
+
+void sheet_set_gpu_pose_owner(bool gpu_owns) {
+    if (s_gpu_pose_owner != gpu_owns) {
+        s_gpu_pose_owner = gpu_owns;
+        bump_sheet_epoch_all();
+    }
+}
+
+bool sheet_has_pending_gpu_steps(void) {
+    return s_gpu_read < s_gpu_queued;
 }
 
 bool sheet_pop_gpu_step(SheetGpuStep *out) {
@@ -1132,6 +1164,8 @@ bool sheet_pop_gpu_step(SheetGpuStep *out) {
     }
     uint32_t idx = s_gpu_read++;
     *out = (SheetGpuStep){
+        .soft_index = s_gpu_soft_idx[idx],
+        .epoch      = s_gpu_epoch[idx],
         .verts      = s_gpu_verts[idx],
         .vert_count = s_gpu_vn[idx],
         .cons       = s_gpu_cons[idx],
@@ -1145,6 +1179,12 @@ bool sheet_pop_gpu_step(SheetGpuStep *out) {
         s_gpu_queued = 0u;
     }
     return true;
+}
+
+void sheet_cancel_gpu_soft_step(uint32_t soft_index, uint32_t epoch) {
+    if (soft_index < k_soft_cap && epoch == s_sheet_epoch) {
+        s_gpu_busy_mask &= ~(1u << soft_index);
+    }
 }
 
 static float soft_strain(const Soft *p) {
@@ -1308,6 +1348,9 @@ static void clamp_bounds(void) {
         }
     }
     for (uint32_t i = 0; i < k_soft_cap; ++i) {
+        if (s_gpu_pose_owner) {
+            continue;
+        }
         Soft *p = &s_sheet.soft[i];
         if (!p->alive || !p->awake) {
             continue;
@@ -1333,7 +1376,36 @@ static void clamp_bounds(void) {
     }
 }
 
+static void clamp_soft_bounds_one(Soft *p) {
+    if (!s_sheet.has_bounds || p == nullptr || !p->alive || !p->awake) {
+        return;
+    }
+    float bx = s_sheet.bound_x;
+    float by = s_sheet.bound_y;
+    uint32_t count = p->cols * p->rows;
+    float e = p->bounce;
+    for (uint32_t k = 0; k < count; ++k) {
+        if (p->x[k] < -bx) {
+            p->x[k] = -bx;
+            if (p->vx[k] < 0.0f) p->vx[k] = (-p->vx[k] > k_sleep * 2.5f) ? -p->vx[k] * e : 0.0f;
+        } else if (p->x[k] > bx) {
+            p->x[k] = bx;
+            if (p->vx[k] > 0.0f) p->vx[k] = (p->vx[k] > k_sleep * 2.5f) ? -p->vx[k] * e : 0.0f;
+        }
+        if (p->y[k] < -by) {
+            p->y[k] = -by;
+            if (p->vy[k] < 0.0f) p->vy[k] = (-p->vy[k] > k_sleep * 2.5f) ? -p->vy[k] * e : 0.0f;
+        } else if (p->y[k] > by) {
+            p->y[k] = by;
+            if (p->vy[k] > 0.0f) p->vy[k] = (p->vy[k] > k_sleep * 2.5f) ? -p->vy[k] * e : 0.0f;
+        }
+    }
+}
+
 static bool any_hot(void) {
+    if (s_gpu_pose_owner && (s_gpu_busy_mask != 0u || s_gpu_read < s_gpu_queued)) {
+        return true;
+    }
     Poly solids[k_poly_cap];
     uint32_t n = gather(solids);
     for (uint32_t i = 0; i < n; ++i) {
@@ -1427,8 +1499,6 @@ bool sheet_integrate(float dt) {
         d->y += d->vy * dt;
         mark_moved();
     }
-    s_gpu_queued = 0u;
-    s_gpu_read   = 0u;
     for (uint32_t i = 0; i < k_soft_cap; ++i) {
         Soft *p = &s_sheet.soft[i];
         if (!p->alive || !p->awake) {
@@ -1437,28 +1507,47 @@ bool sheet_integrate(float dt) {
         uint32_t count = p->cols * p->rows;
         float damp_r = p->damp > 0.0f ? p->damp : k_soft_damp;
         float stiff  = p->spring > 0.0f ? p->spring : k_spring;
-        uint32_t qslot = s_gpu_queued < k_soft_cap ? s_gpu_queued : 0u;
-        uint32_t gvn = 0u;
-        uint32_t gcn = 0u;
+
+        if (s_gpu_pose_owner) {
+            s_soft_def_dt[i] += dt;
+            if (s_soft_def_dt[i] > 0.040f) {
+                s_soft_def_dt[i] = 0.040f;
+            }
+            if ((s_gpu_busy_mask & (1u << i)) == 0u && s_gpu_queued < k_soft_cap) {
+                float step_dt = s_soft_def_dt[i] > 0.016f ? 0.016f : s_soft_def_dt[i];
+                s_soft_def_dt[i] -= step_dt;
+                uint32_t qslot = s_gpu_queued;
+                uint32_t gvn   = 0u;
+                uint32_t gcn   = 0u;
+                avbd_prepare_soft_grid_2d(p->x, p->y, p->vx, p->vy,
+                                          p->cols, p->rows, p->spacing, stiff,
+                                          s_gpu_verts[qslot], &gvn,
+                                          s_gpu_cons[qslot], &gcn);
+                if (gvn > 0u) {
+                    s_gpu_soft_idx[qslot] = i;
+                    s_gpu_epoch[qslot]    = s_sheet_epoch;
+                    s_gpu_vn[qslot]       = gvn;
+                    s_gpu_cn[qslot]       = gcn;
+                    s_gpu_dt[qslot]       = step_dt;
+                    s_gpu_gx[qslot]       = gx;
+                    s_gpu_gy[qslot]       = gy;
+                    s_gpu_keep[qslot]     = expf(-damp_r * step_dt);
+                    s_gpu_queued++;
+                    s_gpu_busy_mask |= (1u << i);
+                }
+            }
+            continue;
+        }
+
         avbd_step_soft_grid_2d(p->x, p->y, p->vx, p->vy,
                                p->cols, p->rows, p->spacing,
                                stiff, damp_r, gx, gy, dt, s_avbd_iters,
-                               s_gpu_verts[qslot], &gvn,
-                               s_gpu_cons[qslot], &gcn);
-        if (gvn > 0u && s_gpu_queued < k_soft_cap) {
-            s_gpu_vn[qslot]   = gvn;
-            s_gpu_cn[qslot]   = gcn;
-            s_gpu_dt[qslot]   = dt;
-            s_gpu_gx[qslot]   = gx;
-            s_gpu_gy[qslot]   = gy;
-            s_gpu_keep[qslot] = expf(-damp_r * dt);
-            s_gpu_queued++;
-        }
+                               nullptr, nullptr, nullptr, nullptr);
         for (uint32_t k = 0; k < count; ++k) {
             cap_speed(&p->vx[k], &p->vy[k]);
             if (!finite2(p->x[k], p->y[k])) {
-                p->x[k] = p->ox + p->rx[k];
-                p->y[k] = p->oy + p->ry[k];
+                p->x[k]  = p->ox + p->rx[k];
+                p->y[k]  = p->oy + p->ry[k];
                 p->vx[k] = 0.0f;
                 p->vy[k] = 0.0f;
             }
@@ -1476,19 +1565,69 @@ bool sheet_integrate(float dt) {
         }
         clamp_bounds();
     }
-    for (uint32_t i = 0; i < k_soft_cap; ++i) {
-        if (s_sheet.soft[i].alive) {
-            push_soft_out(&s_sheet.soft[i]);
+    if (!s_gpu_pose_owner) {
+        for (uint32_t i = 0; i < k_soft_cap; ++i) {
+            if (s_sheet.soft[i].alive) {
+                push_soft_out(&s_sheet.soft[i]);
+            }
         }
+        clamp_bounds();
     }
-    clamp_bounds();
     fall_asleep();
     return sheet_busy();
+}
+
+bool sheet_apply_gpu_soft_step(uint32_t          soft_index,
+                               uint32_t          epoch,
+                               const AvbdVertex *verts,
+                               uint32_t          vert_count,
+                               float             dt) {
+    (void)dt;
+    if (!s_ready || soft_index >= k_soft_cap || epoch != s_sheet_epoch || verts == nullptr) {
+        return false;
+    }
+    s_gpu_busy_mask &= ~(1u << soft_index);
+    Soft *p = &s_sheet.soft[soft_index];
+    if (!p->alive) {
+        return false;
+    }
+    uint32_t count = p->cols * p->rows;
+    if (count == 0u || vert_count < count) {
+        return false;
+    }
+    for (uint32_t k = 0u; k < count; ++k) {
+        p->x[k]  = verts[k].pos[0];
+        p->y[k]  = verts[k].pos[1];
+        p->vx[k] = verts[k].vel[0];
+        p->vy[k] = verts[k].vel[1];
+        cap_speed(&p->vx[k], &p->vy[k]);
+        if (!finite2(p->x[k], p->y[k])) {
+            p->x[k]  = p->ox + p->rx[k];
+            p->y[k]  = p->oy + p->ry[k];
+            p->vx[k] = 0.0f;
+            p->vy[k] = 0.0f;
+        }
+    }
+    p->awake = true;
+    push_soft_out(p);
+    clamp_soft_bounds_one(p);
+    mark_moved();
+    fall_asleep();
+    if (s_moved && !sheet_busy()) {
+        printf("[Sheet] The sheet is resting.\n");
+        fflush(stdout);
+        (void)sheet_save();
+        s_moved = false;
+    }
+    return true;
 }
 
 bool sheet_busy(void) {
     if (!s_ready) {
         return false;
+    }
+    if (s_gpu_pose_owner && (s_gpu_busy_mask != 0u || s_gpu_read < s_gpu_queued)) {
+        return true;
     }
     for (uint32_t i = 0; i < k_rigid_cap; ++i) {
         if (s_sheet.rigid[i].alive && s_sheet.rigid[i].awake) {
@@ -1674,6 +1813,7 @@ static bool click_soft(float x, float y) {
         }
     }
     p->awake = true;
+    bump_sheet_epoch_all();
     mark_moved();
     return true;
 }
@@ -1725,6 +1865,7 @@ bool sheet_delete(void) {
     } else if (s_sel == k_sel_soft) {
         s_sheet.soft[s_sel_i].alive = false;
         s_sheet.soft[s_sel_i].awake = false;
+        bump_sheet_epoch_all();
     } else if (s_sel == k_sel_dyn) {
         s_sheet.dyn[s_sel_i].alive = false;
         s_sheet.dyn[s_sel_i].awake = false;
@@ -1935,6 +2076,7 @@ void sheet_soft_move(uint32_t index, uint32_t point, float dx, float dy) {
                 p->x[point] += dx;
                 p->y[point] += dy;
                 p->awake = true;
+                bump_sheet_epoch_all();
             }
             return;
         }

@@ -32,12 +32,11 @@ unsigned ring_submit(RingContext *r) {
         fprintf(stderr, "[Ring] SQ dropped: %u submission(s) never ran\n", dropped);
     }
     unsigned n = r->sq_pending;
-    if (n == 0) {
-        return 0;
+    if (n > 0) {
+        uint32_t tail = r->sq_tail + n;
+        __atomic_store_n(r->sq_ktail, tail, __ATOMIC_RELEASE);
+        r->sq_tail    = tail;
+        r->sq_pending = 0;
     }
-    uint32_t tail = r->sq_tail + n;
-    __atomic_store_n(r->sq_ktail, tail, __ATOMIC_RELEASE);
-    r->sq_tail    = tail;
-    r->sq_pending = 0;
-    return n;
+    return r->sq_tail - __atomic_load_n(r->sq_khead, __ATOMIC_ACQUIRE);
 }

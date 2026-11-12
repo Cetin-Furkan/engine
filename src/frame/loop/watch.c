@@ -9,14 +9,56 @@ static uint8_t *inotify_bytes(void) {
     return ring_fixed_ptr(ring_get_context(), ENG_FBUF_INOTIFY);
 }
 
+static bool split_watch_path(const char *path, char *out_dir, size_t dir_cap,
+                             char *out_base, size_t base_cap) {
+    if (path == nullptr || path[0] == '\0' || out_dir == nullptr || out_base == nullptr ||
+        dir_cap == 0u || base_cap == 0u) {
+        return false;
+    }
+    const char *slash = strrchr(path, '/');
+    const char *base  = nullptr;
+    if (slash == nullptr) {
+        if (dir_cap < 2u) {
+            return false;
+        }
+        out_dir[0] = '.';
+        out_dir[1] = '\0';
+        base = path;
+    } else if (slash == path) {
+        if (dir_cap < 2u) {
+            return false;
+        }
+        out_dir[0] = '/';
+        out_dir[1] = '\0';
+        base = slash + 1;
+    } else {
+        size_t dir_len = (size_t)(slash - path);
+        if (dir_len >= dir_cap) {
+            return false;
+        }
+        memcpy(out_dir, path, dir_len);
+        out_dir[dir_len] = '\0';
+        base = slash + 1;
+    }
+    size_t base_len = strlen(base);
+    if (base_len == 0u || base_len >= base_cap) {
+        return false;
+    }
+    memcpy(out_base, base, base_len + 1u);
+    return true;
+}
+
 void ensure_inotify_watch(void) {
     if (frame_state.inotify_fd < 0) {
         return;
     }
     if (frame_state.inotify_wd < 0) {
         const ChromeSpec *spec = chrome_spec();
-        if (spec != nullptr && spec->path[0] != '\0') {
-            int wd = inotify_add_watch(frame_state.inotify_fd, spec->path, k_inotify_mask);
+        char dir[256];
+        char base[128];
+        if (spec != nullptr && spec->path[0] != '\0' &&
+            split_watch_path(spec->path, dir, sizeof(dir), base, sizeof(base))) {
+            int wd = inotify_add_watch(frame_state.inotify_fd, dir, k_inotify_mask);
             if (wd < 0) {
                 if (!frame_state.inotify_warned) {
                     fprintf(stderr, "[Chrome] inotify watch failed: %s\n", strerror(errno));
@@ -24,30 +66,46 @@ void ensure_inotify_watch(void) {
                 }
             } else {
                 frame_state.inotify_wd = wd;
+                snprintf(frame_state.chrome_watch_base, sizeof(frame_state.chrome_watch_base),
+                         "%s", base);
             }
         }
     }
-    const char *app_path = (engine_app()->watched_path != nullptr)
+    const char *app_path = (engine_app() != nullptr && engine_app()->watched_path != nullptr)
         ? engine_app()->watched_path()
         : nullptr;
     if (app_path == nullptr || app_path[0] == '\0') {
         if (frame_state.world_wd >= 0) {
-            (void)inotify_rm_watch(frame_state.inotify_fd, frame_state.world_wd);
+            if (frame_state.world_wd != frame_state.inotify_wd) {
+                (void)inotify_rm_watch(frame_state.inotify_fd, frame_state.world_wd);
+            }
             frame_state.world_wd = -1;
         }
         frame_state.world_watch_path[0] = '\0';
+        frame_state.world_watch_dir[0]  = '\0';
+        frame_state.world_watch_base[0] = '\0';
     } else {
         if (frame_state.world_wd >= 0 &&
             strcmp(frame_state.world_watch_path, app_path) != 0) {
-            (void)inotify_rm_watch(frame_state.inotify_fd, frame_state.world_wd);
+            if (frame_state.world_wd != frame_state.inotify_wd) {
+                (void)inotify_rm_watch(frame_state.inotify_fd, frame_state.world_wd);
+            }
             frame_state.world_wd = -1;
         }
         if (frame_state.world_wd < 0) {
-            int wd = inotify_add_watch(frame_state.inotify_fd, app_path, k_inotify_mask);
-            if (wd >= 0) {
-                frame_state.world_wd = wd;
-                snprintf(frame_state.world_watch_path, sizeof(frame_state.world_watch_path),
-                         "%s", app_path);
+            char dir[256];
+            char base[128];
+            if (split_watch_path(app_path, dir, sizeof(dir), base, sizeof(base))) {
+                int wd = inotify_add_watch(frame_state.inotify_fd, dir, k_inotify_mask);
+                if (wd >= 0) {
+                    frame_state.world_wd = wd;
+                    snprintf(frame_state.world_watch_path, sizeof(frame_state.world_watch_path),
+                             "%s", app_path);
+                    snprintf(frame_state.world_watch_dir, sizeof(frame_state.world_watch_dir),
+                             "%s", dir);
+                    snprintf(frame_state.world_watch_base, sizeof(frame_state.world_watch_base),
+                             "%s", base);
+                }
             }
         }
     }
@@ -66,21 +124,38 @@ static void absorb_inotify(int32_t res) {
         if (off + (int)step > res) {
             break;
         }
-        if (ev->wd == frame_state.world_wd && frame_state.world_wd >= 0) {
-            if ((ev->mask & (IN_IGNORED | IN_DELETE_SELF | IN_MOVE_SELF)) != 0) {
-                dropped = true;
-                frame_state.world_wd = -1;
-            }
-            if ((ev->mask & (k_inotify_mask | IN_IGNORED)) != 0) {
+        if ((ev->mask & IN_Q_OVERFLOW) != 0u) {
+            frame_state.chrome_dirty = true;
+            if (frame_state.world_wd >= 0) {
                 frame_state.world_dirty = true;
             }
-        } else {
-            if ((ev->mask & (IN_IGNORED | IN_DELETE_SELF | IN_MOVE_SELF | IN_Q_OVERFLOW)) != 0) {
-                dropped = true;
+            off += (int)step;
+            continue;
+        }
+        bool match_chrome = (frame_state.inotify_wd >= 0 && ev->wd == frame_state.inotify_wd);
+        bool match_world  = (frame_state.world_wd >= 0 && ev->wd == frame_state.world_wd);
+        if (!match_chrome && !match_world) {
+            off += (int)step;
+            continue;
+        }
+        if ((ev->mask & (IN_IGNORED | IN_DELETE_SELF | IN_MOVE_SELF)) != 0u) {
+            if (match_chrome) {
                 frame_state.inotify_wd = -1;
             }
-            if ((ev->mask & (k_inotify_mask | IN_IGNORED | IN_Q_OVERFLOW)) != 0) {
+            if (match_world) {
+                frame_state.world_wd = -1;
+            }
+            dropped = true;
+        }
+        if ((ev->mask & k_inotify_mask) != 0u && ev->len > 0u &&
+            strnlen(ev->name, ev->len) < ev->len && ev->name[0] != '\0') {
+            if (match_chrome && frame_state.chrome_watch_base[0] != '\0' &&
+                strcmp(ev->name, frame_state.chrome_watch_base) == 0) {
                 frame_state.chrome_dirty = true;
+            }
+            if (match_world && frame_state.world_watch_base[0] != '\0' &&
+                strcmp(ev->name, frame_state.world_watch_base) == 0) {
+                frame_state.world_dirty = true;
             }
         }
         off += (int)step;
@@ -123,7 +198,7 @@ void start_inotify(RingContext *ring, bool *armed) {
     if (spec == nullptr || spec->path[0] == '\0') {
         return;
     }
-    int fd = inotify_init1(IN_CLOEXEC);
+    int fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
     if (fd < 0) {
         if (!frame_state.inotify_warned) {
             fprintf(stderr, "[Chrome] inotify unavailable: %s\n", strerror(errno));
@@ -135,7 +210,10 @@ void start_inotify(RingContext *ring, bool *armed) {
     frame_state.inotify_wd = -1;
     frame_state.world_wd = -1;
     frame_state.world_dirty = false;
+    frame_state.chrome_watch_base[0] = '\0';
     frame_state.world_watch_path[0] = '\0';
+    frame_state.world_watch_dir[0] = '\0';
+    frame_state.world_watch_base[0] = '\0';
     frame_state.inotify_fixed = false;
     ensure_inotify_watch();
     if (frame_state.inotify_wd < 0 && frame_state.world_wd < 0) {
@@ -200,7 +278,10 @@ void engine_reload_cqe(const struct io_uring_cqe *cqe, void *user) {
     }
     // The simulation timer and the frame watchdog share this ring. Running
     // either inside a file-load wait would encode Wayland mid-batch.
-    if (cqe->user_data == ENG_UD_SIM_TIMER || cqe->user_data == ENG_UD_FRAME_TIMER) {
+    if (ring_ud_tag(cqe->user_data) == (uint16_t)ENG_UD_SIM_TIMER ||
+        cqe->user_data == ENG_UD_SIM_CANCEL ||
+        cqe->user_data == ENG_UD_FRAME_TIMER ||
+        cqe->user_data == ENG_UD_TIMER_UPDATE) {
         if (wl != nullptr) {
             wayland_on_cqe(wl, cqe);
         }
@@ -208,7 +289,8 @@ void engine_reload_cqe(const struct io_uring_cqe *cqe, void *user) {
     }
     if (wl != nullptr) {
         wayland_on_cqe(wl, cqe);
-    } else if (ring_ud_is_pager(cqe->user_data) && engine_app()->on_cqe != nullptr) {
+    } else if (ring_ud_is_pager(cqe->user_data) &&
+               engine_app() != nullptr && engine_app()->on_cqe != nullptr) {
         if (engine_app()->on_cqe(cqe)) {
             frame_note_picture();
         }
@@ -235,8 +317,8 @@ bool engine_relay_end(EngineRelay *relay, WaylandContext *wl, VulkanContext *vk,
     frame_state.relay = nullptr;
     if (relay->stolen_send) {
         int noted = finish_idle_send(wl, vk, &relay->stolen_cqe, pending_serial);
+        *send_in_flight = false;
         if (noted < 0) {
-            *send_in_flight = false;
             *run_rc = 1;
             *why = wl->err[0] != '\0' ? wl->err : "wayland send failed";
             return true;

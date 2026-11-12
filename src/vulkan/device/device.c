@@ -1,4 +1,6 @@
 #include "vulkan/device.h"
+#include "vulkan/bda.h"
+#include "vulkan/memory.h"
 #include "vulkan/pipe.h"
 #include "chrome/gpu.h"
 #include <errno.h>
@@ -54,16 +56,23 @@ typedef struct GpuCandidate {
     bool                             supports_anisotropy;
     bool                             supports_dyn_render;
     bool                             supports_sync2;
+    bool                             supports_pipeline_cache_control;
     bool                             supports_timeline;
     bool                             supports_maintenance5;
     bool                             supports_maintenance6;
     bool                             supports_push_descriptors;
     bool                             supports_host_image_copy;
     bool                             supports_dynamic_rendering_local_read;
+    bool                             supports_shader_int8;
     bool                             supports_shader_int16;
     bool                             supports_shader_int64;
+    bool                             supports_storage_buffer_8bit;
     bool                             supports_storage_buffer_16bit;
     bool                             supports_shader_float16;
+    bool                             supports_vulkan_memory_model;
+    bool                             supports_vulkan_memory_model_device_scope;
+    bool                             supports_fragment_stores_atomics;
+    bool                             supports_vertex_stores_atomics;
     bool                             supports_shader_expect_assume;
     bool                             supports_shader_float_controls2;
     bool                             supports_shader_subgroup_rotate;
@@ -75,6 +84,13 @@ typedef struct GpuCandidate {
     bool                             supports_draw_indirect_first_instance;
     bool                             supports_acceleration_structure;
     bool                             supports_ray_query;
+    bool                             supports_host_query_reset;
+    bool                             supports_memory_budget;
+    bool                             supports_memory_priority;
+    bool                             supports_pageable_device_memory;
+    bool                             supports_unified_image_layouts;
+    bool                             supports_device_fault;
+    bool                             supports_device_fault_vendor_binary;
 
     bool                             has_drm_primary;
     bool                             has_drm_render;
@@ -401,6 +417,8 @@ static uint32_t score_candidate(const GpuCandidate *candidate) {
     if (candidate->supports_maintenance5)                  score += 500;
     if (candidate->supports_host_image_copy)               score += 500;
     if (candidate->supports_dynamic_rendering_local_read)  score += 500;
+    if (candidate->supports_unified_image_layouts)         score += 250;
+    if (candidate->supports_pageable_device_memory)        score += 250;
 
     // Dedicated VRAM can break ties inside a class. It cannot outrank a discrete GPU
     // with system memory that an integrated GPU reports as device-local.
@@ -486,6 +504,7 @@ static VulkanResult evaluate_device(GpuCandidate *candidate) {
 
     candidate->supports_dyn_render                   = (feat13.dynamicRendering == VK_TRUE);
     candidate->supports_sync2                        = (feat13.synchronization2 == VK_TRUE);
+    candidate->supports_pipeline_cache_control       = (feat13.pipelineCreationCacheControl == VK_TRUE);
     candidate->supports_bda                          = (feat12.bufferDeviceAddress == VK_TRUE);
     candidate->supports_scalar_layout                = (feat12.scalarBlockLayout == VK_TRUE);
     candidate->supports_timeline                     = (feat12.timelineSemaphore == VK_TRUE);
@@ -495,10 +514,19 @@ static VulkanResult evaluate_device(GpuCandidate *candidate) {
     candidate->supports_push_descriptors             = (feat14.pushDescriptor == VK_TRUE);
     candidate->supports_host_image_copy              = (feat14.hostImageCopy == VK_TRUE);
     candidate->supports_dynamic_rendering_local_read = (feat14.dynamicRenderingLocalRead == VK_TRUE);
+    candidate->supports_shader_int8                  = (feat12.shaderInt8 == VK_TRUE);
     candidate->supports_shader_int16                 = (features2.features.shaderInt16 == VK_TRUE);
     candidate->supports_shader_int64                 = (features2.features.shaderInt64 == VK_TRUE);
+    candidate->supports_storage_buffer_8bit          = (feat12.storageBuffer8BitAccess == VK_TRUE);
     candidate->supports_storage_buffer_16bit         = (feat11.storageBuffer16BitAccess == VK_TRUE);
     candidate->supports_shader_float16               = (feat12.shaderFloat16 == VK_TRUE);
+    candidate->supports_vulkan_memory_model          = (feat12.vulkanMemoryModel == VK_TRUE);
+    candidate->supports_vulkan_memory_model_device_scope =
+        (feat12.vulkanMemoryModelDeviceScope == VK_TRUE);
+    candidate->supports_fragment_stores_atomics      =
+        (features2.features.fragmentStoresAndAtomics == VK_TRUE);
+    candidate->supports_vertex_stores_atomics        =
+        (features2.features.vertexPipelineStoresAndAtomics == VK_TRUE);
     candidate->supports_shader_expect_assume         = (feat14.shaderExpectAssume == VK_TRUE);
     candidate->supports_shader_float_controls2       = (feat14.shaderFloatControls2 == VK_TRUE);
     candidate->supports_shader_subgroup_rotate       = (feat14.shaderSubgroupRotate == VK_TRUE);
@@ -509,6 +537,7 @@ static VulkanResult evaluate_device(GpuCandidate *candidate) {
     candidate->supports_multi_draw_indirect          = (features2.features.multiDrawIndirect == VK_TRUE);
     candidate->supports_draw_indirect_count          = (feat12.drawIndirectCount == VK_TRUE);
     candidate->supports_draw_indirect_first_instance = (features2.features.drawIndirectFirstInstance == VK_TRUE);
+    candidate->supports_host_query_reset             = (feat12.hostQueryReset == VK_TRUE);
     candidate->features_probed                       = true;
 
     if (!candidate->supports_dyn_render || !candidate->supports_sync2 ||
@@ -548,6 +577,55 @@ static VulkanResult evaluate_device(GpuCandidate *candidate) {
         &extensions, VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME);
     candidate->supports_physical_device_drm = device_extension_list_has(
         &extensions, VK_EXT_PHYSICAL_DEVICE_DRM_EXTENSION_NAME);
+    candidate->supports_memory_budget = device_extension_list_has(
+        &extensions, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+    if (device_extension_list_has(&extensions, VK_KHR_UNIFIED_IMAGE_LAYOUTS_EXTENSION_NAME)) {
+        VkPhysicalDeviceUnifiedImageLayoutsFeaturesKHR uil_feat = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_UNIFIED_IMAGE_LAYOUTS_FEATURES_KHR,
+        };
+        VkPhysicalDeviceFeatures2 uil_feat2 = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+            .pNext = &uil_feat,
+        };
+        vkGetPhysicalDeviceFeatures2(candidate->device, &uil_feat2);
+        candidate->supports_unified_image_layouts = (uil_feat.unifiedImageLayouts == VK_TRUE);
+    }
+    if (device_extension_list_has(&extensions, VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME)) {
+        const bool has_pageable = device_extension_list_has(
+            &extensions, VK_EXT_PAGEABLE_DEVICE_LOCAL_MEMORY_EXTENSION_NAME);
+        VkPhysicalDevicePageableDeviceLocalMemoryFeaturesEXT page_feat = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PAGEABLE_DEVICE_LOCAL_MEMORY_FEATURES_EXT,
+        };
+        VkPhysicalDeviceMemoryPriorityFeaturesEXT prio_feat = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PRIORITY_FEATURES_EXT,
+            .pNext = has_pageable ? (void *)&page_feat : nullptr,
+        };
+        VkPhysicalDeviceFeatures2 mem_feat2 = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+            .pNext = &prio_feat,
+        };
+        vkGetPhysicalDeviceFeatures2(candidate->device, &mem_feat2);
+        if (prio_feat.memoryPriority == VK_TRUE) {
+            candidate->supports_memory_priority = true;
+            candidate->supports_pageable_device_memory =
+                has_pageable && (page_feat.pageableDeviceLocalMemory == VK_TRUE);
+        }
+    }
+    if (device_extension_list_has(&extensions, VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
+        VkPhysicalDeviceFaultFeaturesEXT fault_feat = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT,
+        };
+        VkPhysicalDeviceFeatures2 fault_feat2 = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+            .pNext = &fault_feat,
+        };
+        vkGetPhysicalDeviceFeatures2(candidate->device, &fault_feat2);
+        if (fault_feat.deviceFault == VK_TRUE) {
+            candidate->supports_device_fault = true;
+            candidate->supports_device_fault_vendor_binary =
+                (fault_feat.deviceFaultVendorBinary == VK_TRUE);
+        }
+    }
     bool has_accel_ext = device_extension_list_has(
         &extensions, VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
     bool has_rq_ext = device_extension_list_has(
@@ -740,12 +818,14 @@ static void print_candidate(uint32_t index, const GpuCandidate *candidate) {
             snprintf(drm_node_info, sizeof drm_node_info, "no");
         }
 
-        printf("      Extensions: external-memory-fd=%s, DMA-BUF=%s, DRM-Modifiers=%s, Syncobj=%s, ForeignQueue=%s, RayQuery=%s, DRM-Node=%s\n",
+        printf("      Extensions: external-memory-fd=%s, DMA-BUF=%s, DRM-Modifiers=%s, Syncobj=%s, ForeignQueue=%s, UnifiedLayouts=%s, PageableVRAM=%s, RayQuery=%s, DRM-Node=%s\n",
                candidate->supports_external_memory_fd ? "yes" : "no",
                candidate->supports_dma_buf ? "yes" : "no",
                candidate->supports_drm_modifiers ? "yes" : "no",
                candidate->supports_syncobj ? "yes" : "no",
                candidate->supports_queue_family_foreign ? "yes" : "no",
+               candidate->supports_unified_image_layouts ? "yes" : "no",
+               candidate->supports_pageable_device_memory ? "yes" : "no",
                candidate->supports_ray_query ? "yes" : "no",
                drm_node_info);
     }
@@ -1051,6 +1131,7 @@ static VulkanResult open_candidate(VulkanContext *ctx, const GpuCandidate *chose
     ctx->device_info.supports_sampler_anisotropy = best.supports_anisotropy;
     ctx->device_info.supports_dynamic_rendering = best.supports_dyn_render;
     ctx->device_info.supports_synchronization2 = best.supports_sync2;
+    ctx->device_info.supports_pipeline_cache_control = best.supports_pipeline_cache_control;
     ctx->device_info.supports_timeline_semaphore = best.supports_timeline;
     ctx->device_info.supports_maintenance5 = best.supports_maintenance5;
     ctx->device_info.supports_maintenance6 = best.supports_maintenance6;
@@ -1073,6 +1154,13 @@ static VulkanResult open_candidate(VulkanContext *ctx, const GpuCandidate *chose
     ctx->device_info.supports_draw_indirect_first_instance = best.supports_draw_indirect_first_instance;
     ctx->device_info.supports_acceleration_structure = best.supports_acceleration_structure;
     ctx->device_info.supports_ray_query = best.supports_ray_query;
+    ctx->device_info.supports_host_query_reset = best.supports_host_query_reset;
+    ctx->device_info.supports_memory_budget = best.supports_memory_budget;
+    ctx->device_info.supports_memory_priority = best.supports_memory_priority;
+    ctx->device_info.supports_pageable_device_memory = best.supports_pageable_device_memory;
+    ctx->device_info.supports_unified_image_layouts = best.supports_unified_image_layouts;
+    ctx->device_info.supports_device_fault = best.supports_device_fault;
+    ctx->device_info.supports_device_fault_vendor_binary = best.supports_device_fault_vendor_binary;
     ctx->device_info.has_drm_primary_node = best.has_drm_primary;
     ctx->device_info.has_drm_render_node = best.has_drm_render;
     ctx->device_info.drm_primary_major = best.drm_primary_major;
@@ -1159,24 +1247,83 @@ static VulkanResult open_candidate(VulkanContext *ctx, const GpuCandidate *chose
         };
     }
 
-    const char *device_extensions[24] = {0};
+    const char *device_extensions[32] = {0};
     uint32_t device_extension_count = 0;
     for (size_t i = 0; i < sizeof k_required_device_extensions / sizeof k_required_device_extensions[0]; ++i) {
-        if (!append_extension(device_extensions, &device_extension_count, 24, k_required_device_extensions[i])) {
+        if (!append_extension(device_extensions, &device_extension_count, 32, k_required_device_extensions[i])) {
             return VULKAN_ERROR_INITIALIZATION_FAILED;
         }
     }
     if (best.supports_ray_query && best.supports_acceleration_structure) {
-        (void)append_extension(device_extensions, &device_extension_count, 24,
+        (void)append_extension(device_extensions, &device_extension_count, 32,
                                VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
-        (void)append_extension(device_extensions, &device_extension_count, 24,
+        (void)append_extension(device_extensions, &device_extension_count, 32,
                                VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
-        (void)append_extension(device_extensions, &device_extension_count, 24,
+        (void)append_extension(device_extensions, &device_extension_count, 32,
                                VK_KHR_RAY_QUERY_EXTENSION_NAME);
+    }
+    if (best.supports_memory_budget) {
+        (void)append_extension(device_extensions, &device_extension_count, 32,
+                               VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+    }
+    if (best.supports_memory_priority) {
+        (void)append_extension(device_extensions, &device_extension_count, 32,
+                               VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME);
+    }
+    if (best.supports_pageable_device_memory) {
+        (void)append_extension(device_extensions, &device_extension_count, 32,
+                               VK_EXT_PAGEABLE_DEVICE_LOCAL_MEMORY_EXTENSION_NAME);
+    }
+    if (best.supports_unified_image_layouts) {
+        (void)append_extension(device_extensions, &device_extension_count, 32,
+                               VK_KHR_UNIFIED_IMAGE_LAYOUTS_EXTENSION_NAME);
+    }
+    if (best.supports_device_fault) {
+        (void)append_extension(device_extensions, &device_extension_count, 32,
+                               VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+    }
+
+    VkPhysicalDeviceFaultFeaturesEXT fault_feat = {
+        .sType                   = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT,
+        .pNext                   = nullptr,
+        .deviceFault             = VK_TRUE,
+        .deviceFaultVendorBinary = best.supports_device_fault_vendor_binary ? VK_TRUE : VK_FALSE,
+    };
+    void *ext_chain = best.supports_device_fault ? (void *)&fault_feat : nullptr;
+
+    VkPhysicalDeviceUnifiedImageLayoutsFeaturesKHR uil_feat = {
+        .sType               = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_UNIFIED_IMAGE_LAYOUTS_FEATURES_KHR,
+        .pNext               = nullptr,
+        .unifiedImageLayouts = VK_TRUE,
+    };
+    if (best.supports_unified_image_layouts) {
+        uil_feat.pNext = ext_chain;
+        ext_chain      = &uil_feat;
+    }
+
+    VkPhysicalDevicePageableDeviceLocalMemoryFeaturesEXT page_feat = {
+        .sType                     = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PAGEABLE_DEVICE_LOCAL_MEMORY_FEATURES_EXT,
+        .pNext                     = nullptr,
+        .pageableDeviceLocalMemory = VK_TRUE,
+    };
+    if (best.supports_pageable_device_memory) {
+        page_feat.pNext = ext_chain;
+        ext_chain       = &page_feat;
+    }
+
+    VkPhysicalDeviceMemoryPriorityFeaturesEXT prio_feat = {
+        .sType          = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PRIORITY_FEATURES_EXT,
+        .pNext          = nullptr,
+        .memoryPriority = VK_TRUE,
+    };
+    if (best.supports_memory_priority) {
+        prio_feat.pNext = ext_chain;
+        ext_chain       = &prio_feat;
     }
 
     VkPhysicalDeviceRayQueryFeaturesKHR rq_feat = {
         .sType    = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR,
+        .pNext    = ext_chain,
         .rayQuery = VK_TRUE,
     };
     VkPhysicalDeviceAccelerationStructureFeaturesKHR as_feat = {
@@ -1184,11 +1331,12 @@ static VulkanResult open_candidate(VulkanContext *ctx, const GpuCandidate *chose
         .pNext                 = &rq_feat,
         .accelerationStructure = VK_TRUE,
     };
+    if (best.supports_ray_query && best.supports_acceleration_structure) {
+        ext_chain = &as_feat;
+    }
     VkPhysicalDeviceVulkan14Features feat14 = {
         .sType                     = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_4_FEATURES,
-        .pNext                     = (best.supports_ray_query && best.supports_acceleration_structure)
-                                         ? (void *)&as_feat
-                                         : nullptr,
+        .pNext                     = ext_chain,
         .maintenance5                  = VK_TRUE,
         .maintenance6                  = VK_TRUE,
         .shaderSubgroupRotate          = best.supports_shader_subgroup_rotate ? VK_TRUE : VK_FALSE,
@@ -1207,16 +1355,25 @@ static VulkanResult open_candidate(VulkanContext *ctx, const GpuCandidate *chose
         .pNext                          = &feat14,
         .dynamicRendering               = VK_TRUE,
         .synchronization2               = VK_TRUE,
+        .pipelineCreationCacheControl   = best.supports_pipeline_cache_control ? VK_TRUE : VK_FALSE,
         .shaderDemoteToHelperInvocation = best.supports_shader_demote ? VK_TRUE : VK_FALSE,
     };
     VkPhysicalDeviceVulkan12Features feat12 = {
-        .sType               = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
-        .pNext               = &feat13,
-        .drawIndirectCount   = best.supports_draw_indirect_count ? VK_TRUE : VK_FALSE,
-        .scalarBlockLayout   = VK_TRUE,
-        .bufferDeviceAddress = VK_TRUE,
-        .shaderFloat16       = VK_TRUE,
-        .timelineSemaphore   = VK_TRUE,
+        .sType                        = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
+        .pNext                        = &feat13,
+        .drawIndirectCount            = best.supports_draw_indirect_count ? VK_TRUE : VK_FALSE,
+        .storageBuffer8BitAccess      = best.supports_storage_buffer_8bit ? VK_TRUE : VK_FALSE,
+        .shaderFloat16                = VK_TRUE,
+        .shaderInt8                   = best.supports_shader_int8 ? VK_TRUE : VK_FALSE,
+        .scalarBlockLayout            = VK_TRUE,
+        .hostQueryReset               = best.supports_host_query_reset ? VK_TRUE : VK_FALSE,
+        .timelineSemaphore            = VK_TRUE,
+        .bufferDeviceAddress          = VK_TRUE,
+        .vulkanMemoryModel            = best.supports_vulkan_memory_model ? VK_TRUE : VK_FALSE,
+        .vulkanMemoryModelDeviceScope =
+            (best.supports_vulkan_memory_model && best.supports_vulkan_memory_model_device_scope)
+                ? VK_TRUE
+                : VK_FALSE,
     };
     VkPhysicalDeviceVulkan11Features feat11 = {
         .sType                     = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
@@ -1228,11 +1385,13 @@ static VulkanResult open_candidate(VulkanContext *ctx, const GpuCandidate *chose
         .sType    = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
         .pNext    = &feat11,
         .features = {
-            .multiDrawIndirect         = best.supports_multi_draw_indirect ? VK_TRUE : VK_FALSE,
-            .drawIndirectFirstInstance = best.supports_draw_indirect_first_instance ? VK_TRUE : VK_FALSE,
-            .samplerAnisotropy         = best.supports_anisotropy ? VK_TRUE : VK_FALSE,
-            .shaderInt16               = VK_TRUE,
-            .shaderInt64               = VK_TRUE,
+            .multiDrawIndirect              = best.supports_multi_draw_indirect ? VK_TRUE : VK_FALSE,
+            .drawIndirectFirstInstance      = best.supports_draw_indirect_first_instance ? VK_TRUE : VK_FALSE,
+            .samplerAnisotropy              = best.supports_anisotropy ? VK_TRUE : VK_FALSE,
+            .vertexPipelineStoresAndAtomics = best.supports_vertex_stores_atomics ? VK_TRUE : VK_FALSE,
+            .fragmentStoresAndAtomics       = best.supports_fragment_stores_atomics ? VK_TRUE : VK_FALSE,
+            .shaderInt16                    = VK_TRUE,
+            .shaderInt64                    = VK_TRUE,
         },
     };
 
@@ -1282,6 +1441,16 @@ static VulkanResult open_candidate(VulkanContext *ctx, const GpuCandidate *chose
     vkGetDeviceQueue(ctx->device, ctx->queues.transfer_family_index,
                      ctx->queues.transfer_queue_index, &ctx->queues.transfer_queue);
 
+    vulkan_name_object(ctx, VK_OBJECT_TYPE_DEVICE, (uint64_t)ctx->device, "Engine:LogicalDevice");
+    vulkan_name_object(ctx, VK_OBJECT_TYPE_QUEUE, (uint64_t)ctx->queues.graphics_queue, "Engine:GraphicsQueue");
+    if (ctx->queues.compute_queue != ctx->queues.graphics_queue) {
+        vulkan_name_object(ctx, VK_OBJECT_TYPE_QUEUE, (uint64_t)ctx->queues.compute_queue, "Engine:ComputeQueue");
+    }
+    if (ctx->queues.transfer_queue != ctx->queues.graphics_queue &&
+        ctx->queues.transfer_queue != ctx->queues.compute_queue) {
+        vulkan_name_object(ctx, VK_OBJECT_TYPE_QUEUE, (uint64_t)ctx->queues.transfer_queue, "Engine:TransferQueue");
+    }
+
     ctx->dispatch.vkGetMemoryFdKHR =
         (PFN_vkGetMemoryFdKHR)vkGetDeviceProcAddr(ctx->device, "vkGetMemoryFdKHR");
     ctx->dispatch.vkGetMemoryFdPropertiesKHR =
@@ -1293,6 +1462,31 @@ static VulkanResult open_candidate(VulkanContext *ctx, const GpuCandidate *chose
         (PFN_vkGetSemaphoreFdKHR)vkGetDeviceProcAddr(ctx->device, "vkGetSemaphoreFdKHR");
     ctx->dispatch.vkImportSemaphoreFdKHR =
         (PFN_vkImportSemaphoreFdKHR)vkGetDeviceProcAddr(ctx->device, "vkImportSemaphoreFdKHR");
+    if (ctx->device_info.supports_device_fault) {
+        ctx->dispatch.vkGetDeviceFaultInfoEXT =
+            (PFN_vkGetDeviceFaultInfoEXT)vkGetDeviceProcAddr(ctx->device, "vkGetDeviceFaultInfoEXT");
+    }
+    if (ctx->device_info.supports_pageable_device_memory) {
+        ctx->dispatch.vkSetDeviceMemoryPriorityEXT =
+            (PFN_vkSetDeviceMemoryPriorityEXT)vkGetDeviceProcAddr(
+                ctx->device, "vkSetDeviceMemoryPriorityEXT");
+    }
+    if (ctx->device_info.supports_host_image_copy) {
+        ctx->dispatch.vkTransitionImageLayout =
+            (PFN_vkTransitionImageLayout)vkGetDeviceProcAddr(ctx->device, "vkTransitionImageLayout");
+        if (ctx->dispatch.vkTransitionImageLayout == nullptr) {
+            ctx->dispatch.vkTransitionImageLayout =
+                (PFN_vkTransitionImageLayout)vkGetDeviceProcAddr(
+                    ctx->device, "vkTransitionImageLayoutEXT");
+        }
+        ctx->dispatch.vkCopyMemoryToImage =
+            (PFN_vkCopyMemoryToImage)vkGetDeviceProcAddr(ctx->device, "vkCopyMemoryToImage");
+        if (ctx->dispatch.vkCopyMemoryToImage == nullptr) {
+            ctx->dispatch.vkCopyMemoryToImage =
+                (PFN_vkCopyMemoryToImage)vkGetDeviceProcAddr(
+                    ctx->device, "vkCopyMemoryToImageEXT");
+        }
+    }
     if (ctx->device_info.supports_push_descriptors) {
         ctx->dispatch.vkCmdPushDescriptorSet =
             (PFN_vkCmdPushDescriptorSet)vkGetDeviceProcAddr(ctx->device, "vkCmdPushDescriptorSet");
@@ -1322,6 +1516,12 @@ void vulkan_device_destroy(VulkanContext *ctx) {
         return;
     }
     vkDeviceWaitIdle(ctx->device);
+    bda_system_shutdown(ctx);
+    if (ctx->cmd_pool != VK_NULL_HANDLE ||
+        ctx->compute_cmd_pool != VK_NULL_HANDLE ||
+        ctx->transfer_cmd_pool != VK_NULL_HANDLE) {
+        vulkan_command_pool_destroy(ctx);
+    }
     vulkan_pipe_cache_close(ctx);
     vkDestroyDevice(ctx->device, nullptr);
     ctx->device = VK_NULL_HANDLE;
@@ -1338,6 +1538,11 @@ void vulkan_device_destroy(VulkanContext *ctx) {
     ctx->dispatch.vkGetImageDrmFormatModifierPropertiesEXT = nullptr;
     ctx->dispatch.vkGetSemaphoreFdKHR = nullptr;
     ctx->dispatch.vkImportSemaphoreFdKHR = nullptr;
+    ctx->dispatch.vkGetDeviceFaultInfoEXT = nullptr;
+    ctx->dispatch.vkSetDeviceMemoryPriorityEXT = nullptr;
+    ctx->dispatch.vkCmdPushDescriptorSet = nullptr;
+    ctx->dispatch.vkTransitionImageLayout = nullptr;
+    ctx->dispatch.vkCopyMemoryToImage = nullptr;
 }
 
 void vulkan_device_log(const VulkanContext *ctx) {
@@ -1412,6 +1617,14 @@ void vulkan_device_log(const VulkanContext *ctx) {
            ctx->device_info.supports_storage_buffer_16bit ? "yes" : "no",
            ctx->device_info.supports_shader_float16 ? "yes" : "no");
 
+    printf("[Vulkan] Telemetry & Residency: HostQueryReset=%s, MemoryBudget=%s, MemoryPriority=%s, PageableVRAM=%s, UnifiedLayouts=%s, DeviceFault=%s\n",
+           ctx->device_info.supports_host_query_reset ? "yes" : "no",
+           ctx->device_info.supports_memory_budget ? "yes" : "no",
+           ctx->device_info.supports_memory_priority ? "yes" : "no",
+           ctx->device_info.supports_pageable_device_memory ? "yes" : "no",
+           ctx->device_info.supports_unified_image_layouts ? "yes" : "no",
+           ctx->device_info.supports_device_fault ? "yes" : "no");
+
     if (ctx->device_info.has_drm_render_node || ctx->device_info.has_drm_primary_node) {
         printf("[Vulkan] DRM Device Nodes: Primary=%s (%lld:%lld), Render=%s (%lld:%lld)\n",
                ctx->device_info.has_drm_primary_node ? "yes" : "no",
@@ -1423,6 +1636,81 @@ void vulkan_device_log(const VulkanContext *ctx) {
     }
 }
 
+void vulkan_report_device_fault(const VulkanContext *ctx, const char *where) {
+    if (ctx == nullptr || ctx->device == VK_NULL_HANDLE) {
+        return;
+    }
+    fprintf(stderr, "[Vulkan Fault] VK_ERROR_DEVICE_LOST at %s on '%s'\n",
+            where != nullptr ? where : "unknown", ctx->device_info.name);
+    BdaStats bda = {0};
+    bda_get_stats(&bda);
+    fprintf(stderr,
+            "[Vulkan Fault] BDA Telemetry: dev=%llu/%llu MiB (%u slabs), stg=%llu/%llu MiB (%u slabs), "
+            "standalone=%llu KiB (%u bufs), vkAllocs=%u, heapUsage=%llu/%llu MiB\n",
+            (unsigned long long)(bda.device_allocated / (1024ull * 1024ull)),
+            (unsigned long long)(bda.device_capacity / (1024ull * 1024ull)),
+            bda.device_blocks,
+            (unsigned long long)(bda.staging_allocated / (1024ull * 1024ull)),
+            (unsigned long long)(bda.staging_capacity / (1024ull * 1024ull)),
+            bda.staging_blocks,
+            (unsigned long long)(bda.standalone_allocated / 1024ull),
+            bda.standalone_blocks,
+            bda.vk_alloc_count,
+            (unsigned long long)(bda.device_heap_usage / (1024ull * 1024ull)),
+            (unsigned long long)(bda.device_heap_budget / (1024ull * 1024ull)));
+
+    if (!ctx->device_info.supports_device_fault ||
+        ctx->dispatch.vkGetDeviceFaultInfoEXT == nullptr) {
+        return;
+    }
+    VkDeviceFaultCountsEXT counts = {
+        .sType = VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT,
+    };
+    VkResult r = ctx->dispatch.vkGetDeviceFaultInfoEXT(ctx->device, &counts, nullptr);
+    if (r != VK_SUCCESS && r != VK_INCOMPLETE) {
+        return;
+    }
+    if (counts.addressInfoCount > 32u) {
+        counts.addressInfoCount = 32u;
+    }
+    if (counts.vendorInfoCount > 32u) {
+        counts.vendorInfoCount = 32u;
+    }
+    counts.vendorBinarySize = 0u;
+
+    VkDeviceFaultAddressInfoEXT addrs[32] = {0};
+    VkDeviceFaultVendorInfoEXT  vendors[32] = {0};
+    VkDeviceFaultInfoEXT info = {
+        .sType            = VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT,
+        .pAddressInfos    = counts.addressInfoCount > 0u ? addrs : nullptr,
+        .pVendorInfos     = counts.vendorInfoCount > 0u ? vendors : nullptr,
+        .pVendorBinaryData = nullptr,
+    };
+    r = ctx->dispatch.vkGetDeviceFaultInfoEXT(ctx->device, &counts, &info);
+    if (r != VK_SUCCESS && r != VK_INCOMPLETE) {
+        return;
+    }
+    if (info.description[0] != '\0') {
+        fprintf(stderr, "[Vulkan Fault] Driver description: %s\n", info.description);
+    }
+    for (uint32_t i = 0u; i < counts.addressInfoCount; ++i) {
+        fprintf(stderr,
+                "[Vulkan Fault] Faulting GPU VA [%u]: type=%u addr=0x%016llx (precision=%llu)\n",
+                i,
+                (unsigned)addrs[i].addressType,
+                (unsigned long long)addrs[i].reportedAddress,
+                (unsigned long long)addrs[i].addressPrecision);
+    }
+    for (uint32_t i = 0u; i < counts.vendorInfoCount; ++i) {
+        fprintf(stderr,
+                "[Vulkan Fault] Vendor fault [%u]: code=0x%llx data=0x%llx '%s'\n",
+                i,
+                (unsigned long long)vendors[i].vendorFaultCode,
+                (unsigned long long)vendors[i].vendorFaultData,
+                vendors[i].description);
+    }
+}
+
 VulkanResult vulkan_device_use_next(VulkanContext *ctx) {
     if (ctx == nullptr) {
         return VULKAN_ERROR_INVALID_ARGUMENT;
@@ -1430,6 +1718,7 @@ VulkanResult vulkan_device_use_next(VulkanContext *ctx) {
     if (g_ranked_locked || g_ranked_pos >= g_ranked_count) {
         return VULKAN_ERROR_NO_SUITABLE_GPU;
     }
+    const bool recreate_pools = (ctx->cmd_pool != VK_NULL_HANDLE);
     vulkan_device_destroy(ctx);
     while (g_ranked_pos < g_ranked_count) {
         uint32_t slot = g_ranked_pos;
@@ -1438,6 +1727,9 @@ VulkanResult vulkan_device_use_next(VulkanContext *ctx) {
         fprintf(stderr, "[Vulkan] Present path failed. Trying GPU [%u] %s.\n",
                 ranked->enum_index, ranked->candidate.properties.deviceName);
         VulkanResult opened = open_candidate(ctx, &ranked->candidate, ranked->enum_index, ranked->note);
+        if (opened == VULKAN_SUCCESS && recreate_pools) {
+            opened = vulkan_command_pool_create(ctx);
+        }
         if (opened == VULKAN_SUCCESS) {
             vulkan_device_log(ctx);
             return VULKAN_SUCCESS;

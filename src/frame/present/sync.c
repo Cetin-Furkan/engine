@@ -37,10 +37,57 @@ bool acquire_point_retired(VulkanContext *vk, uint64_t point) {
     return vkWaitSemaphores(vk->device, &wait_info, 0) == VK_SUCCESS;
 }
 
-bool poll_release_handle(uint32_t handle, uint64_t point) {
-    if (frame_state.drm_fd < 0 || handle == 0 || point == 0) {
+static bool dmabuf_fences_idle(int dmabuf_fd, int timeout_ms) {
+    if (dmabuf_fd < 0) {
+        return true;
+    }
+    struct dma_buf_export_sync_file exp = {
+        .flags = DMA_BUF_SYNC_RW,
+        .fd    = -1,
+    };
+    if (ioctl(dmabuf_fd, DMA_BUF_IOCTL_EXPORT_SYNC_FILE, &exp) == 0) {
+        if (exp.fd < 0) {
+            return true;
+        }
+        struct pollfd pfd = {
+            .fd      = exp.fd,
+            .events  = POLLIN,
+            .revents = 0,
+        };
+        int rc;
+        do {
+            rc = poll(&pfd, 1, timeout_ms);
+        } while (rc < 0 && errno == EINTR && timeout_ms != 0);
+        close(exp.fd);
+        return rc > 0 && (pfd.revents & (POLLIN | POLLERR | POLLNVAL)) == POLLIN;
+    }
+    struct pollfd fallback_pfd = {
+        .fd      = dmabuf_fd,
+        .events  = POLLOUT,
+        .revents = 0,
+    };
+    int rc;
+    do {
+        rc = poll(&fallback_pfd, 1, timeout_ms);
+    } while (rc < 0 && errno == EINTR && timeout_ms != 0);
+    return rc > 0 && (fallback_pfd.revents & POLLOUT) != 0;
+}
+
+bool poll_slot_released(const WaylandContext *wl, const FrameSlot *frame) {
+    if (frame == nullptr) {
+        return true;
+    }
+    if (frame_state.implicit_dmabuf_sync) {
+        if (frame->wl_buffer_id != 0u && !wayland_buffer_is_released(wl, frame->wl_buffer_id)) {
+            return false;
+        }
+        return dmabuf_fences_idle(frame->image.dmabuf_fd, 0);
+    }
+    if (frame_state.drm_fd < 0 || frame->release_handle == 0 || frame->release_point == 0) {
         return false;
     }
+    uint32_t handle = frame->release_handle;
+    uint64_t point  = frame->release_point;
     struct drm_syncobj_timeline_wait wait_arg = {
         .handles       = (uintptr_t)&handle,
         .points        = (uintptr_t)&point,
@@ -105,6 +152,7 @@ int open_drm_render_node(const VulkanContext *vk) {
         frame_state.drm_fd = -1;
     }
     frame_state.drm_fd = fd;
+    frame_state.timeline_fd_to_handle_unsupported = false;
     return 0;
 }
 
@@ -137,6 +185,33 @@ void drm_syncobj_destroy(int drm_fd, uint32_t *handle) {
     *handle = 0;
 }
 
+static int create_export_binary_semaphore(VulkanContext *vk, VkSemaphore *out_sync) {
+    VkSemaphoreTypeCreateInfo binary_type = {
+        .sType         = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
+        .pNext         = nullptr,
+        .semaphoreType = VK_SEMAPHORE_TYPE_BINARY,
+        .initialValue  = 0,
+    };
+    VkExportSemaphoreCreateInfo export_info = {
+        .sType       = VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO,
+        .pNext       = &binary_type,
+        .handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
+    };
+    VkSemaphoreCreateInfo sync_info = {
+        .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
+        .pNext = &export_info,
+        .flags = 0,
+    };
+    VkResult res = vkCreateSemaphore(vk->device, &sync_info, nullptr, out_sync);
+    if (res != VK_SUCCESS) {
+        fprintf(stderr, "[Engine Error] vkCreateSemaphore (acquire sync_file) failed: %s (%d)\n",
+                vulkan_vkresult_to_str(res), (int)res);
+        *out_sync = VK_NULL_HANDLE;
+        return -1;
+    }
+    return 0;
+}
+
 int create_acquire_semaphore(VulkanContext *vk, VkSemaphore *out_timeline, VkSemaphore *out_sync) {
     if (vk == nullptr || vk->device == VK_NULL_HANDLE ||
         out_timeline == nullptr || out_sync == nullptr) {
@@ -163,26 +238,7 @@ int create_acquire_semaphore(VulkanContext *vk, VkSemaphore *out_timeline, VkSem
         return -1;
     }
 
-    VkSemaphoreTypeCreateInfo binary_type = {
-        .sType         = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
-        .pNext         = nullptr,
-        .semaphoreType = VK_SEMAPHORE_TYPE_BINARY,
-        .initialValue  = 0,
-    };
-    VkExportSemaphoreCreateInfo export_info = {
-        .sType       = VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO,
-        .pNext       = &binary_type,
-        .handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
-    };
-    VkSemaphoreCreateInfo sync_info = {
-        .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
-        .pNext = &export_info,
-        .flags = 0,
-    };
-    res = vkCreateSemaphore(vk->device, &sync_info, nullptr, out_sync);
-    if (res != VK_SUCCESS) {
-        fprintf(stderr, "[Engine Error] vkCreateSemaphore (acquire sync_file) failed: %s (%d)\n",
-                vulkan_vkresult_to_str(res), (int)res);
+    if (create_export_binary_semaphore(vk, out_sync) != 0) {
         vkDestroySemaphore(vk->device, *out_timeline, nullptr);
         *out_timeline = VK_NULL_HANDLE;
         return -1;
@@ -232,8 +288,7 @@ static int signal_timeline_point(int drm_fd, uint32_t handle, uint64_t point) {
 }
 
 static int import_sync_file_into_timeline(int drm_fd, uint32_t handle, uint64_t point, int sync_fd) {
-    static bool s_timeline_fd_to_handle_unsupported = false;
-    if (!s_timeline_fd_to_handle_unsupported) {
+    if (!frame_state.timeline_fd_to_handle_unsupported) {
         struct drm_syncobj_handle imp = {
             .handle = handle,
             .flags  = DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_IMPORT_SYNC_FILE |
@@ -250,7 +305,7 @@ static int import_sync_file_into_timeline(int drm_fd, uint32_t handle, uint64_t 
                     strerror(errno));
             return -1;
         }
-        s_timeline_fd_to_handle_unsupported = true;
+        frame_state.timeline_fd_to_handle_unsupported = true;
     }
 
     // Two-step fallback for kernels without DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_TIMELINE:
@@ -293,16 +348,23 @@ static int import_sync_file_into_timeline(int drm_fd, uint32_t handle, uint64_t 
     return rc;
 }
 
-int publish_acquire_point_from(VulkanContext *vk, VkSemaphore sync_sem, uint64_t point) {
+int publish_acquire_point_from(VulkanContext *vk, VkSemaphore *io_sync_sem,
+                               uint64_t point, int dmabuf_fd) {
     if (vk == nullptr || vk->device == VK_NULL_HANDLE ||
-        sync_sem == VK_NULL_HANDLE ||
-        frame_state.drm_fd < 0 || frame_state.acquire_handle == 0 || point == 0) {
+        io_sync_sem == nullptr || *io_sync_sem == VK_NULL_HANDLE || point == 0) {
+        return -1;
+    }
+    if (!frame_state.implicit_dmabuf_sync &&
+        (frame_state.drm_fd < 0 || frame_state.acquire_handle == 0)) {
+        return -1;
+    }
+    if (frame_state.implicit_dmabuf_sync && dmabuf_fd < 0) {
         return -1;
     }
     VkSemaphoreGetFdInfoKHR info = {
         .sType      = VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR,
         .pNext      = nullptr,
-        .semaphore  = sync_sem,
+        .semaphore  = *io_sync_sem,
         .handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
     };
     int sync_fd = -1;
@@ -310,7 +372,36 @@ int publish_acquire_point_from(VulkanContext *vk, VkSemaphore sync_sem, uint64_t
     if (res != VK_SUCCESS) {
         fprintf(stderr, "[Engine Error] vkGetSemaphoreFdKHR (SYNC_FD) failed: %s (%d)\n",
                 vulkan_vkresult_to_str(res), (int)res);
+        // The binary semaphore was left signaled because SYNC_FD export failed.
+        // Wait for the timeline submit to finish, recreate a clean unsignaled
+        // binary semaphore for future frames, and signal the syncobj point directly.
+        bool retired = wait_acquire_point(vk, point);
+        VkSemaphore fresh = VK_NULL_HANDLE;
+        if (retired && create_export_binary_semaphore(vk, &fresh) == 0) {
+            vkDestroySemaphore(vk->device, *io_sync_sem, nullptr);
+            *io_sync_sem = fresh;
+            if (frame_state.implicit_dmabuf_sync) {
+                return 0;
+            }
+            return signal_timeline_point(frame_state.drm_fd, frame_state.acquire_handle, point);
+        }
         return -1;
+    }
+    if (frame_state.implicit_dmabuf_sync) {
+        if (sync_fd < 0) {
+            return 0;
+        }
+        struct dma_buf_import_sync_file imp = {
+            .flags = DMA_BUF_SYNC_WRITE,
+            .fd    = sync_fd,
+        };
+        int imp_rc = 0;
+        if (ioctl(dmabuf_fd, DMA_BUF_IOCTL_IMPORT_SYNC_FILE, &imp) != 0) {
+            fprintf(stderr, "[Engine Error] DMA_BUF_IOCTL_IMPORT_SYNC_FILE: %s\n", strerror(errno));
+            imp_rc = -1;
+        }
+        close(sync_fd);
+        return imp_rc;
     }
     // Vulkan allows SYNC_FD export to return VK_SUCCESS with fd == -1 when the
     // semaphore is already signaled at export time (while still resetting the
@@ -429,7 +520,52 @@ int wait_gpu_release(RingContext *ring, WaylandContext *wl) {
 }
 
 int wait_own_release(const FrameSlot *frame, uint64_t timeout_ns) {
-    if (frame == nullptr || frame->release_handle == 0 ||
+    if (frame == nullptr) {
+        return 0;
+    }
+    if (frame_state.implicit_dmabuf_sync) {
+        uint64_t deadline = ring_mono_ns() + timeout_ns;
+        WaylandContext *wl = wayland_get_context();
+        RingContext *ring  = ring_get_context();
+        while (frame->wl_buffer_id != 0u &&
+               wl != nullptr && wl->is_initialized && !wl->failed &&
+               !wayland_buffer_is_released(wl, frame->wl_buffer_id)) {
+            struct io_uring_cqe cqe;
+            bool progressed = false;
+            while (ring != nullptr && ring->is_initialized && ring_peek(ring, &cqe)) {
+                progressed = true;
+                wayland_on_cqe(wl, &cqe);
+                if (wl->failed) {
+                    break;
+                }
+            }
+            if (wayland_buffer_is_released(wl, frame->wl_buffer_id)) {
+                break;
+            }
+            uint64_t now = ring_mono_ns();
+            if (now >= deadline || ring == nullptr || !ring->is_initialized || wl->failed) {
+                return -ETIMEDOUT;
+            }
+            if (!progressed) {
+                (void)wayland_ensure_recv(wl);
+                uint64_t rem_ms = (deadline - now + 999999ull) / 1000000ull;
+                int wait_ms = rem_ms > 100ull ? 100 : (int)rem_ms;
+                unsigned n = ring_submit(ring);
+                int rc = ring_enter(ring, n, 1u, wait_ms);
+                if (rc < 0 && rc != -ETIME && rc != -EINTR) {
+                    return rc;
+                }
+            }
+        }
+        uint64_t now = ring_mono_ns();
+        int rem_ms = 0;
+        if (now < deadline) {
+            uint64_t ms = (deadline - now + 999999ull) / 1000000ull;
+            rem_ms = (ms > (uint64_t)INT_MAX) ? INT_MAX : (int)ms;
+        }
+        return dmabuf_fences_idle(frame->image.dmabuf_fd, rem_ms) ? 0 : -ETIMEDOUT;
+    }
+    if (frame->release_handle == 0 ||
         frame->release_point == 0 || frame_state.drm_fd < 0) {
         return 0;
     }

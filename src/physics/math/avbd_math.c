@@ -606,6 +606,84 @@ static void push_grid_spring(AvbdConstraint *cons,
     };
 }
 
+void avbd_prepare_soft_grid_2d(const float    *in_x,
+                               const float    *in_y,
+                               const float    *in_vx,
+                               const float    *in_vy,
+                               uint32_t        cols,
+                               uint32_t        rows,
+                               float           spacing,
+                               float           spring_stiff,
+                               AvbdVertex     *out_verts,
+                               uint32_t       *out_vert_count,
+                               AvbdConstraint *out_cons,
+                               uint32_t       *out_con_count) {
+    if (out_vert_count != nullptr) *out_vert_count = 0u;
+    if (out_con_count != nullptr)  *out_con_count  = 0u;
+
+    const uint32_t count = cols * rows;
+    if (in_x == nullptr || in_y == nullptr || in_vx == nullptr || in_vy == nullptr ||
+        out_verts == nullptr || out_cons == nullptr ||
+        cols < 2u || rows < 2u || count > K_AVBD_MAX_VERTS) {
+        return;
+    }
+
+    memset(out_verts, 0, (size_t)count * sizeof(AvbdVertex));
+    for (uint32_t k = 0u; k < count; ++k) {
+        out_verts[k].pos[0]   = in_x[k];
+        out_verts[k].pos[1]   = in_y[k];
+        out_verts[k].pos[2]   = 0.0f;
+        out_verts[k].vel[0]   = in_vx[k];
+        out_verts[k].vel[1]   = in_vy[k];
+        out_verts[k].vel[2]   = 0.0f;
+        out_verts[k].inv_mass = 1.0f;
+    }
+
+    const float k_base  = fmaxf(spring_stiff, 4.0f) * 18.0f;
+    const float k_shear = k_base * 0.85f;
+    const float k_bend  = k_base * 0.35f;
+    const float diag    = spacing * 1.41421356237f;
+    uint32_t    con_cnt = 0u;
+
+    // 1. Structural horizontal & vertical Hookean springs
+    for (uint32_t r = 0u; r < rows; ++r) {
+        for (uint32_t c = 0u; c + 1u < cols; ++c) {
+            uint32_t a = r * cols + c;
+            push_grid_spring(out_cons, &con_cnt, K_AVBD_MAX_CONS, a, a + 1u, spacing, k_base);
+        }
+    }
+    for (uint32_t r = 0u; r + 1u < rows; ++r) {
+        for (uint32_t c = 0u; c < cols; ++c) {
+            uint32_t a = r * cols + c;
+            push_grid_spring(out_cons, &con_cnt, K_AVBD_MAX_CONS, a, a + cols, spacing, k_base);
+        }
+    }
+    // 2. Diagonal shear springs (eliminates 2D quad shear zero-energy modes)
+    for (uint32_t r = 0u; r + 1u < rows; ++r) {
+        for (uint32_t c = 0u; c + 1u < cols; ++c) {
+            uint32_t a = r * cols + c;
+            push_grid_spring(out_cons, &con_cnt, K_AVBD_MAX_CONS, a, a + cols + 1u, diag, k_shear);
+            push_grid_spring(out_cons, &con_cnt, K_AVBD_MAX_CONS, a + 1u, a + cols, diag, k_shear);
+        }
+    }
+    // 3. 2-hop flexion / bending springs (prevents grid inversion under high-speed impact)
+    for (uint32_t r = 0u; r < rows; ++r) {
+        for (uint32_t c = 0u; c + 2u < cols; ++c) {
+            uint32_t a = r * cols + c;
+            push_grid_spring(out_cons, &con_cnt, K_AVBD_MAX_CONS, a, a + 2u, spacing * 2.0f, k_bend);
+        }
+    }
+    for (uint32_t r = 0u; r + 2u < rows; ++r) {
+        for (uint32_t c = 0u; c < cols; ++c) {
+            uint32_t a = r * cols + c;
+            push_grid_spring(out_cons, &con_cnt, K_AVBD_MAX_CONS, a, a + 2u * cols, spacing * 2.0f, k_bend);
+        }
+    }
+
+    if (out_vert_count != nullptr) *out_vert_count = count;
+    if (out_con_count != nullptr)  *out_con_count  = con_cnt;
+}
+
 void avbd_step_soft_grid_2d(float          *io_x,
                             float          *io_y,
                             float          *io_vx,
@@ -633,72 +711,28 @@ void avbd_step_soft_grid_2d(float          *io_x,
 
     AvbdVertex     verts[K_AVBD_MAX_VERTS];
     AvbdConstraint cons[K_AVBD_MAX_CONS];
-    memset(verts, 0, (size_t)count * sizeof(AvbdVertex));
-
-    for (uint32_t k = 0u; k < count; ++k) {
-        verts[k].pos[0]   = io_x[k];
-        verts[k].pos[1]   = io_y[k];
-        verts[k].pos[2]   = 0.0f;
-        verts[k].vel[0]   = io_vx[k];
-        verts[k].vel[1]   = io_vy[k];
-        verts[k].vel[2]   = 0.0f;
-        verts[k].inv_mass = 1.0f;
-    }
-
-    const float k_base  = fmaxf(spring_stiff, 4.0f) * 18.0f;
-    const float k_shear = k_base * 0.85f;
-    const float k_bend  = k_base * 0.35f;
-    const float diag    = spacing * 1.41421356237f;
-    uint32_t    con_cnt = 0u;
-
-    // 1. Structural horizontal & vertical Hookean springs
-    for (uint32_t r = 0u; r < rows; ++r) {
-        for (uint32_t c = 0u; c + 1u < cols; ++c) {
-            uint32_t a = r * cols + c;
-            push_grid_spring(cons, &con_cnt, K_AVBD_MAX_CONS, a, a + 1u, spacing, k_base);
-        }
-    }
-    for (uint32_t r = 0u; r + 1u < rows; ++r) {
-        for (uint32_t c = 0u; c < cols; ++c) {
-            uint32_t a = r * cols + c;
-            push_grid_spring(cons, &con_cnt, K_AVBD_MAX_CONS, a, a + cols, spacing, k_base);
-        }
-    }
-    // 2. Diagonal shear springs (eliminates 2D quad shear zero-energy modes)
-    for (uint32_t r = 0u; r + 1u < rows; ++r) {
-        for (uint32_t c = 0u; c + 1u < cols; ++c) {
-            uint32_t a = r * cols + c;
-            push_grid_spring(cons, &con_cnt, K_AVBD_MAX_CONS, a, a + cols + 1u, diag, k_shear);
-            push_grid_spring(cons, &con_cnt, K_AVBD_MAX_CONS, a + 1u, a + cols, diag, k_shear);
-        }
-    }
-    // 3. 2-hop flexion / bending springs (prevents grid inversion under high-speed impact)
-    for (uint32_t r = 0u; r < rows; ++r) {
-        for (uint32_t c = 0u; c + 2u < cols; ++c) {
-            uint32_t a = r * cols + c;
-            push_grid_spring(cons, &con_cnt, K_AVBD_MAX_CONS, a, a + 2u, spacing * 2.0f, k_bend);
-        }
-    }
-    for (uint32_t r = 0u; r + 2u < rows; ++r) {
-        for (uint32_t c = 0u; c < cols; ++c) {
-            uint32_t a = r * cols + c;
-            push_grid_spring(cons, &con_cnt, K_AVBD_MAX_CONS, a, a + 2u * cols, spacing * 2.0f, k_bend);
-        }
+    uint32_t       vert_cnt = 0u;
+    uint32_t       con_cnt  = 0u;
+    avbd_prepare_soft_grid_2d(io_x, io_y, io_vx, io_vy,
+                              cols, rows, spacing, spring_stiff,
+                              verts, &vert_cnt, cons, &con_cnt);
+    if (vert_cnt == 0u) {
+        return;
     }
 
     if (opt_gpu_verts != nullptr && opt_vert_count != nullptr &&
         opt_gpu_cons != nullptr && opt_con_count != nullptr) {
-        memcpy(opt_gpu_verts, verts, (size_t)count * sizeof(AvbdVertex));
+        memcpy(opt_gpu_verts, verts, (size_t)vert_cnt * sizeof(AvbdVertex));
         memcpy(opt_gpu_cons, cons, (size_t)con_cnt * sizeof(AvbdConstraint));
-        *opt_vert_count = count;
+        *opt_vert_count = vert_cnt;
         *opt_con_count  = con_cnt;
     }
 
     const float grav[3] = { gx, gy, 0.0f };
-    (void)avbd_solve_step(verts, count, cons, con_cnt, dt, grav, iterations);
+    (void)avbd_solve_step(verts, vert_cnt, cons, con_cnt, dt, grav, iterations);
 
     const float keep = expf(-fmaxf(damp_rate, 0.1f) * dt);
-    for (uint32_t k = 0u; k < count; ++k) {
+    for (uint32_t k = 0u; k < vert_cnt; ++k) {
         if (isfinite(verts[k].pos[0]) && isfinite(verts[k].pos[1])) {
             io_x[k]  = verts[k].pos[0];
             io_y[k]  = verts[k].pos[1];

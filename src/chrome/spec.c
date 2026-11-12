@@ -1,4 +1,5 @@
 #include "chrome/spec.h"
+#include "input/pointer.h"
 #include "ring/ring.h"
 #include "wayland/wayland.h"
 #include <ctype.h>
@@ -576,9 +577,16 @@ int chrome_reload(ChromeCqeFn on_cqe, void *user) {
                 s_err[0] != '\0' ? s_err : "read failed");
         return s_read_rc < 0 ? s_read_rc : -EIO;
     }
+    ChromeSpec prev = s_spec;
     if (commit_text(path, text) != 0) {
         fprintf(stderr, "[Chrome] Reload kept the previous spec: %s\n",
                 s_err[0] != '\0' ? s_err : "parse failed");
+        return -EINVAL;
+    }
+    const WaylandContext *wl = wayland_get_context();
+    if (wl != nullptr && wl->is_initialized && pointer_check_spec(wl) != 0) {
+        s_spec = prev;
+        fprintf(stderr, "[Chrome] Reload kept the previous spec: cursor shape unsupported by compositor\n");
         return -EINVAL;
     }
     log_spec("Reloaded");

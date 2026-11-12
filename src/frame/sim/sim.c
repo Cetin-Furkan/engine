@@ -1,16 +1,17 @@
 #include "frame/frame.h"
 #include "frame/internal.h"
-#include <sys/timerfd.h>
 
-// The 8 ms timerfd. A compositor stamp does not call into this file.
-// Pose and the solver share the quanta frame_clock_issue writes.
+// Native kernel multishot IORING_OP_TIMEOUT (8 ms period). A compositor stamp
+// does not call into this file. Pose and the solver share the quanta
+// frame_clock_issue writes.
 
 uint32_t sim_wall_ms(void) {
     uint64_t now = ring_mono_ns();
     if (frame_state.mono0_ns == 0) {
         frame_state.mono0_ns = now;
     }
-    uint64_t ms = (now - frame_state.mono0_ns) / 1000000ull;
+    // Offset by +1 ms so 0 is strictly reserved as the "unset" sentinel.
+    uint64_t ms = (now - frame_state.mono0_ns) / 1000000ull + 1ull;
     if (ms > 0xffffffffull) {
         ms = 0xffffffffull;
     }
@@ -18,27 +19,41 @@ uint32_t sim_wall_ms(void) {
 }
 
 void note_sim_idle(void) {
-    if (frame_sim_wanted() || frame_state.sim_hot || frame_state.scene_dirty) {
+    if (frame_sim_wanted() || frame_state.sim_hot || frame_state.scene_dirty ||
+        frame_state.sim_timer_on || frame_state.sim_mshot_armed ||
+        frame_state.sim_inflight_count > 0u || frame_state.sim_cancel_inflight > 0u) {
         return;
     }
     if (!frame_state.loop_was_busy) {
         return;
     }
     frame_state.loop_was_busy = false;
-    uint32_t frames = 0;
-    uint32_t missed = 0;
-    bool spun = engine_app()->consume_spin();
-    engine_app()->turn_report(&frames, &missed);
-    if (spun) {
-        uint32_t compute_us = 0;
-        uint32_t render_us = 0;
-        uint32_t total_us = 0;
-        frame_gpu_timings(&compute_us, &render_us, &total_us);
-        printf("[Engine] Loop idle. %u frames, %u missed, %u stalls (GPU avg: %u us total, %u us compute, %u us render).\n",
-               frames, missed, frame_state.clock.stalls,
-               total_us, compute_us, render_us);
-        fflush(stdout);
-        engine_app()->simulation_hold();
+    const EngineApp *app = engine_app();
+    bool spun = (app != nullptr && app->consume_spin != nullptr) ? app->consume_spin() : false;
+    uint32_t frames = frame_state.turn_frames;
+    uint32_t missed = frame_state.clock.missed_total;
+    frame_state.turn_frames = 0u;
+    if (app != nullptr && app->turn_report != nullptr) {
+        uint32_t app_frames = 0u;
+        uint32_t app_missed = 0u;
+        app->turn_report(&app_frames, &app_missed);
+        if (app_frames > 0u) {
+            frames = app_frames;
+            missed = app_missed;
+        }
+    }
+    uint32_t compute_us = 0;
+    uint32_t render_us = 0;
+    uint32_t total_us = 0;
+    frame_gpu_timings(&compute_us, &render_us, &total_us);
+    printf("[Engine] Loop idle. %u frames, %u missed, %u stalls, %llu submits, sim_timer=%u (GPU avg: %u us total, %u us compute, %u us render).\n",
+           frames, missed, frame_state.clock.stalls,
+           (unsigned long long)frame_state.gpu_submits,
+           (frame_state.sim_timer_on || frame_state.sim_mshot_armed) ? 1u : 0u,
+           total_us, compute_us, render_us);
+    fflush(stdout);
+    if (spun && app != nullptr && app->simulation_hold != nullptr) {
+        app->simulation_hold();
     }
 }
 
@@ -53,78 +68,126 @@ void frame_note_picture(void) {
 // has to start from the key still being down. camera_active is that poll.
 static bool camera_wants_steps(void) {
     const EngineApp *app = engine_app();
-    return app->camera_active != nullptr && app->camera_active();
+    return app != nullptr && app->camera_active != nullptr && app->camera_active();
 }
 
 bool frame_sim_wanted(void) {
-    return engine_app()->busy() || engine_app()->record_poke_pending() || camera_wants_steps();
+    const EngineApp *app = engine_app();
+    bool app_busy = app != nullptr && app->busy != nullptr && app->busy();
+    bool app_poke = app != nullptr && app->record_poke_pending != nullptr && app->record_poke_pending();
+    return app_busy || app_poke || camera_wants_steps();
 }
 
-void sim_timer_set(RingContext *ring, bool want) {
-    (void)ring;
-    if (frame_state.sim_fd < 0 || want == frame_state.sim_timer_on) {
-        return;
-    }
-    struct itimerspec spec = {0};
-    if (want) {
-        spec.it_interval.tv_nsec = (long)FRAME_SIM_STEP_MS * 1000000L;
-        spec.it_value.tv_nsec = (long)FRAME_SIM_STEP_MS * 1000000L;
-    }
-    if (timerfd_settime(frame_state.sim_fd, 0, &spec, nullptr) != 0) {
-        fprintf(stderr, "[Engine Error] sim timerfd: %s\n", strerror(errno));
-        return;
-    }
-    frame_state.sim_timer_on = want;
-}
-
-static void rearm_sim_if_dead(RingContext *ring, bool alive, int res, bool rearm) {
-    if (rearm && !alive && res != -ECANCELED && res != -EBADF) {
-        (void)frame_arm_sim_mshot(ring);
-    }
-}
-
-int frame_arm_sim_mshot(RingContext *ring) {
-    if (ring == nullptr || frame_state.sim_fd < 0) {
+static int arm_sim_timeout(RingContext *ring) {
+    if (ring == nullptr || !ring->is_initialized) {
         return -EINVAL;
     }
     if (frame_state.sim_mshot_armed) {
         return 0;
     }
-    int rc = ring_arm_read_mshot(ring, ENG_SIM_FD_SLOT, frame_state.sim_fixed, frame_state.sim_fd,
-                                 ENG_SIM_BGID, ENG_UD_SIM_TIMER);
+    uint32_t gen = ++frame_state.sim_gen;
+    if (gen == 0u) {
+        gen = ++frame_state.sim_gen;
+    }
+    uint64_t ud = ring_ud_pack((uint16_t)ENG_UD_SIM_TIMER, 0u, gen);
+    int rc = ring_arm_timeout_multishot(ring, (uint64_t)FRAME_SIM_STEP_MS * 1000000ull, ud);
     if (rc == 0) {
+        frame_state.sim_active_ud   = ud;
         frame_state.sim_mshot_armed = true;
+        frame_state.sim_cancel_sent = false;
+        frame_state.sim_inflight_count++;
     }
     return rc;
 }
 
-bool frame_note_sim_cqe(RingContext *ring, const struct io_uring_cqe *cqe, bool rearm) {
-    if (cqe == nullptr || cqe->user_data != ENG_UD_SIM_TIMER) {
+void sim_timer_set(RingContext *ring, bool want) {
+    if (want) {
+        frame_state.sim_timer_on = true;
+        if (!frame_state.sim_mshot_armed) {
+            (void)arm_sim_timeout(ring);
+        }
+        return;
+    }
+    frame_state.sim_timer_on = false;
+    if (frame_state.sim_mshot_armed && !frame_state.sim_cancel_sent &&
+        ring != nullptr && ring->is_initialized) {
+        if (ring_remove_timeout(ring, frame_state.sim_active_ud, ENG_UD_SIM_CANCEL, false) == 0) {
+            frame_state.sim_cancel_sent = true;
+            frame_state.sim_cancel_inflight++;
+        }
+    }
+}
+
+bool frame_note_sim_cqe(RingContext *ring, const struct io_uring_cqe *cqe,
+                        bool rearm, uint64_t *io_ticks) {
+    if (cqe == nullptr) {
         return false;
     }
-    uint64_t expirations = 0;
-    bool have = ring_take_sim_count(ring, cqe, &expirations);
-    bool alive = (cqe->flags & IORING_CQE_F_MORE) != 0;
-    frame_state.sim_mshot_armed = alive;
-    if (have && expirations > 0) {
-        sim_on_timer(expirations);
+    if (cqe->user_data == ENG_UD_SIM_CANCEL) {
+        if (frame_state.sim_cancel_inflight > 0u) {
+            frame_state.sim_cancel_inflight--;
+        }
+        return true;
     }
-    rearm_sim_if_dead(ring, alive, cqe->res, rearm);
+    if (ring_ud_tag(cqe->user_data) != (uint16_t)ENG_UD_SIM_TIMER) {
+        return false;
+    }
+    bool alive = (cqe->flags & IORING_CQE_F_MORE) != 0;
+    if (!alive && frame_state.sim_inflight_count > 0u) {
+        frame_state.sim_inflight_count--;
+    }
+    if (cqe->user_data != frame_state.sim_active_ud) {
+        return true;
+    }
+    frame_state.sim_mshot_armed = alive;
+    if (!alive) {
+        frame_state.sim_cancel_sent = false;
+    }
+    if (frame_state.sim_timer_on && cqe->res == -ETIME) {
+        if (io_ticks != nullptr) {
+            (*io_ticks)++;
+        } else {
+            sim_on_timer(1u);
+        }
+    }
+    if (rearm && frame_state.sim_timer_on && !alive &&
+        cqe->res != -ECANCELED && cqe->res != -EINVAL) {
+        (void)arm_sim_timeout(ring);
+    }
     return true;
 }
 
-void frame_apply_noted_sim(RingContext *ring, uint64_t expirations, int res, bool alive, bool rearm) {
-    frame_state.sim_mshot_armed = alive;
-    if (expirations > 0) {
-        sim_on_timer(expirations);
+void frame_apply_noted_sim(RingContext *ring, uint64_t last_ud, uint64_t expirations,
+                           uint32_t retired, int res, bool alive, bool rearm) {
+    if (retired > 0u) {
+        if (frame_state.sim_inflight_count >= retired) {
+            frame_state.sim_inflight_count -= retired;
+        } else {
+            frame_state.sim_inflight_count = 0u;
+        }
     }
-    rearm_sim_if_dead(ring, alive, res, rearm);
+    if (last_ud != 0ull && last_ud == frame_state.sim_active_ud) {
+        frame_state.sim_mshot_armed = alive;
+        if (!alive) {
+            frame_state.sim_cancel_sent = false;
+        }
+        if (frame_state.sim_timer_on && expirations > 0u) {
+            sim_on_timer(expirations);
+        }
+        if (rearm && frame_state.sim_timer_on && !alive &&
+            res != -ECANCELED && res != -EINVAL) {
+            (void)arm_sim_timeout(ring);
+        }
+    }
 }
 
 void sim_on_timer(uint64_t expirations) {
+    const EngineApp *app = engine_app();
+    frame_state.loop_was_busy = true;
     if (!frame_state.sim_latched) {
         FrameStep first = { .first = true, .paint = true };
-        if (engine_app()->advance(frame_clock_sim_stamp(&frame_state.clock), &first)) {
+        if (app != nullptr && app->advance != nullptr &&
+            app->advance(frame_clock_sim_stamp(&frame_state.clock), &first)) {
             frame_state.scene_dirty = true;
             if (!frame_state.pending_damage_set) {
                 frame_state.pending_damage_full = true;
@@ -151,7 +214,9 @@ void sim_on_timer(uint64_t expirations) {
     if (steps > 0) {
         uint32_t wall = sim_wall_ms();
         uint32_t heat = 0;
-        pulse = engine_app()->simulation(wall, &step, &heat);
+        if (app != nullptr && app->simulation != nullptr) {
+            pulse = app->simulation(wall, &step, &heat);
+        }
         // The world returns the whole interval still waiting for a present.
         // The cube already sums ticks into that value. Adding it here would
         // integrate the same milliseconds twice.
@@ -159,12 +224,14 @@ void sim_on_timer(uint64_t expirations) {
         if (heat > 0) {
             frame_state.pending_sim_stamp = wall;
             frame_note_picture();
-        } else if (pulse && engine_app()->record_poke_pending()) {
+        } else if (pulse && app != nullptr && app->record_poke_pending != nullptr &&
+                   app->record_poke_pending()) {
             frame_state.pending_sim_stamp = wall;
             frame_note_picture();
         }
         for (uint32_t i = 0; i < steps; ++i) {
-            if (engine_app()->advance(stamps[i], &step)) {
+            if (app != nullptr && app->advance != nullptr &&
+                app->advance(stamps[i], &step)) {
                 frame_state.scene_dirty = true;
                 if (!frame_state.pending_damage_set) {
                     frame_state.pending_damage_full = true;

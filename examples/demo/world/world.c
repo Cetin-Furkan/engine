@@ -314,6 +314,7 @@ void world_record_ok(uint64_t signal_point) {
 }
 
 void world_record_abort(void) {
+    physics_abort_frame(0u);
     table_record_abort();
 }
 
@@ -332,7 +333,21 @@ bool world_record_poke_pending(void) {
     return table_record_poke_pending();
 }
 
+static void world_harvest_gpu_physics(void) {
+    PhysicsSolvedStep step;
+    while (physics_poll_solved_step(&step)) {
+        if (step.channel_id == PHYSICS_CHAN_3D_BODIES) {
+            (void)world_apply_gpu_motion(&step);
+        } else if (step.channel_id >= PHYSICS_CHAN_2D_SOFT_BASE) {
+            uint32_t soft_idx = step.channel_id - PHYSICS_CHAN_2D_SOFT_BASE;
+            (void)sheet_apply_gpu_soft_step(soft_idx, step.epoch,
+                                            step.verts, step.vert_count, step.dt);
+        }
+    }
+}
+
 bool world_simulation(uint32_t time_ms, uint32_t sim_dt_ms, uint32_t *heat_dt) {
+    world_harvest_gpu_physics();
     bool pulse = false;
     if (policy_mode() == MODE_2D) {
         if (heat_dt != nullptr) {
@@ -343,15 +358,23 @@ bool world_simulation(uint32_t time_ms, uint32_t sim_dt_ms, uint32_t *heat_dt) {
     }
     if (policy_mode() != MODE_3D) {
         sheet_set_avbd_iterations(physics_recommended_iterations());
+        sheet_set_gpu_pose_owner(physics_gpu_pose_owner());
         if (sheet_simulate(sim_dt_ms)) {
             pulse = true;
         }
         SheetGpuStep gstep;
         while (sheet_pop_gpu_step(&gstep)) {
-            physics_submit_step(gstep.verts, gstep.vert_count,
-                                gstep.cons, gstep.con_count,
-                                gstep.dt, gstep.gravity, gstep.damp_keep);
+            if (!physics_submit_step(PHYSICS_CHAN_2D_SOFT_BASE + gstep.soft_index,
+                                     gstep.epoch,
+                                     gstep.verts, gstep.vert_count,
+                                     gstep.cons, gstep.con_count,
+                                     gstep.dt, gstep.gravity, gstep.damp_keep)) {
+                sheet_cancel_gpu_soft_step(gstep.soft_index, gstep.epoch);
+            }
         }
+    }
+    if (physics_any_inflight()) {
+        pulse = true;
     }
     return pulse;
 }
@@ -625,20 +648,22 @@ bool world_toggle_smooth(void) {
 }
 
 bool world_busy(void) {
-    bool busy = camera_busy() || text_busy();
+    bool busy = camera_busy() || text_busy() || physics_any_inflight();
     if (policy_mode() == MODE_2D) {
-        busy = busy || plot_wants_frame() || sheet_busy() || face_chain_busy() || table_busy_ops(face_ops());
+        busy = busy || plot_wants_frame() || sheet_busy() || sheet_has_pending_gpu_steps() ||
+               face_chain_busy() || table_busy_ops(face_ops());
     } else {
         busy = busy || overlay_busy() || face_chain_busy() || solid_kind_smooth_dirty() || table_busy();
         if (policy_mode() == MODE_HYBRID) {
-            busy = busy || sheet_busy();
+            busy = busy || sheet_busy() || sheet_has_pending_gpu_steps();
         }
     }
     return busy;
 }
 
 bool world_advance(uint32_t time_ms) {
-    bool changed = text_busy();
+    world_harvest_gpu_physics();
+    bool changed = text_busy() || physics_has_unrecorded_steps();
     if (policy_mode() == MODE_2D) {
         if (plot_wants_frame() || face_chain_busy() || table_advance_ops(time_ms, face_ops())) {
             changed = true;

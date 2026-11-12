@@ -81,7 +81,7 @@ int main(void) {
         return 1;
     }
 
-    // 3. Verify 64-byte Stateful Function Cell (Cell64) + CHERI-D 1-byte inline_id
+    // 3. Verify 64-byte Host Closure (GpuMathStreamCell) + 1-byte inline_id epoch tag
     GpuMathStreamCell cell;
     cell64_init(&cell, 0x5Au);
     RelPtr2D cell_ptr = relptr2d_pack(12, 7, -3, 2u, cell.epoch);
@@ -116,7 +116,7 @@ int main(void) {
     (void)cell64_arm(&cell, test_cell_fn, fresh_ptr, base_addr, 4096ull * 2ull, 21u, 11u, 3u);
     cell.inline_id ^= 0xFFu;
     if (cell64_invoke(&cell, &accum) == 0) {
-        fprintf(stderr, "FAIL: Cell64 CHERI-D capability check failed to reject tampered cell\n");
+        fprintf(stderr, "FAIL: Cell64 inline epoch check failed to reject tampered cell\n");
         return 1;
     }
 

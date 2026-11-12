@@ -55,6 +55,7 @@ typedef struct SystemCapabilities {
 
 [[nodiscard]] int system_init(void);
 void system_shutdown(void);
+[[nodiscard]] const SystemCapabilities *system_get_capabilities(void);
 
 // Applies MADV_HUGEPAGE and MADV_POPULATE_WRITE pre-faulting to an anonymous
 // mmap arena and zeroes it without runtime page-fault jitter.

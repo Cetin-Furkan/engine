@@ -15,8 +15,30 @@ enum : uint32_t {
     ENG_WL_MAX_MODIFIERS    = 64,
     ENG_WL_MAX_INDICES      = 512,
     ENG_WL_DESTROY_LATER    = 16,
-    ENG_DRM_FORMAT_ARGB8888 = 0x34325241u,
+    ENG_WL_TRACKED_BUFS     = 96u,
+    ENG_WL_SEND_STAGE_CAP   = 4096u,
+    ENG_WL_SEND_RING_CAP    = 16384u,
+    ENG_WL_SEND_PKT_CAP     = 64u,
+    ENG_WL_MAX_MSG_FDS          = 4u,
+    ENG_WL_CLIENT_ID_MAX        = 0xfeffffffu,
+    ENG_DRM_FORMAT_ARGB8888     = 0x34325241u,
+    ENG_DRM_FORMAT_XRGB8888     = 0x34325258u,
+    ENG_DRM_FORMAT_XBGR2101010  = 0x30334258u,
+    ENG_DRM_FORMAT_ABGR2101010  = 0x30334241u,
+    ENG_PRESENTATION_ZERO_COPY  = 0x8u,
 };
+
+typedef struct WaylandSendPacket {
+    uint32_t offset;
+    uint32_t len;
+    uint32_t sent;
+    bool     tracks_ack;
+    bool     is_internal;
+    bool     kick_armed;
+    bool     close_fds_on_done;
+    uint8_t  fd_count;
+    int      fds[ENG_WL_MAX_MSG_FDS];
+} WaylandSendPacket;
 
 // xdg_toplevel state values, one bit each. Tiled is any of the four edges.
 enum : uint32_t {
@@ -29,6 +51,8 @@ enum : uint32_t {
     ENG_TOP_TILED_TOP    = 1u << 7,
     ENG_TOP_TILED_BOTTOM = 1u << 8,
     ENG_TOP_SUSPENDED    = 1u << 9,
+    ENG_TOP_TILED_MASK   = ENG_TOP_TILED_LEFT | ENG_TOP_TILED_RIGHT |
+                           ENG_TOP_TILED_TOP | ENG_TOP_TILED_BOTTOM,
 };
 
 // zxdg_toplevel_decoration_v1.mode. Client-side is 1. Server-side is 2.
@@ -61,7 +85,9 @@ typedef struct WaylandContext {
     uint32_t     registry_id;
     uint32_t     sync_id;
     uint32_t     next_id;
-    uint32_t     free_id[ENG_ID_FREE];
+    uint32_t     free_id_inline[ENG_ID_FREE];
+    uint32_t    *free_ids;
+    uint32_t     free_cap;
     uint32_t     nfree;
 
     // Discovered global registry names & versions
@@ -85,6 +111,20 @@ typedef struct WaylandContext {
     uint32_t subcompositor_version;
     uint32_t decoration_global_name;
     uint32_t decoration_version;
+    uint32_t fractional_scale_global_name;
+    uint32_t fractional_scale_version;
+    uint32_t fifo_global_name;
+    uint32_t fifo_version;
+    uint32_t commit_timing_global_name;
+    uint32_t commit_timing_version;
+    uint32_t presentation_global_name;
+    uint32_t presentation_version;
+    uint32_t relative_pointer_global_name;
+    uint32_t relative_pointer_version;
+    uint32_t pointer_constraints_global_name;
+    uint32_t pointer_constraints_version;
+    uint32_t data_device_manager_global_name;
+    uint32_t data_device_manager_version;
 
     // Bound global object IDs
     uint32_t compositor_id;
@@ -100,14 +140,57 @@ typedef struct WaylandContext {
     uint32_t cursor_shape_bound_version;
     uint32_t viewporter_id;
     uint32_t viewport_id;
+    uint32_t bar_viewport_id;
     uint32_t subcompositor_id;
     uint32_t decoration_manager_id;
+    uint32_t fractional_scale_manager_id;
+    uint32_t fractional_scale_id;
+    uint32_t fifo_manager_id;
+    uint32_t fifo_id;
+    uint32_t commit_timing_manager_id;
+    uint32_t commit_timer_id;
+    uint32_t presentation_id;
+    uint32_t presentation_fb_id;
+    uint32_t relative_pointer_manager_id;
+    uint32_t relative_pointer_id;
+    uint32_t pointer_constraints_id;
+    uint32_t locked_pointer_id;
+    uint32_t data_device_manager_id;
+    uint32_t data_device_manager_bound_version;
+    uint32_t data_device_id;
     uint32_t pointer_id;
     uint32_t keyboard_id;
     uint32_t cursor_shape_device_id;
     uint32_t seat_capabilities;
     bool     shm_argb8888;
     bool     configure_resizing;
+    // Fractional HiDPI state (denominator 120: 120 = 1.0x, 180 = 1.5x, 240 = 2.0x)
+    uint32_t scale_120;
+    bool     scale_changed;
+    bool     uncapped_commits;
+    bool     clipboard_updated;
+    uint32_t scene_logical_w;
+    uint32_t scene_logical_h;
+    uint32_t scene_phys_w;
+    uint32_t scene_phys_h;
+    uint32_t bar_logical_w;
+    uint32_t bar_logical_h;
+    uint32_t bar_phys_w;
+    uint32_t bar_phys_h;
+    int32_t  scene_vp_w;
+    int32_t  scene_vp_h;
+    int32_t  bar_vp_w;
+    int32_t  bar_vp_h;
+    // Presentation timing & scanout telemetry (wp_presentation + wp_commit_timing_v1)
+    uint32_t presentation_clk_id;
+    bool     has_presentation_clk;
+    uint64_t target_present_ns;
+    uint64_t last_present_ns;
+    uint32_t last_refresh_ns;
+    uint32_t last_present_flags;
+    uint64_t presented_frames;
+    uint64_t zero_copy_scanout_frames;
+    uint64_t discarded_frames;
     // xdg_toplevel.configure states. ENG_TOP_* bits. Empty means floating.
     uint32_t toplevel_states;
     bool     noted_signal;
@@ -121,14 +204,18 @@ typedef struct WaylandContext {
     bool     noted_sim;
     int      noted_sim_res;
     bool     noted_sim_alive;
+    uint32_t noted_sim_retired;
+    uint32_t noted_sim_cancels;
+    uint64_t noted_sim_last_ud;
     uint64_t noted_sim_exp;
     bool     noted_send;
     int      noted_send_res;
-    // True from the moment an ENG_UD_WL_SEND SQE is queued until its CQE is seen.
-    // A second send over the same buffer is refused while this is set.
+    // True from the moment a client ENG_UD_WL_SEND SQE is queued until its CQE is seen.
     bool     send_queued;
     bool     buffers_detached;
-    uint32_t destroy_later[ENG_WL_DESTROY_LATER];
+    uint32_t destroy_inline[ENG_WL_DESTROY_LATER];
+    uint32_t *destroy_ids;
+    uint32_t destroy_cap;
     uint32_t destroy_later_n;
     bool     send_tracks_ack;
     bool     lock_toplevel_size;
@@ -146,6 +233,9 @@ typedef struct WaylandContext {
     uint32_t bar_surface_id;
     uint32_t bar_subsurface_id;
     uint32_t bar_sync_id;
+    int32_t  bar_pos_x;
+    int32_t  bar_pos_y;
+    bool     bar_is_synced;
     // Top band in window pixels. The scene surface's pointer y is short by this.
     uint32_t bar_px;
     // Window geometry in the scene surface's coordinate space. y is negative
@@ -166,6 +256,7 @@ typedef struct WaylandContext {
     uint32_t xdg_surface_id;
     uint32_t xdg_toplevel_id;
     uint32_t feedback_id;
+    uint32_t retired_feedback_id;
     uint32_t buffer_params_id;
     uint32_t buffer_id;
     uint32_t frame_cb_id;
@@ -183,16 +274,27 @@ typedef struct WaylandContext {
     uint32_t bar_opaque_w;
     uint32_t bar_opaque_h;
 
-    // Toplevel & xdg_surface configure state
+    // Toplevel & xdg_surface configure state (latched on xdg_surface.configure)
     uint32_t configure_width;
     uint32_t configure_height;
     uint32_t configure_serial;
     uint32_t acked_configure_serial;
+    uint32_t staged_width;
+    uint32_t staged_height;
+    uint32_t staged_states;
+    bool     has_staged_toplevel;
+    uint32_t floating_width;
+    uint32_t floating_height;
+    uint32_t configure_bounds_w;
+    uint32_t configure_bounds_h;
+    uint32_t wm_capabilities;
     bool     configure_ack_valid;
     bool     toplevel_configured;
     bool     xdg_surface_configured;
     bool     toplevel_closed;
     bool     buffer_released;
+    uint32_t tracked_buf_ids[ENG_WL_TRACKED_BUFS];
+    uint8_t  tracked_buf_released[ENG_WL_TRACKED_BUFS];
     bool     frame_done;
     uint32_t frame_time_ms;
     bool     frame_stamp_valid;
@@ -211,6 +313,7 @@ typedef struct WaylandContext {
     int64_t                  feedback_main_minor;
     bool                     feedback_has_main_dev;
     bool                     feedback_done;
+    bool                     feedback_updated;
     // Modifiers the compositor's main device can import when that device is
     // not the Vulkan render GPU. Merged into all_modifiers for a cross-device
     // copy. Scanout stays empty: those flags describe the other GPU's tiling.
@@ -224,6 +327,26 @@ typedef struct WaylandContext {
     uint32_t                 feedback_consumer_tranches;
     uint32_t                 feedback_other_tranches;
 
+    // Back-buffer staging for incoming dmabuf_feedback rounds (swapped on done)
+    bool                     feedback_round_open;
+    int64_t                  staging_main_major;
+    int64_t                  staging_main_minor;
+    bool                     staging_has_main_dev;
+    uint64_t                 staging_scanout_mods[ENG_WL_MAX_MODIFIERS];
+    uint32_t                 staging_scanout_count;
+    uint64_t                 staging_all_mods[ENG_WL_MAX_MODIFIERS];
+    uint32_t                 staging_all_count;
+    uint64_t                 staging_prime_mods[ENG_WL_MAX_MODIFIERS];
+    uint32_t                 staging_prime_count;
+    uint64_t                 staging_xrgb_mods[ENG_WL_MAX_MODIFIERS];
+    uint32_t                 staging_xrgb_count;
+    uint64_t                 staging_argb_mods[ENG_WL_MAX_MODIFIERS];
+    uint32_t                 staging_argb_count;
+    uint32_t                 staging_xbgr2101010_count;
+    uint32_t                 staging_prod_tranches;
+    uint32_t                 staging_cons_tranches;
+    uint32_t                 staging_other_tranches;
+
     // Staging for the tranche currently being parsed
     int64_t  tranche_major;
     int64_t  tranche_minor;
@@ -232,11 +355,16 @@ typedef struct WaylandContext {
     uint16_t tranche_indices[ENG_WL_MAX_INDICES];
     uint32_t tranche_index_count;
 
-    // Collected DRM_FORMAT_ARGB8888 modifiers for the matched GPU DRM node
+    // Collected DRM_FORMAT_ARGB8888 / XRGB8888 modifiers for the matched GPU DRM node
     uint64_t scanout_modifiers[ENG_WL_MAX_MODIFIERS];
     uint32_t scanout_modifier_count;
     uint64_t all_modifiers[ENG_WL_MAX_MODIFIERS];
     uint32_t all_modifier_count;
+    uint64_t xrgb_modifiers[ENG_WL_MAX_MODIFIERS];
+    uint32_t xrgb_modifier_count;
+    uint64_t argb_modifiers[ENG_WL_MAX_MODIFIERS];
+    uint32_t argb_modifier_count;
+    uint32_t feedback_xbgr2101010_mods;
 
     // Receive state
     uint32_t      control_reserve;
@@ -244,20 +372,21 @@ typedef struct WaylandContext {
     struct iovec  recv_iov;
     unsigned char recv_control[256];
 
-    // Primary batch send state (supports 1 optional SCM_RIGHTS fd)
-    struct msghdr send_msg;
-    struct iovec  send_iov;
-    unsigned char send_bytes[2048];
-    uint32_t      send_len;
-    uint32_t      send_off;
-    unsigned char send_control[CMSG_SPACE(sizeof(int))];
-
-    // Dedicated pong send state (isolated from send_bytes / ENG_UD_WL_SEND)
-    struct msghdr pong_msg;
-    struct iovec  pong_iov;
-    unsigned char pong_bytes[12];
-    uint32_t      pong_off;
-    bool          pong_in_flight;
+    // CPU-only staging buffer + 16 KiB outgoing circular packet wire ring
+    struct msghdr     send_msg;
+    struct iovec      send_iov[2];
+    unsigned char     send_bytes[ENG_WL_SEND_STAGE_CAP];
+    uint32_t          send_len;
+    uint32_t          send_off;
+    unsigned char     send_control[CMSG_SPACE(sizeof(int) * ENG_WL_MAX_MSG_FDS)];
+    unsigned char     tx_ring[ENG_WL_SEND_RING_CAP];
+    uint32_t          tx_head;
+    uint32_t          tx_tail;
+    WaylandSendPacket tx_pkts[ENG_WL_SEND_PKT_CAP];
+    uint32_t          tx_pkt_head;
+    uint32_t          tx_pkt_count;
+    uint64_t          tx_inflight_tag;
+    bool              pong_in_flight;
 
     struct sockaddr_un addr;
     unsigned           addr_len;
@@ -283,6 +412,60 @@ typedef struct WaylandContext {
 void wayland_shutdown(void);
 [[nodiscard]] WaylandContext *wayland_get_context(void);
 [[nodiscard]] uint32_t wayland_alloc_id(WaylandContext *w);
+
+static inline uint32_t wayland_effective_scale_120(const WaylandContext *w) {
+    if (w == nullptr || w->viewporter_id == 0u || w->scale_120 == 0u) {
+        return 120u;
+    }
+    return w->scale_120;
+}
+
+static inline float wayland_scale_factor(const WaylandContext *w) {
+    return (float)wayland_effective_scale_120(w) / 120.0f;
+}
+
+static inline uint32_t wayland_phys_px(uint32_t logical_px, uint32_t scale_120) {
+    if (logical_px == 0u) {
+        return 0u;
+    }
+    uint32_t s = (scale_120 == 0u) ? 120u : scale_120;
+    uint64_t scaled = ((uint64_t)logical_px * (uint64_t)s + 60ull) / 120ull;
+    if (scaled == 0ull) {
+        scaled = 1ull;
+    }
+    return (scaled > 0xffffffffull) ? 0xffffffffu : (uint32_t)scaled;
+}
+
+static inline uint32_t wayland_drm_fourcc_for_modifier(
+    const WaylandContext *w,
+    uint64_t              modifier,
+    bool                  prefer_opaque
+) {
+    if (w == nullptr) {
+        return ENG_DRM_FORMAT_ARGB8888;
+    }
+    bool has_xrgb = false;
+    bool has_argb = false;
+    for (uint32_t i = 0; i < w->xrgb_modifier_count; ++i) {
+        if (w->xrgb_modifiers[i] == modifier) {
+            has_xrgb = true;
+            break;
+        }
+    }
+    for (uint32_t i = 0; i < w->argb_modifier_count; ++i) {
+        if (w->argb_modifiers[i] == modifier) {
+            has_argb = true;
+            break;
+        }
+    }
+    if (prefer_opaque && has_xrgb) {
+        return ENG_DRM_FORMAT_XRGB8888;
+    }
+    if (has_argb) {
+        return ENG_DRM_FORMAT_ARGB8888;
+    }
+    return has_xrgb ? ENG_DRM_FORMAT_XRGB8888 : ENG_DRM_FORMAT_ARGB8888;
+}
 
 // The next SCM_RIGHTS fd, in arrival order. The caller closes it.
 [[nodiscard]] bool wayland_take_parked_fd(WaylandContext *w, int *out_fd);
@@ -333,6 +516,12 @@ void wayland_on_cqe(WaylandContext *w, const struct io_uring_cqe *cqe);
     uint64_t        modifier,
     uint32_t       *out_buffer_id
 );
+
+void wayland_track_buffer(WaylandContext *w, uint32_t buffer_id);
+void wayland_mark_buffer_busy(WaylandContext *w, uint32_t buffer_id);
+bool wayland_mark_buffer_released(WaylandContext *w, uint32_t buffer_id);
+void wayland_untrack_buffer(WaylandContext *w, uint32_t buffer_id);
+[[nodiscard]] bool wayland_buffer_is_released(const WaylandContext *w, uint32_t buffer_id);
 
 /**
  * @brief Imports one DRM syncobj fd as a wp_linux_drm_syncobj_timeline_v1.
@@ -465,6 +654,7 @@ void wayland_set_window_geom(WaylandContext *w, int32_t x, int32_t y,
  * and its explicit-sync object. The parent surface must already exist.
  */
 [[nodiscard]] int wayland_create_bar(WaylandContext *w, int32_t x, int32_t y);
+[[nodiscard]] bool wayland_encode_bar_sync(WaylandContext *w, int32_t x, int32_t y, bool sync_mode);
 
 /**
  * @brief Arms one bar-surface attach. The next scene commit includes it, or

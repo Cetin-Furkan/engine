@@ -1,4 +1,5 @@
 #include "backend/internal.h"
+#include "ring/ring.h"
 #include "system/system.h"
 #include <math.h>
 #include <stdio.h>
@@ -667,7 +668,12 @@ int backend_init(VulkanContext *vk) {
     g_backend.indirect_hdr       = (GpuMathIndirectBuffer *)g_backend.indirect_buf.map;
     g_backend.overlay_gpu_pixels = (uint32_t *)g_backend.overlay_buf.map;
 
+    if (g_backend.zero_copy_uma && g_backend.bda_buf.map != nullptr) {
+        (void)ring_register_uma_buffer(ring_get_context(), g_backend.bda_buf.map, g_backend.bda_bytes);
+    }
+
     if (backend_gpu_directory_init(vk) != 0) {
+        ring_unregister_uma_buffer(ring_get_context());
         da_buffer_destroy(vk, &g_backend.overlay_buf);
         da_buffer_destroy(vk, &g_backend.indirect_buf);
         da_buffer_destroy(vk, &g_backend.bda_buf);
@@ -676,6 +682,7 @@ int backend_init(VulkanContext *vk) {
 
     if (backend_gpu_survey_init(vk) != 0) {
         backend_gpu_directory_shutdown(vk);
+        ring_unregister_uma_buffer(ring_get_context());
         da_buffer_destroy(vk, &g_backend.overlay_buf);
         da_buffer_destroy(vk, &g_backend.indirect_buf);
         da_buffer_destroy(vk, &g_backend.bda_buf);
@@ -685,6 +692,7 @@ int backend_init(VulkanContext *vk) {
     if (!load_archive_into_bda()) {
         backend_gpu_survey_shutdown(vk);
         backend_gpu_directory_shutdown(vk);
+        ring_unregister_uma_buffer(ring_get_context());
         da_buffer_destroy(vk, &g_backend.overlay_buf);
         da_buffer_destroy(vk, &g_backend.indirect_buf);
         da_buffer_destroy(vk, &g_backend.bda_buf);
@@ -692,10 +700,15 @@ int backend_init(VulkanContext *vk) {
     }
 
     g_backend.initialized = true;
-    printf("[Backend] GPU-Math Terrain Streamer ready: %s (%.2f MiB BDA arena, %u x 100 KiB .epack slots) | BDA=0x%llx | IndirectBDA=0x%llx | %u RelPtr2D nodes (256x256) | Baklan & Beşparmak Dağı (%.0f..%.0f m) | Survey: %u photo(s), %u GCP(s), %u tie-pt(s), %u ortho upload(s) | Bird's-Eye Overlay: %s (%ux%u @ %.0f%% transparency)\n",
+    const RingContext *uring = ring_get_context();
+    const char *uma_io_mode = !g_backend.zero_copy_uma
+        ? "READ_FIXED_STAGED"
+        : ((uring != nullptr && uring->uma_buf_registered) ? "READ_FIXED_ZERO_GUP" : "READ_ZERO_COPY");
+    printf("[Backend] GPU-Math Terrain Streamer ready: %s (%.2f MiB BDA arena, %u x 100 KiB .epack slots, IO=%s) | BDA=0x%llx | IndirectBDA=0x%llx | %u RelPtr2D nodes (256x256) | Baklan & Beşparmak Dağı (%.0f..%.0f m) | Survey: %u photo(s), %u GCP(s), %u tie-pt(s), %u ortho upload(s) | Bird's-Eye Overlay: %s (%ux%u @ %.0f%% transparency)\n",
            g_backend.epack_path,
            (double)g_backend.bda_bytes / (1024.0 * 1024.0),
            g_backend.slot_cap,
+           uma_io_mode,
            (unsigned long long)g_backend.bda_buf.address,
            (unsigned long long)g_backend.indirect_buf.address,
            k_gmpack_node_count,
@@ -718,6 +731,7 @@ void backend_shutdown(VulkanContext *vk) {
         return;
     }
     backend_stream_drain_inflight();
+    ring_unregister_uma_buffer(ring_get_context());
     if (g_backend.pack_fd >= 0) {
         close(g_backend.pack_fd);
         g_backend.pack_fd = -1;

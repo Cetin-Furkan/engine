@@ -68,6 +68,7 @@ typedef struct VulkanDispatchTable {
     // --- Instance-Level Extensions: Debug Utils (VK_EXT_debug_utils) ---
     PFN_vkCreateDebugUtilsMessengerEXT  vkCreateDebugUtilsMessengerEXT;
     PFN_vkDestroyDebugUtilsMessengerEXT vkDestroyDebugUtilsMessengerEXT;
+    PFN_vkSetDebugUtilsObjectNameEXT    vkSetDebugUtilsObjectNameEXT;
 
     // --- Device-Level Extensions: Linux DMA-BUF (VK_KHR_external_memory_fd) ---
     PFN_vkGetMemoryFdKHR                vkGetMemoryFdKHR;
@@ -80,8 +81,14 @@ typedef struct VulkanDispatchTable {
     PFN_vkGetSemaphoreFdKHR             vkGetSemaphoreFdKHR;
     PFN_vkImportSemaphoreFdKHR          vkImportSemaphoreFdKHR;
 
-    // --- Vulkan 1.4 Core / VK_KHR_push_descriptor ---
+    // --- Device-Level Extensions: Crash Diagnostics & Memory Priority ---
+    PFN_vkGetDeviceFaultInfoEXT         vkGetDeviceFaultInfoEXT;
+    PFN_vkSetDeviceMemoryPriorityEXT    vkSetDeviceMemoryPriorityEXT;
+
+    // --- Vulkan 1.4 Core: Push Descriptors & Host Image Copy ---
     PFN_vkCmdPushDescriptorSet          vkCmdPushDescriptorSet;
+    PFN_vkTransitionImageLayout         vkTransitionImageLayout;
+    PFN_vkCopyMemoryToImage             vkCopyMemoryToImage;
 } VulkanDispatchTable;
 
 /**
@@ -156,6 +163,7 @@ typedef struct VulkanDeviceInfo {
     bool supports_sampler_anisotropy;
     bool supports_dynamic_rendering;
     bool supports_synchronization2;
+    bool supports_pipeline_cache_control;
     bool supports_timeline_semaphore;
     bool supports_maintenance5;
     bool supports_maintenance6;
@@ -177,6 +185,13 @@ typedef struct VulkanDeviceInfo {
     bool supports_draw_indirect_first_instance;
     bool supports_acceleration_structure;
     bool supports_ray_query;
+    bool supports_host_query_reset;
+    bool supports_memory_budget;
+    bool supports_memory_priority;
+    bool supports_pageable_device_memory;
+    bool supports_unified_image_layouts;
+    bool supports_device_fault;
+    bool supports_device_fault_vendor_binary;
 
     // Linux DRM device node identity (VK_EXT_physical_device_drm) for Wayland matching.
     bool    has_drm_primary_node;
@@ -220,6 +235,38 @@ static inline void vulkan_cmd_push(VkCommandBuffer cmd, VkPipelineLayout layout,
         .pValues    = values,
     };
     vkCmdPushConstants2(cmd, &info);
+}
+
+static inline void vulkan_name_object(const VulkanContext *vk, VkObjectType type,
+                                      uint64_t handle, const char *name) {
+    if (vk == nullptr || vk->device == VK_NULL_HANDLE || handle == 0u ||
+        name == nullptr || vk->dispatch.vkSetDebugUtilsObjectNameEXT == nullptr) {
+        return;
+    }
+    VkDebugUtilsObjectNameInfoEXT info = {
+        .sType        = VK_STRUCTURE_TYPE_DEBUG_UTILS_OBJECT_NAME_INFO_EXT,
+        .objectType   = type,
+        .objectHandle = handle,
+        .pObjectName  = name,
+    };
+    (void)vk->dispatch.vkSetDebugUtilsObjectNameEXT(vk->device, &info);
+}
+
+static inline const void *vulkan_chain_memory_priority(
+    const VulkanContext             *vk,
+    VkMemoryPriorityAllocateInfoEXT *out_prio,
+    float                            priority,
+    const void                      *next
+) {
+    if (vk == nullptr || out_prio == nullptr || !vk->device_info.supports_memory_priority) {
+        return next;
+    }
+    *out_prio = (VkMemoryPriorityAllocateInfoEXT){
+        .sType    = VK_STRUCTURE_TYPE_MEMORY_PRIORITY_ALLOCATE_INFO_EXT,
+        .pNext    = next,
+        .priority = priority,
+    };
+    return out_prio;
 }
 
 #ifdef __cplusplus

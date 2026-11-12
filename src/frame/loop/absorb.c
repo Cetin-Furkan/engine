@@ -51,7 +51,8 @@ void absorb_side_cqes(RingContext *ring, WaylandContext *wl, VulkanContext *vk,
     }
     if (wl->noted_timer) {
         wl->noted_timer = false;
-        frame_state.timer_armed = false;
+        frame_state.timer_armed       = false;
+        frame_state.timer_deadline_ns = 0ull;
         if (rearm_sim && !*send_in_flight && !*resend_wire) {
             bool queued = false;
             if (frame_watchdog(wl, vk, &queued) == 0 && queued) {
@@ -65,15 +66,27 @@ void absorb_side_cqes(RingContext *ring, WaylandContext *wl, VulkanContext *vk,
         wl->noted_inotify_res = 0;
         note_inotify_cqe(ring, res, inotify_armed);
     }
+    if (wl->noted_sim_cancels > 0u) {
+        if (frame_state.sim_cancel_inflight >= wl->noted_sim_cancels) {
+            frame_state.sim_cancel_inflight -= wl->noted_sim_cancels;
+        } else {
+            frame_state.sim_cancel_inflight = 0u;
+        }
+        wl->noted_sim_cancels = 0u;
+    }
     if (wl->noted_sim) {
         uint64_t expirations = wl->noted_sim_exp;
-        int res = wl->noted_sim_res;
-        bool alive = wl->noted_sim_alive;
-        wl->noted_sim = false;
-        wl->noted_sim_res = 0;
-        wl->noted_sim_alive = false;
-        wl->noted_sim_exp = 0;
-        frame_apply_noted_sim(ring, expirations, res, alive, rearm_sim);
+        uint64_t last_ud     = wl->noted_sim_last_ud;
+        uint32_t retired     = wl->noted_sim_retired;
+        int      res         = wl->noted_sim_res;
+        bool     alive       = wl->noted_sim_alive;
+        wl->noted_sim         = false;
+        wl->noted_sim_res     = 0;
+        wl->noted_sim_alive   = false;
+        wl->noted_sim_retired = 0u;
+        wl->noted_sim_last_ud = 0ull;
+        wl->noted_sim_exp     = 0ull;
+        frame_apply_noted_sim(ring, last_ud, expirations, retired, res, alive, rearm_sim);
     }
     if (wl->noted_pager_mask != 0u) {
         uint16_t pmask = wl->noted_pager_mask;
@@ -87,7 +100,8 @@ void absorb_side_cqes(RingContext *ring, WaylandContext *wl, VulkanContext *vk,
                 .flags     = 0u,
             };
             wl->noted_pager_res[idx] = 0;
-            if (engine_app()->on_cqe != nullptr && engine_app()->on_cqe(&synth)) {
+            if (engine_app() != nullptr && engine_app()->on_cqe != nullptr &&
+                engine_app()->on_cqe(&synth)) {
                 frame_note_picture();
             }
         }

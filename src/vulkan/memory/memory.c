@@ -501,8 +501,10 @@ static VulkanResult create_bound_export_image(
     }
 
     // Dedicated allocation keeps the exported DMA-BUF at offset 0.
+    VkMemoryPriorityAllocateInfoEXT prio_info = {0};
     VkExportMemoryAllocateInfo export_info = {
         .sType       = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO,
+        .pNext       = vulkan_chain_memory_priority(ctx, &prio_info, 1.0f, nullptr),
         .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
     };
     VkMemoryDedicatedAllocateInfo dedicated_info = {

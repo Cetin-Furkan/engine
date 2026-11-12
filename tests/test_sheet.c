@@ -245,6 +245,67 @@ static void test_gravity_and_elastic_presets(void) {
     CHECK(sheet_dyn_count() == 0u);
 }
 
+static void test_single_owner_gpu_pose_contract(void) {
+    // Verify that when GPU AVBD owns the 2D soft-body pose:
+    // 1. sheet_integrate leaves soft particle positions 100% untouched on CPU;
+    // 2. harvesting a GPU-solved AvbdVertex buffer produces the GPU pose and FAILS
+    //    if the drawn pose still matches the CPU integrator.
+    const char *spec =
+        "gravity 0 -680\n"
+        "soft 0 120 4 4 30 48 1.8 0.65\n";
+
+    // Reference CPU-only integrator step
+    sheet_set_gpu_pose_owner(false);
+    CHECK(sheet_load_memory(spec, strlen(spec)) == 0);
+    sheet_soft_move(0u, 0u, 18.0f, 0.0f);
+    float init_x0 = 0.0f, init_y0 = 0.0f;
+    sheet_soft_pos(0u, 0u, &init_x0, &init_y0);
+    (void)sheet_integrate(0.008f);
+    float cpu_x0 = 0.0f, cpu_y0 = 0.0f;
+    sheet_soft_pos(0u, 0u, &cpu_x0, &cpu_y0);
+    CHECK(fabsf(cpu_x0 - init_x0) > 1.0e-3f || fabsf(cpu_y0 - init_y0) > 1.0e-3f);
+
+    // GPU-owned path: prepare step without integrating soft vertices on CPU
+    sheet_set_gpu_pose_owner(true);
+    CHECK(sheet_load_memory(spec, strlen(spec)) == 0);
+    sheet_soft_move(0u, 0u, 18.0f, 0.0f);
+    (void)sheet_integrate(0.008f);
+
+    float pre_harvest_x0 = 0.0f, pre_harvest_y0 = 0.0f;
+    sheet_soft_pos(0u, 0u, &pre_harvest_x0, &pre_harvest_y0);
+    CHECK(fabsf(pre_harvest_x0 - init_x0) < 1.0e-5f);
+    CHECK(fabsf(pre_harvest_y0 - init_y0) < 1.0e-5f);
+    CHECK(sheet_busy());
+
+    SheetGpuStep gstep = {0};
+    CHECK(sheet_pop_gpu_step(&gstep));
+    CHECK(gstep.vert_count == 16u);
+    CHECK(gstep.con_count > 0u);
+
+    // Construct a distinct GPU-solved vertex buffer
+    AvbdVertex gpu_solved[16];
+    memcpy(gpu_solved, gstep.verts, sizeof gpu_solved);
+    for (uint32_t k = 0u; k < 16u; ++k) {
+        gpu_solved[k].pos[0] += 33.5f;
+        gpu_solved[k].pos[1] -= 41.25f;
+        gpu_solved[k].vel[0]  = 12.0f;
+        gpu_solved[k].vel[1]  = -25.0f;
+    }
+
+    CHECK(sheet_apply_gpu_soft_step(gstep.soft_index, gstep.epoch,
+                                    gpu_solved, 16u, gstep.dt));
+
+    float gpu_x0 = 0.0f, gpu_y0 = 0.0f;
+    sheet_soft_pos(0u, 0u, &gpu_x0, &gpu_y0);
+    CHECK(fabsf(gpu_x0 - (init_x0 + 33.5f)) < 1.0e-4f);
+    CHECK(fabsf(gpu_y0 - (init_y0 - 41.25f)) < 1.0e-4f);
+    // Must fail if the drawn pose still matches the CPU integrator
+    CHECK(fabsf(gpu_x0 - cpu_x0) > 20.0f);
+    CHECK(fabsf(gpu_y0 - cpu_y0) > 20.0f);
+
+    sheet_set_gpu_pose_owner(false);
+}
+
 int main(void) {
     sheet_hold_save(true);
     test_document();
@@ -255,6 +316,7 @@ int main(void) {
     test_roundtrip();
     test_shove_and_delete();
     test_gravity_and_elastic_presets();
+    test_single_owner_gpu_pose_contract();
     if (s_failures != 0) {
         fprintf(stderr, "%d check(s) failed\n", s_failures);
         return 1;

@@ -1,9 +1,14 @@
 // Object ids and request encoding.
 #include "wayland/internal.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static_assert((ENG_FD_PARK & (ENG_FD_PARK - 1u)) == 0u, "ENG_FD_PARK must be a power of two");
+static_assert((ENG_WL_SEND_RING_CAP & (ENG_WL_SEND_RING_CAP - 1u)) == 0u,
+              "ENG_WL_SEND_RING_CAP must be a power of two");
+static_assert((ENG_WL_SEND_PKT_CAP & (ENG_WL_SEND_PKT_CAP - 1u)) == 0u,
+              "ENG_WL_SEND_PKT_CAP must be a power of two");
 
 
 void wl_fail(WaylandContext *w, const char *msg) {
@@ -59,60 +64,107 @@ uint32_t wl_min_u32(uint32_t a, uint32_t b) {
     return (a < b) ? a : b;
 }
 
-uint32_t wayland_alloc_id(WaylandContext *w) {
-    uint32_t id;
-    if (w->nfree > 0) {
-        id = w->free_id[--w->nfree];
-    } else if (w->next_id == 0) {
-        wl_fail(w, "wayland object ids wrapped");
-        return 0;
-    } else {
-        id = w->next_id++;
+static bool ensure_free_id_cap(WaylandContext *w) {
+    if (w->free_ids == nullptr || w->free_cap == 0u) {
+        w->free_ids = w->free_id_inline;
+        w->free_cap = ENG_ID_FREE;
     }
-    return id;
+    if (w->nfree < w->free_cap) {
+        return true;
+    }
+    uint32_t new_cap = w->free_cap * 2u;
+    if (new_cap <= w->free_cap) {
+        return false;
+    }
+    uint32_t *grown = nullptr;
+    if (w->free_ids == w->free_id_inline) {
+        grown = (uint32_t *)malloc((size_t)new_cap * sizeof(uint32_t));
+        if (grown == nullptr) {
+            return false;
+        }
+        memcpy(grown, w->free_id_inline, (size_t)w->nfree * sizeof(uint32_t));
+    } else {
+        grown = (uint32_t *)realloc(w->free_ids, (size_t)new_cap * sizeof(uint32_t));
+        if (grown == nullptr) {
+            return false;
+        }
+    }
+    w->free_ids = grown;
+    w->free_cap = new_cap;
+    return true;
+}
+
+uint32_t wayland_alloc_id(WaylandContext *w) {
+    if (w == nullptr) {
+        return 0;
+    }
+    if (w->free_ids == nullptr || w->free_cap == 0u) {
+        w->free_ids = w->free_id_inline;
+        w->free_cap = ENG_ID_FREE;
+    }
+    if (w->nfree > 0) {
+        return w->free_ids[--w->nfree];
+    }
+    if (w->next_id == 0 || w->next_id > ENG_WL_CLIENT_ID_MAX) {
+        wl_fail(w, "wayland client object ids exhausted (< 0xff000000)");
+        return 0;
+    }
+    return w->next_id++;
 }
 
 
 static void clear_id_slot(WaylandContext *w, uint32_t id) {
-    if (id == w->registry_id)         w->registry_id         = 0;
-    if (id == w->sync_id)             w->sync_id             = 0;
-    if (id == w->frame_cb_id)         w->frame_cb_id         = 0;
-    if (id == w->bar_surface_id)      w->bar_surface_id      = 0;
-    if (id == w->bar_subsurface_id)   w->bar_subsurface_id   = 0;
-    if (id == w->bar_sync_id)         w->bar_sync_id         = 0;
-    if (id == w->feedback_id)         w->feedback_id         = 0;
-    if (id == w->buffer_params_id)    w->buffer_params_id    = 0;
-    if (id == w->buffer_id)           w->buffer_id           = 0;
-    if (id == w->explicit_sync_id)    w->explicit_sync_id    = 0;
-    if (id == w->acquire_timeline_id) w->acquire_timeline_id = 0;
-    if (id == w->release_timeline_id) w->release_timeline_id = 0;
-    if (id == w->viewport_id)         w->viewport_id         = 0;
-    if (id == w->decoration_id)       w->decoration_id       = 0;
+    if (id == w->registry_id)           w->registry_id           = 0;
+    if (id == w->sync_id)               w->sync_id               = 0;
+    if (id == w->frame_cb_id)           w->frame_cb_id           = 0;
+    if (id == w->bar_surface_id)        w->bar_surface_id        = 0;
+    if (id == w->bar_subsurface_id)     w->bar_subsurface_id     = 0;
+    if (id == w->bar_sync_id)           w->bar_sync_id           = 0;
+    if (id == w->feedback_id)           w->feedback_id           = 0;
+    if (id == w->retired_feedback_id)   w->retired_feedback_id   = 0;
+    if (id == w->buffer_params_id)      w->buffer_params_id      = 0;
+    if (id == w->buffer_id)             w->buffer_id             = 0;
+    if (id == w->explicit_sync_id)      w->explicit_sync_id      = 0;
+    if (id == w->acquire_timeline_id)   w->acquire_timeline_id   = 0;
+    if (id == w->release_timeline_id)   w->release_timeline_id   = 0;
+    if (id == w->viewport_id)           w->viewport_id           = 0;
+    if (id == w->decoration_id)         w->decoration_id         = 0;
     if (id == w->decoration_manager_id) w->decoration_manager_id = 0;
     if (id == w->scene_opaque_id) {
         w->scene_opaque_id = 0;
-        w->scene_opaque_w = 0;
-        w->scene_opaque_h = 0;
+        w->scene_opaque_w  = 0;
+        w->scene_opaque_h  = 0;
     }
     if (id == w->bar_opaque_id) {
         w->bar_opaque_id = 0;
-        w->bar_opaque_w = 0;
-        w->bar_opaque_h = 0;
+        w->bar_opaque_w  = 0;
+        w->bar_opaque_h  = 0;
     }
+}
+
+static void push_free_id(WaylandContext *w, uint32_t id) {
+    for (uint32_t i = 0; i < w->nfree; ++i) {
+        if (w->free_ids[i] == id) {
+            return;
+        }
+    }
+    if (!ensure_free_id_cap(w)) {
+        wl_fail(w, "wayland free-id stack out of memory");
+        return;
+    }
+    w->free_ids[w->nfree++] = id;
 }
 
 void wl_free_id(WaylandContext *w, uint32_t id) {
-    if (id == 0 || id == w->display_id) return;
-    clear_id_slot(w, id);
-    if (w->nfree >= ENG_ID_FREE) {
-        wl_fail(w, "wayland free-id stack full");
+    if (w == nullptr || id == 0 || id == w->display_id || id > ENG_WL_CLIENT_ID_MAX) {
         return;
     }
-    w->free_id[w->nfree++] = id;
+    clear_id_slot(w, id);
+    push_free_id(w, id);
 }
 
 void wl_release_unsent(WaylandContext *w, uint32_t id) {
-    if (w == nullptr || id == 0 || id == w->display_id) {
+    if (w == nullptr || id == 0 || id == w->display_id || id > ENG_WL_CLIENT_ID_MAX) {
         return;
     }
     clear_id_slot(w, id);
@@ -122,11 +174,7 @@ void wl_release_unsent(WaylandContext *w, uint32_t id) {
         w->next_id = id;
         return;
     }
-    if (w->nfree >= ENG_ID_FREE) {
-        wl_fail(w, "wayland free-id stack full");
-        return;
-    }
-    w->free_id[w->nfree++] = id;
+    push_free_id(w, id);
 }
 
 

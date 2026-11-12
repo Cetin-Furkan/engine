@@ -309,6 +309,7 @@ static bool cube_remove(WorldObj *o) {
         c->vz = 0.0f;
         c->spin.spinning = false;
         c->spin.infinite = false;
+        world_note_motion_epoch();
         material_set(c->mat, false);
         cube_heat_retire(c->heat);
     }
@@ -370,8 +371,19 @@ const WorldOps *cube_ops(void) {
     return &s_ops;
 }
 
-static uint32_t s_motion_stamp = 0;
-static bool     s_motion_have  = false;
+static uint32_t s_motion_stamp       = 0;
+static bool     s_motion_have        = false;
+static uint32_t s_cube_epoch         = 1u;
+static uint32_t s_deferred_motion_ms = 0u;
+static bool     s_last_gpu_owner     = false;
+
+void world_note_motion_epoch(void) {
+    s_cube_epoch++;
+    if (s_cube_epoch == 0u) {
+        s_cube_epoch = 1u;
+    }
+    s_deferred_motion_ms = 0u;
+}
 
 static void cube_kind_reset(void) {
     for (uint32_t i = 0; i < k_cube_cap; ++i) {
@@ -379,6 +391,7 @@ static void cube_kind_reset(void) {
         s_pool[i] = (CubeData){0};
     }
     motion_reset_warm_cache();
+    world_note_motion_epoch();
     s_pick_logged = false;
     s_motion_have = false;
     s_motion_stamp = 0;
@@ -420,6 +433,7 @@ bool cube_kind_spawn_elastic(Coord at, int32_t yaw_milli, bool spinning, bool in
     if (spinning) {
         table_mark_spun();
     }
+    world_note_motion_epoch();
     return true;
 }
 
@@ -541,21 +555,17 @@ static void cube_shove(WorldObj *o, Coord hit) {
         c->vz += 480.0f * c->restitution;
     }
     c->awake = true;
+    world_note_motion_epoch();
     s_motion_drew = true;
     printf("[Cube] Shoved.\n");
     fflush(stdout);
 }
 
-void world_step_motion(uint32_t time_ms, uint32_t sim_dt_ms) {
-    if (sim_dt_ms == 0u || (s_motion_have && s_motion_stamp == time_ms)) {
-        return;
-    }
-    s_motion_have = true;
-    s_motion_stamp = time_ms;
-    enum { k_body_cap = k_cube_cap + 6u };
-    MotionBody bodies[k_body_cap];
-    WorldObj *objs[k_body_cap];
-    uint32_t cube_n = 0;
+enum : uint32_t { k_body_cap = k_cube_cap + 6u };
+
+static uint32_t gather_motion_bodies(MotionBody *bodies, WorldObj **objs,
+                                     uint32_t *out_cube_n, uint32_t *out_solid_n) {
+    uint32_t cube_n = 0u;
     int count = table_count();
     for (int i = 0; i < count && cube_n < k_cube_cap; ++i) {
         WorldObj *o = table_at(i);
@@ -581,55 +591,36 @@ void world_step_motion(uint32_t time_ms, uint32_t sim_dt_ms) {
         cube_n++;
     }
     uint32_t solid_n = solid_kind_gather_motion(bodies + cube_n, objs + cube_n, 6u);
-    uint32_t n = cube_n + solid_n;
-    bool any_before = false;
-    for (uint32_t i = 0; i < n; ++i) {
-        if (bodies[i].awake) {
-            any_before = true;
-        }
-    }
-    uint32_t iters = physics_recommended_iterations();
-    uint32_t left = sim_dt_ms;
-    while (left > 0u) {
-        uint32_t step = left > 8u ? 8u : left;
-        float dt_s = (float)step / 1000.0f;
-        AvbdVertex gpu_v[K_AVBD_MAX_VERTS];
-        AvbdConstraint gpu_c[K_AVBD_MAX_CONS];
-        uint32_t gpu_vn = 0u;
-        uint32_t gpu_cn = 0u;
-        motion_substep_avbd(bodies, n, dt_s, 0.0f, k_fillet_half, iters,
-                            left <= 8u ? gpu_v : nullptr,
-                            left <= 8u ? &gpu_vn : nullptr,
-                            left <= 8u ? gpu_c : nullptr,
-                            left <= 8u ? &gpu_cn : nullptr);
-        if (left <= 8u && gpu_vn > 0u) {
-            const float g_world[3] = { 0.0f, 0.0f, -3200.0f };
-            physics_submit_step(gpu_v, gpu_vn, gpu_c, gpu_cn, dt_s, g_world, expf(-1.8f * dt_s));
-        }
-        left -= step;
-    }
+    if (out_cube_n != nullptr)  *out_cube_n  = cube_n;
+    if (out_solid_n != nullptr) *out_solid_n = solid_n;
+    return cube_n + solid_n;
+}
+
+static void scatter_motion_bodies(const MotionBody *bodies, WorldObj *const *objs,
+                                  uint32_t cube_n, uint32_t solid_n,
+                                  float dt_s, bool any_before) {
     bool any_after = false;
-    bool moved = false;
-    for (uint32_t i = 0; i < cube_n; ++i) {
+    bool moved     = false;
+    for (uint32_t i = 0u; i < cube_n; ++i) {
         WorldObj *o = objs[i];
         CubeData *c = o->data;
-        if (fabsf(o->at.x - bodies[i].x) > 1.0e-3f || fabsf(o->at.y - bodies[i].y) > 1.0e-3f ||
+        if (fabsf(o->at.x - bodies[i].x) > 1.0e-3f ||
+            fabsf(o->at.y - bodies[i].y) > 1.0e-3f ||
             fabsf(o->at.z - bodies[i].z) > 1.0e-3f) {
             moved = true;
         }
-        o->at.x = bodies[i].x;
-        o->at.y = bodies[i].y;
-        o->at.z = bodies[i].z;
-        c->vx = bodies[i].vx;
-        c->vy = bodies[i].vy;
-        c->vz = bodies[i].vz;
+        o->at.x  = bodies[i].x;
+        o->at.y  = bodies[i].y;
+        o->at.z  = bodies[i].z;
+        c->vx    = bodies[i].vx;
+        c->vy    = bodies[i].vy;
+        c->vz    = bodies[i].vz;
         c->awake = bodies[i].awake;
         if (c->awake) {
             any_after = true;
         }
     }
-    if (solid_kind_apply_motion(bodies + cube_n, objs + cube_n, solid_n,
-                                (float)sim_dt_ms / 1000.0f, &any_after)) {
+    if (solid_kind_apply_motion(bodies + cube_n, objs + cube_n, solid_n, dt_s, &any_after)) {
         moved = true;
     }
     if (moved) {
@@ -640,6 +631,115 @@ void world_step_motion(uint32_t time_ms, uint32_t sim_dt_ms) {
         fflush(stdout);
         (void)world_save();
     }
+}
+
+bool world_apply_gpu_motion(const PhysicsSolvedStep *step) {
+    if (step == nullptr || step->epoch != s_cube_epoch || step->verts == nullptr) {
+        return false;
+    }
+    MotionBody bodies[k_body_cap];
+    WorldObj  *objs[k_body_cap];
+    uint32_t   cube_n  = 0u;
+    uint32_t   solid_n = 0u;
+    uint32_t   n       = gather_motion_bodies(bodies, objs, &cube_n, &solid_n);
+    if (n == 0u || step->vert_count < n) {
+        return false;
+    }
+    bool any_before = false;
+    for (uint32_t i = 0u; i < n; ++i) {
+        if (bodies[i].awake) {
+            any_before = true;
+            break;
+        }
+    }
+    motion_apply_solved_avbd(bodies, n, step->dt, 0.0f, k_fillet_half,
+                             step->verts, step->vert_count,
+                             step->cons, step->con_count);
+    scatter_motion_bodies(bodies, objs, cube_n, solid_n, step->dt, any_before);
+    return true;
+}
+
+void world_step_motion(uint32_t time_ms, uint32_t sim_dt_ms) {
+    if (sim_dt_ms == 0u || (s_motion_have && s_motion_stamp == time_ms)) {
+        return;
+    }
+    s_motion_have  = true;
+    s_motion_stamp = time_ms;
+
+    bool gpu_owns = physics_gpu_pose_owner();
+    if (gpu_owns != s_last_gpu_owner) {
+        s_last_gpu_owner = gpu_owns;
+        world_note_motion_epoch();
+    }
+
+    MotionBody bodies[k_body_cap];
+    WorldObj  *objs[k_body_cap];
+    uint32_t   cube_n  = 0u;
+    uint32_t   solid_n = 0u;
+    uint32_t   n       = gather_motion_bodies(bodies, objs, &cube_n, &solid_n);
+    if (n == 0u) {
+        return;
+    }
+
+    bool any_before = false;
+    for (uint32_t i = 0u; i < n; ++i) {
+        if (bodies[i].awake) {
+            any_before = true;
+            break;
+        }
+    }
+    if (!any_before) {
+        s_deferred_motion_ms = 0u;
+        return;
+    }
+
+    if (gpu_owns) {
+        // Single-owner GPU pose: never integrate o->at on the CPU.
+        s_deferred_motion_ms += sim_dt_ms;
+        if (s_deferred_motion_ms > 40u) {
+            s_deferred_motion_ms = 40u;
+        }
+        if (!physics_channel_busy(PHYSICS_CHAN_3D_BODIES, s_cube_epoch) &&
+            s_deferred_motion_ms > 0u) {
+            uint32_t step_ms = s_deferred_motion_ms > 16u ? 16u : s_deferred_motion_ms;
+            float    dt_s    = (float)step_ms / 1000.0f;
+            AvbdVertex     gpu_v[K_AVBD_MAX_VERTS];
+            AvbdConstraint gpu_c[K_AVBD_MAX_CONS];
+            uint32_t       gpu_vn = 0u;
+            uint32_t       gpu_cn = 0u;
+            if (motion_prepare_avbd_step(bodies, n, dt_s, 0.0f, k_fillet_half,
+                                         gpu_v, &gpu_vn, gpu_c, &gpu_cn) &&
+                gpu_vn > 0u) {
+                for (uint32_t i = 0u; i < cube_n; ++i) {
+                    CubeData *c = objs[i]->data;
+                    if (c != nullptr && bodies[i].awake) {
+                        c->awake = true;
+                    }
+                }
+                solid_kind_sync_awake(bodies + cube_n, objs + cube_n, solid_n);
+                const float g_world[3] = { 0.0f, 0.0f, -3200.0f };
+                if (physics_submit_step(PHYSICS_CHAN_3D_BODIES, s_cube_epoch,
+                                        gpu_v, gpu_vn, gpu_c, gpu_cn,
+                                        dt_s, g_world, expf(-1.8f * dt_s))) {
+                    s_deferred_motion_ms -= step_ms;
+                }
+            }
+        }
+        return;
+    }
+
+    // CPU-only fallback owner (when toggled via Key 8 or ENGINE_PHYSICS=cpu)
+    uint32_t iters = physics_recommended_iterations();
+    uint32_t left  = sim_dt_ms;
+    while (left > 0u) {
+        uint32_t step = left > 8u ? 8u : left;
+        float    dt_s = (float)step / 1000.0f;
+        motion_substep_avbd(bodies, n, dt_s, 0.0f, k_fillet_half, iters,
+                            nullptr, nullptr, nullptr, nullptr);
+        left -= step;
+    }
+    scatter_motion_bodies(bodies, objs, cube_n, solid_n,
+                          (float)sim_dt_ms / 1000.0f, any_before);
 }
 
 static bool cube_simulate(WorldObj *o, uint32_t time_ms, uint32_t sim_dt_ms, uint32_t *heat_dt) {

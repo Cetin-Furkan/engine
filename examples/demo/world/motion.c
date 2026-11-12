@@ -220,21 +220,26 @@ static void sleep_one(MotionBody *bodies, uint32_t count, uint32_t index, float 
     b->awake = false;
 }
 
-void motion_substep_avbd(MotionBody     *bodies,
-                         uint32_t        count,
-                         float           dt,
-                         float           ground,
-                         float           half,
-                         uint32_t        iterations,
-                         AvbdVertex     *opt_gpu_verts,
-                         uint32_t       *opt_vert_count,
-                         AvbdConstraint *opt_gpu_cons,
-                         uint32_t       *opt_con_count) {
-    if (opt_vert_count != nullptr) *opt_vert_count = 0u;
-    if (opt_con_count != nullptr)  *opt_con_count  = 0u;
+enum : uint32_t {
+    k_avbd_vpre_flag = 0xA5BD0001u,
+};
 
-    if (bodies == nullptr || count == 0u || count > K_AVBD_MAX_VERTS || !(dt > 0.0f) || !(half > 0.0f)) {
-        return;
+bool motion_prepare_avbd_step(MotionBody     *bodies,
+                              uint32_t        count,
+                              float           dt,
+                              float           ground,
+                              float           half,
+                              AvbdVertex     *out_verts,
+                              uint32_t       *out_vert_count,
+                              AvbdConstraint *out_cons,
+                              uint32_t       *out_con_count) {
+    if (out_vert_count != nullptr) *out_vert_count = 0u;
+    if (out_con_count != nullptr)  *out_con_count  = 0u;
+
+    if (bodies == nullptr || out_verts == nullptr || out_vert_count == nullptr ||
+        out_cons == nullptr || out_con_count == nullptr ||
+        count == 0u || count > K_AVBD_MAX_VERTS || !(dt > 0.0f) || !(half > 0.0f)) {
+        return false;
     }
 
     bool any_awake = false;
@@ -245,26 +250,30 @@ void motion_substep_avbd(MotionBody     *bodies,
         }
     }
     if (!any_awake) {
-        return;
+        return false;
     }
 
     float      rest_z[K_AVBD_MAX_VERTS];
+    float      start_z[K_AVBD_MAX_VERTS];
     float      v_pre[K_AVBD_MAX_VERTS][3];
+    MotionBody base[K_AVBD_MAX_VERTS];
     MotionBody pred[K_AVBD_MAX_VERTS];
 
     for (uint32_t i = 0u; i < count; ++i) {
-        rest_z[i] = ground + body_rest_lift(&bodies[i], half);
-        if (bodies[i].awake && bodies[i].z < rest_z[i] && bodies[i].vz >= 0.0f) {
-            bodies[i].z = rest_z[i];
-        }
-        pred[i] = bodies[i];
+        rest_z[i]  = ground + body_rest_lift(&bodies[i], half);
+        start_z[i] = (bodies[i].awake && bodies[i].z < rest_z[i] && bodies[i].vz >= 0.0f)
+            ? rest_z[i]
+            : bodies[i].z;
+        base[i]    = bodies[i];
+        base[i].z  = start_z[i];
+        pred[i]    = base[i];
         if (bodies[i].awake) {
             v_pre[i][0] = bodies[i].vx;
             v_pre[i][1] = bodies[i].vy;
             v_pre[i][2] = bodies[i].vz - k_gravity * dt;
-            pred[i].x   = bodies[i].x + v_pre[i][0] * dt;
-            pred[i].y   = bodies[i].y + v_pre[i][1] * dt;
-            pred[i].z   = fmaxf(bodies[i].z + v_pre[i][2] * dt, rest_z[i]);
+            pred[i].x   = base[i].x + v_pre[i][0] * dt;
+            pred[i].y   = base[i].y + v_pre[i][1] * dt;
+            pred[i].z   = fmaxf(base[i].z + v_pre[i][2] * dt, rest_z[i]);
         } else {
             v_pre[i][0] = 0.0f;
             v_pre[i][1] = 0.0f;
@@ -272,7 +281,7 @@ void motion_substep_avbd(MotionBody     *bodies,
         }
     }
 
-    // Wake up resting bodies contacted by awake bodies and stand them up on ground
+    // Wake up resting bodies contacted by awake bodies without moving bodies[] on CPU
     for (int pass = 0; pass < 4; ++pass) {
         bool woke_any = false;
         for (uint32_t i = 0u; i < count; ++i) {
@@ -283,19 +292,21 @@ void motion_substep_avbd(MotionBody     *bodies,
                 float pen = 0.0f;
                 float n[3] = { 0.0f, 0.0f, 0.0f };
                 if (body_hit(&pred[i], &pred[j], half, &pen, n) ||
-                    body_hit(&bodies[i], &bodies[j], half, &pen, n)) {
+                    body_hit(&base[i], &base[j], half, &pen, n)) {
                     uint32_t sleeper = bodies[i].awake ? j : i;
                     bodies[sleeper].awake = true;
-                    if (bodies[sleeper].z < rest_z[sleeper]) {
-                        bodies[sleeper].z = rest_z[sleeper];
+                    base[sleeper].awake   = true;
+                    if (start_z[sleeper] < rest_z[sleeper]) {
+                        start_z[sleeper] = rest_z[sleeper];
+                        base[sleeper].z  = rest_z[sleeper];
                     }
                     v_pre[sleeper][0] = bodies[sleeper].vx;
                     v_pre[sleeper][1] = bodies[sleeper].vy;
                     v_pre[sleeper][2] = bodies[sleeper].vz - k_gravity * dt;
-                    pred[sleeper]     = bodies[sleeper];
-                    pred[sleeper].x   = bodies[sleeper].x + v_pre[sleeper][0] * dt;
-                    pred[sleeper].y   = bodies[sleeper].y + v_pre[sleeper][1] * dt;
-                    pred[sleeper].z   = fmaxf(bodies[sleeper].z + v_pre[sleeper][2] * dt, rest_z[sleeper]);
+                    pred[sleeper]     = base[sleeper];
+                    pred[sleeper].x   = base[sleeper].x + v_pre[sleeper][0] * dt;
+                    pred[sleeper].y   = base[sleeper].y + v_pre[sleeper][1] * dt;
+                    pred[sleeper].z   = fmaxf(base[sleeper].z + v_pre[sleeper][2] * dt, rest_z[sleeper]);
                     woke_any = true;
                 }
             }
@@ -305,24 +316,29 @@ void motion_substep_avbd(MotionBody     *bodies,
         }
     }
 
-    AvbdVertex     verts[K_AVBD_MAX_VERTS];
-    AvbdConstraint cons[K_AVBD_MAX_CONS];
-    memset(verts, 0, (size_t)count * sizeof(AvbdVertex));
+    memset(out_verts, 0, (size_t)count * sizeof(AvbdVertex));
     uint32_t con_cnt = 0u;
 
     for (uint32_t i = 0u; i < count; ++i) {
-        verts[i].pos[0]      = bodies[i].x;
-        verts[i].pos[1]      = bodies[i].y;
-        verts[i].pos[2]      = bodies[i].z;
-        verts[i].vel[0]      = bodies[i].vx;
-        verts[i].vel[1]      = bodies[i].vy;
-        verts[i].vel[2]      = bodies[i].vz;
-        verts[i].inv_mass    = bodies[i].awake ? 1.0f : 0.0f;
-        verts[i].radius      = bodies[i].spherical ? (bodies[i].radius > 0.0f ? bodies[i].radius : half) : half;
-        verts[i].restitution = bodies[i].restitution;
+        out_verts[i].pos[0]      = base[i].x;
+        out_verts[i].pos[1]      = base[i].y;
+        out_verts[i].pos[2]      = base[i].z;
+        out_verts[i].vel[0]      = bodies[i].vx;
+        out_verts[i].vel[1]      = bodies[i].vy;
+        out_verts[i].vel[2]      = bodies[i].vz;
+        out_verts[i].prev_pos[0] = base[i].x;
+        out_verts[i].prev_pos[1] = base[i].y;
+        out_verts[i].prev_pos[2] = base[i].z;
+        out_verts[i].inert_y[0]  = base[i].x + v_pre[i][0] * dt;
+        out_verts[i].inert_y[1]  = base[i].y + v_pre[i][1] * dt;
+        out_verts[i].inert_y[2]  = base[i].z + v_pre[i][2] * dt;
+        out_verts[i].inv_mass    = bodies[i].awake ? 1.0f : 0.0f;
+        out_verts[i].radius      = bodies[i].spherical ? (bodies[i].radius > 0.0f ? bodies[i].radius : half) : half;
+        out_verts[i].restitution = bodies[i].restitution;
+        out_verts[i].flags       = k_avbd_vpre_flag;
 
         if (bodies[i].awake && con_cnt < K_AVBD_MAX_CONS) {
-            cons[con_cnt++] = (AvbdConstraint){
+            out_cons[con_cnt++] = (AvbdConstraint){
                 .kind             = AVBD_CON_CONTACT_PLANE,
                 .vert_a           = i,
                 .vert_b           = UINT32_MAX,
@@ -351,8 +367,8 @@ void motion_substep_avbd(MotionBody     *bodies,
             const MotionBody *bb = &pred[j];
             bool hit = body_hit(ba, bb, half, &pen, n);
             if (!hit) {
-                ba  = &bodies[i];
-                bb  = &bodies[j];
+                ba  = &base[i];
+                bb  = &base[j];
                 hit = body_hit(ba, bb, half, &pen, n);
             }
             if (!hit) {
@@ -375,7 +391,7 @@ void motion_substep_avbd(MotionBody     *bodies,
                 d_sep = ux * (bb->x - ba->x) + uy * (bb->y - ba->y) + uz * (bb->z - ba->z) + pen;
             }
 
-            cons[con_cnt++] = (AvbdConstraint){
+            out_cons[con_cnt++] = (AvbdConstraint){
                 .kind             = AVBD_CON_CONTACT_PAIR,
                 .vert_a           = i,
                 .vert_b           = j,
@@ -390,45 +406,66 @@ void motion_substep_avbd(MotionBody     *bodies,
         }
     }
 
-    avbd_warm_apply(&s_motion_warm, cons, con_cnt, 0.85f);
+    avbd_warm_apply(&s_motion_warm, out_cons, con_cnt, 0.85f);
+    *out_vert_count = count;
+    *out_con_count  = con_cnt;
+    return true;
+}
 
-    if (opt_gpu_verts != nullptr && opt_vert_count != nullptr &&
-        opt_gpu_cons != nullptr && opt_con_count != nullptr) {
-        memcpy(opt_gpu_verts, verts, (size_t)count * sizeof(AvbdVertex));
-        memcpy(opt_gpu_cons, cons, (size_t)con_cnt * sizeof(AvbdConstraint));
-        *opt_vert_count = count;
-        *opt_con_count  = con_cnt;
+void motion_apply_solved_avbd(MotionBody           *bodies,
+                              uint32_t              count,
+                              float                 dt,
+                              float                 ground,
+                              float                 half,
+                              const AvbdVertex     *solved_verts,
+                              uint32_t              vert_count,
+                              const AvbdConstraint *solved_cons,
+                              uint32_t              con_count) {
+    if (bodies == nullptr || solved_verts == nullptr || count == 0u ||
+        vert_count < count || count > K_AVBD_MAX_VERTS || !(dt > 0.0f) || !(half > 0.0f)) {
+        return;
     }
 
-    const float grav[3]    = { 0.0f, 0.0f, -k_gravity };
-    const uint32_t n_iters = iterations > 0u ? iterations : 4u;
-    (void)avbd_solve_step(verts, count, cons, con_cnt, dt, grav, n_iters);
-    avbd_warm_store(&s_motion_warm, cons, con_cnt);
+    const uint32_t safe_cons = (solved_cons != nullptr)
+        ? (con_count > K_AVBD_MAX_CONS ? K_AVBD_MAX_CONS : con_count)
+        : 0u;
+    if (safe_cons > 0u) {
+        avbd_warm_store(&s_motion_warm, solved_cons, safe_cons);
+    }
 
+    float rest_z[K_AVBD_MAX_VERTS];
+    const float inv_dt = 1.0f / dt;
     for (uint32_t i = 0u; i < count; ++i) {
+        rest_z[i] = ground + body_rest_lift(&bodies[i], half);
         if (!bodies[i].awake) {
             continue;
         }
-        bodies[i].x  = verts[i].pos[0];
-        bodies[i].y  = verts[i].pos[1];
-        bodies[i].z  = fmaxf(verts[i].pos[2], rest_z[i]);
-        bodies[i].vx = v_pre[i][0];
-        bodies[i].vy = v_pre[i][1];
-        bodies[i].vz = v_pre[i][2];
+        bodies[i].x = solved_verts[i].pos[0];
+        bodies[i].y = solved_verts[i].pos[1];
+        bodies[i].z = fmaxf(solved_verts[i].pos[2], rest_z[i]);
+        if ((solved_verts[i].flags & 0xFFFF0000u) == 0xA5BD0000u) {
+            bodies[i].vx = (solved_verts[i].inert_y[0] - solved_verts[i].prev_pos[0]) * inv_dt;
+            bodies[i].vy = (solved_verts[i].inert_y[1] - solved_verts[i].prev_pos[1]) * inv_dt;
+            bodies[i].vz = (solved_verts[i].inert_y[2] - solved_verts[i].prev_pos[2]) * inv_dt;
+        } else {
+            bodies[i].vx = solved_verts[i].vel[0];
+            bodies[i].vy = solved_verts[i].vel[1];
+            bodies[i].vz = solved_verts[i].vel[2];
+        }
     }
 
     // Apply momentum & restitution transfer across active AVBD contact pairs
-    for (uint32_t c = 0u; c < con_cnt; ++c) {
-        if (cons[c].kind != AVBD_CON_CONTACT_PAIR) {
+    for (uint32_t c = 0u; c < safe_cons; ++c) {
+        if (solved_cons[c].kind != AVBD_CON_CONTACT_PAIR) {
             continue;
         }
-        uint32_t va = cons[c].vert_a;
-        uint32_t vb = cons[c].vert_b;
+        uint32_t va = solved_cons[c].vert_a;
+        uint32_t vb = solved_cons[c].vert_b;
         if (va < count && vb < count) {
             trade(&bodies[va], &bodies[vb],
-                  cons[c].normal_or_target[0],
-                  cons[c].normal_or_target[1],
-                  cons[c].normal_or_target[2]);
+                  solved_cons[c].normal_or_target[0],
+                  solved_cons[c].normal_or_target[1],
+                  solved_cons[c].normal_or_target[2]);
         }
     }
 
@@ -483,6 +520,44 @@ void motion_substep_avbd(MotionBody     *bodies,
     for (uint32_t i = 0u; i < count; ++i) {
         sleep_one(bodies, count, i, ground, half);
     }
+}
+
+void motion_substep_avbd(MotionBody     *bodies,
+                         uint32_t        count,
+                         float           dt,
+                         float           ground,
+                         float           half,
+                         uint32_t        iterations,
+                         AvbdVertex     *opt_gpu_verts,
+                         uint32_t       *opt_vert_count,
+                         AvbdConstraint *opt_gpu_cons,
+                         uint32_t       *opt_con_count) {
+    if (opt_vert_count != nullptr) *opt_vert_count = 0u;
+    if (opt_con_count != nullptr)  *opt_con_count  = 0u;
+
+    AvbdVertex     verts[K_AVBD_MAX_VERTS];
+    AvbdConstraint cons[K_AVBD_MAX_CONS];
+    uint32_t       vert_cnt = 0u;
+    uint32_t       con_cnt  = 0u;
+
+    if (!motion_prepare_avbd_step(bodies, count, dt, ground, half,
+                                  verts, &vert_cnt, cons, &con_cnt)) {
+        return;
+    }
+
+    if (opt_gpu_verts != nullptr && opt_vert_count != nullptr &&
+        opt_gpu_cons != nullptr && opt_con_count != nullptr) {
+        memcpy(opt_gpu_verts, verts, (size_t)vert_cnt * sizeof(AvbdVertex));
+        memcpy(opt_gpu_cons, cons, (size_t)con_cnt * sizeof(AvbdConstraint));
+        *opt_vert_count = vert_cnt;
+        *opt_con_count  = con_cnt;
+    }
+
+    const float    grav[3] = { 0.0f, 0.0f, -k_gravity };
+    const uint32_t n_iters = iterations > 0u ? iterations : 4u;
+    (void)avbd_solve_step(verts, vert_cnt, cons, con_cnt, dt, grav, n_iters);
+    motion_apply_solved_avbd(bodies, vert_cnt, dt, ground, half,
+                             verts, vert_cnt, cons, con_cnt);
 }
 
 void motion_substep(MotionBody *bodies, uint32_t count, float dt, float ground, float half) {

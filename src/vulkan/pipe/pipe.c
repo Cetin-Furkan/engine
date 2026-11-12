@@ -1,4 +1,5 @@
 #include "vulkan/pipe.h"
+#include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,8 +26,8 @@ static_assert(sizeof(PipeHeader) == 28u, "pipeline cache header");
 // A full bank fails the create. In-use pipelines are not evicted.
 enum : uint32_t {
     k_bank_cap   = 128u,
-    k_spec_bytes = 32u,
-    k_spec_maps  = 4u,
+    k_spec_bytes = VULKAN_GFX_SPEC_BYTES,
+    k_spec_maps  = VULKAN_GFX_SPEC_MAPS,
 };
 
 typedef struct PipeSlot {
@@ -61,15 +62,50 @@ static void bank_drop_all(VulkanContext *vk);
 static void cache_path(char *dst, size_t cap) {
     const char *base = getenv("XDG_CACHE_HOME");
     if (base != nullptr && base[0] != '\0') {
-        snprintf(dst, cap, "%s/engine-v2/engine.pipeline", base);
+        snprintf(dst, cap, "%s/engine/engine.pipeline", base);
         return;
     }
     const char *home = getenv("HOME");
     if (home != nullptr && home[0] != '\0') {
-        snprintf(dst, cap, "%s/.cache/engine-v2/engine.pipeline", home);
+        snprintf(dst, cap, "%s/.cache/engine/engine.pipeline", home);
         return;
     }
-    snprintf(dst, cap, "/tmp/engine-v2.pipeline");
+    snprintf(dst, cap, "/tmp/engine.pipeline");
+}
+
+static bool read_full(int fd, void *buf, size_t n) {
+    uint8_t *p = (uint8_t *)buf;
+    size_t got = 0;
+    while (got < n) {
+        ssize_t r = read(fd, p + got, n - got);
+        if (r < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return false;
+        }
+        if (r == 0) {
+            return false;
+        }
+        got += (size_t)r;
+    }
+    return true;
+}
+
+static bool write_full(int fd, const void *buf, size_t n) {
+    const uint8_t *p = (const uint8_t *)buf;
+    size_t sent = 0;
+    while (sent < n) {
+        ssize_t w = write(fd, p + sent, n - sent);
+        if (w < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return false;
+        }
+        sent += (size_t)w;
+    }
+    return true;
 }
 
 static void cache_dir(char *dst, size_t cap) {
@@ -123,11 +159,11 @@ void vulkan_pipe_cache_open(VulkanContext *vk) {
         struct stat st;
         if (fstat(fd, &st) == 0 && (size_t)st.st_size > sizeof(PipeHeader)) {
             PipeHeader hdr = {0};
-            if (read(fd, &hdr, sizeof hdr) == (ssize_t)sizeof hdr && header_matches(&hdr, &props)) {
+            if (read_full(fd, &hdr, sizeof hdr) && header_matches(&hdr, &props)) {
                 blob_bytes = (size_t)st.st_size - sizeof hdr;
                 blob = malloc(blob_bytes);
                 if (blob != nullptr) {
-                    if (read(fd, blob, blob_bytes) != (ssize_t)blob_bytes) {
+                    if (!read_full(fd, blob, blob_bytes)) {
                         free(blob);
                         blob = nullptr;
                         blob_bytes = 0;
@@ -140,6 +176,9 @@ void vulkan_pipe_cache_open(VulkanContext *vk) {
 
     VkPipelineCacheCreateInfo info = {
         .sType           = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO,
+        .flags           = vk->device_info.supports_pipeline_cache_control
+                               ? VK_PIPELINE_CACHE_CREATE_EXTERNALLY_SYNCHRONIZED_BIT
+                               : 0u,
         .initialDataSize = blob_bytes,
         .pInitialData    = blob,
     };
@@ -177,23 +216,39 @@ static uint64_t fnv_mem(uint64_t h, const void *p, size_t n) {
     return h;
 }
 
+static bool spec_valid(const VkSpecializationInfo *spec) {
+    if (spec == nullptr || spec->dataSize == 0u) {
+        return spec == nullptr || spec->mapEntryCount == 0u;
+    }
+    if (spec->pData == nullptr || spec->dataSize > k_spec_bytes ||
+        spec->mapEntryCount == 0u || spec->mapEntryCount > k_spec_maps ||
+        spec->pMapEntries == nullptr) {
+        return false;
+    }
+    for (uint32_t i = 0u; i < spec->mapEntryCount; ++i) {
+        const VkSpecializationMapEntry *e = &spec->pMapEntries[i];
+        if (e->offset > spec->dataSize || e->size == 0u || e->size > spec->dataSize - e->offset) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static bool spec_store(const VkSpecializationInfo *spec, PipeSlot *slot) {
     slot->spec_bytes = 0u;
     slot->spec_maps = 0u;
-    if (spec == nullptr || spec->dataSize == 0u) {
+    if (spec == nullptr || (spec->dataSize == 0u && spec->mapEntryCount == 0u)) {
         return true;
     }
-    if (spec->pData == nullptr || spec->dataSize > k_spec_bytes || spec->mapEntryCount > k_spec_maps) {
-        fprintf(stderr, "[Vulkan Error] Specialization is %zu bytes, the bank holds %u\n",
-                spec->dataSize, k_spec_bytes);
+    if (!spec_valid(spec)) {
+        fprintf(stderr, "[Vulkan Error] Invalid specialization (%zu bytes, %u map entries; bank max %u/%u)\n",
+                spec->dataSize, spec->mapEntryCount, k_spec_bytes, k_spec_maps);
         return false;
     }
     memcpy(slot->spec, spec->pData, spec->dataSize);
     slot->spec_bytes = (uint32_t)spec->dataSize;
-    if (spec->mapEntryCount > 0u && spec->pMapEntries != nullptr) {
-        memcpy(slot->maps, spec->pMapEntries, spec->mapEntryCount * sizeof(VkSpecializationMapEntry));
-        slot->spec_maps = spec->mapEntryCount;
-    }
+    memcpy(slot->maps, spec->pMapEntries, spec->mapEntryCount * sizeof(VkSpecializationMapEntry));
+    slot->spec_maps = spec->mapEntryCount;
     return true;
 }
 
@@ -364,7 +419,9 @@ static VkPipeline create_graphics(VulkanContext *vk, const VulkanGfxPipe *info, 
         .scissorCount  = 1,
     };
     VkSampleCountFlagBits samples = info->samples == 0 ? VK_SAMPLE_COUNT_1_BIT : info->samples;
-    VkCompareOp compare = info->depth_compare == 0 ? VK_COMPARE_OP_LESS : info->depth_compare;
+    VkCompareOp compare = info->custom_depth_compare
+        ? info->depth_compare
+        : (info->depth_compare == 0 ? VK_COMPARE_OP_LESS : info->depth_compare);
     VkPipelineRasterizationStateCreateInfo raster = {
         .sType       = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
         .polygonMode = VK_POLYGON_MODE_FILL,
@@ -469,7 +526,9 @@ static VkPipeline create_compute(VulkanContext *vk, const void *spv, size_t byte
 static VkPipeline bank_hold_graphics(VulkanContext *vk, const VulkanGfxPipe *info, VkFormat format,
                                      const VkSpecializationInfo *spec) {
     VkSampleCountFlagBits samples = info->samples == 0 ? VK_SAMPLE_COUNT_1_BIT : info->samples;
-    VkCompareOp compare = info->depth_compare == 0 ? VK_COMPARE_OP_LESS : info->depth_compare;
+    VkCompareOp compare = info->custom_depth_compare
+        ? info->depth_compare
+        : (info->depth_compare == 0 ? VK_COMPARE_OP_LESS : info->depth_compare);
     PipeSlot spec_tmp = {0};
     if (!spec_store(spec, &spec_tmp)) {
         return VK_NULL_HANDLE;
@@ -573,8 +632,8 @@ void vulkan_pipe_cache_close(VulkanContext *vk) {
                     cache_dir(dir, sizeof dir);
                     cache_path(path, sizeof path);
                     mkdir_p(dir);
-                    char tmp[540];
-                    snprintf(tmp, sizeof tmp, "%s.tmp", path);
+                    char tmp[560];
+                    snprintf(tmp, sizeof tmp, "%s.%d.tmp", path, (int)getpid());
                     int out_fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
                     if (out_fd >= 0) {
                         PipeHeader hdr = {
@@ -583,8 +642,8 @@ void vulkan_pipe_cache_close(VulkanContext *vk) {
                             .device = props.deviceID,
                         };
                         memcpy(hdr.uuid, props.pipelineCacheUUID, VK_UUID_SIZE);
-                        bool ok = write(out_fd, &hdr, sizeof hdr) == (ssize_t)sizeof hdr &&
-                                  write(out_fd, blob, bytes) == (ssize_t)bytes;
+                        bool ok = write_full(out_fd, &hdr, sizeof hdr) &&
+                                  write_full(out_fd, blob, bytes);
                         close(out_fd);
                         if (!ok || rename(tmp, path) != 0) {
                             unlink(tmp);
@@ -651,10 +710,28 @@ void vulkan_gfx_arm(VulkanGfxLive *live, const VulkanGfxPipe *info, VkFormat for
     *live = (VulkanGfxLive){0};
     live->info = *info;
     live->info.color_format = format;
-    live->info.frag_spec = spec;
+    live->info.frag_spec = nullptr;
     live->format = format;
-    live->spec = spec;
     live->armed = true;
+
+    const VkSpecializationInfo *src_spec = (spec != nullptr) ? spec : info->frag_spec;
+    if (src_spec != nullptr && (src_spec->dataSize > 0u || src_spec->mapEntryCount > 0u)) {
+        if (!spec_valid(src_spec)) {
+            fprintf(stderr, "[Vulkan Error] Invalid specialization passed to vulkan_gfx_arm\n");
+            live->failed = true;
+            return;
+        }
+        memcpy(live->spec_data, src_spec->pData, src_spec->dataSize);
+        memcpy(live->spec_maps, src_spec->pMapEntries,
+               src_spec->mapEntryCount * sizeof(VkSpecializationMapEntry));
+        live->owned_spec = (VkSpecializationInfo){
+            .mapEntryCount = src_spec->mapEntryCount,
+            .pMapEntries   = live->spec_maps,
+            .dataSize      = src_spec->dataSize,
+            .pData         = live->spec_data,
+        };
+        live->has_spec = true;
+    }
 }
 
 VkPipeline vulkan_gfx_use(VulkanContext *vk, VulkanGfxLive *live) {
@@ -665,8 +742,13 @@ VkPipeline vulkan_gfx_use(VulkanContext *vk, VulkanGfxLive *live) {
         return live->pipeline;
     }
     VkPipeline out = VK_NULL_HANDLE;
-    const VkSpecializationInfo *specs[1] = { live->spec };
-    if (vulkan_gfx_pipelines(vk, &live->info, &live->format, live->spec != nullptr ? specs : nullptr,
+    const VkSpecializationInfo *specs[1] = { nullptr };
+    if (live->has_spec) {
+        live->owned_spec.pMapEntries = live->spec_maps;
+        live->owned_spec.pData       = live->spec_data;
+        specs[0]                     = &live->owned_spec;
+    }
+    if (vulkan_gfx_pipelines(vk, &live->info, &live->format, live->has_spec ? specs : nullptr,
                              1u, &out) != 0) {
         live->failed = true;
         return VK_NULL_HANDLE;

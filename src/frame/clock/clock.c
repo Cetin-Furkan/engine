@@ -38,20 +38,37 @@ FrameStep frame_clock_step(FrameClock *clock, uint32_t stamp_ms) {
     clock->last_stamp_ms = stamp_ms;
     clock->frames++;
 
-    // Missed refreshes are counted against the period learned before
-    // this stamp; feeding the gap into the EMA first would excuse it.
-    uint32_t period = frame_clock_period_ms(clock);
-    if (period > 0 && raw_dt > period) {
-        step.missed = (raw_dt + period / 2u) / period - 1u;
-        clock->missed_total += step.missed;
-    }
-    if (period == 0) {
-        clock->period_q8 = raw_dt << 8;
+    // Missed refreshes and refresh-period learning only run within normal
+    // cadence intervals. Multi-second occlusions or compositor switches
+    // (> k_max_dt_ms) are clock restarts and must not poison period_q8 or
+    // inflate missed_total.
+    if (raw_dt <= k_max_dt_ms) {
+        uint32_t period = frame_clock_period_ms(clock);
+        if (period > 0 && raw_dt > period) {
+            step.missed = (raw_dt + period / 2u) / period - 1u;
+            clock->missed_total += step.missed;
+        }
+        if (period == 0) {
+            clock->period_q8 = raw_dt << 8;
+            clock->prev_long = false;
+        } else if (step.missed == 0) {
+            // Normal cadence (including 16/17 ms integer rounding jitter) or
+            // refresh upshift (e.g. 60 Hz -> 120 Hz): update EMA directly.
+            uint32_t sample = raw_dt << 8;
+            clock->period_q8 = clock->period_q8 - (clock->period_q8 >> 3) + (sample >> 3);
+            clock->prev_long = false;
+        } else {
+            // Whole refresh(es) missed: ignore a single isolated hitch so one
+            // dropped VBlank never poisons period_q8, while adapting smoothly
+            // if 2+ consecutive frames run at a slower cadence (120 -> 60 Hz).
+            if (clock->prev_long) {
+                uint32_t sample = raw_dt << 8;
+                clock->period_q8 = clock->period_q8 - (clock->period_q8 >> 3) + (sample >> 3);
+            }
+            clock->prev_long = true;
+        }
     } else {
-        // EMA with alpha 1/8 in Q8: stable against one-off hitches,
-        // still tracks a refresh-rate change within a few frames.
-        uint32_t sample = raw_dt << 8;
-        clock->period_q8 = clock->period_q8 - (clock->period_q8 >> 3) + (sample >> 3);
+        clock->prev_long = false;
     }
     step.dt_ms = raw_dt > k_max_dt_ms ? k_max_dt_ms : raw_dt;
     step.paint = true;

@@ -33,6 +33,7 @@ typedef struct FrameClock {
     uint32_t missed_total;
     uint32_t stalls;
     bool     have_stamp;
+    bool     prev_long;
     uint32_t accum_ms;     // Fixed-step accumulator (carried remainder).
     uint32_t sim_steps;    // Fixed steps issued since reset.
     uint32_t sim_ms;       // Monotonic simulation cursor. Advances by issued steps only.

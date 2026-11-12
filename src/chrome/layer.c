@@ -173,6 +173,18 @@ static void surface_size(const WaylandContext *w, uint32_t *surf_w, uint32_t *su
     *surf_h = (w != nullptr && w->bar_surface_id != 0) ? sat_add(s_buf_h, w->bar_px) : s_buf_h;
 }
 
+static bool control_layer_is_rendered(const ChromeSpec *spec, const WaylandContext *w, const char *layer_name) {
+    if (spec == nullptr || w == nullptr || w->bar_surface_id == 0 || layer_name == nullptr) {
+        return false;
+    }
+    for (uint32_t i = 0; i < spec->nlayers; ++i) {
+        if (strcmp(spec->layers[i].name, layer_name) == 0) {
+            return strcmp(spec->layers[i].edge, "top") == 0;
+        }
+    }
+    return false;
+}
+
 void chrome_hit_test(
     const WaylandContext *w,
     uint32_t              surface,
@@ -189,6 +201,10 @@ void chrome_hit_test(
     out->close = false;
     out->title = false;
     if (spec == nullptr || w == nullptr || s_buf_w == 0 || s_buf_h == 0) {
+        return;
+    }
+    // When the compositor forces server-side decorations, suppress client-side chrome hitboxes.
+    if (w->decoration_mode == ENG_DECOR_SERVER) {
         return;
     }
     bool on_bar = w->bar_surface_id != 0 && surface == w->bar_surface_id;
@@ -257,6 +273,9 @@ void chrome_hit_test(
     uint32_t node_count = box_layout(spec, surf_w, surf_h, surf_w, surf_h, nodes, BOX_CAP, nullptr);
     for (uint32_t n = spec->ncontrols; n > 0; --n) {
         const ChromeControlSpec *ctl = &spec->controls[n - 1u];
+        if (!control_layer_is_rendered(spec, w, ctl->layer)) {
+            continue;
+        }
         const BoxNode *cb = find_named(nodes, node_count, BOX_DOCK_CONTROL, ctl->name);
         if (cb == nullptr || !inside(&cb->rect, wx, wy)) {
             continue;

@@ -179,6 +179,63 @@ static void test_elastic_bounce_and_solids(void) {
     CHECK(mix[1].x > 250.0f);
 }
 
+static void test_single_owner_gpu_pose_contract(void) {
+    // Verify that when GPU AVBD owns the pose:
+    // 1. motion_prepare_avbd_step leaves MotionBody positions 100% untouched on CPU;
+    // 2. harvesting a GPU-solved AvbdVertex buffer produces the GPU pose and FAILS
+    //    if the resulting pose still matches the CPU integrator.
+    float lift = motion_rest_lift(0.0f, k_fillet_half);
+    MotionBody cpu_body = {
+        .x           = 10.0f,
+        .y           = -20.0f,
+        .z           = lift + 120.0f,
+        .vx          = 500.0f,
+        .vy          = -150.0f,
+        .vz          = 0.0f,
+        .restitution = 0.75f,
+        .awake       = true,
+    };
+    MotionBody gpu_body = cpu_body;
+
+    // Reference CPU-only integrator step
+    motion_reset_warm_cache();
+    motion_substep(&cpu_body, 1u, 0.008f, 0.0f, k_fillet_half);
+
+    // GPU-owned path: prepare step on CPU without integrating positions
+    motion_reset_warm_cache();
+    AvbdVertex     gpu_verts[K_AVBD_MAX_VERTS];
+    AvbdConstraint gpu_cons[K_AVBD_MAX_CONS];
+    uint32_t       vn = 0u;
+    uint32_t       cn = 0u;
+    CHECK(motion_prepare_avbd_step(&gpu_body, 1u, 0.008f, 0.0f, k_fillet_half,
+                                   gpu_verts, &vn, gpu_cons, &cn));
+    CHECK(vn == 1u);
+    CHECK(cn == 1u);
+
+    // Pre-harvest drawn pose MUST NOT have moved on the CPU
+    CHECK(gpu_body.x == 10.0f);
+    CHECK(gpu_body.y == -20.0f);
+    CHECK(gpu_body.z == lift + 120.0f);
+    CHECK(fabsf(gpu_body.x - cpu_body.x) > 1.0f);
+
+    // Simulate a distinct GPU compute solve in the mapped BDA vertex buffer
+    gpu_verts[0].pos[0] = 77.5f;
+    gpu_verts[0].pos[1] = -88.25f;
+    gpu_verts[0].pos[2] = lift + 64.0f;
+
+    // Harvest the retired GPU vertex buffer
+    motion_apply_solved_avbd(&gpu_body, 1u, 0.008f, 0.0f, k_fillet_half,
+                             gpu_verts, vn, gpu_cons, cn);
+
+    // Drawn pose MUST match the GPU buffer and MUST NOT match the CPU integrator
+    CHECK(fabsf(gpu_body.x - 77.5f) < 1.0e-4f);
+    CHECK(fabsf(gpu_body.y - (-88.25f)) < 1.0e-4f);
+    CHECK(fabsf(gpu_body.z - (lift + 64.0f)) < 1.0e-4f);
+    CHECK(fabsf(gpu_body.x - cpu_body.x) > 50.0f);
+    CHECK(fabsf(gpu_body.y - cpu_body.y) > 50.0f);
+    CHECK(fabsf(gpu_body.z - cpu_body.z) > 40.0f);
+}
+
 int main(void) {
     test_lift_clears_the_pitch();
     test_pose_matches_the_draw();
@@ -187,6 +244,7 @@ int main(void) {
     test_cubes_separate();
     test_pitched_faces_meet();
     test_elastic_bounce_and_solids();
+    test_single_owner_gpu_pose_contract();
     if (s_failures != 0) {
         fprintf(stderr, "test_motion: %d failed\n", s_failures);
         return 1;

@@ -10,6 +10,10 @@ enum : VkDeviceSize {
     BDA_STORAGE_ALIGN     = 256u,                // Storage buffer alignment
 };
 
+enum : uint32_t {
+    BDA_TRANSIENT_SLICES = 4u,                   // 4 timeline-guarded frame slices
+};
+
 typedef struct BdaSlice {
     void           *cpu;
     VkDeviceAddress gpu;
@@ -65,6 +69,7 @@ typedef struct BdaPool {
     VkDeviceSize          slab_size;
     VkBufferUsageFlags    usage;
     VkMemoryPropertyFlags mem_flags;
+    float                 priority;
     bool                  is_host_mapped;
     BdaBlock             *blocks;
     uint32_t              block_count;
@@ -72,13 +77,19 @@ typedef struct BdaPool {
 } BdaPool;
 
 typedef struct BdaSystem {
-    BdaPool  device_pool;   // Dedicated device-local VRAM (or unified LLC UMA pool)
-    BdaPool  staging_pool;  // Host-visible coherent RAM (unused when unified_uma is true)
-    BdaBlock transient_ring;// Two frame halves. See bda_transient_begin_frame.
-    uint32_t transient_slot;
-    VkDeviceSize transient_at[2];
-    bool     unified_uma;
-    bool     is_initialized;
+    VulkanContext *vk;
+    BdaPool        device_pool;   // Dedicated device-local VRAM (or unified LLC UMA pool)
+    BdaPool        staging_pool;  // Host-visible coherent RAM (unused when unified_uma is true)
+    BdaBlock       transient_ring;// Four timeline-guarded slices. See bda_transient_begin_frame.
+    uint32_t       transient_slot;
+    VkDeviceSize   transient_at[BDA_TRANSIENT_SLICES];
+    uint64_t       transient_point[BDA_TRANSIENT_SLICES];
+    VkDeviceSize   standalone_bytes;
+    uint32_t       standalone_count;
+    uint32_t       vk_alloc_count;
+    bool           transient_slice_busy;
+    bool           unified_uma;
+    bool           is_initialized;
 } BdaSystem;
 
 typedef struct BdaStats {
@@ -88,8 +99,13 @@ typedef struct BdaStats {
     VkDeviceSize staging_capacity;
     VkDeviceSize transient_used;
     VkDeviceSize transient_capacity;
+    VkDeviceSize standalone_allocated;
+    VkDeviceSize device_heap_usage;
+    VkDeviceSize device_heap_budget;
     uint32_t     device_blocks;
     uint32_t     staging_blocks;
+    uint32_t     standalone_blocks;
+    uint32_t     vk_alloc_count;
 } BdaStats;
 
 // 2026 Unified BDA Slab System API
@@ -101,11 +117,12 @@ void bda_system_shutdown(VulkanContext *vk);
 void bda_transient_reset(void);
 void bda_get_stats(BdaStats *out);
 
-// Rewind one half of the transient bump. signal_point & 1 selects the half.
-// Call it after that slot's previous acquire has retired. The other half
-// is left for the frame that may still be reading it. An allocation that
-// does not fit the half comes from the staging pool and does not wrap.
-void bda_transient_begin_frame(uint64_t signal_point);
+// Rewind one quarter of the transient bump. signal_point & 3 selects the slice.
+// Polls acquire with timeout 0; if the previous timeline signal recorded on
+// that slice has not yet retired, the slice is left untouched and
+// bda_alloc_transient returns a null BdaSlice for this frame.
+void bda_transient_begin_frame(VkSemaphore acquire, uint64_t signal_point);
+void bda_transient_abort_frame(uint64_t signal_point);
 
 // Compatible wrappers.
 // A fixed buffer is created before the first frame and is not replaced:

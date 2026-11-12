@@ -30,7 +30,32 @@ typedef struct MotionBody {
 // Clears across-tick AVBD dual multiplier warm-start cache on world reset.
 void motion_reset_warm_cache(void);
 
-// Variational 2026 AVBD substep with optional pre-step BDA capture for GPU compute.
+// Builds pre-step AvbdVertex and AvbdConstraint arrays (including sleeper wake
+// propagation and dual warm-starting) WITHOUT integrating bodies[] positions.
+// Returns true when at least one body is awake and out_verts/out_cons are ready.
+[[nodiscard]] bool motion_prepare_avbd_step(MotionBody     *bodies,
+                                            uint32_t        count,
+                                            float           dt,
+                                            float           ground,
+                                            float           half,
+                                            AvbdVertex     *out_verts,
+                                            uint32_t       *out_vert_count,
+                                            AvbdConstraint *out_cons,
+                                            uint32_t       *out_con_count);
+
+// Commits a retired GPU (or CPU) solved AvbdVertex/AvbdConstraint step into
+// bodies[], updating positions, elastic restitution impulses, damping, and sleep.
+void motion_apply_solved_avbd(MotionBody           *bodies,
+                              uint32_t              count,
+                              float                 dt,
+                              float                 ground,
+                              float                 half,
+                              const AvbdVertex     *solved_verts,
+                              uint32_t              vert_count,
+                              const AvbdConstraint *solved_cons,
+                              uint32_t              con_count);
+
+// Variational 2026 AVBD CPU substep (CPU-only fallback and standalone tests).
 void motion_substep_avbd(MotionBody     *bodies,
                          uint32_t        count,
                          float           dt,

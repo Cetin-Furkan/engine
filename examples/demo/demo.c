@@ -507,9 +507,10 @@ static void demo_prepare_draw(VkCommandBuffer cmd, VkImage depth_image) {
 }
 
 static void demo_claim_frame(VkSemaphore acquire, uint64_t signal_point) {
-    // This slot's previous acquire has already retired. Rewind only its
-    // half of the transient bump. The other slot may still be reading.
-    bda_transient_begin_frame(signal_point);
+    // Rewind this frame's timeline-guarded quarter of the transient bump.
+    bda_transient_begin_frame(acquire, signal_point);
+    physics_claim_frame(acquire, signal_point);
+    scene_claim_frame(acquire, signal_point);
     cube_bind_acquire(acquire);
     shape_begin(acquire, signal_point);
     text_begin(acquire, signal_point);
@@ -517,6 +518,9 @@ static void demo_claim_frame(VkSemaphore acquire, uint64_t signal_point) {
 }
 
 static void demo_release_frame(uint64_t signal_point) {
+    bda_transient_abort_frame(signal_point);
+    physics_abort_frame(signal_point);
+    scene_abort_frame(signal_point);
     shape_release(signal_point);
     text_release(signal_point);
     plot_release(signal_point);

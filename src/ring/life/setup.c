@@ -60,16 +60,12 @@ int ring_context_init(RingContext *r, const char *name, bool with_pbuf) {
         r->pbuf_off = len;
         r->bufs_off = r->pbuf_off + page;
         len = r->bufs_off + (size_t)ENG_PBUF_ENTRIES * ENG_PBUF_LEN;
-        r->sim_pbuf_off = ring_align_up(len, page);
-        r->sim_bufs_off = r->sim_pbuf_off + page;
-        len = r->sim_bufs_off + (size_t)ENG_SIM_PBUF_ENTRIES * ENG_SIM_PBUF_LEN;
     }
     r->fixed_off = ring_align_up(len, page);
-    size_t fixed_bytes = (size_t)ENG_FBUF_INOTIFY_LEN + ENG_FBUF_SIGNAL_LEN + ENG_FBUF_RELEASE_LEN;
     if (with_pbuf) {
-        fixed_bytes += (size_t)ENG_FBUF_PAGER_COUNT * (size_t)ENG_FBUF_PAGER_LEN;
         r->pager_fixed_on = true;
     }
+    size_t fixed_bytes = ring_fixed_region_bytes(r->pager_fixed_on);
     len = r->fixed_off + fixed_bytes;
     r->wait_off = ring_align_up(len, page);
     len = r->wait_off + page;
@@ -89,8 +85,6 @@ int ring_context_init(RingContext *r, const char *name, bool with_pbuf) {
     if (with_pbuf) {
         r->pbuf = (struct io_uring_buf_ring *)((char *)arena + r->pbuf_off);
         r->bufs = (uint8_t *)arena + r->bufs_off;
-        r->sim_pbuf = (struct io_uring_buf_ring *)((char *)arena + r->sim_pbuf_off);
-        r->sim_bufs = (uint8_t *)arena + r->sim_bufs_off;
     }
     r->fixed_base = (uint8_t *)arena + r->fixed_off;
     r->wait = (struct io_uring_reg_wait *)((char *)arena + r->wait_off);
@@ -166,12 +160,6 @@ int ring_context_init(RingContext *r, const char *name, bool with_pbuf) {
             ring_context_shutdown(r);
             return prc;
         }
-        prc = ring_sim_pbuf_register(r);
-        if (prc < 0) {
-            fprintf(stderr, "[Ring Error] sim provided buffers failed: %s\n", strerror(-prc));
-            ring_context_shutdown(r);
-            return prc;
-        }
     }
 
     int frc = ring_fixed_register(r);
@@ -194,19 +182,23 @@ int ring_context_init(RingContext *r, const char *name, bool with_pbuf) {
         ring_context_shutdown(r);
         return files;
     }
+    (void)ring_register_file_alloc_range(r);
 
     r->wait_flags = IORING_ENTER_NO_IOWAIT;
     r->is_initialized = true;
-    printf("[Ring] Initialized '%s' (registered index %d, SQ=%u, CQ=%u, PBUF=%ux%uB, SIM=%ux%uB, FixedBuf=%u, FixedFiles=%u, NO_MMAP+REGISTERED_FD_ONLY+DEFER_TASKRUN)\n",
+    printf("[Ring] Initialized '%s' (registered index %d, SQ=%u, CQ=%u, PBUF=%ux%uB [INC=%s], FixedBuf=%u/%u, FixedFiles=%u [Alloc=%u..%u:%s], NO_MMAP+REGISTERED_FD_ONLY+DEFER_TASKRUN)\n",
            r->name,
            r->enter_fd,
            r->sq_entries,
            r->cq_entries,
            with_pbuf ? ENG_PBUF_ENTRIES : 0u,
            ENG_PBUF_LEN,
-           with_pbuf ? ENG_SIM_PBUF_ENTRIES : 0u,
-           ENG_SIM_PBUF_LEN,
+           r->pbuf_inc_on ? "on" : "off",
            r->fixed_count,
-           ENG_FIXED_FILES);
+           r->fixed_table_cap,
+           ENG_FIXED_FILES,
+           ENG_FILE_ALLOC_OFF,
+           ENG_FILE_ALLOC_OFF + ENG_FILE_ALLOC_LEN - 1u,
+           r->file_alloc_range_on ? "on" : "off");
     return 0;
 }

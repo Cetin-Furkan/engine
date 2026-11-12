@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 
 #if defined(ENGINE_DEBUG)
@@ -89,12 +90,13 @@ static bool is_layer_supported(const char *layer_name) {
     return found;
 }
 
-static bool is_extension_supported(const char *extension_name) {
+static bool is_layer_extension_supported(const char *layer_name, const char *extension_name) {
     if (extension_name == nullptr) {
         return false;
     }
     uint32_t extension_count = 0;
-    if (vkEnumerateInstanceExtensionProperties(nullptr, &extension_count, nullptr) != VK_SUCCESS || extension_count == 0) {
+    if (vkEnumerateInstanceExtensionProperties(layer_name, &extension_count, nullptr) != VK_SUCCESS ||
+        extension_count == 0) {
         return false;
     }
 
@@ -104,7 +106,7 @@ static bool is_extension_supported(const char *extension_name) {
         return false;
     }
 
-    if (vkEnumerateInstanceExtensionProperties(nullptr, &extension_count, available_exts) != VK_SUCCESS) {
+    if (vkEnumerateInstanceExtensionProperties(layer_name, &extension_count, available_exts) != VK_SUCCESS) {
         free(available_exts);
         return false;
     }
@@ -119,6 +121,22 @@ static bool is_extension_supported(const char *extension_name) {
 
     free(available_exts);
     return found;
+}
+
+static bool is_extension_supported(const char *extension_name) {
+    return is_layer_extension_supported(nullptr, extension_name);
+}
+
+static bool debug_env_toggle(const char *name, bool default_on) {
+    const char *val = getenv(name);
+    if (val == nullptr || val[0] == '\0') {
+        return default_on;
+    }
+    if (strcmp(val, "0") == 0 || strcasecmp(val, "false") == 0 ||
+        strcasecmp(val, "off") == 0 || strcasecmp(val, "no") == 0) {
+        return false;
+    }
+    return true;
 }
 
 static VKAPI_ATTR VkBool32 VKAPI_CALL vulkan_debug_messenger_callback(
@@ -229,10 +247,19 @@ VulkanResult vulkan_instance_create(VulkanContext *ctx) {
     uint32_t    enabled_extension_count = 0;
 #if defined(ENGINE_DEBUG)
     bool enable_debug_utils = false;
+    bool enable_val_features = false;
     const char *debug_utils_ext = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
-    if (is_extension_supported(debug_utils_ext)) {
+    if (is_extension_supported(debug_utils_ext) ||
+        (enable_validation && is_layer_extension_supported(validation_layer, debug_utils_ext))) {
         enabled_extensions[enabled_extension_count++] = debug_utils_ext;
         enable_debug_utils = true;
+    }
+    const char *val_feat_ext = VK_EXT_VALIDATION_FEATURES_EXTENSION_NAME;
+    if (enable_validation &&
+        (is_extension_supported(val_feat_ext) ||
+         is_layer_extension_supported(validation_layer, val_feat_ext))) {
+        enabled_extensions[enabled_extension_count++] = val_feat_ext;
+        enable_val_features = true;
     }
 #endif
 
@@ -249,9 +276,34 @@ VulkanResult vulkan_instance_create(VulkanContext *ctx) {
     };
 #if defined(ENGINE_DEBUG)
     VkDebugUtilsMessengerCreateInfoEXT debug_create_info = {0};
+    VkValidationFeatureEnableEXT       val_enables[4]    = {0};
+    VkValidationFeaturesEXT            val_features      = {
+        .sType = VK_STRUCTURE_TYPE_VALIDATION_FEATURES_EXT,
+    };
     if (enable_debug_utils) {
         setup_debug_messenger_create_info(&debug_create_info);
         instance_info.pNext = &debug_create_info;
+    }
+    if (enable_val_features) {
+        const bool want_syncval = debug_env_toggle("ENGINE_SYNCVAL", true);
+        const bool want_gpuav   = debug_env_toggle("ENGINE_GPUAV", true);
+        uint32_t   feat_count   = 0u;
+        if (want_syncval) {
+            val_enables[feat_count++] = VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT;
+        }
+        if (want_gpuav) {
+            val_enables[feat_count++] = VK_VALIDATION_FEATURE_ENABLE_GPU_ASSISTED_EXT;
+            val_enables[feat_count++] = VK_VALIDATION_FEATURE_ENABLE_GPU_ASSISTED_RESERVE_BINDING_SLOT_EXT;
+        }
+        if (feat_count > 0u) {
+            val_features.pNext                          = instance_info.pNext;
+            val_features.enabledValidationFeatureCount  = feat_count;
+            val_features.pEnabledValidationFeatures     = val_enables;
+            instance_info.pNext                         = &val_features;
+            printf("[Vulkan Debug] Khronos validation features: SyncVal=%s, GPU-AV=%s\n",
+                   want_syncval ? "on" : "off",
+                   want_gpuav ? "on" : "off");
+        }
     }
 #endif
 
@@ -281,6 +333,9 @@ VulkanResult vulkan_instance_create(VulkanContext *ctx) {
         ctx->dispatch.vkDestroyDebugUtilsMessengerEXT =
             (PFN_vkDestroyDebugUtilsMessengerEXT)vkGetInstanceProcAddr(
                 ctx->instance, "vkDestroyDebugUtilsMessengerEXT");
+        ctx->dispatch.vkSetDebugUtilsObjectNameEXT =
+            (PFN_vkSetDebugUtilsObjectNameEXT)vkGetInstanceProcAddr(
+                ctx->instance, "vkSetDebugUtilsObjectNameEXT");
         if (ctx->dispatch.vkCreateDebugUtilsMessengerEXT != nullptr) {
             VkResult msg_res = ctx->dispatch.vkCreateDebugUtilsMessengerEXT(
                 ctx->instance, &debug_create_info, nullptr, &ctx->debug_messenger);
@@ -312,5 +367,6 @@ void vulkan_instance_destroy(VulkanContext *ctx) {
 
     ctx->dispatch.vkCreateDebugUtilsMessengerEXT  = nullptr;
     ctx->dispatch.vkDestroyDebugUtilsMessengerEXT = nullptr;
+    ctx->dispatch.vkSetDebugUtilsObjectNameEXT    = nullptr;
     ctx->validation_enabled                       = false;
 }

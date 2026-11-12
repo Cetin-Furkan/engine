@@ -275,6 +275,29 @@ static void prepare_pager_sqe(RingContext             *ring,
         }
     }
 
+    // Zero-GUP UMA fastpath: when g_backend.bda_buf is pinned in ENG_FBUF_UMA_BDA via
+    // IORING_REGISTER_BUFFERS_UPDATE, NVMe DMAs straight into GPU UMA pages with 0 memcpy
+    // and 0 get_user_pages_fast() page-table walks.
+    if (g_backend.zero_copy_uma && ring != nullptr && ring->uma_buf_registered &&
+        ring->uma_buf_base != nullptr) {
+        uintptr_t dst_addr = (uintptr_t)&gpu_tile_pool[cell->slot_index];
+        uintptr_t uma_base = (uintptr_t)ring->uma_buf_base;
+        if (dst_addr >= uma_base &&
+            (dst_addr - uma_base) + cell->bytes <= ring->uma_buf_len) {
+            sqe->opcode    = IORING_OP_READ_FIXED;
+            sqe->flags     = IOSQE_FIXED_FILE;
+            sqe->fd        = ENG_PACK_FD_SLOT;
+            sqe->addr      = (uint64_t)dst_addr;
+            sqe->len       = cell->bytes;
+            sqe->off       = cell->ssd_file_offset;
+            sqe->buf_index = (uint16_t)ENG_FBUF_UMA_BDA;
+            sqe->user_data = ENG_UD_PAGER_BASE + (uint64_t)cell_idx;
+            g_backend.cell_uses_fixed_buf[cell_idx] = 0u;
+            g_backend.stream_fixed_buf_reads++;
+            return;
+        }
+    }
+
     sqe->opcode    = IORING_OP_READ;
     sqe->flags     = IOSQE_FIXED_FILE;
     sqe->fd        = ENG_PACK_FD_SLOT;
@@ -389,8 +412,15 @@ static uint32_t submit_async_needed_tiles(const char           *epack_path,
     uint32_t queued_async   = 0u;
     uint32_t instant_cached = 0u;
 
-    for (uint32_t i = 0u; i < needed_count; ++i) {
-        uint32_t node_idx = needed_nodes[i];
+    uint32_t clamp_n = needed_count > k_gmpack_gpu_slot_cap ? k_gmpack_gpu_slot_cap : needed_count;
+    uint32_t local_needed[k_gmpack_gpu_slot_cap];
+    if (clamp_n > 0u) {
+        memcpy(local_needed, needed_nodes, clamp_n * sizeof(uint32_t));
+    }
+    uint32_t rem_needed = 0u;
+
+    for (uint32_t i = 0u; i < clamp_n; ++i) {
+        uint32_t node_idx = local_needed[i];
         if (node_idx >= k_gmpack_node_count) {
             continue;
         }
@@ -410,7 +440,7 @@ static uint32_t submit_async_needed_tiles(const char           *epack_path,
             g_backend.fused_cache[node_idx] != nullptr) {
             int slot = (node_idx == 0u)
                 ? 0
-                : allocate_gpu_tile_slot(hdr, gpu_tile_pool, node_idx, needed_nodes, needed_count);
+                : allocate_gpu_tile_slot(hdr, gpu_tile_pool, node_idx, local_needed, clamp_n);
             if (slot < 0) {
                 continue;
             }
@@ -457,18 +487,27 @@ static uint32_t submit_async_needed_tiles(const char           *epack_path,
             }
         }
         if (free_cell < 0) {
-            break; // Remaining needed tiles stay in pending_needed[] and chain in backend_on_cqe()
+            for (uint32_t r = i; r < clamp_n && rem_needed < k_gmpack_gpu_slot_cap; ++r) {
+                g_backend.pending_needed[rem_needed++] = local_needed[r];
+            }
+            break;
         }
 
         int slot = (node_idx == 0u)
             ? 0
-            : allocate_gpu_tile_slot(hdr, gpu_tile_pool, node_idx, needed_nodes, needed_count);
+            : allocate_gpu_tile_slot(hdr, gpu_tile_pool, node_idx, local_needed, clamp_n);
         if (slot < 0) {
+            if (rem_needed < k_gmpack_gpu_slot_cap) {
+                g_backend.pending_needed[rem_needed++] = node_idx;
+            }
             continue;
         }
 
         struct io_uring_sqe *sqe = ring_sqe(ring);
         if (sqe == nullptr) {
+            for (uint32_t r = i; r < clamp_n && rem_needed < k_gmpack_gpu_slot_cap; ++r) {
+                g_backend.pending_needed[rem_needed++] = local_needed[r];
+            }
             break;
         }
 
@@ -497,6 +536,7 @@ static uint32_t submit_async_needed_tiles(const char           *epack_path,
         prepare_pager_sqe(ring, sqe, cidx, cell, gpu_tile_pool);
         queued_async++;
     }
+    g_backend.pending_needed_count = rem_needed;
 
     if (queued_async > 0u) {
         unsigned to_submit = ring_submit(ring);
@@ -613,33 +653,76 @@ void backend_stream_drain_inflight(void) {
     RingContext    *ring = ring_get_context();
     WaylandContext *wl   = wayland_get_context();
 
-    uint64_t deadline = ring_mono_ns() + 500000000ull;
-    for (;;) {
-        uint32_t busy = 0u;
-        for (uint32_t c = 0u; c < k_backend_cell_ring_cap; ++c) {
-            if (g_backend.cell_busy[c] != 0u) {
-                busy++;
-            }
+    // Prevent CQE completions during teardown from chaining fresh async reads.
+    g_backend.pending_needed_count = 0u;
+
+    // Drain any pager completions previously stashed in WaylandContext.
+    if (wl != nullptr && wl->noted_pager_mask != 0u) {
+        uint32_t mask = wl->noted_pager_mask;
+        wl->noted_pager_mask = 0u;
+        while (mask != 0u) {
+            uint32_t bit = (uint32_t)__builtin_ctz(mask);
+            mask &= mask - 1u;
+            struct io_uring_cqe stashed = {
+                .user_data = ENG_UD_PAGER_BASE + (uint64_t)bit,
+                .res       = wl->noted_pager_res[bit],
+            };
+            wl->noted_pager_res[bit] = 0;
+            (void)backend_on_cqe(&stashed);
         }
-        if (busy == 0u || ring == nullptr || !ring->is_initialized) {
+    }
+
+    bool     cancel_sent     = false;
+    uint32_t cancel_inflight = 0u;
+    uint64_t deadline        = ring_mono_ns() + 500000000ull;
+
+    for (;;) {
+        if (ring == nullptr || !ring->is_initialized) {
             break;
         }
         struct io_uring_cqe cqe;
         while (ring_peek(ring, &cqe)) {
             if (ring_ud_is_pager(cqe.user_data)) {
                 (void)backend_on_cqe(&cqe);
+            } else if (cqe.user_data == ENG_UD_PAGER_CANCEL) {
+                if (cancel_inflight > 0u) {
+                    cancel_inflight--;
+                }
             } else if (wl != nullptr) {
                 wayland_on_cqe(wl, &cqe);
             }
         }
-        busy = 0u;
+        uint32_t busy = 0u;
         for (uint32_t c = 0u; c < k_backend_cell_ring_cap; ++c) {
             if (g_backend.cell_busy[c] != 0u) {
                 busy++;
             }
         }
-        if (busy == 0u || ring_mono_ns() > deadline) {
+        if (busy == 0u && cancel_inflight == 0u) {
             break;
+        }
+        uint64_t now = ring_mono_ns();
+        if (now > deadline) {
+            if (!cancel_sent && busy > 0u) {
+                for (uint32_t c = 0u; c < k_backend_cell_ring_cap; ++c) {
+                    if (g_backend.cell_busy[c] == 0u) {
+                        continue;
+                    }
+                    struct io_uring_sqe *sqe = ring_sqe(ring);
+                    if (sqe == nullptr) {
+                        break;
+                    }
+                    sqe->opcode    = IORING_OP_ASYNC_CANCEL;
+                    sqe->flags     = IORING_ASYNC_CANCEL_ALL;
+                    sqe->addr      = ENG_UD_PAGER_BASE + (uint64_t)c;
+                    sqe->user_data = ENG_UD_PAGER_CANCEL;
+                    cancel_inflight++;
+                }
+                cancel_sent = true;
+                deadline    = now + 2500000000ull;
+            } else {
+                break;
+            }
         }
         unsigned sub = ring_submit(ring);
         int wrc = ring_enter(ring, sub, 1u, 25);

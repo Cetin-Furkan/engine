@@ -725,10 +725,14 @@ bool camera_zoom_steps(float steps) {
         int32_t px = 0;
         int32_t py = 0;
         const WaylandContext *w = wayland_get_context();
-        if (w != nullptr && w->scene_opaque_w > 0u && w->scene_opaque_h > 0u &&
+        uint32_t sw = (w != nullptr && w->scene_phys_w != 0u) ? w->scene_phys_w
+                    : (w != nullptr ? w->scene_opaque_w : 0u);
+        uint32_t sh = (w != nullptr && w->scene_phys_h != 0u) ? w->scene_phys_h
+                    : (w != nullptr ? w->scene_opaque_h : 0u);
+        if (w != nullptr && sw > 0u && sh > 0u &&
             pointer_client_xy(&px, &py) && py >= 0) {
-            float scene_w = (float)w->scene_opaque_w;
-            float scene_h = (float)w->scene_opaque_h;
+            float scene_w = (float)sw;
+            float scene_h = (float)sh;
             float cx = (float)px - scene_w * 0.5f;
             float cy = scene_h * 0.5f - (float)py;
             float inv_delta = (1.0f / old_zoom) - (1.0f / next);

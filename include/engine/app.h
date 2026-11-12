@@ -78,44 +78,60 @@ typedef struct EngineKeyContext {
     RingCqeFn              reload_cqe;
 } EngineKeyContext;
 
+// Hook contract:
+//   - 7 [REQUIRED] hooks define a complete interactive hosted program:
+//     init, shutdown, draw, advance, busy, click, key.
+//   - All remaining 24 hooks/fields are [OPTIONAL] with well-defined platform
+//     defaults documented below (1-sample sRGB color-only pass, automatic
+//     4-slice transient BDA ring rewind/abort, platform turn counters, etc.).
+//   - The platform also guards every hook pointer for null safety so an
+//     omitted hook never crashes and never leaves the 8 ms sim timer armed.
 typedef struct EngineApp {
-    // Short line printed once the window is up (controls, keys). May be null.
+    // [OPTIONAL] Short line printed once the window is up (default: "").
     const char *help;
 
-    // Command-line hook run before subsystems boot. Returns 0 to continue,
-    // >0 to exit 0 after printing help/listing, or <0 on invalid flags.
+    // [OPTIONAL] Command-line hook run before subsystems boot. Returns 0 to
+    // continue, >0 to exit 0 after printing help/listing, or <0 on invalid flags.
     int (*configure)(int argc, char **argv);
 
-    // GPU pipelines and program state. init is called after Vulkan and
-    // chrome exist; load places the opening scene. shutdown runs before
-    // chrome/Vulkan teardown, in reverse order of init.
+    // [REQUIRED] GPU pipelines and program state. Called after Vulkan and chrome
+    // exist. Return 0 on success, <0 to abort boot.
     int (*init)(VulkanContext *vk, RingCqeFn forward_cqe, void *forward_user);
+    // [REQUIRED] Destroy hosted GPU/CPU state before chrome/Vulkan teardown.
     void (*shutdown)(VulkanContext *vk);
+    // [OPTIONAL] Place the opening scene after init (default: succeeds with 0).
     int (*load)(void);
+    // [OPTIONAL] Reset hosted state before subsystem boot (default: no-op).
     void (*reset)(void);
 
-    // Per-slot depth/coverage targets (see EngineTargets).
+    // [OPTIONAL] Per-slot depth/coverage targets (default: zeroed EngineTargets,
+    // running a 1-sample VK_FORMAT_B8G8R8A8_SRGB color-only rendering pass).
     int (*create_targets)(VulkanContext *vk, EngineTargets *targets,
-                                        uint32_t width, uint32_t height);
+                          uint32_t width, uint32_t height);
+    // [OPTIONAL] Destroy per-slot depth/coverage targets (default: zeroes targets).
     void (*destroy_targets)(VulkanContext *vk, EngineTargets *targets);
-    // Optional per-frame clear color query (RGBA in [0..1]). When null, the
-    // engine clears to its default dark neutral backdrop.
+    // [OPTIONAL] Per-frame clear color query in RGBA [0..1] (default: dark neutral).
     void (*clear_color)(float out_rgba[4]);
 
-    // Recording, in command-buffer order: compute, then claim_frame (slice
-    // ownership for this signal point), then prepare_draw, then one
-    // rendering pass. The world and the overlay share that pass when depth
-    // exists. depth_format and samples are the pass pair, or zero for the
-    // flat pass.
+    // [OPTIONAL] Pre-render compute recording (default: no-op).
     void (*record_compute)(VkCommandBuffer cmd, uint32_t heat_dt, bool live);
+    // [OPTIONAL] Offscreen/pre-pass draw preparation when depth exists (default: no-op).
     void (*prepare_draw)(VkCommandBuffer cmd, VkImage depth_image);
+    // [OPTIONAL] Claim timeline-guarded per-frame slices for signal_point
+    // (default: calls bda_transient_begin_frame(acquire, signal_point)).
     void (*claim_frame)(VkSemaphore acquire, uint64_t signal_point);
+    // [REQUIRED] Main scene draw inside vkCmdBeginRendering (viewport and scissor
+    // are already set; matches EngineTargets when create_targets is provided, or
+    // 1-sample VK_FORMAT_B8G8R8A8_SRGB with VK_FORMAT_UNDEFINED depth otherwise).
     void (*draw)(VkCommandBuffer cmd, uint32_t width, uint32_t height, bool live);
+    // [OPTIONAL] HUD/overlay draw at the end of the rendering pass (default: no-op).
     void (*draw_overlay)(VkCommandBuffer cmd, uint32_t width, uint32_t height,
                          VkFormat format, VkFormat depth_format,
                          VkSampleCountFlagBits samples, uint32_t frame_ms,
                          bool have_stamp, uint64_t modifier);
-    // Recording outcome, mirroring the submit that carries the frame.
+    // [OPTIONAL] Recording outcome hooks mirroring the submit carrying the frame.
+    // release_frame defaults to bda_transient_abort_frame(signal_point); others
+    // default to no-op / 0 / false.
     void (*record_abort)(void);
     void (*record_ok)(uint64_t signal_point);
     uint64_t (*record_published)(void);
@@ -129,48 +145,53 @@ typedef struct EngineApp {
     // timer sample, for pulse windows. It is not a compositor stamp.
     // step->sim_dt_ms is the only interval the solver may integrate.
     // time_ms on advance is the simulation cursor, not the wall stamp.
+    // [OPTIONAL] Continuous field/pulse step (default: *heat_dt = 0, returns false).
     bool (*simulation)(uint32_t time_ms, const FrameStep *step, uint32_t *heat_dt);
+    // [OPTIONAL] Called when a spinning turn settles (default: no-op).
     void (*simulation_hold)(void);
+    // [OPTIONAL] Commit accumulated simulation interval on present (default: no-op).
     void (*simulation_commit)(uint32_t time_ms, uint32_t heat_dt);
+    // [REQUIRED] Advance hosted state on the issued simulation cursor (time_ms,
+    // step->sim_dt_ms). Return true when the picture changed.
     bool (*advance)(uint32_t time_ms, const FrameStep *step);
+    // [REQUIRED] True while the hosted program needs the 8 ms simulation timer
+    // armed; false once quiescent so the platform disarms the timer into Loop idle.
     bool (*busy)(void);
+    // [OPTIONAL] True when a completed spin warrants simulation_hold (default: false).
     bool (*consume_spin)(void);
+    // [OPTIONAL] Fold the landed spare frame into shown state (default: no-op).
     void (*commit)(void);
+    // [OPTIONAL] Telemetry hook invoked on each io_uring CQE (default: no-op).
     void (*note_cqe)(void);
-    // Asynchronous io_uring completion hook for hosted-app tags (e.g. non-blocking
-    // terrain tile reads). Returns true when a newly resident resource warrants a picture.
+    // [OPTIONAL] Asynchronous io_uring completion hook for hosted-app tags.
+    // Returns true when a newly resident resource warrants a picture (default: false).
     bool (*on_cqe)(const struct io_uring_cqe *cqe);
+    // [OPTIONAL] Override frame/missed count reported on Loop idle (default:
+    // platform turn_frames and FrameClock::missed).
     void (*turn_report)(uint32_t *frames, uint32_t *missed);
 
     // Input, already translated by the engine (window-center pixels,
     // +X right, +Y up; Linux key codes). True when the picture changed.
+    // [REQUIRED] Left-button press at content-centered (origin_x, origin_y).
     bool (*click)(float origin_x, float origin_y);
-    // Motion while the right or middle button is held, in surface pixels.
-    // buttons is ENG_BUTTON_RIGHT, ENG_BUTTON_MIDDLE, or both. A left press
-    // is a click, not a drag. Null ignores the motion. True when the picture
-    // changed. The engine does not name the camera.
+    // [OPTIONAL] Motion while right/middle button is held (default: false).
     bool (*drag)(float dx, float dy, uint32_t buttons);
-    // Wheel or touchpad notches. Positive steps zoom in. Null ignores them.
-    // The engine does not name zoom; the hosted program decides.
+    // [OPTIONAL] Wheel or touchpad notches; positive zooms in (default: false).
     bool (*scroll)(float steps);
-    // One UTF-8 string from a key tap or a repeat. Null ignores it.
-    // The engine does not name text; the hosted program decides.
+    // [OPTIONAL] UTF-8 string from a key tap or repeat (default: false).
     bool (*text)(const char *utf8, uint32_t bytes);
+    // [REQUIRED] Tapped Linux evdev key; set *ctx->stop = true to exit cleanly.
     bool (*key)(uint32_t key, EngineKeyContext *ctx);
-    // True while a held move, yaw, pitch, or zoom key should keep the
-    // 8 ms timer armed. The idle loop polls this. A null hook means
-    // those keys do not wake a still picture. The key press itself is
-    // not a tap and does not note a picture.
+    // [OPTIONAL] True while held camera keys should keep the 8 ms timer armed
+    // (default: false).
     bool (*camera_active)(void);
 
-    // How a press is classified. The engine does not name the action.
-    // Shift stays inside the pointer. IGNORE drops the press, HOLD keeps
-    // it for polling, TAP queues one press. Null keeps the pointer's
-    // built-in camera set and tap set.
+    // [OPTIONAL] Classify a key press into IGNORE, HOLD, or TAP (default:
+    // platform built-in tap/hold sets, where ESC/Q/Space/digits/letters tap).
     uint8_t (*route_key)(uint32_t evdev_key);
 
-    // Optional watched source file path (e.g. an active .world file) and
-    // hot-reload callback invoked when inotify detects a modification.
+    // [OPTIONAL] Watched source file path and hot-reload callback for inotify
+    // (default: nullptr / false).
     const char *(*watched_path)(void);
     bool (*reload_watched)(void);
 } EngineApp;

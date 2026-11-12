@@ -1,6 +1,7 @@
 #include "chrome/gpu.h"
 #include "chrome/layer.h"
 #include "vulkan/pipe.h"
+#include <math.h>
 #include <stddef.h>
 #include <stdio.h>
 
@@ -188,6 +189,7 @@ void chrome_gpu_draw(VulkanContext *vk, VkCommandBuffer cmd,
     }
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
 
+    double sx = (double)fb_w / (double)window_w;
     uint32_t drawn = 0;
     for (uint32_t i = 0; i < ENG_CHROME_LAYERS; ++i) {
         ChromePaintLayer layer;
@@ -197,15 +199,28 @@ void chrome_gpu_draw(VulkanContext *vk, VkCommandBuffer cmd,
         if (layer.w <= 0 || layer.h <= 0) {
             continue;
         }
-        if (layer.x + layer.w <= origin_x || layer.y + layer.h <= origin_y ||
-            layer.x >= origin_x + (int32_t)fb_w || layer.y >= origin_y + (int32_t)fb_h) {
+        int32_t rx0 = (int32_t)llround((double)(layer.x - origin_x) * sx);
+        int32_t ry0 = (int32_t)llround((double)(layer.y - origin_y) * sx);
+        int32_t rx1 = (int32_t)llround((double)(layer.x - origin_x + layer.w) * sx);
+        int32_t ry1 = (int32_t)llround((double)(layer.y - origin_y + layer.h) * sx);
+        if (layer.x == origin_x && layer.w == (int32_t)window_w) {
+            rx0 = 0;
+            rx1 = (int32_t)fb_w;
+        }
+        if (layer.y == origin_y && ry0 == 0 &&
+            ry1 >= (int32_t)fb_h - 1 && ry1 <= (int32_t)fb_h + 1) {
+            ry1 = (int32_t)fb_h;
+        }
+        if (rx1 <= rx0 || ry1 <= ry0 ||
+            rx1 <= 0 || ry1 <= 0 ||
+            rx0 >= (int32_t)fb_w || ry0 >= (int32_t)fb_h) {
             continue;
         }
         ChromeGpuPush push = {
-            .rect_x      = layer.x - origin_x,
-            .rect_y      = layer.y - origin_y,
-            .rect_w      = layer.w,
-            .rect_h      = layer.h,
+            .rect_x      = rx0,
+            .rect_y      = ry0,
+            .rect_w      = rx1 - rx0,
+            .rect_h      = ry1 - ry0,
             .fb_w        = fb_w,
             .fb_h        = fb_h,
             .layer_color = pack_rgb(layer.r, layer.g, layer.b, 0),
@@ -214,10 +229,21 @@ void chrome_gpu_draw(VulkanContext *vk, VkCommandBuffer cmd,
         };
         for (uint32_t c = 0; c < layer.ncontrols && c < ENG_CHROME_CONTROLS; ++c) {
             const ChromePaintControl *ctl = &layer.controls[c];
-            push.ctl[c].x = ctl->x - origin_x;
-            push.ctl[c].y = ctl->y - origin_y;
-            push.ctl[c].w = ctl->w;
-            push.ctl[c].h = ctl->h;
+            int32_t cx0 = (int32_t)llround((double)(ctl->x - origin_x) * sx);
+            int32_t cy0 = (int32_t)llround((double)(ctl->y - origin_y) * sx);
+            int32_t cx1 = (int32_t)llround((double)(ctl->x - origin_x + ctl->w) * sx);
+            int32_t cy1 = (int32_t)llround((double)(ctl->y - origin_y + ctl->h) * sx);
+            if (ctl->x + ctl->w == (int32_t)window_w && origin_x == 0) {
+                cx1 = (int32_t)fb_w;
+            }
+            if (ctl->y == layer.y && ctl->h == layer.h) {
+                cy0 = ry0;
+                cy1 = ry1;
+            }
+            push.ctl[c].x = cx0;
+            push.ctl[c].y = cy0;
+            push.ctl[c].w = cx1 - cx0;
+            push.ctl[c].h = cy1 - cy0;
             push.ctl[c].color = pack_rgb(ctl->r, ctl->g, ctl->b, ctl->draw_glyph ? 1u : 0u);
             push.ctl[c].glyph = pack_rgb(ctl->gr, ctl->gg, ctl->gb, 0);
         }

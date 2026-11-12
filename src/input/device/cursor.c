@@ -1,4 +1,5 @@
 #include "input/internal.h"
+#include "wayland/internal.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/memfd.h>
@@ -101,34 +102,46 @@ int cursor_make_fallback(WaylandContext *w) {
     s_ptr.cursor_bytes = map != nullptr ? bytes : 0u;
     s_ptr.cursor_sealed = sealed;
 
-    s_ptr.cursor_pool = wayland_alloc_id(w);
-    s_ptr.cursor_buffer = wayland_alloc_id(w);
-    s_ptr.cursor_surface = wayland_alloc_id(w);
-    if (s_ptr.cursor_pool == 0 || s_ptr.cursor_buffer == 0 || s_ptr.cursor_surface == 0) {
+    uint32_t pool_id = wayland_alloc_id(w);
+    uint32_t buf_id  = wayland_alloc_id(w);
+    uint32_t surf_id = wayland_alloc_id(w);
+    if (pool_id == 0 || buf_id == 0 || surf_id == 0) {
+        wl_release_unsent(w, surf_id);
+        wl_release_unsent(w, buf_id);
+        wl_release_unsent(w, pool_id);
         cursor_release_memory();
         return -1;
     }
-    int32_t pool_payload[2] = { (int32_t)s_ptr.cursor_pool, (int32_t)bytes };
+    int32_t pool_payload[2] = { (int32_t)pool_id, (int32_t)bytes };
     int32_t buf_payload[6] = {
-        (int32_t)s_ptr.cursor_buffer, 0, (int32_t)k_cursor_side, (int32_t)k_cursor_side,
+        (int32_t)buf_id, 0, (int32_t)k_cursor_side, (int32_t)k_cursor_side,
         (int32_t)(k_cursor_side * 4u), 0,
     };
-    uint32_t attach[3] = { s_ptr.cursor_buffer, 0u, 0u };
+    uint32_t attach[3] = { buf_id, 0u, 0u };
     int32_t damage[4] = { 0, 0, (int32_t)k_cursor_side, (int32_t)k_cursor_side };
     uint16_t damage_op = (w->compositor_bound_version >= 4u) ? 9u : 2u;
     uint32_t send_mark = w->send_len;
     if (!wayland_put_raw(w, w->shm_id, 0u, pool_payload, sizeof pool_payload) ||
-        !wayland_put_raw(w, s_ptr.cursor_pool, 0u, buf_payload, sizeof buf_payload) ||
-        !wayland_put_raw(w, w->compositor_id, 0u, &s_ptr.cursor_surface, sizeof s_ptr.cursor_surface) ||
-        !wayland_put_raw(w, s_ptr.cursor_surface, 1u, attach, sizeof attach) ||
-        !wayland_put_raw(w, s_ptr.cursor_surface, damage_op, damage, sizeof damage) ||
-        !wayland_put_raw(w, s_ptr.cursor_surface, 6u, nullptr, 0u)) {
+        !wayland_put_raw(w, pool_id, 0u, buf_payload, sizeof buf_payload) ||
+        !wayland_put_raw(w, w->compositor_id, 0u, &surf_id, sizeof surf_id) ||
+        !wayland_put_raw(w, surf_id, 1u, attach, sizeof attach) ||
+        !wayland_put_raw(w, surf_id, damage_op, damage, sizeof damage) ||
+        !wayland_put_raw(w, surf_id, 6u, nullptr, 0u)) {
         wayland_rewind_send(w, send_mark);
+        wl_release_unsent(w, surf_id);
+        wl_release_unsent(w, buf_id);
+        wl_release_unsent(w, pool_id);
         cursor_release_memory();
         return -1;
     }
+    s_ptr.cursor_pool    = pool_id;
+    s_ptr.cursor_buffer  = buf_id;
+    s_ptr.cursor_surface = surf_id;
     if (wayland_roundtrip_batch(w, fd) < 0) {
         fprintf(stderr, "[Pointer Error] Cursor surface failed: %s\n", w->err);
+        s_ptr.cursor_pool    = 0;
+        s_ptr.cursor_buffer  = 0;
+        s_ptr.cursor_surface = 0;
         cursor_release_memory();
         return -1;
     }

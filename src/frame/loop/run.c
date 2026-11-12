@@ -1,9 +1,8 @@
 #include "frame/internal.h"
 #include "frame/loop/lane.h"
-#include <sys/timerfd.h>
 
-// The wait is io_uring. The 8 ms timer advances the simulation. A frame
-// callback is armed only while a picture is owed or the solver is live.
+// The wait is io_uring. Native multishot IORING_OP_TIMEOUT (8 ms) advances the
+// simulation only while active; idle windows hold zero pending kernel timers.
 
 static bool s_was_suspended = false;
 
@@ -32,7 +31,7 @@ int frame_run(void) {
 
     (void)ensure_release_fd(ring);
 
-    int signal_fd = signalfd(-1, &mask, SFD_CLOEXEC);
+    int signal_fd = signalfd(-1, &mask, SFD_NONBLOCK | SFD_CLOEXEC);
     if (signal_fd < 0) {
         fprintf(stderr, "[Engine Error] signalfd: %s\n", strerror(errno));
         (void)sigprocmask(SIG_SETMASK, &old_mask, nullptr);
@@ -40,48 +39,16 @@ int frame_run(void) {
     }
 
     bool signal_fixed = (ring_update_file(ring, ENG_SIGNAL_FD_SLOT, signal_fd) == 0);
-    int sim_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
-    if (sim_fd < 0) {
-        fprintf(stderr, "[Engine Error] timerfd: %s\n", strerror(errno));
-        if (signal_fixed) {
-            (void)ring_update_file(ring, ENG_SIGNAL_FD_SLOT, -1);
-        }
-        close(signal_fd);
-        (void)sigprocmask(SIG_SETMASK, &old_mask, nullptr);
-        return 1;
-    }
-    frame_state.sim_fd = sim_fd;
-    frame_state.sim_fixed = (ring_update_file(ring, ENG_SIM_FD_SLOT, sim_fd) == 0);
-    frame_state.sim_mshot_armed = false;
-    if (frame_arm_sim_mshot(ring) != 0) {
-        fprintf(stderr, "[Engine Error] Failed to arm the simulation timer\n");
-        if (frame_state.sim_fixed) {
-            (void)ring_update_file(ring, ENG_SIM_FD_SLOT, -1);
-            frame_state.sim_fixed = false;
-        }
-        close(sim_fd);
-        frame_state.sim_fd = -1;
-        if (signal_fixed) {
-            (void)ring_update_file(ring, ENG_SIGNAL_FD_SLOT, -1);
-        }
-        close(signal_fd);
-        (void)sigprocmask(SIG_SETMASK, &old_mask, nullptr);
-        return 1;
-    }
+    frame_state.sim_mshot_armed     = false;
+    frame_state.sim_timer_on        = false;
+    frame_state.sim_cancel_sent     = false;
+    frame_state.sim_inflight_count  = 0u;
+    frame_state.sim_cancel_inflight = 0u;
+    frame_state.sim_active_ud       = 0ull;
     int read_rc = arm_slot_read(ring, ENG_SIGNAL_FD_SLOT, signal_fixed, signal_fd,
                                 ENG_FBUF_SIGNAL, ENG_UD_SIGNAL);
     if (read_rc != 0) {
         fprintf(stderr, "[Engine Error] Failed to arm io_uring read on signalfd\n");
-        if (frame_state.sim_mshot_armed) {
-            ring_sqe_unget(ring, 1);
-            frame_state.sim_mshot_armed = false;
-        }
-        if (frame_state.sim_fixed) {
-            (void)ring_update_file(ring, ENG_SIM_FD_SLOT, -1);
-            frame_state.sim_fixed = false;
-        }
-        close(sim_fd);
-        frame_state.sim_fd = -1;
         if (signal_fixed) {
             (void)ring_update_file(ring, ENG_SIGNAL_FD_SLOT, -1);
         }
@@ -94,7 +61,7 @@ int frame_run(void) {
     printf("[Engine] Window %ux%u, scene %ux%u is up. %s\n",
            frame_state.window_w, frame_state.window_h,
            shown()->image.width, shown()->image.height,
-           engine_app()->help != nullptr ? engine_app()->help : "");
+           (engine_app() != nullptr && engine_app()->help != nullptr) ? engine_app()->help : "");
     fflush(stdout);
 
     const ChromeSpec *spec = chrome_spec();
@@ -109,11 +76,15 @@ int frame_run(void) {
     int      run_rc            = 0;
     const char *why            = "idle wait ended";
     start_inotify(ring, &inotify_armed);
+    ring_set_dispatcher(ring, forward_reload_cqe, nullptr);
 
     for (;;) {
         struct io_uring_cqe cqe;
+        uint64_t sim_ticks = 0ull;
         while (ring_peek(ring, &cqe)) {
-            engine_app()->note_cqe();
+            if (engine_app() != nullptr && engine_app()->note_cqe != nullptr) {
+                engine_app()->note_cqe();
+            }
             if (cqe.user_data == ENG_UD_SIGNAL) {
                 signal_poll_armed = false;
                 int got = frame_signal_number(cqe.res);
@@ -122,16 +93,18 @@ int frame_run(void) {
                 }
                 got_signal = true;
             } else if (cqe.user_data == ENG_UD_FRAME_TIMER) {
-                frame_state.timer_armed = false;
+                frame_state.timer_armed       = false;
+                frame_state.timer_deadline_ns = 0ull;
                 if (!send_in_flight && !resend_wire) {
                     bool queued = false;
                     if (frame_watchdog(wl, vk, &queued) == 0 && queued) {
                         send_in_flight = true;
                     }
                 }
+            } else if (cqe.user_data == ENG_UD_TIMER_UPDATE) {
             } else if (cqe.user_data == ENG_UD_INOTIFY) {
                 note_inotify_cqe(ring, cqe.res, &inotify_armed);
-            } else if (frame_note_sim_cqe(ring, &cqe, true)) {
+            } else if (frame_note_sim_cqe(ring, &cqe, true, &sim_ticks)) {
             } else if (cqe.user_data == ENG_UD_WL_SEND) {
                 int noted = finish_idle_send(wl, vk, &cqe, pending_serial);
                 if (noted < 0) {
@@ -146,6 +119,9 @@ int frame_run(void) {
             } else {
                 wayland_on_cqe(wl, &cqe);
             }
+        }
+        if (sim_ticks > 0ull) {
+            sim_on_timer(sim_ticks);
         }
 
         absorb_side_cqes(ring, wl, vk, &signal_poll_armed, &got_signal, &signo,
@@ -205,7 +181,7 @@ int frame_run(void) {
         if (!send_in_flight && !resend_wire && !frame_state.resize_pending &&
             frame_state.world_dirty) {
             frame_state.world_dirty = false;
-            if (engine_app()->reload_watched != nullptr &&
+            if (engine_app() != nullptr && engine_app()->reload_watched != nullptr &&
                 engine_app()->reload_watched()) {
                 frame_note_picture();
             }
@@ -254,6 +230,49 @@ int frame_run(void) {
                 } else {
                     fprintf(stderr, "[Chrome] Repaint was not queued\n");
                 }
+            }
+        }
+
+        if (!send_in_flight && !resend_wire && !frame_state.resize_pending &&
+            !frame_state.turn_swap_pending &&
+            (wl->feedback_updated || wl->scale_changed) && vk != nullptr) {
+            bool had_fb    = wl->feedback_updated;
+            bool had_scale = wl->scale_changed;
+            wl->feedback_updated = false;
+            wl->scale_changed    = false;
+            bool keep_cur = false;
+            if (had_fb && !had_scale &&
+                shown()->image.image != VK_NULL_HANDLE &&
+                wl->feedback_cross_device == shown()->image.prime_copy) {
+                uint64_t cur_mod = shown()->image.drm_format_modifier;
+                const uint64_t *mods = wl->scanout_modifier_count > 0u
+                    ? wl->scanout_modifiers
+                    : wl->all_modifiers;
+                uint32_t mod_n = wl->scanout_modifier_count > 0u
+                    ? wl->scanout_modifier_count
+                    : wl->all_modifier_count;
+                for (uint32_t mi = 0u; mi < mod_n; ++mi) {
+                    if (mods[mi] == cur_mod && (cur_mod != 0ull || mod_n == 1u)) {
+                        keep_cur = true;
+                        break;
+                    }
+                }
+            }
+            int fb_rc = keep_cur ? 1 : queue_feedback_realloc(wl, vk);
+            if (fb_rc == 0) {
+                pending_serial = 0;
+                send_in_flight = true;
+            } else if (fb_rc == 1) {
+                // Current modifier and scanout class already match the updated feedback.
+            } else if (fb_rc == -EAGAIN || fb_rc == -EBUSY) {
+                if (had_fb) {
+                    wl->feedback_updated = true;
+                }
+                if (had_scale) {
+                    wl->scale_changed = true;
+                }
+            } else {
+                fprintf(stderr, "[Engine] DMA-BUF feedback/scale reallocation failed (%d); keeping active buffer\n", fb_rc);
             }
         }
 
@@ -333,30 +352,43 @@ int frame_run(void) {
                 send_in_flight = true;
             }
         } else if (!send_in_flight && !resend_wire) {
-            int enc = pointer_encode(wl);
-            if (enc < 0) {
-                pointer_on_send_done(false);
-                run_rc = 1;
-                why = "pointer encode failed";
-                break;
+            if (!frame_state.resize_pending && frame_state.bar_dirty && vk != nullptr) {
+                int bar_rc = bar_prepare(wl, vk, false);
+                if (bar_rc == 1) {
+                    if (wayland_queue_bar_commit(wl) == 0) {
+                        pending_serial = 0;
+                        send_in_flight = true;
+                    } else {
+                        bar_drop_unsent(wl, vk);
+                    }
+                }
             }
-            if (enc == 1) {
-                int queued = wayland_queue_send(wl, false);
-                if (queued == 0) {
-                    send_in_flight = true;
-                } else {
+            if (!send_in_flight) {
+                int enc = pointer_encode(wl);
+                if (enc < 0) {
                     pointer_on_send_done(false);
                     run_rc = 1;
-                    why = wl->err[0] != '\0' ? wl->err : "pointer send failed";
+                    why = "pointer encode failed";
                     break;
                 }
-            } else {
-                int destroyed = wayland_queue_destroys(wl);
-                if (destroyed == 1) {
-                    pending_serial = 0;
-                    send_in_flight = true;
-                } else if (destroyed < 0 && destroyed != -EBUSY) {
-                    fprintf(stderr, "[Engine Error] Deferred Wayland destroy was not queued\n");
+                if (enc == 1) {
+                    int queued = wayland_queue_send(wl, false);
+                    if (queued == 0) {
+                        send_in_flight = true;
+                    } else {
+                        pointer_on_send_done(false);
+                        run_rc = 1;
+                        why = wl->err[0] != '\0' ? wl->err : "pointer send failed";
+                        break;
+                    }
+                } else {
+                    int destroyed = wayland_queue_destroys(wl);
+                    if (destroyed == 1) {
+                        pending_serial = 0;
+                        send_in_flight = true;
+                    } else if (destroyed < 0 && destroyed != -EBUSY) {
+                        fprintf(stderr, "[Engine Error] Deferred Wayland destroy was not queued\n");
+                    }
                 }
             }
         }
@@ -397,28 +429,52 @@ int frame_run(void) {
                 frame_note_picture();
             }
         }
-        if (!frame_state.sim_mshot_armed) {
-            (void)frame_arm_sim_mshot(ring);
-        }
         sim_timer_set(ring, !suspended && (frame_sim_wanted() || frame_state.sim_hot));
+        if (!suspended &&
+            frame_state.turn_phase == k_turn_run &&
+            !frame_state.sim_timer_on && !frame_state.sim_mshot_armed &&
+            frame_state.sim_inflight_count == 0u && frame_state.sim_cancel_inflight == 0u &&
+            !frame_state.scene_dirty && !frame_state.sim_hot &&
+            !send_in_flight && !resend_wire &&
+            !frame_state.resize_pending && !frame_state.turn_swap_pending &&
+            !frame_state.bar_dirty && !frame_state.world_dirty && !frame_state.chrome_dirty &&
+            !wl->feedback_updated && !wl->scale_changed &&
+            !configure_needs_ack(wl) &&
+            wl->frame_cb_id == 0u && !wl->frame_stamp_valid) {
+            note_sim_idle();
+        }
         // Watchdog only while a callback is outstanding. It re-arms a stall.
-        // It does not step the pose or the solver.
-        if (!suspended && frame_state.turn_phase == k_turn_run && wl->frame_cb_id != 0 &&
-            !wl->frame_stamp_valid && !frame_state.timer_armed && !send_in_flight) {
-            uint64_t deadline = ring_mono_ns() +
-                (uint64_t)frame_clock_stall_after_ms(&frame_state.clock) * 1000000ull;
-            if (ring_arm_timeout_abs(ring, deadline, ENG_UD_FRAME_TIMER) == 0) {
-                frame_state.timer_armed = true;
+        // It does not step the pose or the solver. Key-repeat and held-bar
+        // retries share the same single-shot timeout tag, updating in-place via
+        // IORING_TIMEOUT_UPDATE whenever an earlier deadline arrives.
+        if (!suspended) {
+            uint64_t now_ns        = ring_mono_ns();
+            uint64_t best_deadline = 0ull;
+            if (frame_state.turn_phase == k_turn_run && wl->frame_cb_id != 0 &&
+                !wl->frame_stamp_valid && !send_in_flight) {
+                best_deadline = now_ns +
+                    (uint64_t)frame_clock_stall_after_ms(&frame_state.clock) * 1000000ull;
+            } else if ((frame_state.turn_phase == k_turn_run && !send_in_flight &&
+                        wl->frame_cb_id == 0 && turn_wants_step(wl)) ||
+                       (!send_in_flight && frame_state.bar_dirty)) {
+                best_deadline = now_ns + (uint64_t)FRAME_SIM_STEP_MS * 1000000ull;
             }
-        } else if (!suspended && frame_state.turn_phase == k_turn_run &&
-                   !frame_state.timer_armed && !send_in_flight && wl->frame_cb_id == 0 &&
-                   turn_wants_step(wl)) {
-            // A picture is owed and no callback will wake us. The spare may
-            // still be held. A frameless wl_surface.frame does not attach a
-            // buffer, so it cannot free that image. Retry on the sim quanta.
-            uint64_t deadline = ring_mono_ns() + (uint64_t)FRAME_SIM_STEP_MS * 1000000ull;
-            if (ring_arm_timeout_abs(ring, deadline, ENG_UD_FRAME_TIMER) == 0) {
-                frame_state.timer_armed = true;
+            uint64_t rep_ns = pointer_next_repeat_deadline_ns();
+            if (rep_ns != 0ull && (best_deadline == 0ull || rep_ns < best_deadline)) {
+                best_deadline = rep_ns;
+            }
+            if (best_deadline != 0ull) {
+                if (!frame_state.timer_armed) {
+                    if (ring_arm_timeout_abs(ring, best_deadline, ENG_UD_FRAME_TIMER) == 0) {
+                        frame_state.timer_armed       = true;
+                        frame_state.timer_deadline_ns = best_deadline;
+                    }
+                } else if (best_deadline + 1000000ull < frame_state.timer_deadline_ns) {
+                    if (ring_update_timeout_abs(ring, best_deadline,
+                                                ENG_UD_FRAME_TIMER, ENG_UD_TIMER_UPDATE) == 0) {
+                        frame_state.timer_deadline_ns = best_deadline;
+                    }
+                }
             }
         }
 

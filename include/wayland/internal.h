@@ -24,13 +24,20 @@ void wl_close_feedback_table(WaylandContext *w);
                                            uint32_t version, uint32_t new_id);
 [[nodiscard]] bool wl_append_display_sync(WaylandContext *w, uint32_t sync_id);
 
-[[nodiscard]] int wl_arm_pong(WaylandContext *w);
+[[nodiscard]] int wl_tx_kick(WaylandContext *w);
+[[nodiscard]] int wl_tx_step_head(WaylandContext *w, int32_t res);
+[[nodiscard]] int wl_tx_enqueue_stage(WaylandContext *w, bool tracks_ack);
+[[nodiscard]] bool wl_has_client_tx(const WaylandContext *w);
 void wl_queue_xdg_pong(WaylandContext *w, uint32_t serial);
-[[nodiscard]] int wl_note_send_progress(WaylandContext *w, int32_t res);
+[[nodiscard]] int wl_queue_data_receive(WaylandContext *w, uint32_t offer_id,
+                                        const char *mime, int write_fd);
 [[nodiscard]] bool wl_send_blocked(const WaylandContext *w);
+[[nodiscard]] int wl_send_with_fds(WaylandContext *w, const int *fds, uint8_t fd_count);
 [[nodiscard]] int wl_send_with_fd(WaylandContext *w, int fd_to_send);
 [[nodiscard]] int wl_send_batch(WaylandContext *w);
 [[nodiscard]] int wl_flush_pending(WaylandContext *w);
+[[nodiscard]] uint32_t wl_encode_deferred_destroys(WaylandContext *w);
+void wl_consume_deferred_destroys(WaylandContext *w, uint32_t count);
 [[nodiscard]] int wl_wait_tag(WaylandContext *w, uint64_t tag, struct io_uring_cqe *out);
 [[nodiscard]] int wl_finish_roundtrip(WaylandContext *w, int fd_to_send);
 

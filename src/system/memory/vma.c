@@ -1,5 +1,6 @@
 #include "system/internal.h"
 #include <errno.h>
+#include <fcntl.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/prctl.h>
@@ -75,6 +76,50 @@ void system_vma_advise_arena(void *addr, size_t len) {
     }
 }
 
+static bool parse_proc_mem_available(uint64_t *out_bytes) {
+    int fd = open("/proc/meminfo", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        return false;
+    }
+    char buf[1024];
+    ssize_t n = read(fd, buf, sizeof(buf) - 1u);
+    close(fd);
+    if (n <= 0) {
+        return false;
+    }
+    buf[n] = '\0';
+    const char *tag = "MemAvailable:";
+    const size_t tag_len = 13u;
+    const char *p = nullptr;
+    if (strncmp(buf, tag, tag_len) == 0) {
+        p = buf + tag_len;
+    } else {
+        const char *hit = strstr(buf, "\nMemAvailable:");
+        if (hit != nullptr) {
+            p = hit + 1u + tag_len;
+        }
+    }
+    if (p == nullptr) {
+        return false;
+    }
+    while (*p == ' ' || *p == '\t') {
+        p++;
+    }
+    if (*p < '0' || *p > '9') {
+        return false;
+    }
+    uint64_t kb = 0ull;
+    while (*p >= '0' && *p <= '9') {
+        kb = kb * 10ull + (uint64_t)(*p - '0');
+        p++;
+    }
+    if (kb == 0ull) {
+        return false;
+    }
+    *out_bytes = kb * 1024ull;
+    return true;
+}
+
 int system_probe_memory_and_limits(SystemMemoryInfo *out) {
     if (out == nullptr) {
         return -EINVAL;
@@ -90,6 +135,7 @@ int system_probe_memory_and_limits(SystemMemoryInfo *out) {
         out->total_ram_bytes = (uint64_t)si.totalram * unit;
         out->avail_ram_bytes = (uint64_t)(si.freeram + si.bufferram) * unit;
     }
+    (void)parse_proc_mem_available(&out->avail_ram_bytes);
 
     constexpr rlim_t want_memlock = 64ull * 1024ull * 1024ull;
     int rc = raise_rlimit_target(RLIMIT_MEMLOCK, want_memlock, &out->memlock_bytes, &out->memlock_capped);

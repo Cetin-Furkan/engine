@@ -9,6 +9,7 @@
 
 // ============================================================================
 // Vulkan 1.4 BDA Fused Workgroup SLM AVBD Physics Runtime (avbd_gpu.c)
+// - Single-owner GPU pose architecture (1-frame timeline latency, timeout = 0)
 // - Lazily allocates 4 x 64 KiB = 256 KiB host-mapped BDA ring slab on first step
 //   (0.00 MiB overhead on Pure Engine World 0 and Terrain World 8)
 // - Dual-Architecture Profile Split:
@@ -35,9 +36,35 @@ typedef struct PhysicsComputePush {
 
 static_assert(sizeof(PhysicsComputePush) == 16u, "PhysicsComputePush must be 16 bytes");
 
+typedef struct AvbdStepEntry {
+    uint32_t channel_id;
+    uint32_t epoch;
+    uint32_t off_hdr;
+    uint32_t off_verts;
+    uint32_t off_cons;
+    uint32_t vert_count;
+    uint32_t con_count;
+    float    dt;
+} AvbdStepEntry;
+
+typedef struct AvbdRingSlot {
+    uint64_t      signal_point;
+    uint32_t      entry_count;
+    uint32_t      read_cursor;
+    uint32_t      byte_cursor;
+    uint32_t      total_verts;
+    uint32_t      total_cons;
+    uint32_t      max_colors;
+    bool          recorded;
+    bool          submitted;
+    bool          abandoned;
+    AvbdStepEntry entries[k_max_frame_submits];
+} AvbdRingSlot;
+
 static VulkanContext   *s_vk                 = nullptr;
 static VkPipelineLayout s_comp_layout        = VK_NULL_HANDLE;
 static VkPipeline       s_comp_pipe          = VK_NULL_HANDLE;
+static VkSemaphore      s_acquire_sem        = VK_NULL_HANDLE;
 static DaBuffer         s_ring_buf           = {0};
 static bool             s_slab_ready         = false;
 
@@ -45,13 +72,10 @@ static bool             s_gpu_user_on        = true;
 static uint32_t         s_exec_mode          = AVBD_EXEC_UMA_SLM_4;
 static uint32_t         s_rec_iterations     = 4u;
 
-static uint32_t         s_ring_slot          = 0u;
-static uint32_t         s_slot_cursor        = 0u;
-static uint64_t         s_pending_bda[k_max_frame_submits];
-static uint32_t         s_pending_count      = 0u;
-static uint32_t         s_pending_verts      = 0u;
-static uint32_t         s_pending_cons       = 0u;
-static uint32_t         s_pending_colors     = 0u;
+static AvbdRingSlot     s_slots[k_avbd_ring_slots];
+static uint32_t         s_write_slot         = 0u;
+static uint32_t         s_retire_head        = 0u;
+static int              s_open_record_slot   = -1;
 
 static uint32_t         s_last_dispatches    = 0u;
 static uint32_t         s_last_verts         = 0u;
@@ -151,13 +175,14 @@ int physics_init(VulkanContext *vk) {
         return -1;
     }
     s_vk = vk;
+    s_acquire_sem = VK_NULL_HANDLE;
     parse_physics_env();
     select_profile_params(vk);
     physics_reset();
 
     if (!s_logged_init) {
-        printf("[Physics] Core AVBD kernel armed (LDL^T 3x3 + Graph Color SLM, GPU=%s, profile_iters=%u)\n",
-               s_gpu_user_on ? "on" : "cpu-only",
+        printf("[Physics] Core AVBD kernel armed (LDL^T 3x3 + Graph Color SLM, owner=%s, profile_iters=%u)\n",
+               s_gpu_user_on ? "gpu" : "cpu",
                s_rec_iterations);
         fflush(stdout);
         s_logged_init = true;
@@ -178,6 +203,7 @@ void physics_shutdown(VulkanContext *vk) {
     }
     s_comp_pipe   = VK_NULL_HANDLE;
     s_comp_layout = VK_NULL_HANDLE;
+    s_acquire_sem = VK_NULL_HANDLE;
     s_ring_buf    = (DaBuffer){0};
     s_slab_ready  = false;
     s_vk          = nullptr;
@@ -185,22 +211,50 @@ void physics_shutdown(VulkanContext *vk) {
 }
 
 void physics_reset(void) {
-    s_slot_cursor     = 0u;
-    s_pending_count   = 0u;
-    s_pending_verts   = 0u;
-    s_pending_cons    = 0u;
-    s_pending_colors  = 0u;
-    s_last_dispatches = 0u;
-    s_last_verts      = 0u;
-    s_last_cons       = 0u;
-    s_last_colors     = 0u;
+    if (s_vk == nullptr || s_vk->device == VK_NULL_HANDLE) {
+        memset(s_slots, 0, sizeof s_slots);
+        s_write_slot  = 0u;
+        s_retire_head = 0u;
+    } else {
+        for (uint32_t i = 0u; i < k_avbd_ring_slots; ++i) {
+            if (s_slots[i].submitted || s_slots[i].recorded) {
+                s_slots[i].abandoned = true;
+            } else {
+                s_slots[i] = (AvbdRingSlot){0};
+            }
+        }
+    }
+    s_open_record_slot = -1;
+    s_last_dispatches  = 0u;
+    s_last_verts       = 0u;
+    s_last_cons        = 0u;
+    s_last_colors      = 0u;
 }
 
 uint32_t physics_recommended_iterations(void) {
     return s_rec_iterations > 0u ? s_rec_iterations : 4u;
 }
 
-void physics_submit_step(const AvbdVertex     *verts,
+bool physics_gpu_pose_owner(void) {
+    return s_gpu_user_on && s_vk != nullptr && s_vk->device != VK_NULL_HANDLE &&
+           ensure_physics_gpu_resources();
+}
+
+static int find_staging_slot(void) {
+    for (uint32_t n = 0u; n < k_avbd_ring_slots; ++n) {
+        uint32_t idx = (s_write_slot + n) % k_avbd_ring_slots;
+        const AvbdRingSlot *sl = &s_slots[idx];
+        if (!sl->recorded && !sl->submitted) {
+            s_write_slot = idx;
+            return (int)idx;
+        }
+    }
+    return -1;
+}
+
+bool physics_submit_step(uint32_t              channel_id,
+                         uint32_t              epoch,
+                         const AvbdVertex     *verts,
                          uint32_t              vert_count,
                          const AvbdConstraint *cons,
                          uint32_t              con_count,
@@ -208,7 +262,7 @@ void physics_submit_step(const AvbdVertex     *verts,
                          const float           gravity[3],
                          float                 damp_keep) {
     if (verts == nullptr || vert_count == 0u || vert_count > K_AVBD_MAX_VERTS || !(dt > 1.0e-6f)) {
-        return;
+        return false;
     }
     const uint32_t safe_cons = (cons != nullptr)
         ? (con_count > K_AVBD_MAX_CONS ? K_AVBD_MAX_CONS : con_count)
@@ -226,21 +280,24 @@ void physics_submit_step(const AvbdVertex     *verts,
                                            csr_row, csr_col,
                                            color_verts, color_start, color_count);
 
-    // Record telemetry even when running in CPU-only mode
-    s_pending_verts += vert_count;
-    s_pending_cons  += safe_cons;
-    if (num_colors > s_pending_colors) {
-        s_pending_colors = num_colors;
-    }
-    s_last_verts  = s_pending_verts;
-    s_last_cons   = s_pending_cons;
-    s_last_colors = s_pending_colors;
+    s_last_verts  = vert_count;
+    s_last_cons   = safe_cons;
+    s_last_colors = num_colors;
 
-    if (!s_gpu_user_on || s_pending_count >= k_max_frame_submits || !ensure_physics_gpu_resources()) {
-        return;
+    if (!physics_gpu_pose_owner()) {
+        return false;
     }
 
-    const uint32_t off_hdr   = align_up_u32(s_slot_cursor, 64u);
+    int slot_idx = find_staging_slot();
+    if (slot_idx < 0) {
+        return false;
+    }
+    AvbdRingSlot *slot = &s_slots[slot_idx];
+    if (slot->entry_count >= k_max_frame_submits) {
+        return false;
+    }
+
+    const uint32_t off_hdr   = align_up_u32(slot->byte_cursor, 64u);
     const uint32_t off_verts = align_up_u32(off_hdr + (uint32_t)sizeof(AvbdStepHeader), 64u);
     const uint32_t off_cons  = align_up_u32(off_verts + vert_count * (uint32_t)sizeof(AvbdVertex), 64u);
     const uint32_t off_row   = align_up_u32(off_cons + (safe_cons > 0u ? safe_cons : 1u) * (uint32_t)sizeof(AvbdConstraint), 64u);
@@ -249,10 +306,10 @@ void physics_submit_step(const AvbdVertex     *verts,
     const uint32_t end_bytes = align_up_u32(off_cvert + vert_count * (uint32_t)sizeof(uint32_t), 64u);
 
     if (end_bytes > K_AVBD_SLICE_BYTES) {
-        return;
+        return false;
     }
 
-    const size_t   slot_base_off = (size_t)s_ring_slot * K_AVBD_SLICE_BYTES;
+    const size_t   slot_base_off = (size_t)slot_idx * K_AVBD_SLICE_BYTES;
     uint8_t       *slot_cpu      = (uint8_t *)s_ring_buf.map + slot_base_off;
     const uint64_t slot_bda      = s_ring_buf.address + (uint64_t)slot_base_off;
 
@@ -268,7 +325,7 @@ void physics_submit_step(const AvbdVertex     *verts,
     } else {
         memset(slot_cpu + off_col, 0, sizeof(uint32_t));
     }
-    memcpy(slot_cpu + off_cvert, color_verts, (size_t)vert_count * sizeof(uint32_t));
+    memcpy(slot_cpu + off_cvert, color_verts, (size_t)vert_count * (uint32_t)sizeof(uint32_t));
 
     AvbdStepHeader *hdr = (AvbdStepHeader *)(slot_cpu + off_hdr);
     memset(hdr, 0, sizeof(*hdr));
@@ -293,28 +350,50 @@ void physics_submit_step(const AvbdVertex     *verts,
     memcpy(hdr->color_start, color_start, sizeof color_start);
     memcpy(hdr->color_count, color_count, sizeof color_count);
 
-    s_pending_bda[s_pending_count++] = slot_bda + off_hdr;
-    s_slot_cursor = end_bytes;
+    slot->entries[slot->entry_count++] = (AvbdStepEntry){
+        .channel_id = channel_id,
+        .epoch      = epoch,
+        .off_hdr    = off_hdr,
+        .off_verts  = off_verts,
+        .off_cons   = off_cons,
+        .vert_count = vert_count,
+        .con_count  = safe_cons,
+        .dt         = dt,
+    };
+    slot->byte_cursor  = end_bytes;
+    slot->total_verts += vert_count;
+    slot->total_cons  += safe_cons;
+    if (num_colors > slot->max_colors) {
+        slot->max_colors = num_colors;
+    }
+    return true;
 }
 
 void physics_record_compute(VkCommandBuffer cmd) {
-    if (s_pending_count == 0u) {
-        return;
+    int target = -1;
+    for (uint32_t n = 0u; n < k_avbd_ring_slots; ++n) {
+        uint32_t idx = (s_retire_head + n) % k_avbd_ring_slots;
+        if (s_slots[idx].entry_count > 0u && !s_slots[idx].recorded && !s_slots[idx].submitted) {
+            target = (int)idx;
+            break;
+        }
     }
-    if (cmd == VK_NULL_HANDLE || !s_gpu_user_on || s_comp_pipe == VK_NULL_HANDLE ||
-        s_comp_layout == VK_NULL_HANDLE) {
-        s_pending_count  = 0u;
-        s_pending_verts  = 0u;
-        s_pending_cons   = 0u;
-        s_pending_colors = 0u;
-        s_slot_cursor    = 0u;
+    if (target < 0) {
         return;
     }
 
+    AvbdRingSlot *slot = &s_slots[target];
+    if (cmd == VK_NULL_HANDLE || !s_gpu_user_on || s_comp_pipe == VK_NULL_HANDLE ||
+        s_comp_layout == VK_NULL_HANDLE) {
+        *slot = (AvbdRingSlot){0};
+        return;
+    }
+
+    const uint64_t slot_bda = s_ring_buf.address + (uint64_t)target * K_AVBD_SLICE_BYTES;
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_comp_pipe);
-    for (uint32_t i = 0u; i < s_pending_count; ++i) {
+    for (uint32_t i = 0u; i < slot->entry_count; ++i) {
         PhysicsComputePush push = {
-            .hdr_bda = s_pending_bda[i],
+            .hdr_bda = slot_bda + slot->entries[i].off_hdr,
             .flags   = s_exec_mode,
             .pad0    = 0u,
         };
@@ -328,9 +407,11 @@ void physics_record_compute(VkCommandBuffer cmd) {
         .srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
         .dstStageMask  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
                          VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT |
-                         VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                         VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+                         VK_PIPELINE_STAGE_2_HOST_BIT,
         .dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT |
-                         VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                         VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT |
+                         VK_ACCESS_2_HOST_READ_BIT,
     };
     VkDependencyInfo dep = {
         .sType              = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
@@ -339,17 +420,132 @@ void physics_record_compute(VkCommandBuffer cmd) {
     };
     vkCmdPipelineBarrier2(cmd, &dep);
 
-    s_last_dispatches = s_pending_count;
-    s_last_verts      = s_pending_verts;
-    s_last_cons       = s_pending_cons;
-    s_last_colors     = s_pending_colors;
+    s_last_dispatches  = slot->entry_count;
+    s_last_verts       = slot->total_verts;
+    s_last_cons        = slot->total_cons;
+    s_last_colors      = slot->max_colors;
 
-    s_ring_slot      = (s_ring_slot + 1u) % k_avbd_ring_slots;
-    s_slot_cursor    = 0u;
-    s_pending_count  = 0u;
-    s_pending_verts  = 0u;
-    s_pending_cons   = 0u;
-    s_pending_colors = 0u;
+    slot->recorded     = true;
+    slot->read_cursor  = 0u;
+    s_open_record_slot = target;
+    s_write_slot       = ((uint32_t)target + 1u) % k_avbd_ring_slots;
+}
+
+void physics_claim_frame(VkSemaphore acquire, uint64_t signal_point) {
+    if (acquire != VK_NULL_HANDLE) {
+        s_acquire_sem = acquire;
+    }
+    if (s_open_record_slot >= 0 && (uint32_t)s_open_record_slot < k_avbd_ring_slots) {
+        AvbdRingSlot *slot = &s_slots[s_open_record_slot];
+        slot->signal_point = signal_point;
+        slot->submitted    = true;
+        s_open_record_slot = -1;
+    }
+}
+
+void physics_abort_frame(uint64_t signal_point) {
+    if (s_open_record_slot >= 0 && (uint32_t)s_open_record_slot < k_avbd_ring_slots) {
+        AvbdRingSlot *slot = &s_slots[s_open_record_slot];
+        slot->recorded     = false;
+        slot->submitted    = false;
+        slot->signal_point = 0u;
+        s_open_record_slot = -1;
+    }
+    if (signal_point == 0u) {
+        return;
+    }
+    for (uint32_t i = 0u; i < k_avbd_ring_slots; ++i) {
+        if (s_slots[i].submitted && s_slots[i].signal_point == signal_point) {
+            s_slots[i].recorded     = false;
+            s_slots[i].submitted    = false;
+            s_slots[i].signal_point = 0u;
+        }
+    }
+}
+
+bool physics_poll_solved_step(PhysicsSolvedStep *out_step) {
+    if (out_step == nullptr || !s_slab_ready || s_ring_buf.map == nullptr ||
+        s_vk == nullptr || s_vk->device == VK_NULL_HANDLE || s_acquire_sem == VK_NULL_HANDLE) {
+        return false;
+    }
+
+    uint64_t done = 0u;
+    if (vkGetSemaphoreCounterValue(s_vk->device, s_acquire_sem, &done) != VK_SUCCESS) {
+        return false;
+    }
+
+    for (uint32_t scanned = 0u; scanned < k_avbd_ring_slots; ++scanned) {
+        uint32_t idx = (s_retire_head + scanned) % k_avbd_ring_slots;
+        AvbdRingSlot *slot = &s_slots[idx];
+        if (slot->entry_count == 0u) {
+            continue;
+        }
+        if (!slot->submitted || slot->signal_point == 0u || done < slot->signal_point) {
+            // Preserve strict chronological retirement order across ring slots
+            return false;
+        }
+        if (slot->abandoned) {
+            *slot = (AvbdRingSlot){0};
+            s_retire_head = (idx + 1u) % k_avbd_ring_slots;
+            continue;
+        }
+        if (slot->read_cursor < slot->entry_count) {
+            const AvbdStepEntry *e = &slot->entries[slot->read_cursor++];
+            const uint8_t *slot_cpu = (const uint8_t *)s_ring_buf.map + (size_t)idx * K_AVBD_SLICE_BYTES;
+            *out_step = (PhysicsSolvedStep){
+                .channel_id = e->channel_id,
+                .epoch      = e->epoch,
+                .vert_count = e->vert_count,
+                .con_count  = e->con_count,
+                .dt         = e->dt,
+                .verts      = (const AvbdVertex *)(slot_cpu + e->off_verts),
+                .cons       = e->con_count > 0u ? (const AvbdConstraint *)(slot_cpu + e->off_cons) : nullptr,
+            };
+            if (slot->read_cursor >= slot->entry_count) {
+                *slot = (AvbdRingSlot){0};
+                s_retire_head = (idx + 1u) % k_avbd_ring_slots;
+            }
+            return true;
+        }
+        *slot = (AvbdRingSlot){0};
+        s_retire_head = (idx + 1u) % k_avbd_ring_slots;
+    }
+    return false;
+}
+
+bool physics_channel_busy(uint32_t channel_id, uint32_t epoch) {
+    for (uint32_t s = 0u; s < k_avbd_ring_slots; ++s) {
+        const AvbdRingSlot *slot = &s_slots[s];
+        if (slot->abandoned) {
+            continue;
+        }
+        for (uint32_t i = slot->read_cursor; i < slot->entry_count; ++i) {
+            if (slot->entries[i].channel_id == channel_id &&
+                slot->entries[i].epoch == epoch) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool physics_has_unrecorded_steps(void) {
+    for (uint32_t s = 0u; s < k_avbd_ring_slots; ++s) {
+        if (!s_slots[s].abandoned && s_slots[s].entry_count > 0u &&
+            !s_slots[s].recorded && !s_slots[s].submitted) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool physics_any_inflight(void) {
+    for (uint32_t s = 0u; s < k_avbd_ring_slots; ++s) {
+        if (!s_slots[s].abandoned && s_slots[s].entry_count > s_slots[s].read_cursor) {
+            return true;
+        }
+    }
+    return false;
 }
 
 bool physics_gpu_active(void) {
@@ -358,8 +554,8 @@ bool physics_gpu_active(void) {
 
 bool physics_toggle_gpu(void) {
     s_gpu_user_on = !s_gpu_user_on;
-    printf("[Physics] 2026 AVBD Fused Workgroup SLM Compute: %s (iters=%u)\n",
-           s_gpu_user_on ? "GPU+CPU" : "CPU-ONLY",
+    printf("[Physics] 2026 AVBD Single Pose Owner: %s (iters=%u)\n",
+           s_gpu_user_on ? "GPU BDA SLM" : "CPU-ONLY",
            s_rec_iterations);
     fflush(stdout);
     return true;

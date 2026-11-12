@@ -32,33 +32,47 @@ static uint32_t probe_affinity_cores(void) {
     return (n > 0) ? (uint32_t)n : 1u;
 }
 
+static uint64_t read_xcr0(void) {
+    uint32_t eax = 0u, edx = 0u;
+    __asm__ volatile(".byte 0x0f, 0x01, 0xd0" : "=a"(eax), "=d"(edx) : "c"(0u));
+    return ((uint64_t)edx << 32u) | (uint64_t)eax;
+}
+
+static void enumerate_deterministic_leaf(uint32_t leaf, SystemCpuInfo *out) {
+    for (uint32_t sub = 0u; sub < 8u; ++sub) {
+        unsigned int eax = 0, ebx = 0, ecx = 0, edx = 0;
+        __cpuid_count(leaf, sub, eax, ebx, ecx, edx);
+        uint32_t cache_type = eax & 0x1Fu;
+        if (cache_type == 0u) {
+            break;
+        }
+        uint32_t level      = (eax >> 5) & 0x7u;
+        uint32_t line_size  = (ebx & 0xFFFu) + 1u;
+        uint32_t partitions = ((ebx >> 12) & 0x3FFu) + 1u;
+        uint32_t ways       = ((ebx >> 22) & 0x3FFu) + 1u;
+        uint32_t sets       = ecx + 1u;
+        uint64_t bytes      = (uint64_t)line_size * partitions * ways * sets;
+        uint32_t kb         = (uint32_t)(bytes / 1024ull);
+        if (line_size >= 32u && line_size <= 256u) {
+            out->cache_line_bytes = line_size;
+        }
+        if (level == 1u && (cache_type == 1u || cache_type == 3u)) {
+            out->l1d_kb = kb;
+        } else if (level == 2u) {
+            out->l2_kb = kb;
+        } else if (level == 3u && kb > out->l3_kb) {
+            out->l3_kb = kb;
+        }
+    }
+}
+
 static void probe_deterministic_caches(uint32_t max_leaf, uint32_t max_ext, SystemCpuInfo *out) {
     if (max_leaf >= 4u) {
-        for (uint32_t sub = 0u; sub < 8u; ++sub) {
-            unsigned int eax = 0, ebx = 0, ecx = 0, edx = 0;
-            __cpuid_count(4, sub, eax, ebx, ecx, edx);
-            uint32_t cache_type = eax & 0x1Fu;
-            if (cache_type == 0u) {
-                break;
-            }
-            uint32_t level      = (eax >> 5) & 0x7u;
-            uint32_t line_size  = (ebx & 0xFFFu) + 1u;
-            uint32_t partitions = ((ebx >> 12) & 0x3FFu) + 1u;
-            uint32_t ways       = ((ebx >> 22) & 0x3FFu) + 1u;
-            uint32_t sets       = ecx + 1u;
-            uint64_t bytes      = (uint64_t)line_size * partitions * ways * sets;
-            uint32_t kb         = (uint32_t)(bytes / 1024ull);
-            if (line_size >= 32u && line_size <= 256u) {
-                out->cache_line_bytes = line_size;
-            }
-            if (level == 1u && (cache_type == 1u || cache_type == 3u)) {
-                out->l1d_kb = kb;
-            } else if (level == 2u) {
-                out->l2_kb = kb;
-            } else if (level == 3u) {
-                out->l3_kb = kb;
-            }
-        }
+        enumerate_deterministic_leaf(4u, out);
+    }
+    // AMD Zen deterministic cache topology leaf (CPUID Fn8000_001D)
+    if ((out->l1d_kb == 0u || out->l3_kb == 0u) && max_ext >= 0x8000001Du) {
+        enumerate_deterministic_leaf(0x8000001Du, out);
     }
     if (out->l1d_kb == 0u && max_ext >= 0x80000006u) {
         unsigned int eax = 0, ebx = 0, ecx = 0, edx = 0;
@@ -69,7 +83,9 @@ static void probe_deterministic_caches(uint32_t max_leaf, uint32_t max_ext, Syst
         }
         __cpuid(0x80000006u, eax, ebx, ecx, edx);
         out->l2_kb = (ecx >> 16) & 0xFFFFu;
-        out->l3_kb = ((edx >> 18) & 0x3FFFu) * 512u;
+        if (out->l3_kb == 0u) {
+            out->l3_kb = ((edx >> 18) & 0x3FFFu) * 512u;
+        }
     }
     if (out->cache_line_bytes == 0u || stdc_count_ones_ui(out->cache_line_bytes) != 1u) {
         out->cache_line_bytes = 64u;
@@ -103,16 +119,19 @@ void system_probe_cpu(SystemCpuInfo *out) {
         if (clflush_line >= 32u && clflush_line <= 256u) {
             out->cache_line_bytes = clflush_line;
         }
-        const bool osxsave = (ecx & (1u << 27)) != 0u;
-        out->has_fma  = osxsave && ((ecx & (1u << 12)) != 0u);
-        out->has_f16c = osxsave && ((ecx & (1u << 29)) != 0u);
+        const bool osxsave   = (ecx & (1u << 27)) != 0u;
+        const uint64_t xcr0  = osxsave ? read_xcr0() : 0ull;
+        const bool os_avx    = osxsave && ((xcr0 & 0x6ull) == 0x6ull);
+        const bool os_avx512 = os_avx && ((xcr0 & 0xe0ull) == 0xe0ull);
+        out->has_fma  = os_avx && ((ecx & (1u << 12)) != 0u);
+        out->has_f16c = os_avx && ((ecx & (1u << 29)) != 0u);
 
         if (max_leaf >= 7u) {
             unsigned int eax7 = 0, ebx7 = 0, ecx7 = 0, edx7 = 0;
             __cpuid_count(7, 0, eax7, ebx7, ecx7, edx7);
-            out->has_avx2    = osxsave && ((ebx7 & (1u << 5)) != 0u);
+            out->has_avx2    = os_avx && ((ebx7 & (1u << 5)) != 0u);
             out->has_bmi2    = (ebx7 & (1u << 8)) != 0u;
-            out->has_avx512f = osxsave && ((ebx7 & (1u << 16)) != 0u);
+            out->has_avx512f = os_avx512 && ((ebx7 & (1u << 16)) != 0u);
         }
     }
 

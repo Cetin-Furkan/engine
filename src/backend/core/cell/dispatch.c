@@ -39,7 +39,7 @@ int cell64_arm(GpuMathStreamCell *cell,
     if (cell == nullptr || fn == nullptr) {
         return -1;
     }
-    // Verify CHERI-D in-cache-line lifetime ID before arming
+    // Verify in-cache-line 1-byte epoch tag before arming
     if (cell->state == k_cell_state_poison || cell->epoch != cell->inline_id) {
         return -1;
     }
@@ -65,7 +65,7 @@ int cell64_invoke(GpuMathStreamCell *cell, void *ctx) {
     if (cell == nullptr || cell->fn == nullptr || cell->state != k_cell_state_armed) {
         return -1;
     }
-    // CHERI-D temporal safety check: inline_id in the same 64B cache line must match epoch
+    // Temporal generation check: inline_id in the same 64B cache line must match epoch
     if (cell->epoch != cell->inline_id || !relptr2d_verify(cell->rel_tile, cell->epoch)) {
         cell->state = k_cell_state_poison;
         return -1;

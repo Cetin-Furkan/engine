@@ -10,26 +10,29 @@
 struct xkb_context;
 struct xkb_keymap;
 struct xkb_state;
+struct xkb_compose_table;
+struct xkb_compose_state;
 
 enum : uint32_t {
     k_spawn_cap  = 8u,
     k_key_cap    = 16u,
     k_held_cap   = 32u,
-    k_utf8_cap   = 32u,
+    k_utf8_cap   = 64u,
     k_utf8_bytes = 16u,
+    k_clip_cap   = 1024u,
+    k_dead_cap   = 8u,
 };
 
-// focus, x, y, buttons, and sample_ms are atomic words. The io_uring thread
-// is the only CPU writer; the GPU reads the device page. A publish copies
-// each word with one atomic load so a 32-bit sample cannot tear.
+// Single-threaded CPU seat state owned by the main io_uring event loop.
+// input_page_publish snapshots these fields into the 4-slot GPU ring.
 typedef struct InputCursor {
-    uint32_t         enter_serial;
-    bool             have_enter;
-    _Atomic uint32_t focus;
-    _Atomic float    x;
-    _Atomic float    y;
-    _Atomic uint32_t buttons;
-    _Atomic uint32_t sample_ms;
+    uint32_t enter_serial;
+    bool     have_enter;
+    uint32_t focus;
+    float    x;
+    float    y;
+    uint32_t buttons;
+    uint32_t sample_ms;
     uint32_t wanted_shape;
     uint32_t last_shape;
     bool     have_last;
@@ -38,6 +41,7 @@ typedef struct InputCursor {
     bool     frame_entering;
     uint32_t edge;
     bool     close_hit;
+    bool     close_pressed;
     bool     resize_pending;
     uint32_t resize_serial;
     uint32_t resize_edge;
@@ -59,6 +63,8 @@ typedef struct InputCursor {
     bool     left_dragged;
     float    left_down_x;
     float    left_down_y;
+    bool     rel_frame_seen;
+    bool     lock_wanted;
 } InputCursor;
 
 typedef struct InputSpawn {
@@ -74,40 +80,78 @@ typedef struct InputUtf8 {
 extern InputCursor          s_ptr;
 extern InputSpawn           s_spawn[k_spawn_cap];
 extern uint32_t             s_spawn_n;
-// Same seat snapshot as InputCursor: one writer, tear-free loads in publish.
-extern _Atomic float        s_drag_dx;
-extern _Atomic float        s_drag_dy;
-extern _Atomic uint32_t     s_drag_buttons;
+extern float                s_drag_dx;
+extern float                s_drag_dy;
+extern uint32_t             s_drag_buttons;
 extern uint32_t             s_key_q[k_key_cap];
 extern uint32_t             s_key_n;
-extern _Atomic uint32_t     s_held[k_held_cap];
-extern _Atomic uint32_t     s_held_n;
-extern _Atomic bool         s_key_focus;
-extern _Atomic double       s_scroll;
+extern uint32_t             s_held[k_held_cap];
+extern uint32_t             s_held_n;
+extern bool                 s_key_focus;
+extern double               s_scroll;
+extern bool                 s_seat_caps_dirty;
+extern uint32_t             s_seat_caps_pending;
 
-static_assert(__atomic_always_lock_free(4, (const void *)0), "seat sample is one word");
-static_assert(__atomic_always_lock_free(8, (const void *)0), "scroll sample is one word");
 extern InputUtf8            s_utf8[k_utf8_cap];
 extern uint32_t             s_utf8_n;
-extern struct xkb_context  *s_xkb_ctx;
-extern struct xkb_keymap   *s_xkb_map;
-extern struct xkb_state    *s_xkb_state;
+extern struct xkb_context       *s_xkb_ctx;
+extern struct xkb_keymap        *s_xkb_map;
+extern struct xkb_state         *s_xkb_state;
+extern struct xkb_compose_table *s_xkb_compose_table;
+extern struct xkb_compose_state *s_xkb_compose_state;
 extern int32_t              s_repeat_rate;
 extern int32_t              s_repeat_delay_ms;
 extern bool                 s_repeat_armed;
+extern bool                 s_repeat_tap;
 extern uint32_t             s_repeat_key;
 extern char                 s_repeat_bytes[k_utf8_bytes];
 extern uint8_t              s_repeat_n;
 extern uint64_t             s_repeat_next;
 extern bool                 s_xkb_warned;
+extern uint32_t             s_last_key_serial;
+
+// Wayland clipboard (wl_data_device / wl_data_offer / wl_data_source) + async io_uring pipes
+extern uint32_t             s_pending_offer_id;
+extern uint8_t              s_pending_offer_prio;
+extern char                 s_pending_offer_mime[32];
+extern uint32_t             s_selection_offer_id;
+extern uint8_t              s_selection_prio;
+extern char                 s_selection_mime[32];
+extern uint32_t             s_data_source_id;
+extern uint32_t             s_dead_offers[k_dead_cap];
+extern uint32_t             s_dead_offers_n;
+extern uint32_t             s_dead_sources[k_dead_cap];
+extern uint32_t             s_dead_sources_n;
+extern uint32_t             s_retired_sources[k_dead_cap];
+extern uint32_t             s_retired_sources_cursor;
+extern bool                 s_clip_copy_pending;
+extern char                 s_clip_tx_buf[k_clip_cap];
+extern uint32_t             s_clip_tx_len;
+extern char                 s_clip_write_buf[k_clip_cap];
+extern uint32_t             s_clip_write_len;
+extern uint32_t             s_clip_write_off;
+extern bool                 s_clip_write_active;
+extern char                 s_clip_rx_buf[k_clip_cap];
+extern uint32_t             s_clip_rx_len;
+extern char                 s_clip_rx_carry[4];
+extern uint8_t              s_clip_rx_carry_n;
+extern bool                 s_clip_rx_active;
 
 [[nodiscard]] bool input_take_u32(const unsigned char **p, const unsigned char *end, uint32_t *o);
 [[nodiscard]] bool input_take_i32(const unsigned char **p, const unsigned char *end, int32_t *o);
 
 [[nodiscard]] bool input_on_pointer(WaylandContext *w, uint16_t opcode,
                                     const unsigned char *payload, uint16_t len);
+[[nodiscard]] bool input_on_relative_pointer(WaylandContext *w, uint16_t opcode,
+                                             const unsigned char *payload, uint16_t len);
 [[nodiscard]] bool input_on_keyboard(WaylandContext *w, uint16_t opcode,
                                      const unsigned char *payload, uint16_t len);
+[[nodiscard]] bool input_on_data_device(WaylandContext *w, uint16_t opcode,
+                                        const unsigned char *payload, uint16_t len);
+[[nodiscard]] bool input_on_data_offer(WaylandContext *w, uint32_t id, uint16_t opcode,
+                                       const unsigned char *payload, uint16_t len);
+[[nodiscard]] bool input_on_data_source(WaylandContext *w, uint32_t id, uint16_t opcode,
+                                        const unsigned char *payload, uint16_t len);
 
 [[nodiscard]] int cursor_make_fallback(WaylandContext *w);
 void cursor_release_memory(void);

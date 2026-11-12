@@ -51,10 +51,10 @@ Before opening a ring or allocating graphics memory, [`src/system/system.c`](../
 - **CPU Topology & ISA Probe ([`src/system/probe/cpu.c`](../src/system/probe/cpu.c))**: Executes raw `cpuid` leaves alongside `sched_getaffinity()` and C23 `<stdbit.h>` intrinsics (`stdc_count_ones_ui`, `stdc_bit_width_ui`) to record logical core count, cache-line width, L1d/L2/L3 cache sizes, and ISA support (`AVX2`, `FMA`, `BMI2`, `F16C`, `AVX-512F`).
 - **Kernel `io_uring` Capability Probe ([`src/system/probe/uring.c`](../src/system/probe/uring.c))**: Calls `syscall(__NR_io_uring_register, -1, IORING_REGISTER_QUERY, ...)` to verify that the running Linux kernel supports every setup and feature flag in `k_ring_setup_mask` and `k_ring_required_features` before mapping any ring memory.
 - **1 ns Timer Slack & VMA Naming ([`src/system/memory/vma.c`](../src/system/memory/vma.c))**:
-  - Calls `prctl(PR_SET_TIMERSLACK, 1UL)` to shrink kernel timer coalescing slack from Linux's default `50,000 ns` (`50 µs`) down to `1 ns`, keeping the `8 ms` simulation `timerfd` and frame-stall watchdog sharp.
+  - Calls `prctl(PR_SET_TIMERSLACK, 1UL)` to shrink kernel timer coalescing slack from Linux's default `50,000 ns` (`50 µs`) down to `1 ns`, keeping the `8 ms` native kernel multishot `IORING_OP_TIMEOUT` simulation clock and frame-stall watchdog sharp.
   - Raises `RLIMIT_MEMLOCK` (so `io_uring` can pin registered memory arenas without `ENOMEM`) and `RLIMIT_NOFILE`.
   - Pre-faults anonymous `mmap` arenas with `madvise(..., MADV_HUGEPAGE)` and `MADV_POPULATE_WRITE` so page tables are wired before the first frame rather than faulting mid-frame.
-  - Names anonymous regions via `prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, ...)` so `/proc/<pid>/maps` and `/proc/<pid>/smaps` display human-readable labels such as `[io_uring:sq_cq]`, `[io_uring:pbuf]`, and `[io_uring:sim]`.
+  - Names anonymous regions via `prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, ...)` so `/proc/<pid>/maps` and `/proc/<pid>/smaps` display human-readable labels such as `[io_uring:sq_cq]` and `[io_uring:pbuf]`.
 
 ---
 
@@ -79,11 +79,10 @@ All steady-state I/O runs against pre-registered kernel tables (`ENG_FIXED_FILES
 | `2` | `ENG_SIGNAL_FD_SLOT` | `signalfd` catching `SIGINT`, `SIGTERM`, `SIGHUP` |
 | `3` | `ENG_SCRATCH_FD_SLOT` | Direct slot used by linked `openat -> read -> close` chains |
 | `4` | `ENG_INOTIFY_FD_SLOT` | `inotify` watcher for `window.chrome`, `.world`, and `.manifest` |
-| `5` | `ENG_SIM_FD_SLOT` | `8 ms` `CLOCK_MONOTONIC` simulation `timerfd` |
+| `5` | `ENG_TERRAIN_FD_SLOT` | `.epack` / `.gmpack` SSD archive file descriptor for async `io_uring` tile reads |
+| `6..7` | `ENG_CLIPBOARD_FD_SLOT` / `TX` | Wayland `wl_data_device` clipboard read/write pipe slots |
 
-Two multishot **provided-buffer rings** (`IORING_OP_READ_MULTISHOT` / `RECVSEND_BUNDLE`) keep persistent reads armed without re-submitting SQEs after every packet:
-1. **`ENG_PBUF_BGID = 1`** (`32 × 8,192 B` chunks): Absorbs incoming Wayland wire bursts.
-2. **`ENG_SIM_BGID = 2`** (`16 × 8 B` chunks): Absorbs `uint64_t` expiration counts from the `8 ms` simulation `timerfd` without colliding with Wayland socket bursts.
+A multishot **provided-buffer ring** (`ENG_PBUF_BGID = 1`, `32 × 8,192 B` chunks with `IORING_PBUF_RING_INC` incremental buffer consumption and `IORING_RECVSEND_BUNDLE`) absorbs incoming Wayland wire bursts without re-submitting SQEs after every packet, while the `8 ms` simulation clock uses a native kernel multishot `IORING_OP_TIMEOUT` (`IORING_TIMEOUT_MULTISHOT | IORING_TIMEOUT_ABS` against the registered `CLOCK_MONOTONIC` ring clock, requiring zero file descriptor slots).
 
 ### Linked Async File Chains & `EngineRelay`
 When loading files (`ring_submit_read_file` / `ring_read_file_all` in [`src/ring/load/chain.c`](../src/ring/load/chain.c)), the engine links `IORING_OP_OPENAT` (directly into `ENG_SCRATCH_FD_SLOT` via `IORING_FILE_INDEX_ALLOC` / fixed slot), `IORING_OP_READ`, and `IORING_OP_CLOSE` with `IOSQE_IO_LINK | IOSQE_CQE_SKIP_SUCCESS`.
@@ -119,7 +118,7 @@ In standard Vulkan applications, `VK_KHR_swapchain` hides buffer ownership behin
 ```mermaid
 sequenceDiagram
     participant Ring as io_uring Thread
-    participant Sim as 8 ms timerfd
+    participant Sim as 8 ms Multishot IORING_OP_TIMEOUT
     participant VK as Vulkan 1.4 Queue
     participant DRM as Linux DRM Syncobj
     participant WL as Wayland Compositor
@@ -161,21 +160,21 @@ Each scene submit signals two Vulkan semaphores simultaneously in `vkQueueSubmit
 
 ### Strict Separation of Simulation Clock vs. Display Refresh
 - **`wl_surface.frame` does NOT step physics**: Compositor callbacks only teach `FrameClock` the monitor's refresh period (`16.6 ms` at 60 Hz, `6.9 ms` at 144 Hz) and pace when the next picture is recorded.
-- **`8 ms` `timerfd` drives simulation**: `sim_on_timer()` calls `frame_clock_issue()` in fixed `8 ms` (`125 Hz`) quanta, capped at `FRAME_SIM_MAX_STEPS = 5` so a debugger pause or system hitch drops excess wall time rather than causing a physics spiral-of-death.
-- **True Zero-Wakeup Idle**: As soon as `frame_sim_wanted()` sees no moving bodies, no active heat pulse, and no held camera keys, `sim_timer_set(ring, false)` disarms the `timerfd`. The thread logs `Loop idle` and blocks in `io_uring_enter2` using **0% CPU and 0% GPU** until the next input packet or file change arrives.
+- **`8 ms` native multishot `IORING_OP_TIMEOUT` drives simulation**: `sim_on_timer()` calls `frame_clock_issue()` in fixed `8 ms` (`125 Hz`) quanta, capped at `FRAME_SIM_MAX_STEPS = 5` so a debugger pause or system hitch drops excess wall time rather than causing a physics spiral-of-death.
+- **True Zero-Wakeup Idle & Zero Success-Path Blocking Waits**: As soon as `frame_sim_wanted()` sees `app->busy() == false`, no active simulation pulse, and no held camera keys, `sim_timer_set(ring, false)` cancels the multishot `IORING_OP_TIMEOUT` (`IORING_OP_TIMEOUT_REMOVE`). Once any final dirty picture and Wayland send complete, the thread logs `[Engine] Loop idle. ... sim_timer=0` and blocks in `io_uring_enter2` using **0% CPU and 0% GPU** (with zero GPU submits after `Loop idle`) until the next input packet or file change arrives. Timeline checks (`acquire_point_retired`, `bda_transient_begin_frame`, staged `scene_gpu` DMA uploads, and `orphan` slot sweeps) poll via `vkGetSemaphoreCounterValue` (`timeout = 0`) without blocking the frame thread.
 
 ---
 
-## 6. Descriptorless Vulkan 1.4 BDA & Slang 2026 Pipelines (`src/vulkan/`, `shaders/`)
+## 6. Vulkan 1.4 BDA, Push Descriptors & Slang 2026 Pipelines (`src/vulkan/`, `shaders/`)
 
-### Zero `VkDescriptorSet` Architecture
-Search the entire repository for `vkCreateDescriptorPool`, `vkAllocateDescriptorSets`, or `vkUpdateDescriptorSets`—none exist. Every shader reads and writes GPU memory through **64-bit Buffer Device Addresses (`VkDeviceAddress`)** passed directly inside `vkCmdPushConstants2`.
+### Zero `VkDescriptorSet` Pool Architecture
+Search the entire repository for `vkCreateDescriptorPool`, `vkAllocateDescriptorSets`, or `vkUpdateDescriptorSets`—none exist. Structured buffer memory is addressed via **64-bit Buffer Device Addresses (`VkDeviceAddress`)** passed inside `vkCmdPushConstants`, while sampled image views (`Hi-Z` depth pyramid and `R32_UINT` Visibility Buffer) use **one `VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT` layout and `vkCmdPushDescriptorSet`**.
 
 ### Three-Tier BDA Memory Allocator (`src/vulkan/memory/bda.c`)
 [`include/vulkan/bda.h`](../include/vulkan/bda.h) manages GPU memory through `BdaSystem`:
-1. **`device_pool` (`64 MiB` `DEVICE_LOCAL` slabs)**: Suballocated with a coalescing sorted free-list (`free_list[64]` inline ranges per slab, spilling to `free_extra` only if fragmented beyond 64 disjoint holes). On Resizable BAR (ReBAR / SAM) GPUs where `DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT` heaps cover VRAM, slabs are persistently mapped so CPU ray-picks can inspect GPU compute buffers directly.
-2. **`staging_pool` (Host-visible coherent cached slabs)**: Feeds dynamic uploads across ring-buffered slices reclaimed via timeline semaphore counter values (never `vkQueueWaitIdle`).
-3. **`transient_ring` (`16 MiB` dual-half per-frame bump allocator)**: Partitioned into two `8 MiB` halves selected by `signal_point & 1`. Once a frame slot's previous `acquire_point` retires on the timeline semaphore, its half rewinds to offset `0` in $O(1)$ time.
+1. **`device_pool` (`40 MiB` `UMA_IGPU` / `64 MiB` `DISCRETE_DIRECT` slabs)**: Suballocated with a coalescing sorted free-list (`free_list[64]` inline ranges per slab, spilling to `free_extra` only if fragmented beyond 64 disjoint holes, preserving both alignment-gap padding and trailing remainders). On True UMA and Resizable BAR (ReBAR / SAM) GPUs, slabs are persistently mapped (`HOST_CACHED` LLC preferred on UMA).
+2. **`staging_pool` (Host-visible coherent cached slabs)**: Feeds dynamic uploads across ring-buffered slices reclaimed via non-blocking `vkGetSemaphoreCounterValue` polls (never `vkQueueWaitIdle`).
+3. **`transient_ring` (4-slice per-frame bump allocator)**: Partitioned into `4` timeline-guarded slices selected by `signal_point & 3`. `bda_transient_begin_frame` polls retirement with `timeout = 0`; if an unusually deep queue still holds that slice, it marks the slice busy so `bda_alloc_transient` returns a null `BdaSlice` (causing callers to skip that transient draw cleanly while the frame still presents).
 
 ### Module-Free `Maintenance5` Pipelines & `#embed`ded Slang 2026 Shaders
 - At compile time, `Makefile` compiles every `.slang` shader in [`shaders/`](../shaders/) to **SPIR-V 1.6** (`slangc -target spirv -profile spirv_1_6`) and embeds the binary bytecode directly into C translation units via standard **ISO C23 `#embed`** (`--embed-dir=build/<mode>/gen`).

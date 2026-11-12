@@ -16,8 +16,10 @@
 #include "vulkan/bda.h"
 #include <drm/drm.h>
 #include <errno.h>
+#include <linux/dma-buf.h>
 #include <linux/input-event-codes.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -44,12 +46,12 @@ enum : uint64_t {
     k_ud_signal_cancel  = UINT64_MAX,
     k_ud_release_cancel = UINT64_MAX - 1u,
     k_ud_inotify_cancel = UINT64_MAX - 2u,
-    k_ud_sim_cancel     = UINT64_MAX - 3u,
 };
 
 enum : uint32_t {
-    k_orphan_cap      = 8u,
-    k_gpu_timer_slots = 8u, // Four timestamps on each scene slot.
+    k_orphan_init_cap = 8u,
+    k_orphan_max_cap  = 64u,
+    k_gpu_timer_slots = 12u, // Four gfx timestamps + two async PRIME transfer timestamps per scene slot.
 };
 
 enum : int {
@@ -59,8 +61,8 @@ enum : int {
 };
 
 enum : uint32_t {
-    k_inotify_mask = IN_MODIFY | IN_CLOSE_WRITE | IN_MOVED_TO | IN_ATTRIB |
-                     IN_DELETE_SELF | IN_MOVE_SELF,
+    k_inotify_mask = IN_MODIFY | IN_CLOSE_WRITE | IN_MOVED_TO | IN_CREATE |
+                     IN_ATTRIB | IN_DELETE_SELF | IN_MOVE_SELF,
 };
 
 // One presented image. The DRM node and the shared acquire timeline are not
@@ -78,8 +80,10 @@ typedef struct FrameSlot {
     int                   release_eventfd;
     bool                  release_pending;
     bool                  foreign_owned;
-    bool                  ts_armed; // Timestamp queries were written in the last submit.
-    uint8_t               ts_base;  // First query index in the shared pool.
+    bool                  ts_armed;      // Graphics timestamp queries were written in the last submit.
+    bool                  ts_xfer_armed; // Async PRIME transfer timestamps were written in the last submit.
+    uint8_t               ts_base;       // First graphics query index in the shared pool.
+    uint8_t               ts_xfer_base;  // First transfer query index in the shared pool.
     alignas(64) VulkanExportableImage image;
     VkCommandBuffer       cmd_buf;
     VkImageView           image_view;
@@ -93,6 +97,8 @@ typedef struct FrameSlot {
     VkCommandBuffer       transfer_cmd_buf;
     FrameRect             surface_damage;
     FrameRect             copy_damage;
+    FrameRect             stale_rect;
+    bool                  has_valid_history;
 } FrameSlot;
 
 typedef EngineRelay RunRelay;
@@ -143,7 +149,11 @@ typedef struct FrameState {
     VkSemaphore acquire_sync;
     VkQueryPool ts_pool;
     float    ts_period_ns;
-    bool     sim_fixed;
+    uint32_t ts_valid_bits;
+    uint32_t ts_xfer_valid_bits;
+    uint16_t ts_reset_mask;
+    bool     ts_host_reset;
+    bool     sim_cancel_sent;
     bool     same_repaint;
     bool     release_fixed;
     bool     inotify_fixed;
@@ -151,18 +161,28 @@ typedef struct FrameState {
     bool     inotify_warned;
     bool     world_dirty;
     bool     bench_uncapped;
+    uint32_t sim_gen;
+    uint32_t sim_inflight_count;
+    uint32_t sim_cancel_inflight;
+    uint64_t sim_active_ud;
+    uint64_t timer_deadline_ns;
     uint64_t last_gpu_comp_ns;
     uint64_t last_gpu_rend_ns;
+    uint64_t last_gpu_xfer_ns;
     uint64_t last_gpu_tot_ns;
     uint64_t gpu_samples_retired;
+    uint64_t gpu_submits;
+    uint32_t turn_frames;
     VkSemaphore prime_ready_sem;
     VkSemaphore prime_acquire_sync;
     uint64_t prime_ready_point;
-    uint64_t last_transfer_acquire_point;
+    uint64_t last_acquire_signal_point;
+    VkQueue  last_acquire_signal_queue;
+    bool     timeline_fd_to_handle_unsupported;
+    bool     implicit_dmabuf_sync;
     bool     pending_damage_set;
     bool     pending_damage_full;
     FrameRect pending_damage;
-    FrameRect prev_turn_damage;
     // One eventfd for the life of the process. DRM_IOCTL_SYNCOBJ_EVENTFD is
     // issued only while shutting down, for the point still on screen. The turn
     // does not sleep on it. Slots keep release_eventfd at -1 so a reap cannot
@@ -172,13 +192,17 @@ typedef struct FrameState {
     int      inotify_fd;
     int      inotify_wd;
     int      world_wd;
-    int      sim_fd;
-    uint32_t orphan_mask;
+    uint64_t orphan_mask;
     uint32_t orphan_count;
-    uint32_t orphan_gen[k_orphan_cap];
+    uint32_t orphan_cap;
+    uint32_t orphan_gen[k_orphan_max_cap];
+    FrameSlot *orphans;
     RunRelay *relay;
     char     resize_tranche[16];
+    char     chrome_watch_base[128];
     char     world_watch_path[256];
+    char     world_watch_dir[256];
+    char     world_watch_base[128];
 
     // slot[front] is on screen. The other slot is the spare while the turn runs.
     FrameSlot slot[2];
@@ -188,7 +212,8 @@ typedef struct FrameState {
     FrameSlot resize_fresh;
     // Buffers whose compositor release has not signalled. Indexed by fixed
     // bits in orphan_mask so a SlotRef does not shift when a neighbour is swept.
-    FrameSlot orphans[k_orphan_cap];
+    // Starts inline at 8 slots and dynamically grows up to 64 slots on demand.
+    alignas(64) FrameSlot orphans_inline[k_orphan_init_cap];
 } FrameState;
 
 static_assert(offsetof(FrameState, clock) == 64, "pace is one cache line");
@@ -247,15 +272,17 @@ FrameSlot *slot_from_ref(SlotRef ref);
 // Scene-slot timestamp queries. Resize and bar recordings do not use the pool.
 void gpu_timer_init(VulkanContext *vk);
 void gpu_timer_shutdown(VulkanContext *vk);
-void gpu_timer_begin_frame(VkCommandBuffer cmd, FrameSlot *frame);
+void gpu_timer_begin_frame(VulkanContext *vk, VkCommandBuffer cmd, FrameSlot *frame);
 void gpu_timer_mark_compute_end(VkCommandBuffer cmd, const FrameSlot *frame);
 void gpu_timer_mark_render_begin(VkCommandBuffer cmd, const FrameSlot *frame);
 void gpu_timer_end_frame(VkCommandBuffer cmd, FrameSlot *frame);
+void gpu_timer_begin_transfer(VulkanContext *vk, VkCommandBuffer cmd, FrameSlot *frame);
+void gpu_timer_end_transfer(VkCommandBuffer cmd, FrameSlot *frame);
 void gpu_timer_harvest(VulkanContext *vk, FrameSlot *frame);
 
 bool wait_acquire_point(VulkanContext *vk, uint64_t point);
 bool acquire_point_retired(VulkanContext *vk, uint64_t point);
-bool poll_release_handle(uint32_t handle, uint64_t point);
+bool poll_slot_released(const WaylandContext *wl, const FrameSlot *frame);
 int ensure_frame_targets(VulkanContext *vk, FrameSlot *frame);
 int record_and_submit_clear(VulkanContext *vk, FrameSlot *frame, VkSemaphore acquire,
                                    uint64_t signal_point, bool draw_live, uint32_t heat_dt);
@@ -264,7 +291,8 @@ int drm_syncobj_to_fd(int drm_fd, uint32_t handle);
 void drm_syncobj_destroy(int drm_fd, uint32_t *handle);
 int create_acquire_semaphore(VulkanContext *vk, VkSemaphore *out_timeline, VkSemaphore *out_sync);
 int create_acquire_timeline(WaylandContext *wl);
-int publish_acquire_point_from(VulkanContext *vk, VkSemaphore sync_sem, uint64_t point);
+int publish_acquire_point_from(VulkanContext *vk, VkSemaphore *io_sync_sem,
+                               uint64_t point, int dmabuf_fd);
 int arm_slot_read(RingContext *ring, uint32_t slot, bool fixed, int raw_fd,
                          uint32_t buf_index, uint64_t user_data);
 int prep_cancel_fd(RingContext *ring, int fd, uint32_t slot, bool fixed, uint64_t user_data);
@@ -308,6 +336,7 @@ int finish_idle_send(WaylandContext *wl, VulkanContext *vk,
                             const struct io_uring_cqe *cqe, uint32_t pending_serial);
 int queue_resize_frame(WaylandContext *wl, VulkanContext *vk);
 int queue_chrome_repaint(WaylandContext *wl, VulkanContext *vk);
+int queue_feedback_realloc(WaylandContext *wl, VulkanContext *vk);
 int frame_boot(void);
 void ensure_inotify_watch(void);
 void note_inotify_cqe(RingContext *ring, int32_t res, bool *armed);
@@ -326,8 +355,8 @@ int frame_watchdog(WaylandContext *wl, VulkanContext *vk, bool *queued);
 // Vulkan 1.4 sync2. A discarded image has no source availability.
 // A foreign-queue release publishes through the timeline signal, not a
 // destination pipeline stage.
-void frame_fill_discard_color(VkImageMemoryBarrier2 *out, VkImage image);
-void frame_fill_discard_depth(VkImageMemoryBarrier2 *out, VkImage image);
+void frame_fill_discard_color(VkImageMemoryBarrier2 *out, VkImage image, bool unified);
+void frame_fill_discard_depth(VkImageMemoryBarrier2 *out, VkImage image, bool unified);
 void frame_fill_release_foreign(VkImageMemoryBarrier2 *out, const VulkanContext *vk, VkImage image);
 void frame_cmd_barriers(VkCommandBuffer cmd, const VkImageMemoryBarrier2 *barriers, uint32_t count);
 // Direct present releases the color attachment. A cross-device present copies
@@ -371,11 +400,10 @@ void sim_on_timer(uint64_t expirations);
 void sim_timer_set(struct RingContext *ring, bool want);
 void frame_note_picture(void);
 bool frame_sim_wanted(void);
-// One multishot read of the simulation timerfd. A completion carries the
-// coalesced expiration count in a provided buffer.
-[[nodiscard]] int frame_arm_sim_mshot(struct RingContext *ring);
-bool frame_note_sim_cqe(struct RingContext *ring, const struct io_uring_cqe *cqe, bool rearm);
-void frame_apply_noted_sim(struct RingContext *ring, uint64_t expirations, int res, bool alive, bool rearm);
+bool frame_note_sim_cqe(struct RingContext *ring, const struct io_uring_cqe *cqe,
+                        bool rearm, uint64_t *io_ticks);
+void frame_apply_noted_sim(struct RingContext *ring, uint64_t last_ud, uint64_t expirations,
+                           uint32_t retired, int res, bool alive, bool rearm);
 int frame_run(void);
 int frame_stop(void);
 

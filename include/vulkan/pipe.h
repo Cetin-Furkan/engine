@@ -11,6 +11,11 @@
 // Viewport and scissor stay dynamic. Other state is part of the key, because
 // the draws do not set it on the command buffer.
 
+enum : uint32_t {
+    VULKAN_GFX_SPEC_BYTES = 32u,
+    VULKAN_GFX_SPEC_MAPS  = 4u,
+};
+
 typedef struct VulkanGfxPipe {
     const void                  *vert;
     size_t                       vert_bytes;
@@ -25,17 +30,21 @@ typedef struct VulkanGfxPipe {
     VkBool32                     depth_write;
     VkCompareOp                  depth_compare;
     VkBool32                     blend;
+    bool                         custom_depth_compare;
     const VkSpecializationInfo  *frag_spec;
 } VulkanGfxPipe;
 
 // One graphics situation. Armed at init, created on the first draw of this
-// format, depth, and specialization. The SPIR-V and specialization bytes
-// must outlive the armed record. A second format is a second record.
+// format, depth, and specialization. SPIR-V bytes must outlive the armed
+// record; specialization constants and map entries are deep-copied inline.
 typedef struct VulkanGfxLive {
     VulkanGfxPipe                info;
     VkFormat                     format;
-    const VkSpecializationInfo  *spec;
     VkPipeline                   pipeline;
+    VkSpecializationInfo         owned_spec;
+    VkSpecializationMapEntry     spec_maps[VULKAN_GFX_SPEC_MAPS];
+    uint8_t                      spec_data[VULKAN_GFX_SPEC_BYTES];
+    bool                         has_spec;
     bool                         armed;
     bool                         failed;
 } VulkanGfxLive;

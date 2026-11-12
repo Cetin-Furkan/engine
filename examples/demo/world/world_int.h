@@ -15,6 +15,7 @@ typedef struct WorldOps {
     bool (*hit)(const WorldObj *o, const CameraRay *ray, float *t, Coord *at);
     // A click that hit this object. True when the picture changed.
     bool (*on_click)(WorldObj *o, Coord hit);
+    void (*prepare_scene)(const WorldObj *o, bool live);
     void (*draw)(const WorldObj *o, VkCommandBuffer cmd, uint32_t width, uint32_t height, bool live);
     bool (*advance)(WorldObj *o, uint32_t time_ms);
     void (*commit)(WorldObj *o);
@@ -86,6 +87,7 @@ void table_select_quiet(int index);
 void table_clear_selection(void);
 bool table_highlight(const WorldObj *o, bool live);
 int table_pick(const CameraRay *ray, Coord *at, float *t_hit);
+void table_prepare_scene(bool live);
 void table_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height, bool live);
 void table_draw_ops(VkCommandBuffer cmd, uint32_t width, uint32_t height, bool live, const WorldOps *ops);
 bool table_advance(uint32_t time_ms);

@@ -1244,6 +1244,15 @@ static VulkanResult open_candidate(VulkanContext *ctx, const GpuCandidate *chose
         (PFN_vkGetSemaphoreFdKHR)vkGetDeviceProcAddr(ctx->device, "vkGetSemaphoreFdKHR");
     ctx->dispatch.vkImportSemaphoreFdKHR =
         (PFN_vkImportSemaphoreFdKHR)vkGetDeviceProcAddr(ctx->device, "vkImportSemaphoreFdKHR");
+    if (ctx->device_info.supports_push_descriptors) {
+        ctx->dispatch.vkCmdPushDescriptorSet =
+            (PFN_vkCmdPushDescriptorSet)vkGetDeviceProcAddr(ctx->device, "vkCmdPushDescriptorSet");
+        if (ctx->dispatch.vkCmdPushDescriptorSet == nullptr) {
+            ctx->dispatch.vkCmdPushDescriptorSet =
+                (PFN_vkCmdPushDescriptorSet)vkGetDeviceProcAddr(
+                    ctx->device, "vkCmdPushDescriptorSetKHR");
+        }
+    }
 
     if (ctx->dispatch.vkGetMemoryFdKHR == nullptr ||
         ctx->dispatch.vkGetImageDrmFormatModifierPropertiesEXT == nullptr ||

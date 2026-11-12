@@ -24,7 +24,7 @@ static_assert(sizeof(PipeHeader) == 28u, "pipeline cache header");
 // the fixed state. Two draws of the same situation share the pipeline.
 // A full bank fails the create. In-use pipelines are not evicted.
 enum : uint32_t {
-    k_bank_cap   = 64u,
+    k_bank_cap   = 128u,
     k_spec_bytes = 32u,
     k_spec_maps  = 4u,
 };
@@ -330,6 +330,8 @@ static VkShaderModuleCreateInfo module_info(const void *code, size_t bytes) {
 
 static VkPipeline create_graphics(VulkanContext *vk, const VulkanGfxPipe *info, VkFormat format,
                                   const VkSpecializationInfo *spec) {
+    const bool has_color = (format != VK_FORMAT_UNDEFINED);
+    const bool has_frag  = (info->frag != nullptr && info->frag_bytes > 0u);
     VkShaderModuleCreateInfo vert_mod = module_info(info->vert, info->vert_bytes);
     VkShaderModuleCreateInfo frag_mod = module_info(info->frag, info->frag_bytes);
     VkPipelineShaderStageCreateInfo stages[2] = {
@@ -393,8 +395,8 @@ static VkPipeline create_graphics(VulkanContext *vk, const VulkanGfxPipe *info, 
     };
     VkPipelineColorBlendStateCreateInfo blend = {
         .sType           = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
-        .attachmentCount = 1,
-        .pAttachments    = &blend_att,
+        .attachmentCount = has_color ? 1u : 0u,
+        .pAttachments    = has_color ? &blend_att : nullptr,
     };
     VkDynamicState dynamics[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
     VkPipelineDynamicStateCreateInfo dynamic = {
@@ -404,14 +406,14 @@ static VkPipeline create_graphics(VulkanContext *vk, const VulkanGfxPipe *info, 
     };
     VkPipelineRenderingCreateInfo rendering = {
         .sType                   = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
-        .colorAttachmentCount    = 1,
-        .pColorAttachmentFormats = &format,
+        .colorAttachmentCount    = has_color ? 1u : 0u,
+        .pColorAttachmentFormats = has_color ? &format : nullptr,
         .depthAttachmentFormat   = info->depth_format,
     };
     VkGraphicsPipelineCreateInfo pipe = {
         .sType               = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
         .pNext               = &rendering,
-        .stageCount          = 2,
+        .stageCount          = has_frag ? 2u : 1u,
         .pStages             = stages,
         .pVertexInputState   = &vertex,
         .pInputAssemblyState = &assembly,
@@ -604,9 +606,14 @@ int vulkan_gfx_pipelines(VulkanContext *vk, const VulkanGfxPipe *info,
                          const VkFormat *formats, const VkSpecializationInfo *const *specs,
                          uint32_t count, VkPipeline *out) {
     if (vk == nullptr || info == nullptr || formats == nullptr || out == nullptr ||
-        count == 0u || count > 4u || info->vert == nullptr || info->frag == nullptr ||
+        count == 0u || count > 4u || info->vert == nullptr ||
         info->layout == VK_NULL_HANDLE) {
         return -1;
+    }
+    for (uint32_t i = 0u; i < count; ++i) {
+        if (formats[i] != VK_FORMAT_UNDEFINED && info->frag == nullptr) {
+            return -1;
+        }
     }
     for (uint32_t i = 0u; i < count; ++i) {
         out[i] = VK_NULL_HANDLE;

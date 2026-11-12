@@ -58,11 +58,11 @@ static bool mesh_busy(const WorldObj *o) {
     return mesh_wants_frame();
 }
 
-static void mesh_draw_obj(const WorldObj *o, VkCommandBuffer cmd, uint32_t width, uint32_t height, bool live) {
+static void mesh_prepare_obj(const WorldObj *o, bool live) {
     const MeshData *m = o->data;
     bool glow = live ? m->spin.glow : m->spin.shown_glow;
     material_set(k_mat_mesh, glow);
-    mesh_draw(cmd, width, height, spin_deg(&m->spin, live), table_highlight(o, live));
+    mesh_submit_scene(spin_deg(&m->spin, live), table_highlight(o, live));
 }
 
 static bool mesh_toggle_spin(WorldObj *o) {
@@ -124,17 +124,17 @@ static uint32_t mesh_vertices(const WorldObj *o) {
 }
 
 static const WorldOps s_ops = {
-    .hit         = mesh_hit,
-    .vertices    = mesh_vertices,
-    .draw        = mesh_draw_obj,
-    .advance     = mesh_advance,
-    .commit      = mesh_commit_obj,
-    .busy        = mesh_busy,
-    .toggle_spin = mesh_toggle_spin,
-    .toggle_glow = mesh_toggle_glow,
-    .respin      = mesh_respin,
-    .remove      = mesh_remove,
-    .name        = mesh_name,
+    .hit           = mesh_hit,
+    .vertices      = mesh_vertices,
+    .prepare_scene = mesh_prepare_obj,
+    .advance       = mesh_advance,
+    .commit        = mesh_commit_obj,
+    .busy          = mesh_busy,
+    .toggle_spin   = mesh_toggle_spin,
+    .toggle_glow   = mesh_toggle_glow,
+    .respin        = mesh_respin,
+    .remove        = mesh_remove,
+    .name          = mesh_name,
 };
 
 void mesh_kind_reset(void) {

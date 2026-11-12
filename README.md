@@ -2,7 +2,7 @@
 
 **Pure ISO C23 (`-std=c23`) · Linux 7.1+ `io_uring` · Raw Wayland Wire · DRM Timeline Explicit Sync · Vulkan 1.4 Descriptorless BDA · Slang 2026 (SPIR-V 1.6)**
 
-`Engine` is a 3D, 2D, and geospatial simulation/graphics engine written from scratch in strict ISO C23 (~53,000 lines of C23 and Slang, compiling into a single `2.2 MiB` release binary with shaders and fonts embedded directly inside the executable via C23 `#embed`).
+`Engine` is a 3D, 2D, and geospatial simulation/graphics engine written from scratch in strict ISO C23 (~55,000 lines of C23 and Slang, compiling into a single `2.4 MiB` release binary with shaders and fonts embedded directly inside the executable via C23 `#embed`).
 
 It uses **no windowing libraries** (`SDL`, `GLFW`), **no protocol wrappers** (`libwayland-client`), **no ring wrappers** (`liburing`), **no Vulkan WSI swapchain** (`VK_KHR_swapchain`), and **no Vulkan descriptor sets** (`VkDescriptorSet`). Instead, a single thread talks straight to the Linux kernel over a registered `io_uring` instance, speaks the Wayland binary wire protocol over a Unix socket, presents exported `DMA-BUF` images synchronized with Linux DRM `drm_syncobj` timelines, and addresses all GPU buffers through raw 64-bit GPU pointers (`VK_KHR_buffer_device_address`).
 
@@ -21,6 +21,7 @@ This README gives a clear, human-readable tour of why the engine exists, what it
 | **[`doc/V02_GPU_PROFILES_AND_2026_ALGORITHMS.md`](doc/V02_GPU_PROFILES_AND_2026_ALGORITHMS.md)** | `Engine v0.2` Dual-Architecture specification (`UMA_IGPU`, `DISCRETE_DIRECT`, `HYBRID_MUXLESS`) and 2026 algorithms roadmap (`.epack` v1 codec, async `io_uring`, quantized meshlets, `SSILVB`, Split Radiance Cascades, `AVBD`, `2DGS`). |
 | **[`doc/BENCHMARK_V01_VS_V02_M1.md`](doc/BENCHMARK_V01_VS_V02_M1.md)** | Hardware benchmark report comparing `v0.1` Baseline vs `v0.2` Milestone 1 (`UMA_IGPU` zero-staging BDA pool, `HOST_CACHED` LLC ranking, adaptive `2x MSAA`, `-69.7%` UMA RAM reduction). |
 | **[`doc/BENCHMARK_V02_M2.md`](doc/BENCHMARK_V02_M2.md)** | Three-way empirical report (`v0.1` vs `v0.2-M1` vs `v0.2-M2`): `0.00 ms` non-blocking `io_uring` tile streaming, `3.84x` `.epack` v1 GPU-decoded terrain codec (`4.01x` total World 8 RAM reduction), and `HYBRID_MUXLESS` partial-damage PRIME presentation. |
+| **[`doc/BENCHMARK_V02_M3.md`](doc/BENCHMARK_V02_M3.md)** | Four-way empirical report (`v0.1` vs `M1` vs `M2` vs `v0.2-M3`): unified `16 B/vert` quantized meshlet scene kernel (`5.35x` geometry compression), Subgroup single-pass `Hi-Z` + Two-Phase GPU occlusion culling, `1x R32_UINT` Visibility Buffer + analytical barycentric specular AA, and **`2.03x`–`2.32x` faster** 3D frame times. |
 | **[`pointers.md`](pointers.md)** | Research background behind the 2025–2026 pointer architectures implemented in `src/backend/` (`RelPtr2D`, Project Lilliput compact headers, 64-byte flat closures, CHERI-D inline lifetime IDs, and PULSE active windows). |
 | **[`doc/engineers_note.md`](doc/engineers_note.md)** | Build segregation (`build/debug` vs. `build/release`), semantic version tagging, and Vulkan/DRM runtime contracts. |
 
@@ -144,6 +145,7 @@ When presenting a frame:
 ## 4. What `v0.1.0` Is Capable Of Today
 
 - **Pure Empty Boot by Default (`World 0`)**: Running `./build/release/bin/engine` with no flags boots a completely blank, zero-permission sealed engine—zero objects, no grid, no HUD, no lazy terrain allocation—proving that the platform engine carries zero scene baggage unless asked.
+- **Unified `16 B/vert` Meshlet Kernel, Subgroup Two-Phase `Hi-Z` & `R32_UINT` Visibility Buffer (`src/scene/`)**: Clusterizes procedural solid cages and `.obj` meshes into `64`-vertex / `124`-triangle meshlets (`uint16` local AABB positions + octahedral `snorm16` normals — **`5.35x` smaller** than raw `36 B` vertices), runs GPU normal-cone + frustum + Subgroup Two-Phase `Hi-Z` occlusion culling into `vkCmdDrawIndirectCount`, and supports live `Y`-key switching between hardware MSAA indirect rasterization and a `1x R32_UINT` Visibility Buffer deferred resolve with analytical screen-space barycentric derivatives and geometric specular AA (`0` `VkDescriptorSet`s).
 - **3D Rigid/Elastic Physics & 128³ GPU Heat Compute**: Cubes and 6 smooth/faceted solids (`Tetrahedron`, `Octahedron`, `Icosahedron`, `Cylinder`, `Cone`, `Torus`) drop, collide, and deform with volume-preserving squash-and-stretch ($\text{scale}_{xy} = 1/\sqrt{\text{scale}_z}$), while clicks inject 5-second thermal pulses solved across a 128³ fp16 GPU volume lattice.
 - **2D Soft-Body & Convex Polygon Physics (`sheet.c`)**: Tunable mass-spring deformable meshes (jelly to stiff), oriented rigid bumpers, and Separating Axis Theorem (SAT) convex polygons running standalone (`MODE_2D`) or composited live over 3D worlds (`MODE_HYBRID`).
 - **Interactive Click-to-Draw Ear-Clipped Faces (`face.c`, `clip.c`)**: Granting `PERM_DRAW` lets ground clicks place vertices and preview edges; clicking the first corner or pressing `F` ear-clips arbitrary non-self-intersecting polygons into live 3D/2D faces.
@@ -186,8 +188,8 @@ make release
 # 3. Build CPU-tuned native release binary (-march=native)
 make release NATIVE=1
 
-# 4. Run all 9 standalone unit & subsystem test suites
-#    (handles, clock, world, motion, policy, sheet, text, bda, backend)
+# 4. Run all 10 standalone unit & subsystem test suites
+#    (handles, clock, world, motion, policy, sheet, text, bda, backend, scene)
 make test
 ```
 
@@ -208,6 +210,10 @@ make test
 ENGINE_GPU_INDEX=0 ./build/release/bin/engine --world=2
 ENGINE_GPU=NVIDIA  ./build/release/bin/engine --world=8
 ENGINE_GPU=Intel   ./build/release/bin/engine --world=3
+
+# Override execution profile, MSAA, Visibility Buffer, or Subgroup Hi-Z policy
+ENGINE_GPU_PROFILE=auto|uma|discrete|hybrid ./build/release/bin/engine --world=8
+ENGINE_MSAA=1 ENGINE_VISBUF=1 ENGINE_HIZ=auto ./build/release/bin/engine --world=7
 ```
 
 ### Ingest Drone / Smartphone Survey Photos into World 8
@@ -260,6 +266,7 @@ Press **`F1`–`F9`** at any time inside the running window to switch straight i
 | **Wheel / `+` / `-`** | Zoom in/out (`0.0001x` .. `10,000x`, zoom-to-cursor in World 8) | Zoom in/out | Zoom in/out |
 | **`Numpad 8,2,4,6,5,1,7,9`** | Top/Bottom/Left/Right/Front-Back/Home/Gimbal/Toggle `PERM_DRAW` | Home (`KP1`), Front (`KP5`), `PERM_DRAW` (`KP9`) | Full Numpad camera & `PERM_DRAW` controls |
 | **`K` / `Numpad 0`** | Toggle `20 m` / `100 m` elevation contour lines (World 8) | Toggle contours | Toggle contours |
+| **`Y`** | Toggle `1x R32_UINT` Visibility Buffer deferred shading vs MSAA Indirect | Toggle VisBuf policy | Toggle `1x R32_UINT` Visibility Buffer |
 | **`M` / `L`** | Cycle math/CSV plot / Hot-reload `.world`, CSV, OBJ & `.manifest` | Cycle plot / Hot-reload `.world`, CSV & `sheet.world` | Cycle plot / Hot-reload all active files |
 | **Hold `T` + 2 Clicks** | Place interactive SDF text box (type UTF-8, `Esc` to finish) | Place interactive SDF text box | Place interactive SDF text box |
 
@@ -280,6 +287,7 @@ include/
 ├── frame/           64B FrameClock, SlotRef generation handles & frame subsystem entrypoints
 ├── input/           Lock-free seqlock GPU input page & Wayland seat/pointer/keyboard headers
 ├── ring/            Registered io_uring context, SQ/CQ/PBUF/SIM arenas & linked file chains
+├── scene/           64v/124t quantized meshlets, octahedral snorm16, Subgroup Hi-Z & R32_UINT VisBuf API
 ├── system/          CPU topology/ISA probe, io_uring kernel feature query & VMA/hugepage tuning
 ├── util/            Zero-allocation FmtBuf integer/string formatting
 ├── vulkan/          Vulkan 1.4 context, device scorer, 64 MiB BDA slab system & pipeline bank
@@ -291,12 +299,13 @@ src/
 ├── frame/           io_uring event loop, 8 ms timerfd driver, GPU timestamp profiler & DRM explicit present
 ├── input/           Wayland seat wire decoders, sub-pixel pointer accumulator, xkb keymap & GPU input page
 ├── ring/            NO_MMAP ring setup, provided-buffer rings, registered FDs & async file chains
+├── scene/           Meshlet clusterizer, 16B quantizer, Subgroup Hi-Z, Two-Phase cull & VisBuf runtime
 ├── system/          CPUID detector, chained IORING_REGISTER_QUERY, RLIMITs & VMA naming
 ├── vulkan/          Instance/device bring-up, prime_copy, coalescing BDA allocator & Maintenance5 pipes
 └── wayland/         Socket connection, wire sendmsg/recvmsg + SCM_RIGHTS & surface/toplevel lifecycle
 
 shaders/             Slang 2026 shaders compiled to SPIR-V 1.6 and #embedded into the binary
 examples/demo/       Hosted 3D/2D/Hybrid program, WorkspacePolicy, WorldBuilder, 10 worlds, DEM archive & SDF text
-scripts/             Environment probe, AWS/Esri .gmpack builder & EXIF/XMP survey photo ingestion CLI
-tests/               9 standalone unit test suites (handles, clock, world, motion, policy, sheet, text, bda, backend)
+scripts/             Environment probe, AWS/Esri .gmpack builder, EXIF/XMP survey CLI & benchmark harness
+tests/               10 standalone unit test suites (handles, clock, world, motion, policy, sheet, text, bda, backend, scene)
 ```

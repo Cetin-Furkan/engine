@@ -7,6 +7,7 @@
 #include "frame/sheet.h"
 #include "frame/terrain.h"
 #include "frame/text.h"
+#include "scene/scene.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -271,6 +272,7 @@ void world_reset(void) {
     mesh_kind_reset();
     terrain_kind_reset();
     terrain_set_contours(false);
+    scene_invalidate_hiz();
     spin_clear();
     camera_reset();
     if (s_world_id == 0u) {
@@ -659,11 +661,37 @@ bool world_consume_spin(void) {
     return true;
 }
 
+void world_prepare_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height, bool live) {
+    if (policy_mode() == MODE_2D || world_selected_id() == 0u) {
+        return;
+    }
+    camera_bind(live);
+    ViewPush vp = {0};
+    view_push_fill(&vp, 0u);
+    SceneViewParams sv = {
+        .materials_bda = vp.materials,
+        .mat_index     = vp.mat_index,
+        .mat_pad       = vp.mat_pad,
+        .qx            = vp.qx,
+        .qy            = vp.qy,
+        .qz            = vp.qz,
+        .qw            = vp.qw,
+        .cam_x         = vp.cam_x,
+        .cam_y         = vp.cam_y,
+        .cam_z         = vp.cam_z,
+        .zoom          = vp.zoom,
+    };
+    scene_begin_frame(width, height, &sv);
+    table_prepare_scene(live);
+    scene_prepare_draw(cmd, width, height);
+}
+
 void world_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height, bool live) {
     camera_bind(live);
     ground_draw(cmd, width, height);
     if (policy_mode() != MODE_2D) {
         table_draw(cmd, width, height, live);
+        scene_draw(cmd, width, height);
         face_draw_chain(cmd, width, height, live);
     } else {
         table_draw_ops(cmd, width, height, live, face_ops());

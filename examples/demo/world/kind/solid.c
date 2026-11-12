@@ -145,14 +145,14 @@ static bool solid_simulate(WorldObj *o, uint32_t time_ms, uint32_t sim_dt_ms, ui
     return s->awake;
 }
 
-static void solid_draw_obj(const WorldObj *o, VkCommandBuffer cmd, uint32_t width, uint32_t height, bool live) {
+static void solid_prepare_obj(const WorldObj *o, bool live) {
     const SolidData *s = o->data;
     bool glow = live ? s->spin.glow : s->spin.shown_glow;
     material_set(k_mat_solid0 + s->kind, glow);
     bool curved = live ? s_curved : s_shown_curved;
     float squash = live ? s->squash : s->shown_squash;
-    solid_draw(cmd, width, height, s->kind, curved, spin_deg(&s->spin, live),
-               o->at.x, o->at.y, o->at.z, squash, table_highlight(o, live));
+    solid_submit_scene(s->kind, curved, spin_deg(&s->spin, live),
+                       o->at.x, o->at.y, o->at.z, squash, table_highlight(o, live));
 }
 
 static bool solid_toggle_spin(WorldObj *o) {
@@ -213,19 +213,19 @@ static uint32_t solid_vertices(const WorldObj *o) {
 }
 
 static const WorldOps s_ops = {
-    .hit         = solid_hit,
-    .on_click    = solid_on_click,
-    .vertices    = solid_vertices,
-    .draw        = solid_draw_obj,
-    .advance     = solid_advance,
-    .commit      = solid_commit,
-    .busy        = solid_busy,
-    .simulate    = solid_simulate,
-    .toggle_spin = solid_toggle_spin,
-    .toggle_glow = solid_toggle_glow,
-    .respin      = solid_respin,
-    .remove      = solid_remove,
-    .name        = solid_name,
+    .hit           = solid_hit,
+    .on_click      = solid_on_click,
+    .vertices      = solid_vertices,
+    .prepare_scene = solid_prepare_obj,
+    .advance       = solid_advance,
+    .commit        = solid_commit,
+    .busy          = solid_busy,
+    .simulate      = solid_simulate,
+    .toggle_spin   = solid_toggle_spin,
+    .toggle_glow   = solid_toggle_glow,
+    .respin        = solid_respin,
+    .remove        = solid_remove,
+    .name          = solid_name,
 };
 
 void solid_kind_reset(void) {

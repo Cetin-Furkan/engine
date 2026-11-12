@@ -179,6 +179,17 @@ int table_pick(const CameraRay *ray, Coord *at, float *t_hit) {
     return best;
 }
 
+void table_prepare_scene(bool live) {
+    for (int i = 0; i < s_n; ++i) {
+        const WorldObj *o = &s_obj[i];
+        bool up = live ? o->alive : o->shown_alive;
+        if (!up || o->ops == nullptr || o->ops->prepare_scene == nullptr) {
+            continue;
+        }
+        o->ops->prepare_scene(o, live);
+    }
+}
+
 void table_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height, bool live) {
     for (int i = 0; i < s_n; ++i) {
         WorldObj *o = &s_obj[i];

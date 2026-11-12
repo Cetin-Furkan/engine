@@ -140,6 +140,9 @@ void world_commit(void);
 // A static corner preview does not count. Clears that pending notice.
 bool world_consume_spin(void);
 
+// Prepare unified GPU scene culling / Hi-Z / VisBuf passes before vkCmdBeginRendering.
+void world_prepare_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height, bool live);
+
 // live draws the pose world_advance just computed. Otherwise the shown pose.
 void world_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height, bool live);
 

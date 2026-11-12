@@ -79,6 +79,9 @@ typedef struct VulkanDispatchTable {
     // --- Device-Level Extensions: Linux DRM Syncobj (VK_KHR_external_semaphore_fd) ---
     PFN_vkGetSemaphoreFdKHR             vkGetSemaphoreFdKHR;
     PFN_vkImportSemaphoreFdKHR          vkImportSemaphoreFdKHR;
+
+    // --- Vulkan 1.4 Core / VK_KHR_push_descriptor ---
+    PFN_vkCmdPushDescriptorSet          vkCmdPushDescriptorSet;
 } VulkanDispatchTable;
 
 /**

@@ -20,6 +20,7 @@
 #include "frame/text.h"
 #include "frame/world.h"
 #include "frame/frame.h"
+#include "scene/scene.h"
 #include "ring/ring.h"
 #include "vulkan/core.h"
 #include "input/pointer.h"
@@ -51,23 +52,33 @@ enum : uint32_t { k_target_cap = 16 };
 typedef struct TargetEntry {
     PassDepth    depth;
     PassCoverage coverage;
+    uint32_t     width;
+    uint32_t     height;
     uint32_t     generation;
     bool         used;
 } TargetEntry;
 
 static TargetEntry s_targets[k_target_cap];
 static uint32_t    s_target_generation = 1;
+static bool        s_prepare_live      = true;
+
+static TargetEntry *target_find_by_depth(VkImage depth_image) {
+    if (depth_image == VK_NULL_HANDLE) {
+        return nullptr;
+    }
+    for (uint32_t i = 0; i < k_target_cap; ++i) {
+        if (s_targets[i].used && s_targets[i].depth.image == depth_image) {
+            return &s_targets[i];
+        }
+    }
+    return nullptr;
+}
 
 static TargetEntry *target_find(const EngineTargets *targets) {
     if (targets == nullptr || targets->depth_image == VK_NULL_HANDLE) {
         return nullptr;
     }
-    for (uint32_t i = 0; i < k_target_cap; ++i) {
-        if (s_targets[i].used && s_targets[i].depth.image == targets->depth_image) {
-            return &s_targets[i];
-        }
-    }
-    return nullptr;
+    return target_find_by_depth(targets->depth_image);
 }
 
 static int demo_create_targets(VulkanContext *vk, EngineTargets *targets,
@@ -96,6 +107,8 @@ static int demo_create_targets(VulkanContext *vk, EngineTargets *targets,
         *targets = (EngineTargets){0};
         return -1;
     }
+    entry->width      = width;
+    entry->height     = height;
     entry->generation = s_target_generation++;
     if (s_target_generation == 0) {
         s_target_generation = 1;
@@ -183,6 +196,9 @@ static void emit_bench_summary(uint32_t width, uint32_t height, uint64_t modifie
     pass_pool_stats(&depth_pool_bytes, &cover_pool_bytes);
     BackendBenchStats bstat = {0};
     backend_get_bench_stats(&bstat);
+    SceneBenchStats sstat = {0};
+    scene_get_stats(&sstat);
+    bool visbuf_on = scene_visbuf_active();
     uint64_t rss_kib = 0u;
     uint64_t hwm_kib = 0u;
     read_proc_rss_kib(&rss_kib, &hwm_kib);
@@ -197,6 +213,7 @@ static void emit_bench_summary(uint32_t width, uint32_t height, uint64_t modifie
            "bda_dev_mib=%.2f/%.2f bda_stg_mib=%.2f/%.2f "
            "terrain_arena_mib=%.2f overlay_arena_mib=%.2f fused_cache_mib=%.2f "
            "tiles_res=%u/%u stream_loads=%u uring_us=%llu uring_boot_us=%llu async_cqes=%u fixed_buf_reads=%u zero_copy_uma=%u "
+           "scene_slab_kib=%.1f meshlets=%u/%u(p1=%u,p2=%u,cone=%u,frust=%u,hiz=%u) visbuf=%u hiz_pass=%u "
            "rss_mib=%.2f hwm_mib=%.2f objs=%u verts=%u mod=0x%llx gpu=\"%s\" profile=\"%s\"\n",
            world_selected_id(),
            width, height,
@@ -220,6 +237,12 @@ static void emit_bench_summary(uint32_t width, uint32_t height, uint64_t modifie
            bstat.stream_async_cqes,
            bstat.stream_fixed_buf_reads,
            bstat.zero_copy_uma ? 1u : 0u,
+           (double)sstat.slab_bytes / 1024.0,
+           sstat.visible_meshlets, sstat.active_meshlets,
+           sstat.phase1_draws, sstat.phase2_draws,
+           sstat.cone_culled, sstat.frustum_culled, sstat.hiz_culled,
+           visbuf_on ? 1u : 0u,
+           sstat.hiz_enabled ? 1u : 0u,
            (double)rss_kib / 1024.0,
            (double)hwm_kib / 1024.0,
            objects, verts,
@@ -404,6 +427,7 @@ static int demo_configure(int argc, char **argv) {
 static int demo_init(VulkanContext *vk, RingCqeFn forward_cqe, void *forward_user) {
     world_apply_policy();
     if (pass_init(vk) != 0 ||
+        scene_init(vk, pass_depth_format(), pass_raster_samples()) != 0 ||
         chrome_gpu_bind_pass(vk, pass_depth_format(), pass_raster_samples()) != 0 ||
         cube_init(vk) != 0 || solid_init(vk) != 0 || shape_init(vk) != 0 ||
         plane_init(vk) != 0 || material_init(vk) != 0 ||
@@ -433,16 +457,21 @@ static void demo_shutdown(VulkanContext *vk) {
     shape_shutdown(vk);
     solid_shutdown(vk);
     cube_shutdown(vk);
+    scene_shutdown(vk);
     pass_shutdown(vk);
 }
 
 static void demo_record_compute(VkCommandBuffer cmd, uint32_t heat_dt, bool live) {
+    s_prepare_live = live;
     world_record(cmd, heat_dt, live);
 }
 
 static void demo_prepare_draw(VkCommandBuffer cmd, VkImage depth_image) {
-    (void)depth_image;
     plot_prepare(cmd);
+    const TargetEntry *entry = target_find_by_depth(depth_image);
+    if (entry != nullptr) {
+        world_prepare_draw(cmd, entry->width, entry->height, s_prepare_live);
+    }
 }
 
 static void demo_claim_frame(VkSemaphore acquire, uint64_t signal_point) {
@@ -453,14 +482,12 @@ static void demo_claim_frame(VkSemaphore acquire, uint64_t signal_point) {
     shape_begin(acquire, signal_point);
     text_begin(acquire, signal_point);
     plot_begin(acquire, signal_point);
-    mesh_begin(acquire, signal_point);
 }
 
 static void demo_release_frame(uint64_t signal_point) {
     shape_release(signal_point);
     text_release(signal_point);
     plot_release(signal_point);
-    mesh_release(signal_point);
 }
 
 static void demo_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height, bool live) {
@@ -578,7 +605,7 @@ static uint8_t demo_route_key(uint32_t key) {
         return ENGINE_KEY_HOLD;
     }
     if ((key >= KEY_F1 && key <= KEY_F10) || key == KEY_0 ||
-        key == KEY_K || key == KEY_KP0) {
+        key == KEY_K || key == KEY_KP0 || key == KEY_Y) {
         return ENGINE_KEY_TAP;
     }
     if (world_selected_id() == 8u) {
@@ -617,6 +644,9 @@ static bool demo_key(uint32_t key, EngineKeyContext *ctx) {
     }
     if (key == KEY_K || key == KEY_KP0) {
         return terrain_toggle_contours();
+    }
+    if (key == KEY_Y) {
+        return scene_toggle_visbuf();
     }
     if (world_selected_id() == 8u) {
         bool shift = demo_shift_down();
@@ -804,7 +834,8 @@ static const EngineApp s_app = {
             "Empty clicks then place points, and F closes them into a face that stays. "
             "R spins until R again. F5 turns the selection again. F1-F9 switch worlds 1-9, "
             "F10 or 0 switches to Pure Engine (World 0). K or numpad 0 toggles topographic "
-            "elevation contours in World 8. A click on a mesh "
+            "elevation contours in World 8. Y toggles R32_UINT Visibility Buffer deferred shading. "
+            "A click on a mesh "
             "selects it. A cube click plants heat for five seconds and shoves the cube. "
             "It stops on the ground and against other cubes, and that place is saved. "
             "It can be selected while other meshes are up. Its colors sweep on that clock, then hold. "

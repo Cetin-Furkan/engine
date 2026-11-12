@@ -5,8 +5,8 @@
 #include "vulkan/types.h"
 #include <stdint.h>
 
-// Faces from plots/mesh.obj, fitted once into a box beside the cube.
-// The vertex shader yaws about Y through that center. L reads the file again.
+// Faces from plots/mesh.obj, fitted into a box beside the cube and clusterized
+// into 64v/124t 16-byte quantized BDA meshlets. L reads the file again.
 // A missing file does not fail startup. The chart keeps the OBJ polylines.
 
 [[nodiscard]] int mesh_init(VulkanContext *vk, RingCqeFn on_cqe, void *on_user);
@@ -26,13 +26,6 @@ bool mesh_sphere(float *cx, float *cy, float *radius);
 bool mesh_wants_frame(void);
 void mesh_commit(void);
 
-// mesh_begin copies the CPU corners into a retired slice. A full ring
-// keeps the previous slice and stays dirty. mesh_release returns the
-// slice when the submit does not happen.
-void mesh_begin(VkSemaphore acquire, uint64_t signal_point);
-void mesh_release(uint64_t signal_point);
-
-void mesh_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height,
-               float yaw_deg, bool selected);
+void mesh_submit_scene(float yaw_deg, bool selected);
 
 #endif /* ENGINE_FRAME_MESH_H */

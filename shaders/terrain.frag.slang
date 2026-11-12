@@ -36,7 +36,7 @@ struct FSInput {
     float3   view_nrm     : TEXCOORD0;
     float3   world_pos    : TEXCOORD1;
     float2   tile_uv      : TEXCOORD2;
-    float2   elev_span    : TEXCOORD3; // x = elev_m, y = resolved_tile_world_span
+    float3   elev_span    : TEXCOORD3; // x = elev_m, y = resolved_tile_world_span, z = view_pos.z
     nointerpolation uint64_t tile_rel_ptr : TEXCOORD4;
 };
 
@@ -269,12 +269,22 @@ float4 main(FSInput input) : SV_Target0 {
     float fill = max(dot(world_nrm, fill_dir), 0.0);
     float ao   = lerp(0.72, 1.05, img_srgb.a);
 
-    // Balanced physically-inspired daylight illumination for base terrain,
-    // and true-color unshadowed fidelity for real uploaded aerial/satellite photographs
+    // Balanced physically-inspired daylight + 2026 SSILVB canyon AO & Split HRC cliff-to-valley GI bounce
     float3 sun_light   = float3(1.06, 0.99, 0.92) * (0.68 * ndl);
     float3 sky_fill    = float3(0.42, 0.48, 0.56) * (0.44 + 0.22 * world_nrm.z + 0.18 * fill);
     float3 bounce_fill = float3(0.32, 0.28, 0.22) * (0.14 * saturate(1.0 - world_nrm.z));
-    float3 synth_lit   = sat_linear * (sky_fill + sun_light + bounce_fill) * ao;
+
+    float  gi_ao       = 1.0;
+    float3 gi_bent     = normalize(input.view_nrm);
+    float3 gi_ind_rgb  = float3(0.0);
+    float3 vnrm_cur    = normalize(view_rotate(pc.view.q, world_nrm));
+    if (lighting_sample_gi(pc.view.materials, input.sv_pos.xy, input.elev_span.z, vnrm_cur,
+                           gi_ao, gi_bent, gi_ind_rgb)) {
+        ao          *= lerp(0.52, 1.0, gi_ao);
+        bounce_fill  = bounce_fill * 0.35 + gi_ind_rgb * 0.85;
+    }
+
+    float3 synth_lit   = sat_linear * (sky_fill * ao + sun_light * lerp(0.75, 1.0, gi_ao) + bounce_fill);
     float3 photo_lit   = sat_linear * lerp(0.95, 1.05, ndl);
     float3 lit_color   = lerp(synth_lit, photo_lit, hi_res_photo_mask);
 

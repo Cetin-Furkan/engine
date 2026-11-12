@@ -20,6 +20,8 @@
 #include "frame/text.h"
 #include "frame/world.h"
 #include "frame/frame.h"
+#include "lighting/lighting.h"
+#include "physics/physics.h"
 #include "scene/scene.h"
 #include "ring/ring.h"
 #include "vulkan/core.h"
@@ -198,7 +200,13 @@ static void emit_bench_summary(uint32_t width, uint32_t height, uint64_t modifie
     backend_get_bench_stats(&bstat);
     SceneBenchStats sstat = {0};
     scene_get_stats(&sstat);
+    LightingBenchStats lstat = {0};
+    lighting_get_stats(&lstat);
+    PhysicsBenchStats pstat = {0};
+    physics_get_stats(&pstat);
     bool visbuf_on = scene_visbuf_active();
+    bool phys_on   = physics_gpu_active();
+    bool gs_on     = backend_2dgs_active();
     uint64_t rss_kib = 0u;
     uint64_t hwm_kib = 0u;
     read_proc_rss_kib(&rss_kib, &hwm_kib);
@@ -213,7 +221,10 @@ static void emit_bench_summary(uint32_t width, uint32_t height, uint64_t modifie
            "bda_dev_mib=%.2f/%.2f bda_stg_mib=%.2f/%.2f "
            "terrain_arena_mib=%.2f overlay_arena_mib=%.2f fused_cache_mib=%.2f "
            "tiles_res=%u/%u stream_loads=%u uring_us=%llu uring_boot_us=%llu async_cqes=%u fixed_buf_reads=%u zero_copy_uma=%u "
+           "2dgs=%u surfels=%u/%u surfel_kib=%.1f mvs_gpu=%u "
            "scene_slab_kib=%.1f meshlets=%u/%u(p1=%u,p2=%u,cone=%u,frust=%u,hiz=%u) visbuf=%u hiz_pass=%u "
+           "gi=%u gi_oracle=%u gi_res=%ux%u gi_rays=%u gi_proxies=%u gi_mib=%.2f "
+           "phys_gpu=%u phys_iters=%u phys_verts=%u phys_cons=%u phys_colors=%u phys_disp=%u phys_kib=%.1f "
            "rss_mib=%.2f hwm_mib=%.2f objs=%u verts=%u mod=0x%llx gpu=\"%s\" profile=\"%s\"\n",
            world_selected_id(),
            width, height,
@@ -237,12 +248,29 @@ static void emit_bench_summary(uint32_t width, uint32_t height, uint64_t modifie
            bstat.stream_async_cqes,
            bstat.stream_fixed_buf_reads,
            bstat.zero_copy_uma ? 1u : 0u,
+           gs_on ? 1u : 0u,
+           bstat.visible_surfels, bstat.surfel_count,
+           (double)bstat.surfel_bda_bytes / 1024.0,
+           bstat.mvs_gpu_dispatches,
            (double)sstat.slab_bytes / 1024.0,
            sstat.visible_meshlets, sstat.active_meshlets,
            sstat.phase1_draws, sstat.phase2_draws,
            sstat.cone_culled, sstat.frustum_culled, sstat.hiz_culled,
            visbuf_on ? 1u : 0u,
            sstat.hiz_enabled ? 1u : 0u,
+           lstat.gi_enabled ? 1u : 0u,
+           lstat.oracle_mode,
+           lstat.gi_width, lstat.gi_height,
+           lstat.hrc_total_rays,
+           lstat.active_proxies,
+           (double)lstat.bda_bytes / (1024.0 * 1024.0),
+           (phys_on && pstat.gpu_enabled) ? 1u : 0u,
+           pstat.iterations,
+           pstat.active_verts,
+           pstat.active_constraints,
+           pstat.num_colors,
+           pstat.dispatches_frame,
+           (double)pstat.bda_bytes / 1024.0,
            (double)rss_kib / 1024.0,
            (double)hwm_kib / 1024.0,
            objects, verts,
@@ -427,6 +455,8 @@ static int demo_configure(int argc, char **argv) {
 static int demo_init(VulkanContext *vk, RingCqeFn forward_cqe, void *forward_user) {
     world_apply_policy();
     if (pass_init(vk) != 0 ||
+        lighting_init(vk) != 0 ||
+        physics_init(vk) != 0 ||
         scene_init(vk, pass_depth_format(), pass_raster_samples()) != 0 ||
         chrome_gpu_bind_pass(vk, pass_depth_format(), pass_raster_samples()) != 0 ||
         cube_init(vk) != 0 || solid_init(vk) != 0 || shape_init(vk) != 0 ||
@@ -458,6 +488,8 @@ static void demo_shutdown(VulkanContext *vk) {
     solid_shutdown(vk);
     cube_shutdown(vk);
     scene_shutdown(vk);
+    physics_shutdown(vk);
+    lighting_shutdown(vk);
     pass_shutdown(vk);
 }
 
@@ -605,7 +637,8 @@ static uint8_t demo_route_key(uint32_t key) {
         return ENGINE_KEY_HOLD;
     }
     if ((key >= KEY_F1 && key <= KEY_F10) || key == KEY_0 ||
-        key == KEY_K || key == KEY_KP0 || key == KEY_Y) {
+        key == KEY_K || key == KEY_KP0 || key == KEY_Y || key == KEY_H ||
+        key == KEY_7 || key == KEY_8) {
         return ENGINE_KEY_TAP;
     }
     if (world_selected_id() == 8u) {
@@ -647,6 +680,15 @@ static bool demo_key(uint32_t key, EngineKeyContext *ctx) {
     }
     if (key == KEY_Y) {
         return scene_toggle_visbuf();
+    }
+    if (key == KEY_H) {
+        return lighting_toggle_gi();
+    }
+    if (key == KEY_7) {
+        return backend_toggle_2dgs();
+    }
+    if (key == KEY_8) {
+        return physics_toggle_gpu();
     }
     if (world_selected_id() == 8u) {
         bool shift = demo_shift_down();
@@ -835,6 +877,9 @@ static const EngineApp s_app = {
             "R spins until R again. F5 turns the selection again. F1-F9 switch worlds 1-9, "
             "F10 or 0 switches to Pure Engine (World 0). K or numpad 0 toggles topographic "
             "elevation contours in World 8. Y toggles R32_UINT Visibility Buffer deferred shading. "
+            "H toggles 2026 SSILVB + Split Radiance Cascade Global Illumination. "
+            "7 toggles Oriented 2D Gaussian Splatting (2DGS) geodetic surfels in World 8. "
+            "8 toggles GPU Augmented Vertex Block Descent (AVBD) physics compute. "
             "A click on a mesh "
             "selects it. A cube click plants heat for five seconds and shoves the cube. "
             "It stops on the ground and against other cubes, and that place is saved. "

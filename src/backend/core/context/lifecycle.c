@@ -59,6 +59,11 @@ static void resolve_epack_path(const char *pack_path, char *out, size_t cap) {
 }
 
 static void resolve_survey_manifest_path(const char *pack_path, char *out, size_t cap) {
+    const char *env_man = getenv("ENGINE_SURVEY_MANIFEST");
+    if (env_man != nullptr && env_man[0] != '\0') {
+        snprintf(out, cap, "%s", env_man);
+        return;
+    }
     if (pack_path != nullptr && pack_path[0] != '\0') {
         const char *slash = strrchr(pack_path, '/');
         if (slash != nullptr) {
@@ -571,6 +576,15 @@ static bool load_archive_into_bda(void) {
         };
         (void)backend_stream_cull_frustum(g_backend.gpu_hdr, &init_cull, g_backend.indirect_hdr);
     }
+
+    const uint32_t cap = backend_slot_cap();
+    for (uint32_t n = 0u; n < k_gmpack_node_count; ++n) {
+        const GpuMathQuadNode *nd = &g_backend.gpu_hdr->nodes[n];
+        if (nd->resident != 0u && nd->gpu_slot < cap && g_backend.slot_to_node[nd->gpu_slot] == n) {
+            backend_gpu_survey_queue_mvs_tile(nd->gpu_slot, n);
+        }
+    }
+    backend_gpu_survey_rebuild_surfels();
     return true;
 }
 
@@ -660,7 +674,16 @@ int backend_init(VulkanContext *vk) {
         return -1;
     }
 
+    if (backend_gpu_survey_init(vk) != 0) {
+        backend_gpu_directory_shutdown(vk);
+        da_buffer_destroy(vk, &g_backend.overlay_buf);
+        da_buffer_destroy(vk, &g_backend.indirect_buf);
+        da_buffer_destroy(vk, &g_backend.bda_buf);
+        return -1;
+    }
+
     if (!load_archive_into_bda()) {
+        backend_gpu_survey_shutdown(vk);
         backend_gpu_directory_shutdown(vk);
         da_buffer_destroy(vk, &g_backend.overlay_buf);
         da_buffer_destroy(vk, &g_backend.indirect_buf);
@@ -710,6 +733,7 @@ void backend_shutdown(VulkanContext *vk) {
     free(g_backend.overlay_cpu_pixels);
     g_backend.overlay_cpu_pixels = nullptr;
     backend_survey_dataset_free(&g_backend.survey);
+    backend_gpu_survey_shutdown(vk);
     backend_gpu_directory_shutdown(vk);
     da_buffer_destroy(vk, &g_backend.overlay_buf);
     da_buffer_destroy(vk, &g_backend.indirect_buf);
@@ -745,7 +769,11 @@ bool backend_update_camera_zoom(float focus_x, float focus_y, float zoom) {
                                         needed_count,
                                         &newly_paged_mask);
     g_backend.dirty_slots_mask |= newly_paged_mask;
-    return cut_changed || (newly_paged_mask != 0ull);
+    if (cut_changed || newly_paged_mask != 0ull) {
+        backend_gpu_survey_rebuild_surfels();
+        return true;
+    }
+    return false;
 }
 
 void backend_record_compute(VkCommandBuffer cmd, const TerrainCullParams *cull) {
@@ -756,6 +784,7 @@ void backend_record_compute(VkCommandBuffer cmd, const TerrainCullParams *cull) 
     if (cull != nullptr) {
         backend_gpu_record_cull(cmd, cull);
     }
+    backend_gpu_survey_record_compute(cmd, cull);
 }
 
 uint64_t backend_directory_bda(void) {
@@ -1437,4 +1466,9 @@ void backend_get_bench_stats(BackendBenchStats *out) {
     out->stream_async_cqes      = g_backend.stream_async_cqes;
     out->stream_fixed_buf_reads = g_backend.stream_fixed_buf_reads;
     out->zero_copy_uma          = g_backend.zero_copy_uma;
+    out->two_dgs_enabled        = backend_2dgs_active();
+    backend_gpu_survey_get_stats(&out->surfel_bda_bytes,
+                                 &out->surfel_count,
+                                 &out->visible_surfels,
+                                 &out->mvs_gpu_dispatches);
 }

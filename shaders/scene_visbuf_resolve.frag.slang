@@ -80,9 +80,10 @@ ResolvePSOut main(float4 sv_pos : SV_Position) {
     float  n_var = min(0.18, 0.35 * (dot(dn_dx, dn_dx) + dot(dn_dy, dn_dy)));
     float  aa_rgh = sqrt(clamp(rgh * rgh + n_var, 0.04, 1.0));
 
-    SurfaceFragment surf = { nrm, alb, emi, aa_rgh };
+    SurfaceFragment surf   = { nrm, alb, emi, aa_rgh };
+    float           view_z = (0.5 - bary.z_ndc - inst.depth_bias) * 4096.0;
     ResolvePSOut out;
-    out.color = float4(shade_surface(surf), 1.0);
+    out.color = float4(shade_surface_gi(surf, sv_pos.xy, view_z, pc.view.materials), 1.0);
     out.depth = clamp(bary.z_ndc, 0.0, 1.0);
     return out;
 }

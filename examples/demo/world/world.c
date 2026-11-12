@@ -1,4 +1,5 @@
 #include "world/world_int.h"
+#include "backend/backend.h"
 #include "frame/camera.h"
 #include "frame/gimbal.h"
 #include "frame/hud.h"
@@ -7,6 +8,8 @@
 #include "frame/sheet.h"
 #include "frame/terrain.h"
 #include "frame/text.h"
+#include "lighting/lighting.h"
+#include "physics/physics.h"
 #include "scene/scene.h"
 #include <stdio.h>
 #include <string.h>
@@ -184,6 +187,7 @@ bool world_reload(void) {
     }
     if (s_world_id == 8u) {
         bool ok = terrain_reload();
+        lighting_invalidate_history();
         printf("[World] Hot-reloaded World 8 (%s) terrain & survey dataset\n",
                world_selected_title());
         fflush(stdout);
@@ -273,6 +277,8 @@ void world_reset(void) {
     terrain_kind_reset();
     terrain_set_contours(false);
     scene_invalidate_hiz();
+    lighting_reset();
+    physics_reset();
     spin_clear();
     camera_reset();
     if (s_world_id == 0u) {
@@ -295,6 +301,7 @@ void world_reset(void) {
 }
 
 void world_record(VkCommandBuffer cmd, uint32_t heat_dt, bool live) {
+    physics_record_compute(cmd);
     // 2D keeps the fillet heat and the 128³ lattice off the queue.
     if (policy_mode() == MODE_2D) {
         return;
@@ -334,8 +341,17 @@ bool world_simulation(uint32_t time_ms, uint32_t sim_dt_ms, uint32_t *heat_dt) {
     } else {
         pulse = table_simulate(time_ms, sim_dt_ms, heat_dt);
     }
-    if (policy_mode() != MODE_3D && sheet_simulate(sim_dt_ms)) {
-        pulse = true;
+    if (policy_mode() != MODE_3D) {
+        sheet_set_avbd_iterations(physics_recommended_iterations());
+        if (sheet_simulate(sim_dt_ms)) {
+            pulse = true;
+        }
+        SheetGpuStep gstep;
+        while (sheet_pop_gpu_step(&gstep)) {
+            physics_submit_step(gstep.verts, gstep.vert_count,
+                                gstep.cons, gstep.con_count,
+                                gstep.dt, gstep.gravity, gstep.damp_keep);
+        }
     }
     return pulse;
 }
@@ -668,6 +684,29 @@ void world_prepare_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height, bo
     camera_bind(live);
     ViewPush vp = {0};
     view_push_fill(&vp, 0u);
+    LightingCameraParams lcam = {
+        .qx    = vp.qx,
+        .qy    = vp.qy,
+        .qz    = vp.qz,
+        .qw    = vp.qw,
+        .cam_x = vp.cam_x,
+        .cam_y = vp.cam_y,
+        .cam_z = vp.cam_z,
+        .zoom  = vp.zoom,
+    };
+    lighting_begin_frame(width, height, &lcam);
+    if (world_selected_id() == 8u) {
+        uint64_t dir_bda = backend_directory_bda();
+        if (dir_bda != 0ull) {
+            lighting_set_terrain_field(dir_bda, k_besparmak_elev_min, 1.15f);
+        }
+    } else if (ground_is_visible() && coord_ground_set()) {
+        const float ground_alb[3] = { 0.08f, 0.20f, 0.38f };
+        lighting_set_ground_plane(true, 0.0f, ground_alb);
+    }
+
+    // Re-fetch ViewPush now that lighting_begin_frame rotated the active LightingEnvBlock slice
+    view_push_fill(&vp, 0u);
     SceneViewParams sv = {
         .materials_bda = vp.materials,
         .mat_index     = vp.mat_index,
@@ -684,6 +723,7 @@ void world_prepare_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height, bo
     scene_begin_frame(width, height, &sv);
     table_prepare_scene(live);
     scene_prepare_draw(cmd, width, height);
+    lighting_prepare(cmd, width, height);
 }
 
 void world_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height, bool live) {

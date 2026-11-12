@@ -73,6 +73,8 @@ typedef struct GpuCandidate {
     bool                             supports_multi_draw_indirect;
     bool                             supports_draw_indirect_count;
     bool                             supports_draw_indirect_first_instance;
+    bool                             supports_acceleration_structure;
+    bool                             supports_ray_query;
 
     bool                             has_drm_primary;
     bool                             has_drm_render;
@@ -546,6 +548,30 @@ static VulkanResult evaluate_device(GpuCandidate *candidate) {
         &extensions, VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME);
     candidate->supports_physical_device_drm = device_extension_list_has(
         &extensions, VK_EXT_PHYSICAL_DEVICE_DRM_EXTENSION_NAME);
+    bool has_accel_ext = device_extension_list_has(
+        &extensions, VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
+    bool has_rq_ext = device_extension_list_has(
+        &extensions, VK_KHR_RAY_QUERY_EXTENSION_NAME);
+    bool has_dho_ext = device_extension_list_has(
+        &extensions, VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
+    if (has_accel_ext && has_rq_ext && has_dho_ext) {
+        VkPhysicalDeviceRayQueryFeaturesKHR rq_feat = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR,
+        };
+        VkPhysicalDeviceAccelerationStructureFeaturesKHR as_feat = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR,
+            .pNext = &rq_feat,
+        };
+        VkPhysicalDeviceFeatures2 rt_feat2 = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+            .pNext = &as_feat,
+        };
+        vkGetPhysicalDeviceFeatures2(candidate->device, &rt_feat2);
+        if (as_feat.accelerationStructure == VK_TRUE && rq_feat.rayQuery == VK_TRUE) {
+            candidate->supports_acceleration_structure = true;
+            candidate->supports_ray_query              = true;
+        }
+    }
     candidate->extensions_probed = true;
 
     if (candidate->supports_physical_device_drm) {
@@ -714,12 +740,13 @@ static void print_candidate(uint32_t index, const GpuCandidate *candidate) {
             snprintf(drm_node_info, sizeof drm_node_info, "no");
         }
 
-        printf("      Extensions: external-memory-fd=%s, DMA-BUF=%s, DRM-Modifiers=%s, Syncobj=%s, ForeignQueue=%s, DRM-Node=%s\n",
+        printf("      Extensions: external-memory-fd=%s, DMA-BUF=%s, DRM-Modifiers=%s, Syncobj=%s, ForeignQueue=%s, RayQuery=%s, DRM-Node=%s\n",
                candidate->supports_external_memory_fd ? "yes" : "no",
                candidate->supports_dma_buf ? "yes" : "no",
                candidate->supports_drm_modifiers ? "yes" : "no",
                candidate->supports_syncobj ? "yes" : "no",
                candidate->supports_queue_family_foreign ? "yes" : "no",
+               candidate->supports_ray_query ? "yes" : "no",
                drm_node_info);
     }
 
@@ -1044,6 +1071,8 @@ static VulkanResult open_candidate(VulkanContext *ctx, const GpuCandidate *chose
     ctx->device_info.supports_multi_draw_indirect = best.supports_multi_draw_indirect;
     ctx->device_info.supports_draw_indirect_count = best.supports_draw_indirect_count;
     ctx->device_info.supports_draw_indirect_first_instance = best.supports_draw_indirect_first_instance;
+    ctx->device_info.supports_acceleration_structure = best.supports_acceleration_structure;
+    ctx->device_info.supports_ray_query = best.supports_ray_query;
     ctx->device_info.has_drm_primary_node = best.has_drm_primary;
     ctx->device_info.has_drm_render_node = best.has_drm_render;
     ctx->device_info.drm_primary_major = best.drm_primary_major;
@@ -1076,7 +1105,7 @@ static VulkanResult open_candidate(VulkanContext *ctx, const GpuCandidate *chose
     ctx->device_info.has_uma_cached    = best.has_uma_cached;
     if (profile == VULKAN_PROFILE_UMA_IGPU) {
         ctx->device_info.recommended_msaa          = 2u;
-        ctx->device_info.recommended_bda_slab_mib  = 16u;
+        ctx->device_info.recommended_bda_slab_mib  = 40u;
         ctx->device_info.recommended_terrain_slots = 96u;
     } else if (profile == VULKAN_PROFILE_HYBRID_MUXLESS) {
         ctx->device_info.recommended_msaa          = 4u;
@@ -1130,16 +1159,36 @@ static VulkanResult open_candidate(VulkanContext *ctx, const GpuCandidate *chose
         };
     }
 
-    const char *device_extensions[16] = {0};
+    const char *device_extensions[24] = {0};
     uint32_t device_extension_count = 0;
     for (size_t i = 0; i < sizeof k_required_device_extensions / sizeof k_required_device_extensions[0]; ++i) {
-        if (!append_extension(device_extensions, &device_extension_count, 16, k_required_device_extensions[i])) {
+        if (!append_extension(device_extensions, &device_extension_count, 24, k_required_device_extensions[i])) {
             return VULKAN_ERROR_INITIALIZATION_FAILED;
         }
     }
+    if (best.supports_ray_query && best.supports_acceleration_structure) {
+        (void)append_extension(device_extensions, &device_extension_count, 24,
+                               VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
+        (void)append_extension(device_extensions, &device_extension_count, 24,
+                               VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
+        (void)append_extension(device_extensions, &device_extension_count, 24,
+                               VK_KHR_RAY_QUERY_EXTENSION_NAME);
+    }
 
+    VkPhysicalDeviceRayQueryFeaturesKHR rq_feat = {
+        .sType    = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR,
+        .rayQuery = VK_TRUE,
+    };
+    VkPhysicalDeviceAccelerationStructureFeaturesKHR as_feat = {
+        .sType                 = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR,
+        .pNext                 = &rq_feat,
+        .accelerationStructure = VK_TRUE,
+    };
     VkPhysicalDeviceVulkan14Features feat14 = {
         .sType                     = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_4_FEATURES,
+        .pNext                     = (best.supports_ray_query && best.supports_acceleration_structure)
+                                         ? (void *)&as_feat
+                                         : nullptr,
         .maintenance5                  = VK_TRUE,
         .maintenance6                  = VK_TRUE,
         .shaderSubgroupRotate          = best.supports_shader_subgroup_rotate ? VK_TRUE : VK_FALSE,
@@ -1339,7 +1388,7 @@ void vulkan_device_log(const VulkanContext *ctx) {
            ctx->device_info.supports_shader_subgroup_rotate_clustered ? "yes" : "no",
            ctx->device_info.supports_shader_demote ? "yes" : "no",
            ctx->device_info.supports_shader_draw_parameters ? "yes" : "no");
-    printf("[Vulkan] Capabilities: DMA-BUF=%s, DRM-Modifiers=%s, ForeignQueue=%s, Syncobj=%s, BDA=%s, ScalarLayout=%s, Anisotropy=%s, DynRender=%s, LocalRead=%s, Sync2=%s, Timeline=%s, Maint5=%s, Maint6=%s, PushDesc=%s, HostImageCopy=%s, MultiDrawIndirect=%s, DrawIndirectCount=%s, Int16=%s, Int64=%s, Storage16=%s, Float16=%s\n",
+    printf("[Vulkan] Capabilities: DMA-BUF=%s, DRM-Modifiers=%s, ForeignQueue=%s, Syncobj=%s, BDA=%s, ScalarLayout=%s, Anisotropy=%s, DynRender=%s, LocalRead=%s, Sync2=%s, Timeline=%s, Maint5=%s, Maint6=%s, PushDesc=%s, HostImageCopy=%s, MultiDrawIndirect=%s, DrawIndirectCount=%s, RayQuery=%s, Int16=%s, Int64=%s, Storage16=%s, Float16=%s\n",
            ctx->device_info.supports_dma_buf ? "yes" : "no",
            ctx->device_info.supports_drm_format_modifiers ? "yes" : "no",
            ctx->device_info.supports_queue_family_foreign ? "yes" : "no",
@@ -1357,6 +1406,7 @@ void vulkan_device_log(const VulkanContext *ctx) {
            ctx->device_info.supports_host_image_copy ? "yes" : "no",
            ctx->device_info.supports_multi_draw_indirect ? "yes" : "no",
            ctx->device_info.supports_draw_indirect_count ? "yes" : "no",
+           ctx->device_info.supports_ray_query ? "yes" : "no",
            ctx->device_info.supports_shader_int16 ? "yes" : "no",
            ctx->device_info.supports_shader_int64 ? "yes" : "no",
            ctx->device_info.supports_storage_buffer_16bit ? "yes" : "no",

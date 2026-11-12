@@ -68,7 +68,7 @@ $(GEN_DIR)/%.spv: shaders/%.slang
 
 # plane.frag calls WaveRotate. The rotate profile keeps slangc from
 # auto-upgrading spirv_1_6 and warning on that one module.
-$(GEN_DIR)/plane.frag.spv: shaders/plane.frag.slang
+$(GEN_DIR)/plane.frag.spv: shaders/plane.frag.slang shaders/camera.slang shaders/lighting.slang
 	@mkdir -p $(dir $@)
 	$(SLANGC) -target spirv -profile spirv_1_6+spvGroupNonUniformRotateKHR -stage fragment -entry main -fvk-use-entrypoint-name -depfile "$(GEN_DIR)/plane.frag.d" -Ishaders -o "$@" "$<"
 
@@ -80,6 +80,10 @@ $(GEN_DIR)/scene_cull.comp.spv: shaders/scene_cull.comp.slang
 $(GEN_DIR)/scene_hiz.comp.spv: shaders/scene_hiz.comp.slang
 	@mkdir -p $(dir $@)
 	$(SLANGC) -target spirv -profile spirv_1_6+spvGroupNonUniform+spvGroupNonUniformShuffle -stage compute -entry main -fvk-use-entrypoint-name -depfile "$(GEN_DIR)/scene_hiz.comp.d" -Ishaders -o "$@" "$<"
+
+$(GEN_DIR)/survey_2dgs_cull.comp.spv: shaders/survey_2dgs_cull.comp.slang
+	@mkdir -p $(dir $@)
+	$(SLANGC) -target spirv -profile spirv_1_6+spvGroupNonUniform+spvGroupNonUniformBallot+spvGroupNonUniformArithmetic -stage compute -entry main -fvk-use-entrypoint-name -depfile "$(GEN_DIR)/survey_2dgs_cull.comp.d" -Ishaders -o "$@" "$<"
 
 $(GEN_DIR)/bevel.comp.spv: shaders/face_grid.slang
 $(GEN_DIR)/heat.comp.spv: shaders/heat_nbr.slang shaders/face_grid.slang
@@ -99,6 +103,12 @@ $(GEN_DIR)/scene_visbuf.frag.spv: shaders/scene_common.slang shaders/camera.slan
 $(GEN_DIR)/scene_visbuf_resolve.frag.spv: shaders/scene_common.slang shaders/camera.slang shaders/material.slang shaders/lighting.slang
 $(GEN_DIR)/scene_meshlet.vert.spv: shaders/scene_common.slang shaders/camera.slang shaders/material.slang
 $(GEN_DIR)/scene_meshlet.frag.spv: shaders/lighting.slang
+$(GEN_DIR)/lighting_gbuf.comp.spv: shaders/lighting_gi_common.slang shaders/camera.slang shaders/terrain_math.slang shaders/lighting.slang
+$(GEN_DIR)/lighting_hrc.comp.spv: shaders/lighting_gi_common.slang shaders/camera.slang shaders/terrain_math.slang shaders/lighting.slang
+$(GEN_DIR)/lighting_ssilvb.comp.spv: shaders/lighting_gi_common.slang shaders/camera.slang shaders/terrain_math.slang shaders/lighting.slang
+$(GEN_DIR)/survey_2dgs_cull.comp.spv: shaders/camera.slang
+$(GEN_DIR)/survey_2dgs.vert.spv: shaders/camera.slang
+$(GEN_DIR)/survey_2dgs.frag.spv: shaders/camera.slang shaders/terrain_math.slang shaders/lighting.slang
 
 -include $(wildcard $(GEN_DIR)/*.d)
 
@@ -125,7 +135,10 @@ $(OBJ_DIR)/examples/demo/text/face/face.o: examples/demo/text/face/bundled/Inter
 $(OBJ_DIR)/src/chrome/gpu.o: $(GEN_DIR)/chrome.vert.spv $(GEN_DIR)/chrome.frag.spv
 $(OBJ_DIR)/src/input/page/page.o: $(GEN_DIR)/input.comp.spv
 $(OBJ_DIR)/src/backend/math/gpu/directory.o: $(GEN_DIR)/terrain_filter.comp.spv $(GEN_DIR)/terrain_cull.comp.spv
+$(OBJ_DIR)/src/backend/terrain/survey/gpu_survey.o: $(GEN_DIR)/survey_mvs.comp.spv $(GEN_DIR)/survey_2dgs_cull.comp.spv $(GEN_DIR)/survey_2dgs.vert.spv $(GEN_DIR)/survey_2dgs.frag.spv
 $(OBJ_DIR)/src/scene/gpu/scene_gpu.o: $(GEN_DIR)/scene_cull.comp.spv $(GEN_DIR)/scene_hiz.comp.spv $(GEN_DIR)/scene_visbuf.vert.spv $(GEN_DIR)/scene_visbuf.frag.spv $(GEN_DIR)/scene_visbuf_resolve.vert.spv $(GEN_DIR)/scene_visbuf_resolve.frag.spv $(GEN_DIR)/scene_meshlet.vert.spv $(GEN_DIR)/scene_meshlet.frag.spv
+$(OBJ_DIR)/src/lighting/gpu/lighting_gpu.o: $(GEN_DIR)/lighting_gbuf.comp.spv $(GEN_DIR)/lighting_hrc.comp.spv $(GEN_DIR)/lighting_ssilvb.comp.spv
+$(OBJ_DIR)/src/physics/gpu/avbd_gpu.o: $(GEN_DIR)/physics_avbd.comp.spv
 
 # Compiler & Preprocessor Flags
 CFLAGS ?= $(C23_FLAGS) -D_GNU_SOURCE -Wall -Wextra -Wunused-function -Werror=unused-function -Wmissing-declarations \
@@ -164,7 +177,7 @@ $(TARGET): $(OBJS)
 		cat $(BUILD_DIR)/link.log >&2; \
 		exit 1; \
 	fi
-	@dead=$$(grep -E "removing unused section '\.text\.[^']*' in file '.*(src/vulkan|src/frame|src/ring|src/wayland|src/input|src/chrome|src/system|src/backend|src/scene)" $(BUILD_DIR)/link.log || true); \
+	@dead=$$(grep -E "removing unused section '\.text\.[^']*' in file '.*(src/vulkan|src/frame|src/ring|src/wayland|src/input|src/chrome|src/system|src/backend|src/scene|src/lighting|src/physics)" $(BUILD_DIR)/link.log || true); \
 	if [ -n "$$dead" ]; then \
 		echo -e "\033[0;31m[Link Error] Dead/hallucinated functions detected:\033[0m" >&2; \
 		echo "$$dead" >&2; rm -f $@; exit 1; \
@@ -267,11 +280,11 @@ test: $(CONFIG_MK)
 	./build/test_clock
 	$(CC) $(CFLAGS) -o build/test_world tests/test_world.c examples/demo/world/table.c examples/demo/world/spin.c -lm
 	./build/test_world
-	$(CC) $(CFLAGS) -o build/test_motion tests/test_motion.c examples/demo/world/motion.c examples/demo/world/fillet.c -lm
+	$(CC) $(CFLAGS) -o build/test_motion tests/test_motion.c examples/demo/world/motion.c examples/demo/world/fillet.c src/physics/math/avbd_math.c -lm
 	./build/test_motion
 	$(CC) $(CFLAGS) -o build/test_policy tests/test_policy.c examples/demo/world/policy.c
 	./build/test_policy
-	$(CC) $(CFLAGS) -o build/test_sheet tests/test_sheet.c examples/demo/world/sheet.c -lm
+	$(CC) $(CFLAGS) -o build/test_sheet tests/test_sheet.c examples/demo/world/sheet.c src/physics/math/avbd_math.c -lm
 	./build/test_sheet
 	$(CC) $(CFLAGS) -o build/test_text tests/test_text.c \
 		examples/demo/text/face/face.c examples/demo/text/shape/shape.c \
@@ -289,6 +302,7 @@ test: $(CONFIG_MK)
 		src/backend/terrain/survey/camera_model.c \
 		src/backend/terrain/survey/mvs_fusion.c \
 		src/backend/terrain/survey/manifest_io.c \
+		src/backend/terrain/survey/surfel_2dgs.c \
 		-lpng16 -lm
 	./build/test_backend
 	$(CC) $(CFLAGS) -o build/test_scene tests/test_scene.c \
@@ -296,6 +310,14 @@ test: $(CONFIG_MK)
 		src/scene/meshlet/builder.c \
 		-lm
 	./build/test_scene
+	$(CC) $(CFLAGS) -o build/test_lighting tests/test_lighting.c \
+		src/lighting/math/lighting_math.c \
+		-lm
+	./build/test_lighting
+	$(CC) $(CFLAGS) -o build/test_physics tests/test_physics.c \
+		src/physics/math/avbd_math.c \
+		-lm
+	./build/test_physics
 
 bench:
 	./scripts/run_benchmark.sh benchmarks/latest

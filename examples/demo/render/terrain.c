@@ -103,6 +103,9 @@ static int terrain_ensure_ready(void) {
         (ov_wx != 1595.0f || ov_wy != -650.0f)) {
         float ov_wz = backend_sample_elevation_world_z(ov_wx, ov_wy);
         camera_set_home_pose(ov_wx, ov_wy, ov_wz, 0.0f, 0.42f, 0.48f);
+    } else {
+        float focus_z = backend_sample_elevation_world_z(1595.0f, -650.0f);
+        camera_set_home_pose(1595.0f, -650.0f, focus_z, -0.18f, 0.52f, 0.16f);
     }
     VkPushConstantRange push = {
         .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
@@ -278,6 +281,16 @@ void terrain_draw(VkCommandBuffer cmd,
     } else {
         vkCmdDraw(cmd, k_terrain_tile_verts, leaf_count, 0u, 0u);
     }
+
+    backend_record_draw_surfels(cmd,
+                                width,
+                                height,
+                                pass_depth_format(),
+                                pass_raster_samples(),
+                                k_besparmak_elev_min,
+                                1.15f,
+                                &push.view,
+                                sizeof push.view);
 }
 
 bool terrain_reload(void) {

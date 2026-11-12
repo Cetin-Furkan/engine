@@ -29,7 +29,6 @@ static const float k_deg       = 0.017453292519943295f;
 static const float k_shove     = 640.0f;
 static const float k_damp      = 1.8f;
 static const float k_spring    = 48.0f;
-static const float k_rel       = 6.0f;
 static const float k_soft_damp = 2.2f;
 static const float k_sleep     = 8.0f;
 static const float k_slop      = 0.5f;
@@ -1109,22 +1108,43 @@ static void cap_speed(float *vx, float *vy) {
     }
 }
 
-static void spring_pair(Soft *p, uint32_t a, uint32_t b, float rest, float *fx, float *fy) {
-    float dx = p->x[b] - p->x[a];
-    float dy = p->y[b] - p->y[a];
-    float len = hypotf(dx, dy);
-    if (len < 1.0e-3f) {
-        return;
+static uint32_t s_avbd_iters = 4u;
+static AvbdVertex     s_gpu_verts[k_soft_cap][K_AVBD_MAX_VERTS];
+static AvbdConstraint s_gpu_cons[k_soft_cap][K_AVBD_MAX_CONS];
+static uint32_t       s_gpu_vn[k_soft_cap];
+static uint32_t       s_gpu_cn[k_soft_cap];
+static float          s_gpu_dt[k_soft_cap];
+static float          s_gpu_gx[k_soft_cap];
+static float          s_gpu_gy[k_soft_cap];
+static float          s_gpu_keep[k_soft_cap];
+static uint32_t       s_gpu_queued = 0u;
+static uint32_t       s_gpu_read   = 0u;
+
+void sheet_set_avbd_iterations(uint32_t iterations) {
+    s_avbd_iters = (iterations >= 1u && iterations <= 32u) ? iterations : 4u;
+}
+
+bool sheet_pop_gpu_step(SheetGpuStep *out) {
+    if (out == nullptr || s_gpu_read >= s_gpu_queued) {
+        s_gpu_read   = 0u;
+        s_gpu_queued = 0u;
+        return false;
     }
-    float ux = dx / len;
-    float uy = dy / len;
-    float vrel = (p->vx[b] - p->vx[a]) * ux + (p->vy[b] - p->vy[a]) * uy;
-    float k = p->spring > 0.0f ? p->spring : k_spring;
-    float f = k * (len - rest) + k_rel * vrel;
-    fx[a] += f * ux;
-    fy[a] += f * uy;
-    fx[b] -= f * ux;
-    fy[b] -= f * uy;
+    uint32_t idx = s_gpu_read++;
+    *out = (SheetGpuStep){
+        .verts      = s_gpu_verts[idx],
+        .vert_count = s_gpu_vn[idx],
+        .cons       = s_gpu_cons[idx],
+        .con_count  = s_gpu_cn[idx],
+        .dt         = s_gpu_dt[idx],
+        .gravity    = { s_gpu_gx[idx], s_gpu_gy[idx], 0.0f },
+        .damp_keep  = s_gpu_keep[idx],
+    };
+    if (s_gpu_read >= s_gpu_queued) {
+        s_gpu_read   = 0u;
+        s_gpu_queued = 0u;
+    }
+    return true;
 }
 
 static float soft_strain(const Soft *p) {
@@ -1407,41 +1427,35 @@ bool sheet_integrate(float dt) {
         d->y += d->vy * dt;
         mark_moved();
     }
+    s_gpu_queued = 0u;
+    s_gpu_read   = 0u;
     for (uint32_t i = 0; i < k_soft_cap; ++i) {
         Soft *p = &s_sheet.soft[i];
         if (!p->alive || !p->awake) {
             continue;
         }
-        float sd = expf(-(p->damp > 0.0f ? p->damp : k_soft_damp) * dt);
-        float fx[k_soft_pts];
-        float fy[k_soft_pts];
         uint32_t count = p->cols * p->rows;
-        memset(fx, 0, sizeof fx);
-        memset(fy, 0, sizeof fy);
-        for (uint32_t r = 0; r < p->rows; ++r) {
-            for (uint32_t c = 0; c + 1u < p->cols; ++c) {
-                spring_pair(p, r * p->cols + c, r * p->cols + c + 1u, p->spacing, fx, fy);
-            }
-        }
-        for (uint32_t r = 0; r + 1u < p->rows; ++r) {
-            for (uint32_t c = 0; c < p->cols; ++c) {
-                spring_pair(p, r * p->cols + c, (r + 1u) * p->cols + c, p->spacing, fx, fy);
-            }
-        }
-        float diag = p->spacing * 1.41421356237f;
-        for (uint32_t r = 0; r + 1u < p->rows; ++r) {
-            for (uint32_t c = 0; c + 1u < p->cols; ++c) {
-                uint32_t a = r * p->cols + c;
-                spring_pair(p, a, a + p->cols + 1u, diag, fx, fy);
-                spring_pair(p, a + 1u, a + p->cols, diag, fx, fy);
-            }
+        float damp_r = p->damp > 0.0f ? p->damp : k_soft_damp;
+        float stiff  = p->spring > 0.0f ? p->spring : k_spring;
+        uint32_t qslot = s_gpu_queued < k_soft_cap ? s_gpu_queued : 0u;
+        uint32_t gvn = 0u;
+        uint32_t gcn = 0u;
+        avbd_step_soft_grid_2d(p->x, p->y, p->vx, p->vy,
+                               p->cols, p->rows, p->spacing,
+                               stiff, damp_r, gx, gy, dt, s_avbd_iters,
+                               s_gpu_verts[qslot], &gvn,
+                               s_gpu_cons[qslot], &gcn);
+        if (gvn > 0u && s_gpu_queued < k_soft_cap) {
+            s_gpu_vn[qslot]   = gvn;
+            s_gpu_cn[qslot]   = gcn;
+            s_gpu_dt[qslot]   = dt;
+            s_gpu_gx[qslot]   = gx;
+            s_gpu_gy[qslot]   = gy;
+            s_gpu_keep[qslot] = expf(-damp_r * dt);
+            s_gpu_queued++;
         }
         for (uint32_t k = 0; k < count; ++k) {
-            p->vx[k] = (p->vx[k] + (fx[k] + gx) * dt) * sd;
-            p->vy[k] = (p->vy[k] + (fy[k] + gy) * dt) * sd;
             cap_speed(&p->vx[k], &p->vy[k]);
-            p->x[k] += p->vx[k] * dt;
-            p->y[k] += p->vy[k] * dt;
             if (!finite2(p->x[k], p->y[k])) {
                 p->x[k] = p->ox + p->rx[k];
                 p->y[k] = p->oy + p->ry[k];

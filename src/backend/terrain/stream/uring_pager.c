@@ -579,6 +579,10 @@ bool backend_on_cqe(const struct io_uring_cqe *cqe) {
 
     refresh_resident_tile_count(g_backend.gpu_hdr);
     backend_gpu_directory_sync();
+    if (became_resident) {
+        backend_gpu_survey_queue_mvs_tile(slot, tid);
+        backend_gpu_survey_rebuild_surfels();
+    }
 
     // Chain any remaining needed tiles from a large >16-tile camera jump
     if (g_backend.initialized && g_backend.pending_needed_count > 0u) {

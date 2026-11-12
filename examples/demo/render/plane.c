@@ -2,6 +2,7 @@
 #include "frame/camera.h"
 #include "frame/grid_math.h"
 #include "frame/pass.h"
+#include "lighting/lighting.h"
 #include "vulkan/pipe.h"
 #include <math.h>
 #include <stddef.h>
@@ -30,13 +31,17 @@ typedef struct PlanePush {
     float    origin_y;
     float    zoom;
     float    coarse;
+    uint32_t is_3d;
+    uint32_t pad0;
+    ViewPush view;
 } PlanePush;
 
 static_assert(offsetof(PlanePush, cell_med) == 8u, "plane cell_med");
 static_assert(offsetof(PlanePush, origin_x) == 16u, "plane origin");
 static_assert(offsetof(PlanePush, zoom) == 24u, "plane zoom");
 static_assert(offsetof(PlanePush, coarse) == 28u, "plane coarse");
-static_assert(sizeof(PlanePush) == 32u, "plane push");
+static_assert(offsetof(PlanePush, view) == 40u, "plane view");
+static_assert(sizeof(PlanePush) == 88u, "plane push");
 
 static VulkanContext   *s_vk = nullptr;
 static VkPipelineLayout s_layout = VK_NULL_HANDLE;
@@ -155,6 +160,9 @@ void plane_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height) {
         .origin_y   = plane_grid_wrap(view.cam_y, grid.coarse),
         .zoom       = view.zoom,
         .coarse     = grid.coarse,
+        .is_3d      = lighting_gi_active() ? 1u : 0u,
+        .pad0       = 0u,
+        .view       = view,
     };
     vulkan_cmd_push(cmd, s_layout, VK_SHADER_STAGE_FRAGMENT_BIT, sizeof push, &push);
     vkCmdDraw(cmd, 3u, 1u, 0u, 0u);

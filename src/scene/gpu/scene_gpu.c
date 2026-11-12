@@ -1,9 +1,11 @@
 #include "scene/scene.h"
+#include "lighting/lighting.h"
 #include "vulkan/bda.h"
 #include "vulkan/core.h"
 #include "vulkan/memory.h"
 #include "vulkan/pipe.h"
 #include <ctype.h>
+#include <math.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -173,6 +175,10 @@ typedef struct SceneMeshRecord {
     uint32_t vert_count;
     uint32_t tri_offset;
     uint32_t tri_count;
+    float    local_center[3];
+    float    half_extents[3];
+    float    avg_albedo[3];
+    float    avg_roughness;
 } SceneMeshRecord;
 
 typedef struct SceneTargetImage {
@@ -487,6 +493,49 @@ static int upload_slab_bytes(VkDeviceSize dst_off, const void *src, VkDeviceSize
     return res == VK_SUCCESS ? 0 : -1;
 }
 
+static void compute_mesh_proxy_meta(SceneMeshRecord *rec, const SceneMeshletBuild *b) {
+    if (rec == nullptr || b == nullptr || b->meshlet_count == 0u) {
+        return;
+    }
+    float bmin[3] = {  1.0e30f,  1.0e30f,  1.0e30f };
+    float bmax[3] = { -1.0e30f, -1.0e30f, -1.0e30f };
+    for (uint32_t i = 0u; i < b->meshlet_count; ++i) {
+        const SceneMeshlet *ml = &b->meshlets[i];
+        for (int a = 0; a < 3; ++a) {
+            float lo = ml->origin[a];
+            float hi = ml->origin[a] + ml->scale[a];
+            if (lo < bmin[a]) bmin[a] = lo;
+            if (hi > bmax[a]) bmax[a] = hi;
+        }
+    }
+    for (int a = 0; a < 3; ++a) {
+        rec->local_center[a] = 0.5f * (bmin[a] + bmax[a]);
+        rec->half_extents[a] = fmaxf(0.5f * (bmax[a] - bmin[a]), 1.0e-3f);
+    }
+
+    double sum_r = 0.0, sum_g = 0.0, sum_b = 0.0, sum_a = 0.0;
+    uint32_t vc  = b->vertex_count;
+    for (uint32_t v = 0u; v < vc; ++v) {
+        uint32_t rgba = b->vertices[v].rgba8;
+        sum_r += (double)( rgba         & 0xFFu) * (1.0 / 255.0);
+        sum_g += (double)((rgba >>  8u) & 0xFFu) * (1.0 / 255.0);
+        sum_b += (double)((rgba >> 16u) & 0xFFu) * (1.0 / 255.0);
+        sum_a += (double)((rgba >> 24u) & 0xFFu) * (1.0 / 255.0);
+    }
+    if (vc > 0u) {
+        double inv = 1.0 / (double)vc;
+        rec->avg_albedo[0] = (float)(sum_r * inv);
+        rec->avg_albedo[1] = (float)(sum_g * inv);
+        rec->avg_albedo[2] = (float)(sum_b * inv);
+        rec->avg_roughness = (float)(sum_a * inv);
+    } else {
+        rec->avg_albedo[0] = 0.5f;
+        rec->avg_albedo[1] = 0.5f;
+        rec->avg_albedo[2] = 0.5f;
+        rec->avg_roughness = 0.35f;
+    }
+}
+
 static int upload_mesh_build(uint32_t mesh_id, const SceneMeshletBuild *b) {
     if (mesh_id >= K_SCENE_MAX_MESHES || b == nullptr) {
         return -1;
@@ -548,6 +597,7 @@ static int upload_mesh_build(uint32_t mesh_id, const SceneMeshletBuild *b) {
         .tri_offset    = tr_base,
         .tri_count     = b->triangle_count,
     };
+    compute_mesh_proxy_meta(&s_meshes[mesh_id], b);
     return 0;
 }
 
@@ -905,11 +955,12 @@ int scene_update_mesh(uint32_t mesh_id, const SceneCorner *corners,
             rc = -1;
         }
         free(patched);
-        scene_meshlet_build_free(&build);
         if (rc == 0) {
             rec->meshlet_count = build.meshlet_count;
+            compute_mesh_proxy_meta(rec, &build);
             scene_invalidate_hiz();
         }
+        scene_meshlet_build_free(&build);
         return rc;
     }
 
@@ -1006,6 +1057,53 @@ void scene_submit_instance(uint32_t mesh_id, float origin_x, float origin_y, flo
 
     for (uint32_t m = 0u; m < rec->meshlet_count; ++m) {
         slot->work_pairs[s_cur_work_items++] = (inst_idx << 16u) | (rec->first_meshlet + m);
+    }
+
+    // Submit 3D analytical occluder & emitter proxy to Core Engine Lighting (HRC + G-Buffer)
+    {
+        float cx = cosf(pitch_rad), sx = sinf(pitch_rad);
+        float cy = cosf(yaw_rad),   sy = sinf(yaw_rad);
+        float lx = rec->local_center[0];
+        float ly = rec->local_center[1] * cx - rec->local_center[2] * sx;
+        float lz = rec->local_center[1] * sx + rec->local_center[2] * cx;
+        float wx =  lx * cy + lz * sy;
+        float wy =  ly;
+        float wz = -lx * sy + lz * cy;
+
+        float sz  = fminf(fmaxf(1.0f + squash, 0.45f), 1.85f);
+        float sxy = 1.0f / sqrtf(sz);
+
+        float center[3] = {
+            origin_x + wx * uniform_scale * sxy,
+            origin_y + wy * uniform_scale * sxy,
+            origin_z + wz * uniform_scale * sz,
+        };
+        float extents[3] = {
+            rec->half_extents[0] * uniform_scale * sxy,
+            rec->half_extents[1] * uniform_scale * sxy,
+            rec->half_extents[2] * uniform_scale * sz,
+        };
+
+        float sel = fminf(fmaxf(selected, 0.0f), 1.0f) * 0.42f;
+        float alb[3] = {
+            rec->avg_albedo[0] + (1.0f - rec->avg_albedo[0]) * sel,
+            rec->avg_albedo[1] + (1.0f - rec->avg_albedo[1]) * sel,
+            rec->avg_albedo[2] + (1.0f - rec->avg_albedo[2]) * sel,
+        };
+        float emi[3] = {0};
+        lighting_material_get_emissive(mat_index, emi);
+        float rgh = roughness > 0.0f ? roughness : rec->avg_roughness;
+
+        // When squash is active on an isotropic sphere, world-space Z squash is axis-aligned
+        bool  iso_squash = fabsf(squash) > 1.0e-3f &&
+                           fabsf(rec->half_extents[0] - rec->half_extents[2]) < 0.08f * rec->half_extents[0];
+        float pr = iso_squash ? 0.0f : pitch_rad;
+        float yr = iso_squash ? 0.0f : yaw_rad;
+
+        LightingProxy proxy = {0};
+        lighting_proxy_fill(&proxy, LIGHTING_PROXY_ELLIPSOID, center, extents,
+                            pr, yr, rgh, alb, emi);
+        lighting_submit_proxy(&proxy);
     }
 }
 
@@ -1416,6 +1514,7 @@ void scene_prepare_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height) {
     vkCmdPipelineBarrier2(cmd, &post_p2_dep);
 
     record_hiz_pyramid(cmd, true);
+    lighting_set_scene_hiz(s_hiz_buf.address);
 
     s_used_hiz_this_frame = true;
     s_prepared_this_frame = true;

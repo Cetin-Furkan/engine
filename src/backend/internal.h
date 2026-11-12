@@ -106,5 +106,16 @@ void backend_gpu_record_cull(VkCommandBuffer cmd, const TerrainCullParams *cull)
 float backend_eval_besparmak_elevation_m(double lat, double lon);
 int   backend_synth_besparmak_archive(const char *pack_path);
 
+// terrain/survey/gpu_survey.c
+int      backend_gpu_survey_init(VulkanContext *vk);
+void     backend_gpu_survey_shutdown(VulkanContext *vk);
+void     backend_gpu_survey_rebuild_surfels(void);
+void     backend_gpu_survey_queue_mvs_tile(uint32_t slot_index, uint32_t node_index);
+void     backend_gpu_survey_record_compute(VkCommandBuffer cmd, const TerrainCullParams *cull);
+void     backend_gpu_survey_get_stats(uint64_t *out_bda_bytes,
+                                      uint32_t *out_total_surfels,
+                                      uint32_t *out_visible_surfels,
+                                      uint32_t *out_mvs_dispatches);
+
 #endif /* ENGINE_BACKEND_INTERNAL_H */
 

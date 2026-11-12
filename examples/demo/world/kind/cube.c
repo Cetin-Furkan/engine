@@ -4,6 +4,8 @@
 #include "frame/fillet.h"
 #include "frame/grid.h"
 #include "frame/material.h"
+#include "lighting/lighting.h"
+#include "physics/physics.h"
 #include <math.h>
 #include <stdio.h>
 
@@ -199,6 +201,54 @@ static void cube_commit(WorldObj *o) {
     c->phase_shown = c->phase;
 }
 
+static void cube_prepare_scene(const WorldObj *o, bool live) {
+    const CubeData *c = o->data;
+    if (c == nullptr) {
+        return;
+    }
+    bool glow = live ? c->spin.glow : c->spin.shown_glow;
+    material_set(c->mat, glow);
+
+    float phase   = live ? c->phase : c->phase_shown;
+    float ang     = 6.28318530718f * phase;
+    float ca      = cosf(ang);
+    float sa      = sinf(ang);
+    const float k = 0.57735026919f;
+    const float base[3] = { 0.72f, 0.46f, 0.28f };
+    float dot_kb  = k * (base[0] + base[1] + base[2]);
+    float cx      = k * (base[2] - base[1]);
+    float cy      = k * (base[0] - base[2]);
+    float cz      = k * (base[1] - base[0]);
+
+    float sel = table_highlight(o, live);
+    float alb[3] = {
+        fminf(fmaxf(base[0] * ca + cx * sa + k * dot_kb * (1.0f - ca), 0.0f), 1.0f),
+        fminf(fmaxf(base[1] * ca + cy * sa + k * dot_kb * (1.0f - ca), 0.0f), 1.0f),
+        fminf(fmaxf(base[2] * ca + cz * sa + k * dot_kb * (1.0f - ca), 0.0f), 1.0f),
+    };
+    for (int i = 0; i < 3; ++i) {
+        alb[i] = alb[i] + (1.0f - alb[i]) * (sel * 0.42f);
+    }
+
+    float emi[3] = {0};
+    lighting_material_get_emissive(c->mat, emi);
+    if (!cube_heat_held(c->heat)) {
+        emi[0] += 0.88f;
+        emi[1] += 0.34f;
+        emi[2] += 0.08f;
+    }
+
+    const float center[3]  = { o->at.x, o->at.y, o->at.z };
+    const float extents[3] = { k_fillet_half, k_fillet_half, k_fillet_half };
+    const float pitch_rad  = 28.0f * (3.14159265359f / 180.0f);
+    const float yaw_rad    = spin_deg(&c->spin, live) * (3.14159265359f / 180.0f);
+
+    LightingProxy proxy = {0};
+    lighting_proxy_fill(&proxy, LIGHTING_PROXY_OBB, center, extents,
+                        pitch_rad, yaw_rad, 0.36f, alb, emi);
+    lighting_submit_proxy(&proxy);
+}
+
 static void cube_draw_obj(const WorldObj *o, VkCommandBuffer cmd, uint32_t width, uint32_t height, bool live) {
     const CubeData *c = o->data;
     if (c == nullptr) {
@@ -294,6 +344,7 @@ static const WorldOps s_ops = {
     .hit                  = cube_hit,
     .on_click             = cube_on_click,
     .vertices             = cube_vertices,
+    .prepare_scene        = cube_prepare_scene,
     .draw                 = cube_draw_obj,
     .advance              = cube_advance,
     .commit               = cube_commit,
@@ -327,6 +378,7 @@ static void cube_kind_reset(void) {
         material_set(mat_of(i), false);
         s_pool[i] = (CubeData){0};
     }
+    motion_reset_warm_cache();
     s_pick_logged = false;
     s_motion_have = false;
     s_motion_stamp = 0;
@@ -536,10 +588,24 @@ void world_step_motion(uint32_t time_ms, uint32_t sim_dt_ms) {
             any_before = true;
         }
     }
+    uint32_t iters = physics_recommended_iterations();
     uint32_t left = sim_dt_ms;
     while (left > 0u) {
         uint32_t step = left > 8u ? 8u : left;
-        motion_substep(bodies, n, (float)step / 1000.0f, 0.0f, k_fillet_half);
+        float dt_s = (float)step / 1000.0f;
+        AvbdVertex gpu_v[K_AVBD_MAX_VERTS];
+        AvbdConstraint gpu_c[K_AVBD_MAX_CONS];
+        uint32_t gpu_vn = 0u;
+        uint32_t gpu_cn = 0u;
+        motion_substep_avbd(bodies, n, dt_s, 0.0f, k_fillet_half, iters,
+                            left <= 8u ? gpu_v : nullptr,
+                            left <= 8u ? &gpu_vn : nullptr,
+                            left <= 8u ? gpu_c : nullptr,
+                            left <= 8u ? &gpu_cn : nullptr);
+        if (left <= 8u && gpu_vn > 0u) {
+            const float g_world[3] = { 0.0f, 0.0f, -3200.0f };
+            physics_submit_step(gpu_v, gpu_vn, gpu_c, gpu_cn, dt_s, g_world, expf(-1.8f * dt_s));
+        }
         left -= step;
     }
     bool any_after = false;

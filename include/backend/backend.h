@@ -77,23 +77,41 @@ bool               backend_overlay_stretch_2d(int step_x, int step_y);
 bool               backend_overlay_commit_upload(void);
 bool               backend_overlay_get_center(float *out_wx, float *out_wy);
 
+// Oriented 2D Gaussian Splatting (2DGS) Geodetic Surfel Pass & Toggle (KEY_7)
+void               backend_record_draw_surfels(VkCommandBuffer       cmd,
+                                               uint32_t              width,
+                                               uint32_t              height,
+                                               VkFormat              depth_format,
+                                               VkSampleCountFlagBits samples,
+                                               float                 elev_base_m,
+                                               float                 vertical_scale,
+                                               const void           *view_push_ptr,
+                                               size_t                view_push_bytes);
+bool               backend_toggle_2dgs(void);
+bool               backend_2dgs_active(void);
+
 typedef struct BackendBenchStats {
     uint64_t bda_arena_bytes;
     uint64_t indirect_bytes;
     uint64_t overlay_arena_bytes;
     uint64_t fused_cache_bytes;
+    uint64_t surfel_bda_bytes;
     uint64_t stream_uring_us_total;
     uint64_t stream_boot_uring_us;
     uint32_t slot_capacity;
     uint32_t resident_tiles;
     uint32_t active_leaves;
     uint32_t visible_leaves;
+    uint32_t surfel_count;
+    uint32_t visible_surfels;
+    uint32_t mvs_gpu_dispatches;
     uint32_t stream_loads_total;
     uint32_t stream_uring_turns;
     uint32_t stream_async_cqes;
     uint32_t stream_fixed_buf_reads;
     bool     initialized;
     bool     zero_copy_uma;
+    bool     two_dgs_enabled;
 } BackendBenchStats;
 
 void               backend_get_bench_stats(BackendBenchStats *out);

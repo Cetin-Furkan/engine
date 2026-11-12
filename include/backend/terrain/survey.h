@@ -272,4 +272,86 @@ int  backend_survey_load_manifest(TerrainSurveyDataset       *ds,
 int  backend_survey_ensure_default_manifest(const char                 *manifest_path,
                                             const GpuMathPageDirectory *dir);
 
+// ============================================================================
+// Engine v0.2 Milestone 5: Oriented 2D Gaussian Splatting (2DGS) Geodetic Surfels
+// Reference: Huang et al., "2D Gaussian Splatting for Geometrically Accurate
+//            Radiance Fields" (SIGGRAPH 2024–2026) + Energy-Conserving Mip-2DGS
+// ============================================================================
+
+enum : uint32_t {
+    k_surfel_cap_uma       = 16384u, // 512 KiB on UMA_IGPU (fits single 40 MiB slab)
+    k_surfel_cap_dgpu      = 65536u, // 2.00 MiB on DISCRETE_DIRECT / HYBRID_MUXLESS
+    k_surfel_flag_cliff    = 1u << 0u,
+    k_surfel_flag_gcp      = 1u << 1u,
+    k_surfel_flag_tiepoint = 1u << 2u,
+    k_surfel_flag_breakln  = 1u << 3u,
+};
+
+// 32-byte cache-line-packed Oriented 2D Gaussian Splatting (2DGS) Geodetic Surfel
+// (exact 2 surfels per 64B cache line; 0 affine EWA warping error)
+typedef struct TerrainSurfel2DGS {
+    alignas(32) float center_x; // Metric East world X (meters)
+    float    center_y;          // Metric North world Y (meters)
+    float    elev_m;            // Geodetic MSL elevation (meters)
+    uint32_t nrm_tan_packed;    // Low 16b: Oct-SNORM8 normal N; High 16b: UNORM16 tangent angle phi
+    uint32_t scale_uv_f16;      // Low 16b: fp16 sigma_u (meters); High 16b: fp16 sigma_v (meters)
+    uint32_t rgba_opa_packed;   // RGBA8: sRGB rock/survey albedo (R,G,B) + base opacity (A)
+    uint32_t flags_node_id;     // Low 16b: quadtree node_id; High 16b: surfel kind flags
+    uint32_t reserved_pad;      // Exact 32-byte alignment stride
+} TerrainSurfel2DGS;
+
+static_assert(sizeof(TerrainSurfel2DGS) == 32u, "TerrainSurfel2DGS must be 32 bytes");
+
+typedef struct TerrainSurfelRayHit {
+    float t_ray;     // Ray distance along world ray O + t * D
+    float u_norm;    // Normalized tangent-plane coordinate u / sigma_u
+    float v_norm;    // Normalized tangent-plane coordinate v / sigma_v
+    float alpha;     // Evaluated Mip-2DGS energy-conserving Gaussian opacity in [0..1]
+    bool  valid;
+} TerrainSurfelRayHit;
+
+void backend_surfel_2dgs_pack(TerrainSurfel2DGS *out,
+                              float              wx,
+                              float              wy,
+                              float              elev_m,
+                              const float        normal[3],
+                              float              tangent_angle_rad,
+                              float              sigma_u_m,
+                              float              sigma_v_m,
+                              uint8_t            r,
+                              uint8_t            g,
+                              uint8_t            b,
+                              uint8_t            opacity_u8,
+                              uint16_t           node_id,
+                              uint16_t           flags);
+
+void backend_surfel_2dgs_unpack_basis(const TerrainSurfel2DGS *surfel,
+                                      float                    out_nrm[3],
+                                      float                    out_tan_u[3],
+                                      float                    out_tan_v[3],
+                                      float                   *out_sigma_u_m,
+                                      float                   *out_sigma_v_m);
+
+bool backend_surfel_2dgs_eval_ray(const TerrainSurfel2DGS *surfel,
+                                  float                    elev_base_m,
+                                  float                    vertical_scale,
+                                  const float              ray_origin[3],
+                                  const float              ray_dir[3],
+                                  float                    filter_sigma_m,
+                                  TerrainSurfelRayHit     *out_hit);
+
+uint32_t backend_surfel_2dgs_extract_tile(const GpuMathQuadNode *node,
+                                          uint32_t               node_index,
+                                          const EpackTileBlock  *tile,
+                                          float                  vertical_scale,
+                                          uint32_t               sample_stride,
+                                          TerrainSurfel2DGS     *out_surfels,
+                                          uint32_t               max_surfels);
+
+uint32_t backend_surfel_2dgs_extract_survey(const TerrainSurveyDataset *ds,
+                                            TerrainSurfel2DGS          *out_surfels,
+                                            uint32_t                    max_surfels);
+
+[[nodiscard]] bool backend_surfel_2dgs_self_check(void);
+
 #endif /* ENGINE_BACKEND_TERRAIN_SURVEY_H */

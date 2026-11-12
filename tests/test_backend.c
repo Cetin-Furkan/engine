@@ -1083,10 +1083,60 @@ int main(void) {
         return 1;
     }
 
-    printf("test_backend: ok (RelPtr2D + Lilliput64 + Cell64 + .epack 3.84x [RMSE %.4f m, border 0.0000 m, %.1f dB, fixed_buf=%u] + Survey MVS/GCP fused %u posts [%u MVS @ ZNCC %.3f] & %u ortho texels)\n",
+    // 13. Milestone 5: Oriented 2D Gaussian Splatting (2DGS) Geodetic Surfels (32B, 0 EWA warp)
+    if (sizeof(TerrainSurfel2DGS) != 32u || !backend_surfel_2dgs_self_check()) {
+        fprintf(stderr, "FAIL: 2DGS geodetic surfel self-check or 32B struct invariant failed\n");
+        return 1;
+    }
+    static TerrainSurfel2DGS summit_surfels[512];
+    uint32_t tile_surfel_cnt = backend_surfel_2dgs_extract_tile(&epack_hdr.nodes[summit_leaf],
+                                                                summit_leaf,
+                                                                &enc_summit,
+                                                                1.15f,
+                                                                6u,
+                                                                summit_surfels,
+                                                                512u);
+    if (tile_surfel_cnt == 0u) {
+        fprintf(stderr, "FAIL: 2DGS cliff/karst surfel extractor emitted 0 surfels on Beşparmak summit tile\n");
+        return 1;
+    }
+    float sn[3], stu[3], stv[3], ssu = 0.0f, ssv = 0.0f;
+    backend_surfel_2dgs_unpack_basis(&summit_surfels[0], sn, stu, stv, &ssu, &ssv);
+    float ortho_err = fabsf(sn[0] * stu[0] + sn[1] * stu[1] + sn[2] * stu[2]) +
+                      fabsf(stu[0] * stv[0] + stu[1] * stv[1] + stu[2] * stv[2]);
+    if (ortho_err > 1.0e-3f || ssu <= 0.0f || ssv <= 0.0f) {
+        fprintf(stderr, "FAIL: unpacked summit 2DGS surfel tangent basis non-orthonormal (err=%.6f)\n",
+                (double)ortho_err);
+        return 1;
+    }
+
+    TerrainSurveyDataset ds_gs;
+    backend_survey_dataset_init(&ds_gs);
+    TerrainSurveyPoint gcp_pt = {
+        .world_x = 1520.0f, .world_y = -620.0f, .elevation_m = 1612.0f,
+        .radius_m = 12.0f, .weight = 1.0f, .r = 250u, .g = 90u, .b = 40u, .has_color = true
+    };
+    TerrainSurveyBreakline gcp_bl = {
+        .world_ax = 1480.0f, .world_ay = -640.0f, .elev_a_m = 1590.0f,
+        .world_bx = 1560.0f, .world_by = -600.0f, .elev_b_m = 1610.0f,
+        .radius_m = 8.0f, .weight = 0.9f
+    };
+    (void)backend_survey_add_point(&ds_gs, &archive_hdr.dir, &gcp_pt);
+    (void)backend_survey_add_breakline(&ds_gs, &gcp_bl);
+    TerrainSurfel2DGS survey_surfels[64];
+    uint32_t survey_surfel_cnt = backend_surfel_2dgs_extract_survey(&ds_gs, survey_surfels, 64u);
+    backend_survey_dataset_free(&ds_gs);
+    if (survey_surfel_cnt < 4u) {
+        fprintf(stderr, "FAIL: backend_surfel_2dgs_extract_survey emitted %u surfels (expected >= 4)\n",
+                survey_surfel_cnt);
+        return 1;
+    }
+
+    printf("test_backend: ok (RelPtr2D + Lilliput64 + Cell64 + .epack 3.84x [RMSE %.4f m, border 0.0000 m, %.1f dB, fixed_buf=%u] + Survey MVS/GCP fused %u posts [%u MVS @ ZNCC %.3f] & %u ortho texels + 2DGS %u+%u surfels)\n",
            elev_rmse_m, rgb_psnr_db, 1u,
            fuse_stats.dem_posts_refined, fuse_stats.mvs_elev_posts_refined,
-           (double)fuse_stats.mean_mvs_ncc, fuse_stats.texels_orthorectified);
+           (double)fuse_stats.mean_mvs_ncc, fuse_stats.texels_orthorectified,
+           tile_surfel_cnt, survey_surfel_cnt);
     return 0;
 }
 

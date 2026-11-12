@@ -1,9 +1,20 @@
 #ifndef ENGINE_FRAME_SHEET_H
 #define ENGINE_FRAME_SHEET_H
 
+#include "physics/physics.h"
 #include "vulkan/types.h"
 #include <stddef.h>
 #include <stdint.h>
+
+typedef struct SheetGpuStep {
+    const AvbdVertex     *verts;
+    uint32_t              vert_count;
+    const AvbdConstraint *cons;
+    uint32_t              con_count;
+    float                 dt;
+    float                 gravity[3];
+    float                 damp_keep;
+} SheetGpuStep;
 
 // The flat sheet: rigid boxes, soft patches, and convex shapes from a file.
 // examples/demo/world/sheet.world is the document L reads in 2D and Hybrid.
@@ -56,5 +67,8 @@ void sheet_dyn_local(uint32_t index, uint32_t vert, float *x, float *y);
 void sheet_soft_move(uint32_t index, uint32_t point, float dx, float dy);
 void sheet_soft_pos(uint32_t index, uint32_t point, float *x, float *y);
 void sheet_soft_layout(uint32_t index, uint32_t *cols, uint32_t *rows, float *spacing);
+
+void sheet_set_avbd_iterations(uint32_t iterations);
+bool sheet_pop_gpu_step(SheetGpuStep *out);
 
 #endif /* ENGINE_FRAME_SHEET_H */

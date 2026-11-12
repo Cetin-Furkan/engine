@@ -175,6 +175,8 @@ typedef struct VulkanDeviceInfo {
     bool supports_multi_draw_indirect;
     bool supports_draw_indirect_count;
     bool supports_draw_indirect_first_instance;
+    bool supports_acceleration_structure;
+    bool supports_ray_query;
 
     // Linux DRM device node identity (VK_EXT_physical_device_drm) for Wayland matching.
     bool    has_drm_primary_node;

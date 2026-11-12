@@ -25,6 +25,8 @@ struct VSOutput {
     [[vk::location(0)]] float3 v_nrm : TEXCOORD0;
     [[vk::location(1)]] float3 v_albedo : TEXCOORD1;
     [[vk::location(2)]] float3 v_emit : TEXCOORD2;
+    [[vk::location(3)]] float  v_view_z : TEXCOORD3;
+    [[vk::location(4)]] nointerpolation uint64_t v_env_bda : TEXCOORD4;
 };
 
 static const float k_edge_px = 240.0;
@@ -250,6 +252,8 @@ VSOutput main(uint vert_id : SV_VulkanVertexID) {
     VSOutput out;
     out.sv_pos = view_ndc(view, screen.view.zoom, screen.width, screen.height, screen.depth_bias);
     out.v_nrm = view_rotate(screen.view.q, posed_nrm);
+    out.v_view_z = view.z;
+    out.v_env_bda = screen.view.materials;
 
     float3 axis = float3(0.57735026919);
     float ang = 6.28318530718 * (screen.phase + dot(in_pos, float3(0.10, 0.14, 0.08)));

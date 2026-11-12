@@ -22,6 +22,8 @@ struct MeshletVSOut {
     [[vk::location(1)]] float3 v_albedo    : TEXCOORD1;
     [[vk::location(2)]] float3 v_emit      : TEXCOORD2;
     [[vk::location(3)]] float  v_roughness : TEXCOORD3;
+    [[vk::location(4)]] float  v_view_z    : TEXCOORD4;
+    [[vk::location(5)]] nointerpolation uint64_t v_env_bda : TEXCOORD5;
 };
 
 [shader("vertex")]
@@ -32,6 +34,8 @@ MeshletVSOut main(uint vert_id : SV_VulkanVertexID, uint vulkan_inst_id : SV_Vul
     out.v_albedo    = float3(0.0);
     out.v_emit      = float3(0.0);
     out.v_roughness = 0.35;
+    out.v_view_z    = 0.0;
+    out.v_env_bda   = pc.view.materials;
 
     uint pair = vulkan_inst_id;
     if (pc.phase_cmd_mode != 0u) {
@@ -62,5 +66,6 @@ MeshletVSOut main(uint vert_id : SV_VulkanVertexID, uint vulkan_inst_id : SV_Vul
 
     scene_transform_vertex(pv, ml, inst, pc.view, pc.width, pc.height,
                            out.sv_pos, out.v_nrm, out.v_albedo, out.v_emit, out.v_roughness);
+    out.v_view_z = (0.5 - out.sv_pos.z - inst.depth_bias) * 4096.0;
     return out;
 }

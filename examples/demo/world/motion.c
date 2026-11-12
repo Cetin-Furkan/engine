@@ -1,12 +1,18 @@
 #include "world/motion.h"
 #include "frame/fillet.h"
 #include <math.h>
+#include <string.h>
 
 static constexpr float k_gravity     = 3200.0f;
 static constexpr float k_damp        = 1.8f;
 static constexpr float k_sleep_speed = 12.0f;
 static constexpr float k_slop        = 0.5f;
-static constexpr int   k_passes      = 4;
+
+static AvbdWarmCache s_motion_warm;
+
+void motion_reset_warm_cache(void) {
+    avbd_warm_cache_reset(&s_motion_warm);
+}
 
 static void extent(float yaw, float half, float out[3]) {
     float ax[3];
@@ -31,13 +37,12 @@ static float body_rest_lift(const MotionBody *b, float half) {
     return motion_rest_lift(b->yaw, half);
 }
 
-static void clamp_ground(MotionBody *b, float ground, float half) {
+static void resolve_ground_velocity(MotionBody *b, float rest_z) {
     if (!b->awake) {
         return;
     }
-    float rest = ground + body_rest_lift(b, half);
-    if (b->z < rest) {
-        b->z = rest;
+    if (b->z <= rest_z + 1.0e-2f) {
+        b->z = rest_z;
         if (b->vz < 0.0f) {
             float down = -b->vz;
             if (down > b->impact) {
@@ -193,60 +198,6 @@ static void trade(MotionBody *a, MotionBody *b, float nx, float ny, float nz) {
     b->vz += nz * j;
 }
 
-static void collide_pair(MotionBody *a, MotionBody *b, float ground, float half) {
-    if (!a->awake && !b->awake) {
-        return;
-    }
-    float pen = 0.0f;
-    float n[3] = { 0.0f, 0.0f, 0.0f };
-    if (!body_hit(a, b, half, &pen, n)) {
-        return;
-    }
-    // A still cube stands up when something hits it. Separate after that,
-    // at the height the two of them will actually keep.
-    a->awake = true;
-    b->awake = true;
-    clamp_ground(a, ground, half);
-    clamp_ground(b, ground, half);
-    if (!body_hit(a, b, half, &pen, n)) {
-        return;
-    }
-    float horiz = sqrtf(n[0] * n[0] + n[1] * n[1]);
-    // A pitched face leans. Pushing along that normal sinks one center, and
-    // the plane hands the lift back as a shove. A side hit slides in xy by
-    // enough to open the same face. A floor hit keeps the vertical push.
-    if (horiz >= fabsf(n[2]) && horiz > 1.0e-4f) {
-        float inv = 1.0f / horiz;
-        float hx = n[0] * inv;
-        float hy = n[1] * inv;
-        float shift = pen * 0.5f * inv;
-        a->x -= hx * shift;
-        a->y -= hy * shift;
-        b->x += hx * shift;
-        b->y += hy * shift;
-        trade(a, b, hx, hy, 0.0f);
-        return;
-    }
-    float shift = pen * 0.5f;
-    a->x -= n[0] * shift;
-    a->y -= n[1] * shift;
-    a->z -= n[2] * shift;
-    b->x += n[0] * shift;
-    b->y += n[1] * shift;
-    b->z += n[2] * shift;
-    float az = a->z;
-    float bz = b->z;
-    clamp_ground(a, ground, half);
-    clamp_ground(b, ground, half);
-    float lift_a = a->z - az;
-    float lift_b = b->z - bz;
-    b->z += lift_a;
-    a->z += lift_b;
-    clamp_ground(a, ground, half);
-    clamp_ground(b, ground, half);
-    trade(a, b, n[0], n[1], n[2]);
-}
-
 static void sleep_one(MotionBody *bodies, uint32_t count, uint32_t index, float ground, float half) {
     MotionBody *b = &bodies[index];
     if (!b->awake) {
@@ -269,41 +220,271 @@ static void sleep_one(MotionBody *bodies, uint32_t count, uint32_t index, float 
     b->awake = false;
 }
 
-void motion_substep(MotionBody *bodies, uint32_t count, float dt, float ground, float half) {
-    if (bodies == nullptr || count == 0 || !(dt > 0.0f) || !(half > 0.0f)) {
+void motion_substep_avbd(MotionBody     *bodies,
+                         uint32_t        count,
+                         float           dt,
+                         float           ground,
+                         float           half,
+                         uint32_t        iterations,
+                         AvbdVertex     *opt_gpu_verts,
+                         uint32_t       *opt_vert_count,
+                         AvbdConstraint *opt_gpu_cons,
+                         uint32_t       *opt_con_count) {
+    if (opt_vert_count != nullptr) *opt_vert_count = 0u;
+    if (opt_con_count != nullptr)  *opt_con_count  = 0u;
+
+    if (bodies == nullptr || count == 0u || count > K_AVBD_MAX_VERTS || !(dt > 0.0f) || !(half > 0.0f)) {
         return;
     }
-    for (uint32_t i = 0; i < count; ++i) {
-        MotionBody *b = &bodies[i];
-        if (!b->awake) {
-            continue;
+
+    bool any_awake = false;
+    for (uint32_t i = 0u; i < count; ++i) {
+        if (bodies[i].awake) {
+            any_awake = true;
+            break;
         }
-        b->vz -= k_gravity * dt;
-        b->x += b->vx * dt;
-        b->y += b->vy * dt;
-        b->z += b->vz * dt;
-        clamp_ground(b, ground, half);
     }
-    for (int pass = 0; pass < k_passes; ++pass) {
-        for (uint32_t i = 0; i < count; ++i) {
-            for (uint32_t j = i + 1; j < count; ++j) {
-                collide_pair(&bodies[i], &bodies[j], ground, half);
+    if (!any_awake) {
+        return;
+    }
+
+    float      rest_z[K_AVBD_MAX_VERTS];
+    float      v_pre[K_AVBD_MAX_VERTS][3];
+    MotionBody pred[K_AVBD_MAX_VERTS];
+
+    for (uint32_t i = 0u; i < count; ++i) {
+        rest_z[i] = ground + body_rest_lift(&bodies[i], half);
+        if (bodies[i].awake && bodies[i].z < rest_z[i] && bodies[i].vz >= 0.0f) {
+            bodies[i].z = rest_z[i];
+        }
+        pred[i] = bodies[i];
+        if (bodies[i].awake) {
+            v_pre[i][0] = bodies[i].vx;
+            v_pre[i][1] = bodies[i].vy;
+            v_pre[i][2] = bodies[i].vz - k_gravity * dt;
+            pred[i].x   = bodies[i].x + v_pre[i][0] * dt;
+            pred[i].y   = bodies[i].y + v_pre[i][1] * dt;
+            pred[i].z   = fmaxf(bodies[i].z + v_pre[i][2] * dt, rest_z[i]);
+        } else {
+            v_pre[i][0] = 0.0f;
+            v_pre[i][1] = 0.0f;
+            v_pre[i][2] = 0.0f;
+        }
+    }
+
+    // Wake up resting bodies contacted by awake bodies and stand them up on ground
+    for (int pass = 0; pass < 4; ++pass) {
+        bool woke_any = false;
+        for (uint32_t i = 0u; i < count; ++i) {
+            for (uint32_t j = i + 1u; j < count; ++j) {
+                if (bodies[i].awake == bodies[j].awake) {
+                    continue;
+                }
+                float pen = 0.0f;
+                float n[3] = { 0.0f, 0.0f, 0.0f };
+                if (body_hit(&pred[i], &pred[j], half, &pen, n) ||
+                    body_hit(&bodies[i], &bodies[j], half, &pen, n)) {
+                    uint32_t sleeper = bodies[i].awake ? j : i;
+                    bodies[sleeper].awake = true;
+                    if (bodies[sleeper].z < rest_z[sleeper]) {
+                        bodies[sleeper].z = rest_z[sleeper];
+                    }
+                    v_pre[sleeper][0] = bodies[sleeper].vx;
+                    v_pre[sleeper][1] = bodies[sleeper].vy;
+                    v_pre[sleeper][2] = bodies[sleeper].vz - k_gravity * dt;
+                    pred[sleeper]     = bodies[sleeper];
+                    pred[sleeper].x   = bodies[sleeper].x + v_pre[sleeper][0] * dt;
+                    pred[sleeper].y   = bodies[sleeper].y + v_pre[sleeper][1] * dt;
+                    pred[sleeper].z   = fmaxf(bodies[sleeper].z + v_pre[sleeper][2] * dt, rest_z[sleeper]);
+                    woke_any = true;
+                }
             }
         }
-        for (uint32_t i = 0; i < count; ++i) {
-            clamp_ground(&bodies[i], ground, half);
+        if (!woke_any) {
+            break;
         }
     }
-    float keep = expf(-k_damp * dt);
-    for (uint32_t i = 0; i < count; ++i) {
+
+    AvbdVertex     verts[K_AVBD_MAX_VERTS];
+    AvbdConstraint cons[K_AVBD_MAX_CONS];
+    memset(verts, 0, (size_t)count * sizeof(AvbdVertex));
+    uint32_t con_cnt = 0u;
+
+    for (uint32_t i = 0u; i < count; ++i) {
+        verts[i].pos[0]      = bodies[i].x;
+        verts[i].pos[1]      = bodies[i].y;
+        verts[i].pos[2]      = bodies[i].z;
+        verts[i].vel[0]      = bodies[i].vx;
+        verts[i].vel[1]      = bodies[i].vy;
+        verts[i].vel[2]      = bodies[i].vz;
+        verts[i].inv_mass    = bodies[i].awake ? 1.0f : 0.0f;
+        verts[i].radius      = bodies[i].spherical ? (bodies[i].radius > 0.0f ? bodies[i].radius : half) : half;
+        verts[i].restitution = bodies[i].restitution;
+
+        if (bodies[i].awake && con_cnt < K_AVBD_MAX_CONS) {
+            cons[con_cnt++] = (AvbdConstraint){
+                .kind             = AVBD_CON_CONTACT_PLANE,
+                .vert_a           = i,
+                .vert_b           = UINT32_MAX,
+                .hash_key         = 0x10000u | i,
+                .normal_or_target = { 0.0f, 0.0f, 1.0f },
+                .rest_or_offset   = rest_z[i],
+                .stiffness_min    = 1.0e7f,
+                .stiffness_max    = 1.0e10f,
+                .penalty_k        = 1.0e7f,
+                .beta_ramp        = 10.0f,
+            };
+        }
+    }
+
+    for (uint32_t i = 0u; i < count; ++i) {
+        for (uint32_t j = i + 1u; j < count; ++j) {
+            if (!bodies[i].awake && !bodies[j].awake) {
+                continue;
+            }
+            if (con_cnt >= K_AVBD_MAX_CONS) {
+                break;
+            }
+            float pen = 0.0f;
+            float n[3] = { 0.0f, 0.0f, 0.0f };
+            const MotionBody *ba = &pred[i];
+            const MotionBody *bb = &pred[j];
+            bool hit = body_hit(ba, bb, half, &pen, n);
+            if (!hit) {
+                ba  = &bodies[i];
+                bb  = &bodies[j];
+                hit = body_hit(ba, bb, half, &pen, n);
+            }
+            if (!hit) {
+                continue;
+            }
+
+            float ux    = n[0];
+            float uy    = n[1];
+            float uz    = n[2];
+            float d_sep = 0.0f;
+            float horiz = hypotf(n[0], n[1]);
+            // A pitched face leans; side impacts slide horizontally in xy so neither cube sinks into ground
+            if (horiz >= fabsf(n[2]) && horiz > 1.0e-4f) {
+                float inv_h = 1.0f / horiz;
+                ux    = n[0] * inv_h;
+                uy    = n[1] * inv_h;
+                uz    = 0.0f;
+                d_sep = ux * (bb->x - ba->x) + uy * (bb->y - ba->y) + pen * inv_h;
+            } else {
+                d_sep = ux * (bb->x - ba->x) + uy * (bb->y - ba->y) + uz * (bb->z - ba->z) + pen;
+            }
+
+            cons[con_cnt++] = (AvbdConstraint){
+                .kind             = AVBD_CON_CONTACT_PAIR,
+                .vert_a           = i,
+                .vert_b           = j,
+                .hash_key         = 0x20000u | (i << 8u) | j,
+                .normal_or_target = { ux, uy, uz },
+                .rest_or_offset   = d_sep,
+                .stiffness_min    = 1.0e7f,
+                .stiffness_max    = 1.0e10f,
+                .penalty_k        = 1.0e7f,
+                .beta_ramp        = 10.0f,
+            };
+        }
+    }
+
+    avbd_warm_apply(&s_motion_warm, cons, con_cnt, 0.85f);
+
+    if (opt_gpu_verts != nullptr && opt_vert_count != nullptr &&
+        opt_gpu_cons != nullptr && opt_con_count != nullptr) {
+        memcpy(opt_gpu_verts, verts, (size_t)count * sizeof(AvbdVertex));
+        memcpy(opt_gpu_cons, cons, (size_t)con_cnt * sizeof(AvbdConstraint));
+        *opt_vert_count = count;
+        *opt_con_count  = con_cnt;
+    }
+
+    const float grav[3]    = { 0.0f, 0.0f, -k_gravity };
+    const uint32_t n_iters = iterations > 0u ? iterations : 4u;
+    (void)avbd_solve_step(verts, count, cons, con_cnt, dt, grav, n_iters);
+    avbd_warm_store(&s_motion_warm, cons, con_cnt);
+
+    for (uint32_t i = 0u; i < count; ++i) {
         if (!bodies[i].awake) {
             continue;
         }
+        bodies[i].x  = verts[i].pos[0];
+        bodies[i].y  = verts[i].pos[1];
+        bodies[i].z  = fmaxf(verts[i].pos[2], rest_z[i]);
+        bodies[i].vx = v_pre[i][0];
+        bodies[i].vy = v_pre[i][1];
+        bodies[i].vz = v_pre[i][2];
+    }
+
+    // Apply momentum & restitution transfer across active AVBD contact pairs
+    for (uint32_t c = 0u; c < con_cnt; ++c) {
+        if (cons[c].kind != AVBD_CON_CONTACT_PAIR) {
+            continue;
+        }
+        uint32_t va = cons[c].vert_a;
+        uint32_t vb = cons[c].vert_b;
+        if (va < count && vb < count) {
+            trade(&bodies[va], &bodies[vb],
+                  cons[c].normal_or_target[0],
+                  cons[c].normal_or_target[1],
+                  cons[c].normal_or_target[2]);
+        }
+    }
+
+    // Secondary nonlinear OBB corner polish if rotating multi-body piles expose a new SAT face
+    for (int polish = 0; polish < 2; ++polish) {
+        for (uint32_t i = 0u; i < count; ++i) {
+            for (uint32_t j = i + 1u; j < count; ++j) {
+                if (!bodies[i].awake && !bodies[j].awake) {
+                    continue;
+                }
+                float pen = 0.0f;
+                float n[3] = { 0.0f, 0.0f, 0.0f };
+                if (!body_hit(&bodies[i], &bodies[j], half, &pen, n)) {
+                    continue;
+                }
+                float horiz = hypotf(n[0], n[1]);
+                if (horiz >= fabsf(n[2]) && horiz > 1.0e-4f) {
+                    float inv_h = 1.0f / horiz;
+                    float hx = n[0] * inv_h;
+                    float hy = n[1] * inv_h;
+                    float shift = pen * 0.5f * inv_h;
+                    bodies[i].x -= hx * shift;
+                    bodies[i].y -= hy * shift;
+                    bodies[j].x += hx * shift;
+                    bodies[j].y += hy * shift;
+                    trade(&bodies[i], &bodies[j], hx, hy, 0.0f);
+                } else {
+                    float shift = pen * 0.5f;
+                    bodies[i].x -= n[0] * shift;
+                    bodies[i].y -= n[1] * shift;
+                    bodies[i].z  = fmaxf(bodies[i].z - n[2] * shift, rest_z[i]);
+                    bodies[j].x += n[0] * shift;
+                    bodies[j].y += n[1] * shift;
+                    bodies[j].z  = fmaxf(bodies[j].z + n[2] * shift, rest_z[j]);
+                    trade(&bodies[i], &bodies[j], n[0], n[1], n[2]);
+                }
+            }
+        }
+    }
+
+    float keep = expf(-k_damp * dt);
+    for (uint32_t i = 0u; i < count; ++i) {
+        if (!bodies[i].awake) {
+            continue;
+        }
+        resolve_ground_velocity(&bodies[i], rest_z[i]);
         bodies[i].vx *= keep;
         bodies[i].vy *= keep;
         bodies[i].vz *= keep;
     }
-    for (uint32_t i = 0; i < count; ++i) {
+
+    for (uint32_t i = 0u; i < count; ++i) {
         sleep_one(bodies, count, i, ground, half);
     }
+}
+
+void motion_substep(MotionBody *bodies, uint32_t count, float dt, float ground, float half) {
+    motion_substep_avbd(bodies, count, dt, ground, half, 4u, nullptr, nullptr, nullptr, nullptr);
 }

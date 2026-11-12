@@ -32,7 +32,7 @@ struct VSOutput {
     float3   view_nrm     : TEXCOORD0;
     float3   world_pos    : TEXCOORD1;
     float2   tile_uv      : TEXCOORD2;
-    float2   elev_span    : TEXCOORD3; // x = elev_m, y = resolved_tile_world_span
+    float3   elev_span    : TEXCOORD3; // x = elev_m, y = resolved_tile_world_span, z = view_pos.z
     nointerpolation uint64_t tile_rel_ptr : TEXCOORD4;
 };
 
@@ -165,7 +165,7 @@ VSOutput main(uint vert_id : SV_VulkanVertexID, uint inst_id : SV_VulkanInstance
     out.view_nrm     = normalize(view_rotate(pc.view.q, world_nrm));
     out.world_pos    = world_pos;
     out.tile_uv      = resolved_uv;
-    out.elev_span    = float2(elev_m, resolved_span);
+    out.elev_span    = float3(elev_m, resolved_span, view_pos.z);
     out.tile_rel_ptr = tile_rel;
     return out;
 }

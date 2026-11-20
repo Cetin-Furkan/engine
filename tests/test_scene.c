@@ -110,10 +110,10 @@ static void test_visbuf_bitpacking(void) {
     CHECK(scene_visbuf_unpack(id0, &inst, &ml, &prim));
     CHECK(inst == 0u && ml == 0u && prim == 0u);
 
-    // Upper range limits: instance 16382 ((16382+1)=16383=0x3FFF), meshlet 2047 (0x7FF), prim 123
-    uint32_t id_max = scene_visbuf_pack(16382u, 2047u, 123u);
+    // Upper range limits: instance 2046 ((2046+1)=2047=0x7FF), meshlet 16383 (0x3FFF), prim 123
+    uint32_t id_max = scene_visbuf_pack(2046u, 16383u, 123u);
     CHECK(scene_visbuf_unpack(id_max, &inst, &ml, &prim));
-    CHECK(inst == 16382u && ml == 2047u && prim == 123u);
+    CHECK(inst == 2046u && ml == 16383u && prim == 123u);
 }
 
 static void test_analytical_barycentrics(void) {

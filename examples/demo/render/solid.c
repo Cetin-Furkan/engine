@@ -224,10 +224,9 @@ int solid_init(VulkanContext *vk) {
     return 0;
 }
 
-void solid_submit_scene(uint32_t kind, bool curved, float yaw_deg,
-                        float origin_x, float origin_y, float origin_z,
-                        float squash, bool selected) {
-    if (kind >= 6u || !solid_ensure_ready()) {
+void solid_submit_scene(uint32_t kind, bool curved, const float world_m[12],
+                        float squash, uint32_t entity_id) {
+    if (kind >= 6u || world_m == nullptr || !solid_ensure_ready()) {
         return;
     }
     uint32_t cage = curved ? 1u : 0u;
@@ -235,18 +234,15 @@ void solid_submit_scene(uint32_t kind, bool curved, float yaw_deg,
     if (mid == K_SCENE_INVALID_MESH) {
         return;
     }
-    const float k_deg_to_rad = 0.017453292519943295f;
-    scene_submit_instance(mid,
-                          origin_x, origin_y, origin_z,
-                          84.0f,
-                          28.0f * k_deg_to_rad,
-                          yaw_deg * k_deg_to_rad,
-                          squash,
-                          0.30f,
-                          selected ? 1.0f : 0.0f,
-                          0.0f,
-                          k_mat_solid0 + kind,
-                          0u);
+    // Right-multiply by uniform 84.0 local mesh scale so ECS entity scale (1,1,1) = natural 84px radius.
+    constexpr float k_solid_base_scale = 84.0f;
+    const float scaled_m[12] = {
+        world_m[0] * k_solid_base_scale, world_m[1] * k_solid_base_scale, world_m[2]  * k_solid_base_scale, world_m[3],
+        world_m[4] * k_solid_base_scale, world_m[5] * k_solid_base_scale, world_m[6]  * k_solid_base_scale, world_m[7],
+        world_m[8] * k_solid_base_scale, world_m[9] * k_solid_base_scale, world_m[10] * k_solid_base_scale, world_m[11],
+    };
+    scene_submit_instance(mid, scaled_m, squash, 0.30f, 0.0f,
+                          k_mat_solid0 + kind, 0u, entity_id);
 }
 
 uint32_t solid_vertex_count_for(uint32_t kind, bool curved) {

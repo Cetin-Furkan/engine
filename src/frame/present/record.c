@@ -136,13 +136,21 @@ int record_and_submit_clear(VulkanContext *vk, FrameSlot *frame, VkSemaphore acq
     // contents, so this is not a queue-family acquire. The release at the
     // end of the buffer is the ownership handoff to the compositor, and
     // the release syncobj is what lets this record start.
-    const bool depth_pass = srgb_view && frame->targets.depth_image != VK_NULL_HANDLE;
+    const bool depth_pass       = srgb_view && frame->targets.depth_image != VK_NULL_HANDLE;
+    const bool use_hdr          = depth_pass &&
+                                  frame->targets.hdr_image != VK_NULL_HANDLE &&
+                                  frame->targets.hdr_view  != VK_NULL_HANDLE &&
+                                  app != nullptr && app->post_process != nullptr;
     const bool unified_internal = vk->device_info.supports_unified_image_layouts;
     const bool unified_color    = unified_internal && (frame->prime_image != VK_NULL_HANDLE);
     VkImage color_image = frame->prime_image != VK_NULL_HANDLE ? frame->prime_image : frame->image.image;
     VkImageMemoryBarrier2 barriers[3] = {0};
     uint32_t nbar = 0;
-    frame_fill_discard_color(&barriers[nbar++], color_image, unified_color);
+    if (use_hdr) {
+        frame_fill_discard_color(&barriers[nbar++], frame->targets.hdr_image, unified_internal);
+    } else {
+        frame_fill_discard_color(&barriers[nbar++], color_image, unified_color);
+    }
     if (frame->targets.coverage_image != VK_NULL_HANDLE) {
         frame_fill_discard_color(&barriers[nbar++], frame->targets.coverage_image, unified_internal);
     }
@@ -159,11 +167,15 @@ int record_and_submit_clear(VulkanContext *vk, FrameSlot *frame, VkSemaphore acq
     if (app != nullptr && app->clear_color != nullptr) {
         app->clear_color(clear_rgba);
     }
+    VkImageView   target_view   = use_hdr ? frame->targets.hdr_view : frame->image_view;
+    VkImageLayout target_layout = use_hdr
+        ? (unified_internal ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)
+        : (unified_color    ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
     VkRenderingAttachmentInfo color_attachment = {
         .sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
         .pNext       = nullptr,
-        .imageView   = frame->image_view,
-        .imageLayout = unified_color ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        .imageView   = target_view,
+        .imageLayout = target_layout,
         .resolveMode = VK_RESOLVE_MODE_NONE,
         .loadOp      = VK_ATTACHMENT_LOAD_OP_CLEAR,
         .storeOp     = VK_ATTACHMENT_STORE_OP_STORE,
@@ -199,7 +211,7 @@ int record_and_submit_clear(VulkanContext *vk, FrameSlot *frame, VkSemaphore acq
         .imageLayout = unified_internal ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
         .loadOp      = VK_ATTACHMENT_LOAD_OP_CLEAR,
         .storeOp     = VK_ATTACHMENT_STORE_OP_DONT_CARE,
-        .clearValue  = { .depthStencil = { .depth = 1.0f, .stencil = 0 } },
+        .clearValue  = { .depthStencil = { .depth = frame->targets.reverse_z ? 0.0f : 1.0f, .stencil = 0 } },
     };
     if (depth_pass && frame->targets.depth_view != VK_NULL_HANDLE) {
         rendering_info.pDepthAttachment = &depth_attachment;
@@ -208,8 +220,8 @@ int record_and_submit_clear(VulkanContext *vk, FrameSlot *frame, VkSemaphore acq
         color_attachment.imageView          = frame->targets.coverage_view;
         color_attachment.imageLayout        = unified_internal ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
         color_attachment.resolveMode        = VK_RESOLVE_MODE_AVERAGE_BIT;
-        color_attachment.resolveImageView   = frame->image_view;
-        color_attachment.resolveImageLayout = unified_color ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        color_attachment.resolveImageView   = target_view;
+        color_attachment.resolveImageLayout = target_layout;
         color_attachment.storeOp            = VK_ATTACHMENT_STORE_OP_DONT_CARE;
     }
 
@@ -230,24 +242,87 @@ int record_and_submit_clear(VulkanContext *vk, FrameSlot *frame, VkSemaphore acq
         (rendering_info.pDepthAttachment != nullptr || app->create_targets == nullptr)) {
         app->draw(frame->cmd_buf, frame->image.width, frame->image.height, draw_live);
     }
-    // The bar is its own surface. This pass is the scene and the readout.
-    // Sample shading is off, so one fragment covers every sample and the
-    // resolve at vkCmdEndRendering is the only color store.
-    VkFormat overlay_depth = VK_FORMAT_UNDEFINED;
-    VkSampleCountFlagBits overlay_samples = VK_SAMPLE_COUNT_1_BIT;
-    if (rendering_info.pDepthAttachment != nullptr) {
-        overlay_depth = frame->targets.depth_format;
-        overlay_samples = frame->targets.samples;
+
+    if (use_hdr) {
+        vkCmdEndRendering(frame->cmd_buf);
+
+        const uint32_t slot_idx = (frame == &frame_state.slot[1]) ? 1u : 0u;
+        app->post_process(frame->cmd_buf, slot_idx,
+                          frame->targets.hdr_image, frame->targets.hdr_view,
+                          color_image, frame->image_view, frame->view_format,
+                          frame->image.width, frame->image.height,
+                          unified_internal, unified_color);
+
+        if (app->draw_overlay != nullptr) {
+            const VkImageLayout swap_layout = unified_color
+                ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            VkImageMemoryBarrier2 ov_bar = {
+                .sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+                .srcStageMask        = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                .srcAccessMask       = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                .dstStageMask        = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                .dstAccessMask       = VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                .oldLayout           = swap_layout,
+                .newLayout           = swap_layout,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .image               = color_image,
+                .subresourceRange    = {
+                    .aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
+                    .baseMipLevel   = 0u,
+                    .levelCount     = 1u,
+                    .baseArrayLayer = 0u,
+                    .layerCount     = 1u,
+                },
+            };
+            frame_cmd_barriers(frame->cmd_buf, &ov_bar, 1u);
+
+            VkRenderingAttachmentInfo ov_color = {
+                .sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+                .imageView   = frame->image_view,
+                .imageLayout = swap_layout,
+                .resolveMode = VK_RESOLVE_MODE_NONE,
+                .loadOp      = VK_ATTACHMENT_LOAD_OP_LOAD,
+                .storeOp     = VK_ATTACHMENT_STORE_OP_STORE,
+            };
+            VkRenderingInfo ov_info = {
+                .sType                = VK_STRUCTURE_TYPE_RENDERING_INFO,
+                .renderArea           = { .extent = { .width = frame->image.width, .height = frame->image.height } },
+                .layerCount           = 1u,
+                .colorAttachmentCount = 1u,
+                .pColorAttachments    = &ov_color,
+            };
+            vkCmdBeginRendering(frame->cmd_buf, &ov_info);
+            vkCmdSetViewport(frame->cmd_buf, 0, 1, &viewport);
+            vkCmdSetScissor(frame->cmd_buf, 0, 1, &scissor);
+            WaylandContext *wl_hud = wayland_get_context();
+            bool have_stamp = wl_hud != nullptr && wl_hud->frame_stamp_valid;
+            app->draw_overlay(frame->cmd_buf, frame->image.width, frame->image.height,
+                              frame->view_format, VK_FORMAT_UNDEFINED, VK_SAMPLE_COUNT_1_BIT,
+                              have_stamp ? wl_hud->frame_time_ms : 0u, have_stamp,
+                              frame->image.drm_format_modifier);
+            vkCmdEndRendering(frame->cmd_buf);
+        }
+    } else {
+        // The bar is its own surface. This pass is the scene and the readout.
+        // Sample shading is off, so one fragment covers every sample and the
+        // resolve at vkCmdEndRendering is the only color store.
+        VkFormat overlay_depth = VK_FORMAT_UNDEFINED;
+        VkSampleCountFlagBits overlay_samples = VK_SAMPLE_COUNT_1_BIT;
+        if (rendering_info.pDepthAttachment != nullptr) {
+            overlay_depth = frame->targets.depth_format;
+            overlay_samples = frame->targets.samples;
+        }
+        if (app != nullptr && app->draw_overlay != nullptr) {
+            WaylandContext *wl_hud = wayland_get_context();
+            bool have_stamp = wl_hud != nullptr && wl_hud->frame_stamp_valid;
+            app->draw_overlay(frame->cmd_buf, frame->image.width, frame->image.height,
+                              frame->view_format, overlay_depth, overlay_samples,
+                              have_stamp ? wl_hud->frame_time_ms : 0u, have_stamp,
+                              frame->image.drm_format_modifier);
+        }
+        vkCmdEndRendering(frame->cmd_buf);
     }
-    if (app != nullptr && app->draw_overlay != nullptr) {
-        WaylandContext *wl_hud = wayland_get_context();
-        bool have_stamp = wl_hud != nullptr && wl_hud->frame_stamp_valid;
-        app->draw_overlay(frame->cmd_buf, frame->image.width, frame->image.height,
-                          frame->view_format, overlay_depth, overlay_samples,
-                          have_stamp ? wl_hud->frame_time_ms : 0u, have_stamp,
-                          frame->image.drm_format_modifier);
-    }
-    vkCmdEndRendering(frame->cmd_buf);
 
     frame_cmd_finish_present(frame->cmd_buf, vk, frame);
     gpu_timer_end_frame(frame->cmd_buf, frame);

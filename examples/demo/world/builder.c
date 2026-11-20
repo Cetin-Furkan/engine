@@ -396,8 +396,35 @@ int world_build_procedural_cathedral(void) {
     if (world_builder_commit(&wb) != 0) {
         return -1;
     }
-    printf("[WorldBuilder] Procedurally constructed World 7: %u cubes, %u non-cube solids (smooth=%s)\n",
-           wb.cubes_placed, wb.solids_placed, wb.smooth_solids ? "yes" : "no");
+
+    // 4. Wire multi-level 3D Transform Hierarchy links (depth 1 & depth 2) preserving world poses
+    EcsWorld *ecs = world_ecs();
+    uint32_t hier_links = 0u;
+    static const int k_links[][2] = {
+        { 1,  0 }, // Ring cube 1 orbits hero cube 0
+        { 9,  8 }, // West tower upper cube attached to lower cube
+        { 11, 10 }, // East tower upper cube attached to lower cube
+        { 13, 12 }, // Octahedron child of Tetrahedron (depth 1)
+        { 14, 13 }, // Icosahedron child of Octahedron (depth 2!)
+        { 16, 15 }, // Cone child of Cylinder (depth 1)
+        { 17, 16 }, // Torus child of Cone (depth 2!)
+    };
+    for (size_t i = 0u; i < sizeof(k_links) / sizeof(k_links[0]); ++i) {
+        WorldObj *child  = table_at(k_links[i][0]);
+        WorldObj *parent = table_at(k_links[i][1]);
+        if (child != nullptr && parent != nullptr && child->alive && parent->alive) {
+            if (ecs_set_parent(ecs, child->entity, parent->entity, true)) {
+                hier_links++;
+            }
+        }
+    }
+    ecs_propagate_transforms(ecs);
+    if (table_count() > 0) {
+        table_select_quiet(0);
+    }
+
+    printf("[WorldBuilder] Procedurally constructed World 7: %u cubes, %u non-cube solids, %u hierarchy links (smooth=%s)\n",
+           wb.cubes_placed, wb.solids_placed, hier_links, wb.smooth_solids ? "yes" : "no");
     fflush(stdout);
     return 0;
 }

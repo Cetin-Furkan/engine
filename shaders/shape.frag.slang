@@ -20,5 +20,5 @@ struct FullPush {
 
 [shader("fragment")]
 float4 main([[vk::location(0)]] nointerpolation float3 v_emit : TEXCOORD0) : SV_Target0 {
-    return float4(min(float3(pc.r, pc.g, pc.b) + v_emit, float3(1.0)), pc.a);
+    return float4(max(float3(pc.r, pc.g, pc.b) + v_emit, float3(0.0)), pc.a);
 }

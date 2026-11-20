@@ -65,6 +65,7 @@ typedef struct InputCursor {
     float    left_down_y;
     bool     rel_frame_seen;
     bool     lock_wanted;
+    bool     hover_dirty;
 } InputCursor;
 
 typedef struct InputSpawn {

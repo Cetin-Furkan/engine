@@ -72,12 +72,18 @@ struct WorldObj {
     bool            alive;
     bool            shown_alive;
     Spin           *spin;
+    EcsEntity       entity;
+    float           last_spin_deg;
 };
 
-enum : int { k_table_cap = 64 };
+enum : int { k_table_cap = 512 };
 
 void table_reset(void);
 int table_add(const WorldOps *ops, void *data, Coord at, Spin *spin);
+void table_configure_entity(int index, EcsKind kind, const float half_ext[3],
+                            float radius, float pitch_deg);
+void table_sync_ecs(bool live);
+void table_sync_entity_world_pos(WorldObj *o);
 void table_publish(void);
 WorldObj *table_at(int index);
 int table_count(void);
@@ -180,6 +186,9 @@ void terrain_kind_reset(void);
 bool terrain_kind_spawn(void);
 const WorldOps *terrain_ops(void);
 
+void model_kind_reset(void);
+bool model_kind_spawn(const char *path, Coord at, float scale, bool auto_fit);
+
 // A removed cube, solid, or mesh. Newest is the last entry. Faces are not stored.
 enum : int {
     k_removed_cube  = 0,
@@ -253,5 +262,9 @@ bool world_builder_add_helix(WorldBuilder *wb, Coord center, float radius,
 [[nodiscard]] int world_builder_commit(const WorldBuilder *wb);
 [[nodiscard]] int world_build_procedural_cathedral(void);
 [[nodiscard]] int world_build_besparmak_terrain(void);
+
+void world_interact_reset(void);
+bool world_interact_release(void);
+bool world_interact_busy(void);
 
 #endif /* ENGINE_WORLD_INT_H */

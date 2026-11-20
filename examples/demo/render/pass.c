@@ -1,9 +1,11 @@
 #include "frame/pass.h"
+#include "post/post.h"
 #include "vulkan/memory.h"
 #include <stdio.h>
 #include <stdlib.h>
 
 static VkFormat              s_depth_format = VK_FORMAT_UNDEFINED;
+static VkFormat              s_hdr_format   = VK_FORMAT_B10G11R11_UFLOAT_PACK32;
 static VkSampleCountFlagBits s_samples = VK_SAMPLE_COUNT_1_BIT;
 
 static void pass_fail(const char *what, VkResult res) {
@@ -73,10 +75,12 @@ int pass_init(VulkanContext *vk) {
         fprintf(stderr, "[Pass Error] No depth attachment format\n");
         return -1;
     }
-    // Color and depth must share a count. A resolve and a depth test
-    // that disagree are not the same pass.
+    // Color (linear HDR) and depth must share a sample count. A resolve and a
+    // depth test that disagree are not the same pass.
+    VkFormat hdr_fmt = post_hdr_format();
+    s_hdr_format = (hdr_fmt != VK_FORMAT_UNDEFINED) ? hdr_fmt : VK_FORMAT_R16G16B16A16_SFLOAT;
     VkSampleCountFlags color_counts = image_sample_counts(
-        vk, VK_FORMAT_B8G8R8A8_SRGB, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+        vk, s_hdr_format, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
     VkSampleCountFlags depth_counts = image_sample_counts(
         vk, s_depth_format, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT);
     s_samples = pick_samples(color_counts & depth_counts, resolve_max_msaa(vk));
@@ -96,6 +100,7 @@ typedef struct PoolSlot {
 
 static PoolSlot s_depth_pool[k_pool];
 static PoolSlot s_cover_pool[k_pool];
+static PoolSlot s_hdr_pool[k_pool];
 
 static void pool_free_all(VulkanContext *vk, PoolSlot *pool) {
     if (vk == nullptr || vk->device == VK_NULL_HANDLE) {
@@ -109,8 +114,8 @@ static void pool_free_all(VulkanContext *vk, PoolSlot *pool) {
     }
 }
 
-static int pool_acquire(VulkanContext *vk, PoolSlot *pool, const VkMemoryRequirements *reqs,
-                        VkDeviceMemory *out) {
+static int pool_acquire_flags(VulkanContext *vk, PoolSlot *pool, const VkMemoryRequirements *reqs,
+                              bool allow_lazy, VkDeviceMemory *out) {
     int best_i = -1;
     for (uint32_t i = 0; i < k_pool; ++i) {
         if (pool[i].live || pool[i].memory == VK_NULL_HANDLE) {
@@ -160,10 +165,13 @@ static int pool_acquire(VulkanContext *vk, PoolSlot *pool, const VkMemoryRequire
         return -1;
     }
     uint32_t type_index = 0;
-    VulkanResult mem = vulkan_find_memory_type(
-        vk, reqs->memoryTypeBits,
-        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT,
-        &type_index);
+    VulkanResult mem = VULKAN_ERROR_UNKNOWN;
+    if (allow_lazy) {
+        mem = vulkan_find_memory_type(
+            vk, reqs->memoryTypeBits,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT,
+            &type_index);
+    }
     if (mem != VULKAN_SUCCESS) {
         mem = vulkan_find_memory_type(
             vk, reqs->memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &type_index);
@@ -204,6 +212,11 @@ static int pool_acquire(VulkanContext *vk, PoolSlot *pool, const VkMemoryRequire
     return 0;
 }
 
+static int pool_acquire(VulkanContext *vk, PoolSlot *pool, const VkMemoryRequirements *reqs,
+                        VkDeviceMemory *out) {
+    return pool_acquire_flags(vk, pool, reqs, true, out);
+}
+
 static void pool_release(PoolSlot *pool, VkDeviceMemory memory) {
     if (memory == VK_NULL_HANDLE) {
         return;
@@ -219,12 +232,18 @@ static void pool_release(PoolSlot *pool, VkDeviceMemory memory) {
 void pass_shutdown(VulkanContext *vk) {
     pool_free_all(vk, s_depth_pool);
     pool_free_all(vk, s_cover_pool);
+    pool_free_all(vk, s_hdr_pool);
     s_depth_format = VK_FORMAT_UNDEFINED;
+    s_hdr_format   = VK_FORMAT_B10G11R11_UFLOAT_PACK32;
     s_samples = VK_SAMPLE_COUNT_1_BIT;
 }
 
 VkFormat pass_depth_format(void) {
     return s_depth_format;
+}
+
+VkFormat pass_hdr_format(void) {
+    return s_hdr_format;
 }
 
 VkSampleCountFlagBits pass_raster_samples(void) {
@@ -240,6 +259,9 @@ void pass_pool_stats(uint64_t *out_depth_bytes, uint64_t *out_cover_bytes) {
         }
         if (s_cover_pool[i].memory != VK_NULL_HANDLE) {
             cover_sum += (uint64_t)s_cover_pool[i].capacity;
+        }
+        if (s_hdr_pool[i].memory != VK_NULL_HANDLE) {
+            cover_sum += (uint64_t)s_hdr_pool[i].capacity;
         }
     }
     if (out_depth_bytes != nullptr) {
@@ -388,7 +410,7 @@ int pass_coverage_create(VulkanContext *vk, PassCoverage *coverage,
     VkImageCreateInfo image_info = {
         .sType         = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
         .imageType     = VK_IMAGE_TYPE_2D,
-        .format        = VK_FORMAT_B8G8R8A8_SRGB,
+        .format        = s_hdr_format,
         .extent        = { .width = width, .height = height, .depth = 1 },
         .mipLevels     = 1,
         .arrayLayers   = 1,
@@ -450,7 +472,7 @@ int pass_coverage_create(VulkanContext *vk, PassCoverage *coverage,
         .sType    = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
         .image    = coverage->image,
         .viewType = VK_IMAGE_VIEW_TYPE_2D,
-        .format   = VK_FORMAT_B8G8R8A8_SRGB,
+        .format   = s_hdr_format,
         .subresourceRange = {
             .aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
             .baseMipLevel   = 0,
@@ -463,6 +485,92 @@ int pass_coverage_create(VulkanContext *vk, PassCoverage *coverage,
     if (res != VK_SUCCESS) {
         pass_fail("vkCreateImageView coverage", res);
         pass_coverage_destroy(vk, coverage);
+        return -1;
+    }
+    return 0;
+}
+
+void pass_hdr_destroy(VulkanContext *vk, PassHdr *hdr) {
+    if (hdr == nullptr) {
+        return;
+    }
+    if (vk != nullptr && vk->device != VK_NULL_HANDLE) {
+        if (hdr->view != VK_NULL_HANDLE) {
+            vkDestroyImageView(vk->device, hdr->view, nullptr);
+        }
+        if (hdr->image != VK_NULL_HANDLE) {
+            vkDestroyImage(vk->device, hdr->image, nullptr);
+        }
+        pool_release(s_hdr_pool, hdr->memory);
+    }
+    *hdr = (PassHdr){0};
+}
+
+int pass_hdr_create(VulkanContext *vk, PassHdr *hdr, uint32_t width, uint32_t height) {
+    if (vk == nullptr || hdr == nullptr || width == 0u || height == 0u ||
+        s_hdr_format == VK_FORMAT_UNDEFINED) {
+        return -1;
+    }
+    pass_hdr_destroy(vk, hdr);
+    VkImageCreateInfo image_info = {
+        .sType         = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        .imageType     = VK_IMAGE_TYPE_2D,
+        .format        = s_hdr_format,
+        .extent        = { .width = width, .height = height, .depth = 1u },
+        .mipLevels     = 1u,
+        .arrayLayers   = 1u,
+        .samples       = VK_SAMPLE_COUNT_1_BIT,
+        .tiling        = VK_IMAGE_TILING_OPTIMAL,
+        .usage         = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+    };
+    VkResult res = vkCreateImage(vk->device, &image_info, nullptr, &hdr->image);
+    if (res != VK_SUCCESS) {
+        pass_fail("vkCreateImage hdr", res);
+        pass_hdr_destroy(vk, hdr);
+        return -1;
+    }
+    VkImageMemoryRequirementsInfo2 req_info = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2,
+        .image = hdr->image,
+    };
+    VkMemoryRequirements2 reqs2 = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2,
+    };
+    vkGetImageMemoryRequirements2(vk->device, &req_info, &reqs2);
+    if (pool_acquire_flags(vk, s_hdr_pool, &reqs2.memoryRequirements, false, &hdr->memory) != 0) {
+        fprintf(stderr, "[Pass Error] No memory for the linear HDR image\n");
+        pass_hdr_destroy(vk, hdr);
+        return -1;
+    }
+    VkBindImageMemoryInfo bind = {
+        .sType  = VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_INFO,
+        .image  = hdr->image,
+        .memory = hdr->memory,
+    };
+    res = vkBindImageMemory2(vk->device, 1u, &bind);
+    if (res != VK_SUCCESS) {
+        pass_fail("vkBindImageMemory2 hdr", res);
+        pass_hdr_destroy(vk, hdr);
+        return -1;
+    }
+    VkImageViewCreateInfo view = {
+        .sType    = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+        .image    = hdr->image,
+        .viewType = VK_IMAGE_VIEW_TYPE_2D,
+        .format   = s_hdr_format,
+        .subresourceRange = {
+            .aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
+            .baseMipLevel   = 0u,
+            .levelCount     = 1u,
+            .baseArrayLayer = 0u,
+            .layerCount     = 1u,
+        },
+    };
+    res = vkCreateImageView(vk->device, &view, nullptr, &hdr->view);
+    if (res != VK_SUCCESS) {
+        pass_fail("vkCreateImageView hdr", res);
+        pass_hdr_destroy(vk, hdr);
         return -1;
     }
     return 0;

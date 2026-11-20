@@ -431,5 +431,5 @@ float4 main(FSInput input) : SV_Target0 {
         lit_color = lerp(lit_color, float3(1.00, 0.86, 0.18), ov_corner_mask * 0.95);
     }
 
-    return float4(clamp(lit_color, float3(0.0), float3(1.0)), 1.0);
+    return float4(max(lit_color, float3(0.0)), 1.0);
 }

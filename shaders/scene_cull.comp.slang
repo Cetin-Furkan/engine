@@ -53,7 +53,7 @@ bool test_hiz_occluded(float3 world_center, float world_radius, float depth_bias
     uint  fh    = hdr.full_height;
 
     float3 vc = view_of(world_center, q, cam);
-    float  z_sphere_min;
+    float  z_sphere_max; // Closest Reverse-Z depth of sphere (higher = closer)
     float  cx_px, cy_px, r_px;
 
     if (persp > 1.0e-7) {
@@ -62,17 +62,17 @@ bool test_hiz_occluded(float3 world_center, float world_radius, float depth_bias
             return false;
         }
         float w_c = max(1.0 - vc.z * persp, k_persp_w_near);
-        z_sphere_min = (k_persp_z_a - k_persp_z_b / w_near_sph) - depth_bias - 1.5e-4;
+        z_sphere_max = (k_persp_w_near / w_near_sph) + depth_bias + 1.5e-4;
         cx_px = 0.5 * float(fw) + (vc.x / w_c) * zoom;
         cy_px = 0.5 * float(fh) - (vc.y / w_c) * zoom;
         r_px  = (world_radius / w_near_sph) * zoom + 2.0;
     } else {
-        z_sphere_min = 0.5 - (vc.z + world_radius) / 4096.0 - depth_bias - 1.5e-4;
+        z_sphere_max = 0.5 + (vc.z + world_radius) / 8192.0 + depth_bias + 1.5e-4;
         cx_px = 0.5 * float(fw) + vc.x * zoom;
         cy_px = 0.5 * float(fh) - vc.y * zoom;
         r_px  = world_radius * zoom + 1.0;
     }
-    if (z_sphere_min <= 0.0) {
+    if (z_sphere_max >= 1.0) {
         return false;
     }
 
@@ -111,21 +111,18 @@ bool test_hiz_occluded(float3 world_center, float world_radius, float depth_bias
     float d10 = hiz_floats[base + my0 * mi.width + mx1];
     float d01 = hiz_floats[base + my1 * mi.width + mx0];
     float d11 = hiz_floats[base + my1 * mi.width + mx1];
-    float hiz_max = max(max(d00, d10), max(d01, d11));
+    float hiz_min = min(min(d00, d10), min(d01, d11));
 
-    return z_sphere_min > hiz_max;
+    // In Reverse-Z, smaller depth is farther; occluded when sphere's closest z < tile's farthest z
+    return z_sphere_max < hiz_min;
 }
 
 void compute_meshlet_world_sphere(SceneMeshlet ml, SceneInstance inst,
                                   out float3 out_center, out float out_radius) {
     float sz  = clamp(1.0 + inst.squash, 0.45, 1.85);
     float sxy = rsqrt(sz);
-    float3 posed_c = rotate_pose(ml.center, inst.pitch_rad, inst.yaw_rad) * inst.uniform_scale;
-    posed_c.x *= sxy;
-    posed_c.y *= sxy;
-    posed_c.z *= sz;
-    out_center = posed_c + float3(inst.origin_x, inst.origin_y, inst.origin_z);
-    out_radius = max(sxy, sz) * inst.uniform_scale * ml.radius;
+    out_center = scene_transform_point_squash(ml.center, inst);
+    out_radius = max(sxy, sz) * inst.bound_scale * ml.radius;
 }
 
 bool test_cone_backfacing(SceneMeshlet ml, SceneInstance inst, float4 q_cam,
@@ -138,6 +135,23 @@ bool test_cone_backfacing(SceneMeshlet ml, SceneInstance inst, float4 q_cam,
 
     float sz  = clamp(1.0 + inst.squash, 0.45, 1.85);
     float sxy = rsqrt(sz);
+    float3 a0 = inst.world_r0.xyz * sxy;
+    float3 a1 = inst.world_r1.xyz * sxy;
+    float3 a2 = inst.world_r2.xyz * sz;
+
+    // Conservative anisotropy ratio so non-uniformly scaled / sheared instances never false-cull
+    float3 col0 = float3(a0.x, a1.x, a2.x);
+    float3 col1 = float3(a0.y, a1.y, a2.y);
+    float3 col2 = float3(a0.z, a1.z, a2.z);
+    float  s0   = length(col0);
+    float  s1   = length(col1);
+    float  s2   = length(col2);
+    float  smin = min(s0, min(s1, s2));
+    float  smax = max(s0, max(s1, s2));
+    if (smin < 1.0e-5) {
+        return false;
+    }
+
     float3 cam_dir_world;
     float  angular_pad = 0.0;
     if (pc.persp > 1.0e-7) {
@@ -149,13 +163,23 @@ bool test_cone_backfacing(SceneMeshlet ml, SceneInstance inst, float4 q_cam,
             return false;
         }
         cam_dir_world = to_eye / dist;
-        angular_pad   = world_radius / dist;
+        angular_pad   = (world_radius / dist) * (smax / smin);
     } else {
         cam_dir_world = scene_inv_view_rotate(q_cam, float3(0.0, 0.0, 1.0));
     }
 
-    float3 cam_dir_scaled = float3(cam_dir_world.x / sxy, cam_dir_world.y / sxy, cam_dir_world.z / sz);
-    float3 w_model = normalize(scene_inv_rotate_pose(cam_dir_scaled, inst.pitch_rad, inst.yaw_rad));
+    // Transform world view direction to local space via adjugate(A) * sign(det(A))
+    // so dot(world_n, cam_dir_world) > 0 <=> dot(local_n, w_model) > 0
+    float3 c0 = cross(a1, a2);
+    float3 c1 = cross(a2, a0);
+    float3 c2 = cross(a0, a1);
+    float  ds = dot(a0, c0) < 0.0 ? -1.0 : 1.0;
+    float3 vm = (c0 * cam_dir_world.x + c1 * cam_dir_world.y + c2 * cam_dir_world.z) * ds;
+    float  vl2 = dot(vm, vm);
+    if (vl2 < 1.0e-12) {
+        return false;
+    }
+    float3 w_model = vm * rsqrt(vl2);
 
     return dot(axis, w_model) < (cutoff - angular_pad);
 }
@@ -170,8 +194,7 @@ bool test_sphere_in_frustum(float3 world_center, float world_radius, float depth
 
     if (pc.persp > 1.0e-7) {
         float w_far_sph  = 1.0 - (vc.z - world_radius) * pc.persp;
-        float w_near_sph = 1.0 - (vc.z + world_radius) * pc.persp;
-        if (w_far_sph < k_persp_w_near || w_near_sph > k_persp_w_far) {
+        if (w_far_sph < k_persp_w_near) {
             return false;
         }
         float w_max = max(w_far_sph, k_persp_w_near);
@@ -189,8 +212,8 @@ bool test_sphere_in_frustum(float3 world_center, float world_radius, float depth
         return false;
     }
 
-    float z_min = 0.5 - (vc.z + world_radius) / 4096.0 - depth_bias;
-    float z_max = 0.5 - (vc.z - world_radius) / 4096.0 - depth_bias;
+    float z_max = 0.5 + (vc.z + world_radius) / 8192.0 + depth_bias;
+    float z_min = 0.5 + (vc.z - world_radius) / 8192.0 + depth_bias;
     if (z_max < 0.0 || z_min > 1.0) {
         return false;
     }

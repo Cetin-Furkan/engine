@@ -18,7 +18,6 @@ static bool     s_pose_glow = false;
 static const WorldOps s_ops;
 
 static bool mesh_hit(const WorldObj *o, const CameraRay *ray, float *t, Coord *at) {
-    (void)o;
     float cx = 0.0f;
     float cy = 0.0f;
     float radius = 0.0f;
@@ -26,6 +25,11 @@ static bool mesh_hit(const WorldObj *o, const CameraRay *ray, float *t, Coord *a
         return false;
     }
     Coord center = { cx, cy, 0.0f };
+    EcsSphere sph = {0};
+    if (o != nullptr && ecs_get_world_sphere(world_ecs(), o->entity, &sph) && sph.radius > 1.0f) {
+        center = (Coord){ sph.center[0], sph.center[1], sph.center[2] };
+        radius = sph.radius;
+    }
     if (!coord_sphere_hit(ray, center, radius, t)) {
         return false;
     }
@@ -60,9 +64,13 @@ static bool mesh_busy(const WorldObj *o) {
 
 static void mesh_prepare_obj(const WorldObj *o, bool live) {
     const MeshData *m = o->data;
+    float world_m[12];
+    if (m == nullptr || !ecs_get_world_matrix(world_ecs(), o->entity, world_m)) {
+        return;
+    }
     bool glow = live ? m->spin.glow : m->spin.shown_glow;
     material_set(k_mat_mesh, glow);
-    mesh_submit_scene(spin_deg(&m->spin, live), table_highlight(o, live));
+    mesh_submit_scene(world_m, o->entity);
 }
 
 static bool mesh_toggle_spin(WorldObj *o) {
@@ -177,6 +185,8 @@ bool mesh_kind_raise(void) {
         fprintf(stderr, "[World] No room for the mesh.\n");
         return false;
     }
+    const float ext[3] = { 90.0f, 70.0f, 48.0f };
+    table_configure_entity(index, ECS_KIND_MESH, ext, radius, 0.0f);
     table_select_quiet(index);
     s_have_pose = false;
     if (s_mesh.spin.spinning) {

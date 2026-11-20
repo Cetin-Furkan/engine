@@ -11,9 +11,8 @@
 [[nodiscard]] int solid_init(VulkanContext *vk);
 void solid_shutdown(VulkanContext *vk);
 
-void solid_submit_scene(uint32_t kind, bool curved, float yaw_deg,
-                        float origin_x, float origin_y, float origin_z,
-                        float squash, bool selected);
+void solid_submit_scene(uint32_t kind, bool curved, const float world_m[12],
+                        float squash, uint32_t entity_id);
 
 // Vertices one raised solid of this kind represents (faceted or rounded cage).
 uint32_t solid_vertex_count_for(uint32_t kind, bool curved);

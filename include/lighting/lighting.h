@@ -31,7 +31,22 @@ enum : uint32_t {
 enum : uint32_t {
     K_LIGHTING_FLAG_HAS_SHADOW   = 1u << 0,
     K_LIGHTING_FLAG_FILT_IN_GBUF = 1u << 1,
+    K_LIGHTING_DEBUG_SHIFT       = 4u,
+    K_LIGHTING_DEBUG_MASK        = 0xFu << 4u,
 };
+
+typedef enum LightingDebugView : uint32_t {
+    LIGHTING_DEBUG_LIT       = 0u,
+    LIGHTING_DEBUG_ALBEDO    = 1u,
+    LIGHTING_DEBUG_NORMALS   = 2u,
+    LIGHTING_DEBUG_ROUGHNESS = 3u,
+    LIGHTING_DEBUG_DEPTH     = 4u,
+    LIGHTING_DEBUG_GI        = 5u,
+    LIGHTING_DEBUG_AO        = 6u,
+    LIGHTING_DEBUG_SHADOW    = 7u,
+    LIGHTING_DEBUG_MESHLETS  = 8u,
+    LIGHTING_DEBUG_COUNT     = 9u,
+} LightingDebugView;
 
 // 144-byte directional shadow map + studio sky & perspective block at env_bda + 12608.
 typedef struct LightingShadowBlock {
@@ -300,9 +315,14 @@ void lighting_shadow_get_descriptor(VkImageView *out_view, VkSampler *out_sample
 [[nodiscard]] bool lighting_shadow_begin(VkCommandBuffer cmd, float out_light_clip_vp[16]);
 void lighting_shadow_end(VkCommandBuffer cmd);
 
-void lighting_prepare(VkCommandBuffer cmd, uint32_t width, uint32_t height);
+struct RgGraph;
+void lighting_prepare(struct RgGraph *g, uint32_t width, uint32_t height);
 
 bool lighting_toggle_gi(void);
 void lighting_get_stats(LightingBenchStats *out_stats);
+
+LightingDebugView lighting_debug_view(void);
+LightingDebugView lighting_cycle_debug_view(bool reset_to_lit);
+const char       *lighting_debug_view_name(LightingDebugView view);
 
 #endif /* ENGINE_LIGHTING_H */

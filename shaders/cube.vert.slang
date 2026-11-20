@@ -2,20 +2,29 @@
 #include "material.slang"
 #include "face_grid.slang"
 
+struct CubeXform {
+    float4 world_r0;
+    float4 world_r1;
+    float4 world_r2;
+    uint   entity_id;
+    uint   pad0;
+    uint   pad1;
+    uint   pad2;
+};
+
 struct DrawPush {
     uint64_t verts;
-    uint width;
-    uint height;
-    float yaw_deg;
-    float origin_x;
-    float origin_y;
-    float depth_bias;
     uint64_t heat;
-    float phase;
-    float selected;
+    uint64_t xform;
     uint64_t grid;
-    uint grid_n;
-    float origin_z;
+    uint     width;
+    uint     height;
+    uint     grid_n;
+    float    depth_bias;
+    float    phase;
+    uint     entity_id;
+    uint     pad0;
+    uint     pad1;
     ViewPush view;
 };
 [[vk::push_constant]] DrawPush screen;
@@ -26,7 +35,8 @@ struct VSOutput {
     [[vk::location(1)]] float3 v_albedo : TEXCOORD1;
     [[vk::location(2)]] float3 v_emit : TEXCOORD2;
     [[vk::location(3)]] float  v_view_z : TEXCOORD3;
-    [[vk::location(4)]] nointerpolation uint64_t v_env_bda : TEXCOORD4;
+    [[vk::location(4)]] nointerpolation uint64_t v_env_bda    : TEXCOORD4;
+    [[vk::location(5)]] nointerpolation uint     v_cluster_id : TEXCOORD5;
 };
 
 static const float k_edge_px = 240.0;
@@ -238,22 +248,28 @@ VSOutput main(uint vert_id : SV_VulkanVertexID) {
         }
     }
 
-    const float ax = radians(28.0);
-    float ay = radians(screen.yaw_deg);
-    float3 posed_pos = rotate_pose(in_pos, ax, ay);
-    float3 posed_nrm = rotate_pose(in_nrm, ax, ay);
+    CubeXform xf = ((CubeXform *)screen.xform)[0];
+    float3 local_px = in_pos * (k_edge_px * 0.5);
+    float3 p = float3(
+        dot(xf.world_r0.xyz, local_px) + xf.world_r0.w,
+        dot(xf.world_r1.xyz, local_px) + xf.world_r1.w,
+        dot(xf.world_r2.xyz, local_px) + xf.world_r2.w);
 
-    float3 p = posed_pos * (k_edge_px * 0.5);
-    p.x += screen.origin_x;
-    p.y += screen.origin_y;
-    p.z += screen.origin_z;
+    float3 c0 = cross(xf.world_r1.xyz, xf.world_r2.xyz);
+    float3 c1 = cross(xf.world_r2.xyz, xf.world_r0.xyz);
+    float3 c2 = cross(xf.world_r0.xyz, xf.world_r1.xyz);
+    float  ds = dot(xf.world_r0.xyz, c0) < 0.0 ? -1.0 : 1.0;
+    float3 wn = float3(dot(c0, in_nrm), dot(c1, in_nrm), dot(c2, in_nrm)) * ds;
+    float  wl = dot(wn, wn);
+    float3 posed_nrm = wl > 1.0e-12 ? wn * rsqrt(wl) : float3(0.0, 0.0, 1.0);
 
     float3 view = view_of(p, screen.view.q, screen.view.cam);
     VSOutput out;
-    out.sv_pos = view_ndc_persp(view, screen.view.zoom, screen.view.persp, screen.width, screen.height, screen.depth_bias);
-    out.v_nrm = view_rotate(screen.view.q, posed_nrm);
-    out.v_view_z = view.z;
-    out.v_env_bda = screen.view.materials;
+    out.sv_pos       = view_ndc_persp(view, screen.view.zoom, screen.view.persp, screen.width, screen.height, screen.depth_bias);
+    out.v_nrm        = view_rotate(screen.view.q, posed_nrm);
+    out.v_view_z     = view.z;
+    out.v_env_bda    = screen.view.materials;
+    out.v_cluster_id = screen.entity_id != 0u ? screen.entity_id : 1u;
 
     float3 axis = float3(0.57735026919);
     float ang = 6.28318530718 * (screen.phase + dot(in_pos, float3(0.10, 0.14, 0.08)));
@@ -290,10 +306,8 @@ VSOutput main(uint vert_id : SV_VulkanVertexID) {
         cool = lerp(graded, float3(0.45, 0.72, 1.0), cell);
     }
 
-    float temp = clamp(sv.temp, 0.0, 1.0);
-    out.v_albedo = lerp(cool, float3(1.0, 0.42, 0.12), temp);
-    out.v_albedo = lerp(out.v_albedo, float3(1.0), clamp(screen.selected, 0.0, 1.0) * 0.42);
-    out.v_emit = material_emit(screen.view.materials, screen.view.mat_index);
+    out.v_albedo = cool;
+    out.v_emit   = material_emit(screen.view.materials, screen.view.mat_index);
 
     return out;
 }

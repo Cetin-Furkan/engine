@@ -3,6 +3,11 @@
 #include "frame/frame.h"
 #include "frame/pass.h"
 #include "frame/world.h"
+#include "ecs/ecs.h"
+#include "gizmo/gizmo.h"
+#include "graph/graph.h"
+#include "lighting/lighting.h"
+#include "post/post.h"
 #include "ring/ring.h"
 #include "vulkan/bda.h"
 #include "vulkan/pipe.h"
@@ -44,7 +49,7 @@ static_assert(sizeof(HudPush) == 16u, "hud push");
 
 static VulkanContext *s_vk = nullptr;
 
-enum { k_hud_lines = 5, k_line_cap = 48 };
+enum { k_hud_base_lines = 5, k_hud_max_lines = 24, k_line_cap = 52 };
 
 static const uint32_t k_flag_srgb = 1u;
 static const uint32_t k_flag_unorm = 0u;
@@ -73,8 +78,10 @@ static VulkanGfxLive    s_scene_srgb;
 static VulkanGfxLive    s_scene_unorm;
 static VkFormat              s_scene_depth = VK_FORMAT_UNDEFINED;
 static VkSampleCountFlagBits s_scene_samples = VK_SAMPLE_COUNT_1_BIT;
-static char             s_line[k_hud_lines][k_line_cap + 1];
-static uint32_t         s_line_n[k_hud_lines];
+static char             s_line[k_hud_max_lines][k_line_cap + 1];
+static uint32_t         s_line_n[k_hud_max_lines];
+static uint32_t         s_active_lines = k_hud_base_lines;
+static bool             s_profiler_open = false;
 static uint32_t         s_cqe_count = 0;
 static uint32_t         s_cqe_rate = 0;
 static uint64_t         s_cqe_t0 = 0;
@@ -338,13 +345,88 @@ void hud_prepare(uint32_t frame_ms, bool have_stamp, uint64_t modifier) {
         s_bda_t0 = now;
     }
     double bda_mib = s_bda_mib;
-    int wrote[k_hud_lines];
+    int wrote[k_hud_max_lines];
+    for (uint32_t r = 0u; r < k_hud_max_lines; ++r) {
+        wrote[r] = -1;
+    }
     wrote[0] = snprintf(s_line[0], sizeof s_line[0], "%u fps  %u us", fps, us);
     wrote[1] = snprintf(s_line[1], sizeof s_line[1], "miss %u  %u cq/s", s_turn_missed, cqe_rate());
     wrote[2] = snprintf(s_line[2], sizeof s_line[2], "obj %u  vert %u", objects, verts);
     wrote[3] = snprintf(s_line[3], sizeof s_line[3], "%s  zoom %s", kind, zoom_text);
     wrote[4] = snprintf(s_line[4], sizeof s_line[4], "gpu %u+%u us  bda %.1fM", comp_us, rend_us, bda_mib);
-    for (uint32_t row = 0; row < k_hud_lines; ++row) {
+
+    uint32_t lines = k_hud_base_lines;
+    LightingDebugView dbg_v = lighting_debug_view();
+    if (dbg_v != LIGHTING_DEBUG_LIT && lines < k_hud_max_lines) {
+        wrote[lines] = snprintf(s_line[lines], sizeof s_line[lines],
+                                "VIEW %s (F12)", lighting_debug_view_name(dbg_v));
+        lines++;
+    }
+    const EcsWorld   *ecs = world_ecs();
+    const GizmoState *gz  = world_gizmo();
+    EcsEntity         sel = world_selected_entity();
+    if (ecs != nullptr && gz != nullptr && sel != ECS_NULL_ENTITY && ecs_alive(ecs, sel) &&
+        lines + 3u <= k_hud_max_lines) {
+        const char *ename  = ecs_get_name(ecs, sel);
+        EcsKind     ekind  = ecs_get_kind(ecs, sel);
+        EcsEntity   parent = ecs_get_parent(ecs, sel);
+        uint32_t    depth  = ecs_get_depth(ecs, sel);
+        uint32_t    kids   = ecs_count_children(ecs, sel);
+        char        pbuf[16];
+        if (parent != ECS_NULL_ENTITY) {
+            snprintf(pbuf, sizeof pbuf, "P#%u", (unsigned)(parent & ECS_INDEX_MASK));
+        } else {
+            snprintf(pbuf, sizeof pbuf, "root");
+        }
+        wrote[lines] = snprintf(s_line[lines], sizeof s_line[lines],
+                                "#%u %s(k%u) %s D%u C%u",
+                                (unsigned)(sel & ECS_INDEX_MASK),
+                                ename != nullptr ? ename : "Obj",
+                                (unsigned)ekind, pbuf, depth, kids);
+        lines++;
+
+        EcsTrs wt = {0};
+        if (ecs_get_world_trs(ecs, sel, &wt)) {
+            float eul[3] = {0};
+            ecs_quat_to_euler_deg(wt.rot, eul);
+            wrote[lines] = snprintf(s_line[lines], sizeof s_line[lines],
+                                    "GZM %s[%s]%s POS %.0f,%.0f,%.0f",
+                                    gizmo_mode_name(gz->mode),
+                                    gizmo_space_name(gz->space),
+                                    gz->snap_active ? "*" : "",
+                                    (double)wt.pos[0], (double)wt.pos[1], (double)wt.pos[2]);
+            lines++;
+            wrote[lines] = snprintf(s_line[lines], sizeof s_line[lines],
+                                    "ROT %.0f,%.0f,%.0f SCL %.2f,%.2f,%.2f",
+                                    (double)eul[0], (double)eul[1], (double)eul[2],
+                                    (double)wt.scale[0], (double)wt.scale[1], (double)wt.scale[2]);
+            lines++;
+        }
+    } else if (gz != nullptr && gz->debug_draw && lines < k_hud_max_lines) {
+        wrote[lines] = snprintf(s_line[lines], sizeof s_line[lines],
+                                "DBG3D AABB+Hierarchy+Triads (B)");
+        lines++;
+    }
+    if (s_profiler_open && lines < k_hud_max_lines) {
+        PostBenchStats pbs = {0};
+        post_get_stats(&pbs);
+        const char *fmt_s = (pbs.hdr_format == VK_FORMAT_B10G11R11_UFLOAT_PACK32) ? "R11G11B10F" : "RGBA16F";
+        wrote[lines] = snprintf(s_line[lines], sizeof s_line[lines],
+                                "HDR %s exp=%.2f blm=%s",
+                                fmt_s, (double)pbs.last_exposure_scale,
+                                pbs.bloom_enabled ? "ON" : "OFF");
+        lines++;
+        RgProfileSnapshot snap = {0};
+        rg_get_profile(&snap);
+        for (uint32_t p = 0u; p < snap.pass_count && lines < k_hud_max_lines; ++p) {
+            wrote[lines] = snprintf(s_line[lines], sizeof s_line[lines],
+                                    " %-14s %5u us",
+                                    snap.passes[p].name, snap.passes[p].gpu_us);
+            lines++;
+        }
+    }
+    s_active_lines = lines;
+    for (uint32_t row = 0; row < s_active_lines; ++row) {
         if (wrote[row] < 0) {
             s_line[row][0] = '\0';
             s_line_n[row] = 0;
@@ -357,6 +439,14 @@ void hud_prepare(uint32_t frame_ms, bool have_stamp, uint64_t modifier) {
         }
         s_line_n[row] = n;
     }
+}
+
+bool hud_toggle_profiler(void) {
+    s_profiler_open = !s_profiler_open;
+    printf("[HUD] Render Graph Per-Pass GPU Profiler (F11): %s\n",
+           s_profiler_open ? "ON" : "OFF");
+    fflush(stdout);
+    return true;
 }
 
 static bool bind_pipeline(VkCommandBuffer cmd, VkFormat format, VkFormat depth_format,
@@ -385,8 +475,9 @@ void hud_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height, VkFormat for
     }
     if (!bind_pipeline(cmd, format, depth_format, samples)) return;
 
+    const uint32_t lines = s_active_lines > 0u ? s_active_lines : k_hud_base_lines;
     uint32_t longest = 0;
-    for (uint32_t row = 0; row < k_hud_lines; ++row) {
+    for (uint32_t row = 0; row < lines; ++row) {
         if (s_line_n[row] > longest) {
             longest = s_line_n[row];
         }
@@ -397,22 +488,22 @@ void hud_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height, VkFormat for
     }
     if (longest == 0) return;
 
-    uint32_t cap = 1u + k_hud_lines * k_line_cap;
+    uint32_t cap = 1u + lines * k_line_cap;
     BdaSlice slice = bda_alloc_transient(s_vk, (VkDeviceSize)cap * sizeof(HudInstance), 16u);
     if (slice.cpu == nullptr || slice.gpu == 0) return;
 
     HudInstance *inst = (HudInstance *)slice.cpu;
     uint32_t plate_w = longest * 8u + 4u;
-    uint32_t plate_h = k_hud_lines * 8u + 4u;
+    uint32_t plate_h = lines * 8u + 4u;
     uint32_t plate_x = 10u;
-    uint32_t plate_y = height - 10u - plate_h;
+    uint32_t plate_y = height > (10u + plate_h) ? (height - 10u - plate_h) : 0u;
 
     uint32_t count = 0;
     inst[count++] = (HudInstance){
         .x = plate_x, .y = plate_y, .w = plate_w, .h = plate_h, .solid = 1u,
     };
 
-    for (uint32_t row = 0; row < k_hud_lines; ++row) {
+    for (uint32_t row = 0; row < lines; ++row) {
         uint32_t n = s_line_n[row];
         if (n > max_chars) {
             n = max_chars;

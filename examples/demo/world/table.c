@@ -1,5 +1,8 @@
 #include "world/world_int.h"
+#include <math.h>
 #include <stdio.h>
+
+static constexpr float k_deg_to_rad = 0.017453292519943295f;
 
 static WorldObj s_obj[k_table_cap];
 static int      s_n = 0;
@@ -8,8 +11,32 @@ static int      s_selected = -1;
 static uint32_t s_selected_generation = 0;
 static int      s_shown_selected = -1;
 static bool     s_spun = false;
+static EcsWorld s_ecs;
+static bool     s_ecs_ready = false;
+
+static void ensure_ecs(void) {
+    if (!s_ecs_ready) {
+        ecs_world_init(&s_ecs);
+        s_ecs_ready = true;
+    }
+}
+
+EcsWorld *world_ecs(void) {
+    ensure_ecs();
+    return &s_ecs;
+}
+
+EcsEntity world_selected_entity(void) {
+    WorldObj *o = table_selected();
+    if (o == nullptr || !o->alive) {
+        return ECS_NULL_ENTITY;
+    }
+    return o->entity;
+}
 
 void table_reset(void) {
+    ensure_ecs();
+    ecs_world_reset(&s_ecs);
     // Poison every entry: ops nulled and generation bumped, so any
     // WorldObj* or index held across the reset fails validation instead
     // of silently naming whatever is placed next.
@@ -18,6 +45,8 @@ void table_reset(void) {
         s_obj[i].data = nullptr;
         s_obj[i].alive = false;
         s_obj[i].shown_alive = false;
+        s_obj[i].entity = ECS_NULL_ENTITY;
+        s_obj[i].last_spin_deg = 0.0f;
         s_obj[i].generation = s_next_generation++;
         if (s_next_generation == 0) {
             s_next_generation = 1;
@@ -31,22 +60,125 @@ void table_reset(void) {
 }
 
 int table_add(const WorldOps *ops, void *data, Coord at, Spin *spin) {
+    ensure_ecs();
     if (ops == nullptr || s_n >= k_table_cap) {
         return -1;
     }
     int index = s_n++;
+    float init_yaw = spin != nullptr ? spin_deg(spin, true) : 0.0f;
     s_obj[index] = (WorldObj){
-        .ops        = ops,
-        .data       = data,
-        .at         = at,
-        .generation = s_next_generation++,
-        .alive      = true,
-        .spin       = spin,
+        .ops           = ops,
+        .data          = data,
+        .at            = at,
+        .generation    = s_next_generation++,
+        .alive         = true,
+        .spin          = spin,
+        .entity        = ECS_NULL_ENTITY,
+        .last_spin_deg = init_yaw,
     };
     if (s_next_generation == 0) {
         s_next_generation = 1;
     }
+
+    const char *ename = "Entity";
+    if (ops->name != nullptr) {
+        const char *n = ops->name(&s_obj[index]);
+        if (n != nullptr && n[0] != '\0') {
+            ename = n;
+        }
+    }
+    uint32_t mask = ECS_COMP_TRANSFORM | ECS_COMP_HIERARCHY | ECS_COMP_BOUNDS | ECS_COMP_RENDER;
+    EcsEntity e = ecs_spawn(&s_ecs, ename, ECS_KIND_EMPTY, mask, (int32_t)index);
+    s_obj[index].entity = e;
+    if (e != ECS_NULL_ENTITY) {
+        float q[4];
+        ecs_quat_from_pose(0.0f, init_yaw * k_deg_to_rad, q);
+        const float pos[3] = { at.x, at.y, at.z };
+        const float scl[3] = { 1.0f, 1.0f, 1.0f };
+        const float ext[3] = { 60.0f, 60.0f, 60.0f };
+        ecs_set_local_trs(&s_ecs, e, pos, q, scl);
+        ecs_set_local_bounds(&s_ecs, e, ext, 80.0f);
+        ecs_propagate_transforms(&s_ecs);
+    }
     return index;
+}
+
+void table_configure_entity(int index, EcsKind kind, const float half_ext[3],
+                            float radius, float pitch_deg) {
+    ensure_ecs();
+    WorldObj *o = table_at(index);
+    if (o == nullptr || !o->alive || o->entity == ECS_NULL_ENTITY) {
+        return;
+    }
+    uint32_t d = ecs_dense_index(&s_ecs, o->entity);
+    if (d != ECS_INVALID_DENSE) {
+        s_ecs.kind[d] = (uint8_t)kind;
+        if (kind == ECS_KIND_CUBE || kind == ECS_KIND_SOLID) {
+            s_ecs.comp_mask[d] |= ECS_COMP_PHYSICS;
+        }
+    }
+    float init_yaw = o->spin != nullptr ? spin_deg(o->spin, true) : 0.0f;
+    o->last_spin_deg = init_yaw;
+    float q[4];
+    ecs_quat_from_pose(pitch_deg * k_deg_to_rad, init_yaw * k_deg_to_rad, q);
+    const float pos[3] = { o->at.x, o->at.y, o->at.z };
+    const float scl[3] = { 1.0f, 1.0f, 1.0f };
+    ecs_set_local_trs(&s_ecs, o->entity, pos, q, scl);
+    if (half_ext != nullptr) {
+        ecs_set_local_bounds(&s_ecs, o->entity, half_ext, radius);
+    }
+    ecs_propagate_transforms(&s_ecs);
+}
+
+void table_sync_entity_world_pos(WorldObj *o) {
+    ensure_ecs();
+    if (o == nullptr || !o->alive || o->entity == ECS_NULL_ENTITY) {
+        return;
+    }
+    ecs_set_world_pos(&s_ecs, o->entity, o->at.x, o->at.y, o->at.z);
+}
+
+void table_sync_ecs(bool live) {
+    ensure_ecs();
+    if (live) {
+        for (int i = 0; i < s_n; ++i) {
+            WorldObj *o = &s_obj[i];
+            if (!o->alive || o->entity == ECS_NULL_ENTITY || !ecs_alive(&s_ecs, o->entity)) {
+                continue;
+            }
+            if (o->spin != nullptr) {
+                float cur_yaw = spin_deg(o->spin, true);
+                float dyaw = cur_yaw - o->last_spin_deg;
+                if (fabsf(dyaw) > 1.0e-5f) {
+                    EcsTrs local = {0};
+                    if (ecs_get_local_trs(&s_ecs, o->entity, &local)) {
+                        float q_delta[4];
+                        float q_next[4];
+                        ecs_quat_from_axis_angle((const float[3]){ 0.0f, 1.0f, 0.0f },
+                                                 dyaw * k_deg_to_rad, q_delta);
+                        ecs_quat_mul(q_delta, local.rot, q_next);
+                        ecs_quat_norm(q_next);
+                        ecs_set_local_rot(&s_ecs, o->entity, q_next);
+                    }
+                    o->last_spin_deg = cur_yaw;
+                }
+            }
+        }
+    }
+    ecs_propagate_transforms(&s_ecs);
+    // Keep legacy WorldObj::at synchronized with propagated world positions (essential for children)
+    for (int i = 0; i < s_n; ++i) {
+        WorldObj *o = &s_obj[i];
+        if (!o->alive || o->entity == ECS_NULL_ENTITY) {
+            continue;
+        }
+        EcsTrs wt = {0};
+        if (ecs_get_world_trs(&s_ecs, o->entity, &wt)) {
+            o->at.x = wt.pos[0];
+            o->at.y = wt.pos[1];
+            o->at.z = wt.pos[2];
+        }
+    }
 }
 
 void table_publish(void) {
@@ -267,10 +399,15 @@ bool table_advance_ops(uint32_t time_ms, const WorldOps *ops) {
 }
 
 void table_commit(void) {
+    ensure_ecs();
     int write = 0;
     int selected = -1;
     for (int i = 0; i < s_n; ++i) {
         if (!s_obj[i].alive) {
+            if (s_obj[i].entity != ECS_NULL_ENTITY) {
+                ecs_destroy(&s_ecs, s_obj[i].entity);
+                s_obj[i].entity = ECS_NULL_ENTITY;
+            }
             continue;
         }
         if (i == s_selected) {
@@ -286,11 +423,15 @@ void table_commit(void) {
         if (write != i) {
             s_obj[write] = s_obj[i];
         }
+        if (s_obj[write].entity != ECS_NULL_ENTITY) {
+            ecs_set_user_slot(&s_ecs, s_obj[write].entity, (int32_t)write);
+        }
         write++;
     }
     s_n = write;
     s_selected = selected;
     s_shown_selected = selected;
+    ecs_propagate_transforms(&s_ecs);
 }
 
 bool table_busy(void) {

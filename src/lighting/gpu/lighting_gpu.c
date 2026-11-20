@@ -1,4 +1,5 @@
 #include "lighting/lighting.h"
+#include "graph/graph.h"
 #include "vulkan/bda.h"
 #include "vulkan/core.h"
 #include "vulkan/memory.h"
@@ -78,6 +79,7 @@ static uint32_t              s_proxy_count    = 0u;
 
 static bool                  s_gi_user_on     = true;
 static bool                  s_gi_frame_live  = false;
+static LightingDebugView     s_debug_view     = LIGHTING_DEBUG_LIT;
 static uint32_t              s_oracle_mode    = LIGHTING_ORACLE_ANALYTICAL_UMA;
 static uint32_t              s_frame_index    = 0u;
 static uint32_t              s_ping_index     = 0u;
@@ -1084,20 +1086,105 @@ void lighting_shadow_end(VkCommandBuffer cmd) {
         shadow_read_layout());
 }
 
-void lighting_prepare(VkCommandBuffer cmd, uint32_t width, uint32_t height) {
-    if (cmd == VK_NULL_HANDLE) {
+typedef struct LightingGraphCtx {
+    uint64_t env_bda;
+    uint32_t gi_w;
+    uint32_t gi_h;
+    uint32_t hrc_w0;
+    uint32_t hrc_h0;
+} LightingGraphCtx;
+
+static LightingGraphCtx s_lg_ctx = {0};
+
+static void exec_shadow_init_noop(VkCommandBuffer cmd, void *user) {
+    (void)cmd;
+    (void)user;
+    if (s_vk != nullptr) {
+        s_shadow_layout = shadow_read_layout();
+    }
+}
+
+static void exec_gi_gbuf(VkCommandBuffer cmd, void *user) {
+    const LightingGraphCtx *ctx = (const LightingGraphCtx *)user;
+    LightingComputePush push = {
+        .env_bda     = ctx->env_bda,
+        .cascade_idx = 0u,
+        .flags       = 0u,
+    };
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_pipe_gbuf);
+    lighting_bind_shadow(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_gbuf_layout);
+    vulkan_cmd_push(cmd, s_gbuf_layout, VK_SHADER_STAGE_COMPUTE_BIT, sizeof push, &push);
+    vkCmdDispatch(cmd, (ctx->gi_w + 7u) / 8u, (ctx->gi_h + 7u) / 8u, 1u);
+}
+
+static void exec_gi_hrc(VkCommandBuffer cmd, void *user) {
+    const LightingGraphCtx *ctx = (const LightingGraphCtx *)user;
+    LightingComputePush push = {
+        .env_bda     = ctx->env_bda,
+        .cascade_idx = 0u,
+        .flags       = 0u,
+    };
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_pipe_hrc);
+    for (int c = (int)K_LIGHTING_MAX_CASCADES - 1; c >= 0; --c) {
+        uint32_t uc    = (uint32_t)c;
+        uint32_t cw    = ctx->hrc_w0 >> uc;
+        uint32_t ch    = ctx->hrc_h0 >> uc;
+        if (cw == 0u) cw = 1u;
+        if (ch == 0u) ch = 1u;
+        uint32_t m_cnt = 4u << uc;
+        uint32_t tx    = cw * m_cnt;
+
+        push.cascade_idx = uc;
+        vulkan_cmd_push(cmd, s_comp_layout, VK_SHADER_STAGE_COMPUTE_BIT, sizeof push, &push);
+        vkCmdDispatch(cmd, (tx + 7u) / 8u, (ch + 7u) / 8u, 1u);
+
+        if (c > 0) {
+            cmd_compute_barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                                VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+        }
+    }
+}
+
+static void exec_gi_ssilvb(VkCommandBuffer cmd, void *user) {
+    const LightingGraphCtx *ctx = (const LightingGraphCtx *)user;
+    LightingComputePush push = {
+        .env_bda     = ctx->env_bda,
+        .cascade_idx = 0u,
+        .flags       = 0u,
+    };
+    // 3a. 2026 SSILVB (32-Bit Visibility Bitmask) + HRC C0 Fusion + Temporal Accumulation -> gi_curr_bda
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_pipe_ssilvb);
+    vulkan_cmd_push(cmd, s_comp_layout, VK_SHADER_STAGE_COMPUTE_BIT, sizeof push, &push);
+    vkCmdDispatch(cmd, (ctx->gi_w + 7u) / 8u, (ctx->gi_h + 7u) / 8u, 1u);
+
+    cmd_compute_barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                        VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+
+    // 3b. Seamless 10x10-halo SLM cross-bilateral spatial denoise: gi_curr_bda -> gbuf_bda (0 extra VRAM)
+    push.flags = 1u;
+    vulkan_cmd_push(cmd, s_comp_layout, VK_SHADER_STAGE_COMPUTE_BIT, sizeof push, &push);
+    vkCmdDispatch(cmd, (ctx->gi_w + 7u) / 8u, (ctx->gi_h + 7u) / 8u, 1u);
+
+    // Publish filtered LightingGiTexel grid to all downstream surface fragment shaders
+    cmd_compute_barrier(cmd,
+                        VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                        VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+}
+
+void lighting_prepare(RgGraph *g, uint32_t width, uint32_t height) {
+    if (g == nullptr) {
         return;
     }
 
     // Ensure shadow image is always in a valid sampled layout even on 2D or shadow-free frames
-    if (ensure_shadow_resources() && s_shadow_layout == VK_IMAGE_LAYOUT_UNDEFINED) {
-        transition_shadow_image(
-            cmd,
-            VK_PIPELINE_STAGE_2_NONE,
-            VK_ACCESS_2_NONE,
-            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
-            VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
-            shadow_read_layout());
+    RgResHandle sh_res = RG_INVALID_RES;
+    if (ensure_shadow_resources() && s_shadow_layout == VK_IMAGE_LAYOUT_UNDEFINED && s_vk != nullptr) {
+        const bool unified = s_vk->device_info.supports_unified_image_layouts;
+        sh_res = rg_import_image(g, "ShadowMap", s_shadow_img,
+                                 VK_IMAGE_ASPECT_DEPTH_BIT, 0u, 1u,
+                                 s_shadow_layout, &s_shadow_layout, unified);
+        RgAccess acc[] = { { sh_res, RG_USE_FRAG_SAMPLED } };
+        rg_add_pass(g, "ShadowInit", RG_PASS_SHADOW, acc, 1u, exec_shadow_init_noop, nullptr);
     }
 
     if (!s_env_ready || s_env_buf.map == nullptr || width == 0u || height == 0u) {
@@ -1124,7 +1211,7 @@ void lighting_prepare(VkCommandBuffer cmd, uint32_t width, uint32_t height) {
     float ao_str    = (s_terrain_bda != 0ull) ? 0.85f : 0.90f;
     float radius_px = (s_oracle_mode == LIGHTING_ORACLE_DISCRETE_HIGH) ? 48.0f : 38.0f;
 
-    uint32_t scene_flags = 0u;
+    uint32_t scene_flags = (((uint32_t)s_debug_view & 0xFu) << K_LIGHTING_DEBUG_SHIFT);
     if (s_shadow_rendered) {
         scene_flags |= K_LIGHTING_FLAG_HAS_SHADOW;
     }
@@ -1214,58 +1301,47 @@ void lighting_prepare(VkCommandBuffer cmd, uint32_t width, uint32_t height) {
         return;
     }
 
-    // 1. Primary GI G-Buffer + Direct/Multi-Bounce Radiance Compute Pass (with hardware shadow map)
-    LightingComputePush push = {
-        .env_bda     = slice_bda,
-        .cascade_idx = 0u,
-        .flags       = 0u,
+    s_lg_ctx = (LightingGraphCtx){
+        .env_bda = slice_bda,
+        .gi_w    = s_gi_w,
+        .gi_h    = s_gi_h,
+        .hrc_w0  = s_hrc_w0,
+        .hrc_h0  = s_hrc_h0,
     };
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_pipe_gbuf);
-    lighting_bind_shadow(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_gbuf_layout);
-    vulkan_cmd_push(cmd, s_gbuf_layout, VK_SHADER_STAGE_COMPUTE_BIT, sizeof push, &push);
-    vkCmdDispatch(cmd, (s_gi_w + 7u) / 8u, (s_gi_h + 7u) / 8u, 1u);
 
-    cmd_compute_barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                        VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
-
-    // 2. 4-Level Split / Holographic Radiance Cascades (coarse c=3 -> fine c=0)
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_pipe_hrc);
-    for (int c = (int)K_LIGHTING_MAX_CASCADES - 1; c >= 0; --c) {
-        uint32_t uc    = (uint32_t)c;
-        uint32_t cw    = s_hrc_w0 >> uc;
-        uint32_t ch    = s_hrc_h0 >> uc;
-        if (cw == 0u) cw = 1u;
-        if (ch == 0u) ch = 1u;
-        uint32_t m_cnt = 4u << uc;
-        uint32_t tx    = cw * m_cnt;
-
-        push.cascade_idx = uc;
-        vulkan_cmd_push(cmd, s_comp_layout, VK_SHADER_STAGE_COMPUTE_BIT, sizeof push, &push);
-        vkCmdDispatch(cmd, (tx + 7u) / 8u, (ch + 7u) / 8u, 1u);
-
-        cmd_compute_barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                            VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+    RgResHandle gi_gbuf = rg_import_buffer(g, "GiGbuf", VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE);
+    RgResHandle gi_hrc  = rg_import_buffer(g, "GiHrc",  VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE);
+    RgResHandle gi_out  = rg_import_buffer(g, "GiOut",  VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE);
+    if (s_frame_index > 0u) {
+        // Cross-frame WAR/WAW guard: previous SceneHDR read gbuf_bda in fragment shaders
+        rg_set_prior_access(g, gi_gbuf,
+                            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                            VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                            VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
     }
 
-    // 3a. 2026 SSILVB (32-Bit Visibility Bitmask) + HRC C0 Fusion + Temporal Accumulation -> gi_curr_bda
-    push.cascade_idx = 0u;
-    push.flags       = 0u;
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_pipe_ssilvb);
-    vulkan_cmd_push(cmd, s_comp_layout, VK_SHADER_STAGE_COMPUTE_BIT, sizeof push, &push);
-    vkCmdDispatch(cmd, (s_gi_w + 7u) / 8u, (s_gi_h + 7u) / 8u, 1u);
+    // 1. Primary GI G-Buffer + Direct/Multi-Bounce Radiance Compute Pass
+    RgAccess acc_gbuf[2] = { { gi_gbuf, RG_USE_COMPUTE_WRITE }, { RG_INVALID_RES, RG_USE_NONE } };
+    uint32_t acc_gbuf_n  = 1u;
+    if (sh_res != RG_INVALID_RES) {
+        acc_gbuf[acc_gbuf_n++] = (RgAccess){ sh_res, RG_USE_COMPUTE_SAMPLED };
+    }
+    rg_add_pass(g, "GI-GBuf", RG_PASS_GI, acc_gbuf, acc_gbuf_n, exec_gi_gbuf, &s_lg_ctx);
 
-    cmd_compute_barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                        VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+    // 2. 4-Level Split / Holographic Radiance Cascades (coarse c=3 -> fine c=0)
+    RgAccess acc_hrc[] = {
+        { gi_gbuf, RG_USE_COMPUTE_READ },
+        { gi_hrc,  RG_USE_COMPUTE_WRITE },
+    };
+    rg_add_pass(g, "GI-HRC", RG_PASS_GI, acc_hrc, 2u, exec_gi_hrc, &s_lg_ctx);
 
-    // 3b. Seamless 10x10-halo SLM cross-bilateral spatial denoise: gi_curr_bda -> gbuf_bda (0 extra VRAM, 0 tile seams)
-    push.flags = 1u;
-    vulkan_cmd_push(cmd, s_comp_layout, VK_SHADER_STAGE_COMPUTE_BIT, sizeof push, &push);
-    vkCmdDispatch(cmd, (s_gi_w + 7u) / 8u, (s_gi_h + 7u) / 8u, 1u);
-
-    // Publish filtered LightingGiTexel grid to all downstream surface fragment shaders
-    cmd_compute_barrier(cmd,
-                        VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                        VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+    // 3. 32-Bit SSILVB + HRC Fusion + 10x10-Halo SLM Spatial Denoise
+    RgAccess acc_ssilvb[] = {
+        { gi_gbuf, RG_USE_COMPUTE_RW },
+        { gi_hrc,  RG_USE_COMPUTE_READ },
+        { gi_out,  RG_USE_COMPUTE_RW },
+    };
+    rg_add_pass(g, "GI-SSILVB", RG_PASS_GI, acc_ssilvb, 3u, exec_gi_ssilvb, &s_lg_ctx);
 
     s_gi_frame_live = true;
     s_history_valid = true;
@@ -1309,4 +1385,39 @@ void lighting_get_stats(LightingBenchStats *out_stats) {
         .active_proxies = s_proxy_count,
         .bda_bytes      = bda_total,
     };
+}
+
+LightingDebugView lighting_debug_view(void) {
+    return s_debug_view;
+}
+
+const char *lighting_debug_view_name(LightingDebugView view) {
+    switch (view) {
+    case LIGHTING_DEBUG_LIT:       return "Lit PBR";
+    case LIGHTING_DEBUG_ALBEDO:    return "Albedo";
+    case LIGHTING_DEBUG_NORMALS:   return "World Normals";
+    case LIGHTING_DEBUG_ROUGHNESS: return "Roughness";
+    case LIGHTING_DEBUG_DEPTH:     return "Linear Depth";
+    case LIGHTING_DEBUG_GI:        return "Indirect GI";
+    case LIGHTING_DEBUG_AO:        return "32b VBAO";
+    case LIGHTING_DEBUG_SHADOW:    return "Shadow Vis";
+    case LIGHTING_DEBUG_MESHLETS:  return "Meshlet IDs";
+    case LIGHTING_DEBUG_COUNT:
+    default:                       return "Lit PBR";
+    }
+}
+
+LightingDebugView lighting_cycle_debug_view(bool reset_to_lit) {
+    if (reset_to_lit) {
+        s_debug_view = LIGHTING_DEBUG_LIT;
+    } else {
+        uint32_t next = ((uint32_t)s_debug_view + 1u) % (uint32_t)LIGHTING_DEBUG_COUNT;
+        s_debug_view  = (LightingDebugView)next;
+    }
+    printf("[DebugView] %s (%u/%u)\n",
+           lighting_debug_view_name(s_debug_view),
+           (unsigned)s_debug_view,
+           (unsigned)(LIGHTING_DEBUG_COUNT - 1u));
+    fflush(stdout);
+    return s_debug_view;
 }

@@ -1,6 +1,5 @@
 #include "world/world_int.h"
 #include "backend/backend.h"
-#include "engine/app.h"
 #include "frame/camera.h"
 #include "frame/gimbal.h"
 #include "frame/hud.h"
@@ -9,310 +8,25 @@
 #include "frame/sheet.h"
 #include "frame/terrain.h"
 #include "frame/text.h"
-#include "input/pointer.h"
+#include "graph/graph.h"
 #include "lighting/lighting.h"
 #include "physics/physics.h"
-#include "ring/ring.h"
+#include "post/post.h"
 #include "scene/scene.h"
-#include <linux/input-event-codes.h>
-#include <math.h>
 #include <stdio.h>
 #include <string.h>
 
-// Starts the world and calls the layers under src/world. Object kinds live
-// in kind/. Faces live in face/. The file reader is load.c. This file does
-// not contain a cube, a face list, or a key's geometry.
+// World lifecycle & per-frame orchestration.
+// Presets live in presets.c; pointer/gizmo/ECS interaction lives in interact.c;
+// object kinds live in kind/; faces in face/; scene parser in load.c.
 
-enum : uint32_t { k_removed_cap = 24 };
+enum : uint32_t { k_removed_cap = 24u };
 
 static WorldRemoved s_removed[k_removed_cap];
-static uint32_t     s_removed_n = 0;
-static uint32_t     s_world_id  = 0;
-static char         s_custom_file[1024];
-static float        s_clear_rgba[4] = { 0.015f, 0.018f, 0.024f, 1.0f };
-
-static constexpr float k_grab_lift_z = 24.0f;
-
-typedef struct GrabState {
-    bool     active;
-    bool     empty_orbit;
-    int      index;
-    uint32_t generation;
-    int32_t  origin_x;
-    int32_t  origin_y;
-    float    plane_z;
-    float    off_x;
-    float    off_y;
-    float    last_x;
-    float    last_y;
-    float    vx;
-    float    vy;
-    uint64_t last_ns;
-} GrabState;
-
-static GrabState s_grab = { .index = -1 };
-
-static void grab_clear(void) {
-    s_grab = (GrabState){ .index = -1 };
-}
-
-static bool grab_move_obj(WorldObj *o, Coord pos, float vx, float vy, bool release) {
-    if (o == nullptr || !o->alive) {
-        return false;
-    }
-    if (o->ops == cube_ops()) {
-        return cube_kind_grab_move(o, pos, vx, vy, release);
-    }
-    if (o->ops == solid_ops()) {
-        return solid_kind_grab_move(o, pos, vx, vy, release);
-    }
-    return false;
-}
-
-static bool grab_screen_from_client(int32_t px, int32_t py, float *sx, float *sy) {
-    const WaylandContext *w = wayland_get_context();
-    if (w == nullptr || sx == nullptr || sy == nullptr) {
-        return false;
-    }
-    uint32_t sw = w->scene_phys_w != 0u ? w->scene_phys_w : w->scene_opaque_w;
-    uint32_t sh = w->scene_phys_h != 0u ? w->scene_phys_h : w->scene_opaque_h;
-    if (sw == 0u || sh == 0u) {
-        return false;
-    }
-    *sx = (float)px - (float)sw * 0.5f;
-    *sy = (float)sh * 0.5f - (float)py;
-    return true;
-}
-
-static bool grab_ray_plane_z(const CameraRay *ray, float z, float *wx, float *wy) {
-    if (ray == nullptr || wx == nullptr || wy == nullptr || fabsf(ray->dz) < 0.04f) {
-        return false;
-    }
-    float t = (z - ray->oz) / ray->dz;
-    if (!isfinite(t) || t <= 0.0f || t > 24000.0f) {
-        return false;
-    }
-    *wx = ray->ox + t * ray->dx;
-    *wy = ray->oy + t * ray->dy;
-    return isfinite(*wx) && isfinite(*wy);
-}
-
-static bool grab_release(void) {
-    if (!s_grab.active) {
-        s_grab.empty_orbit = false;
-        return false;
-    }
-    int      idx = s_grab.index;
-    uint32_t gen = s_grab.generation;
-    float    vx  = s_grab.vx;
-    float    vy  = s_grab.vy;
-    grab_clear();
-    WorldObj *o = table_at(idx);
-    if (o == nullptr || !o->alive || o->generation != gen) {
-        return false;
-    }
-    return grab_move_obj(o, o->at, vx, vy, true);
-}
-
-void world_set_clear_color(float r, float g, float b, float a) {
-    s_clear_rgba[0] = r;
-    s_clear_rgba[1] = g;
-    s_clear_rgba[2] = b;
-    s_clear_rgba[3] = a;
-}
-
-void world_clear_color(float out_rgba[4]) {
-    if (out_rgba == nullptr) {
-        return;
-    }
-    out_rgba[0] = s_clear_rgba[0];
-    out_rgba[1] = s_clear_rgba[1];
-    out_rgba[2] = s_clear_rgba[2];
-    out_rgba[3] = s_clear_rgba[3];
-}
-
-void world_select(uint32_t world_id) {
-    if (world_id > k_world_preset_max) {
-        world_id = 0u;
-    }
-    s_world_id = world_id;
-    s_custom_file[0] = '\0';
-    sheet_select_world(s_world_id);
-}
-
-bool world_select_file(const char *path) {
-    if (path == nullptr || path[0] == '\0') {
-        return false;
-    }
-    int wrote = snprintf(s_custom_file, sizeof s_custom_file, "%s", path);
-    if (wrote <= 0 || (size_t)wrote >= sizeof s_custom_file) {
-        s_custom_file[0] = '\0';
-        return false;
-    }
-    s_world_id = k_world_custom_file;
-    sheet_select_world(9u);
-    return true;
-}
-
-const char *world_custom_path(void) {
-    return s_custom_file[0] != '\0' ? s_custom_file : nullptr;
-}
-
-uint32_t world_selected_id(void) {
-    return s_world_id;
-}
-
-const char *world_selected_title(void) {
-    switch (s_world_id) {
-    case 0u:
-        return "Pure Empty Engine (Zero Objects, Zero Overlays)";
-    case 1u:
-        return "3D-Only Click-to-Draw Studio (Points -> Lines -> Faces)";
-    case 2u:
-        return "3D-Only Gravity & Elastic Non-Cube Solids (Squash-and-Stretch)";
-    case 3u:
-        return "2D-Only Gravity, Deformable Soft Bodies & Elastic Polygons";
-    case 4u:
-        return "2D-Only Click-to-Draw Polygon Workshop & Elastic Sheet";
-    case 5u:
-        return "Hybrid 3D+2D Click-to-Draw, Gravity & Multi-Elasticity";
-    case 6u:
-        return "3D+2D Switchable Restitution Staircase & Bumper Lab";
-    case 7u:
-        return "Procedural C23 WorldBuilder: Kinetic Cathedral & Cascade";
-    case 8u:
-        return "Baklan & Beşparmak Dağı SSD-Streamed DEM + Satellite Map (Denizli, TR)";
-    case k_world_custom_file:
-        return s_custom_file[0] != '\0' ? s_custom_file : "Custom .world Document";
-    case 9u:
-    default:
-        return "Interactive Full Sandbox (Switchable 3D / 2D / Hybrid + Plots)";
-    }
-}
-
-void world_apply_policy(void) {
-    switch (s_world_id) {
-    case 0u:
-        // World 0: Pure Empty Engine canvas. Revoke all permissions and seal.
-        policy_apply_world(MODE_3D, PERM_NONE, 0xFFFFu, true);
-        camera_set_scene_3d(false, false, false);
-        return;
-    case 1u:
-        // World 1: 3D-only, click-to-draw (PERM_DRAW) enabled at boot, mode switching locked.
-        policy_apply_world(MODE_3D, PERM_DRAW, PERM_MODE_SWITCH | PERM_PLOT_CYCLE, false);
-        camera_set_scene_3d(true, true, false);
-        camera_set_home_pose(0.0f, 0.0f, 60.0f, -0.46f, 0.96f, 0.76f);
-        break;
-    case 2u:
-        // World 2: 3D-only gravity & elastic non-cube solids, mode switching locked.
-        policy_apply_world(MODE_3D, PERM_NONE, PERM_MODE_SWITCH | PERM_PLOT_CYCLE, false);
-        camera_set_scene_3d(true, true, false);
-        camera_set_home_pose(0.0f, 0.0f, 70.0f, -0.46f, 0.96f, 0.74f);
-        break;
-    case 3u:
-        // World 3: 2D-only gravity & deformable soft patches, mode switching locked.
-        policy_apply_world(MODE_2D, PERM_NONE, PERM_MODE_SWITCH | PERM_PLOT_CYCLE, false);
-        camera_set_scene_3d(false, false, false);
-        (void)camera_snap_front();
-        camera_commit();
-        break;
-    case 4u:
-        // World 4: 2D-only with click-to-draw (PERM_DRAW) enabled at boot, mode switching locked.
-        policy_apply_world(MODE_2D, PERM_DRAW, PERM_MODE_SWITCH | PERM_PLOT_CYCLE, false);
-        camera_set_scene_3d(false, false, false);
-        (void)camera_snap_front();
-        camera_commit();
-        break;
-    case 5u:
-        // World 5: Hybrid 3D+2D with click-to-draw enabled at boot, Tab mode switch allowed.
-        policy_apply_world(MODE_HYBRID, PERM_DRAW, PERM_PLOT_CYCLE, false);
-        camera_set_scene_3d(true, true, false);
-        camera_set_home_pose(0.0f, 0.0f, 60.0f, -0.46f, 0.96f, 0.72f);
-        break;
-    case 6u:
-        // World 6: 3D+2D switchable restitution staircase & bumper lab, Tab mode switch allowed.
-        policy_apply_world(MODE_3D, PERM_NONE, PERM_PLOT_CYCLE, false);
-        camera_set_scene_3d(true, true, false);
-        camera_set_home_pose(0.0f, 0.0f, 70.0f, -0.42f, 0.94f, 0.70f);
-        break;
-    case 7u:
-        // World 7: Procedural C23 WorldBuilder (Hybrid 3D+2D + click-to-draw + Tab mode switch).
-        policy_apply_world(MODE_HYBRID, PERM_DRAW, PERM_PLOT_CYCLE, false);
-        camera_set_scene_3d(true, true, false);
-        camera_set_home_pose(0.0f, 0.0f, 90.0f, -0.46f, 0.94f, 0.62f);
-        break;
-    case 8u:
-        // World 8: Baklan & Beşparmak Dağı SSD-Streamed DEM + Satellite Map (Pure 3D Map, Z-up turntable mouse controls).
-        policy_apply_world(MODE_3D, PERM_NONE, PERM_PLOT_CYCLE | PERM_OBJ_SPAWN | PERM_MODE_SWITCH, false);
-        camera_set_scene_3d(true, false, true);
-        camera_set_home_pose(1595.0f, -650.0f, 520.0f, -0.18f, 0.52f, 0.16f);
-        printf("[Bird's-Eye Overlay] Active at 50%% transparency | Keys: 'O'=+Transparency, 'P'=-Transparency, 'W/A/S/D'=Move parallel to map, 'Shift+WASD' (or I/U, J/N, ]/[)=0.5%% 2D Stretch, 'B'=Top-Down Bird's-Eye View, 'Enter'=Upload & Bake onto Map\n");
-        break;
-    case k_world_custom_file:
-        policy_boot();
-        camera_set_scene_3d(true, true, false);
-        camera_set_home_pose(0.0f, 0.0f, 60.0f, -0.46f, 0.96f, 0.74f);
-        return;
-    case 9u:
-    default:
-        policy_boot();
-        camera_set_scene_3d(true, true, false);
-        camera_set_home_pose(0.0f, 0.0f, 60.0f, -0.46f, 0.96f, 0.74f);
-        break;
-    }
-    const WorkspacePolicy *pol = policy_active();
-    printf("[World] Active #%u: %s | Mode=%s (Tab switch=%s, click-draw=%s)\n",
-           s_world_id, world_selected_title(), pol->name,
-           policy_allows(PERM_MODE_SWITCH) ? "on" : "locked",
-           policy_allows(PERM_DRAW) ? "on" : "off");
-    fflush(stdout);
-}
-
-bool world_switch_to(uint32_t world_id) {
-    if (world_id > k_world_preset_max) {
-        return false;
-    }
-    (void)world_save();
-    (void)sheet_save();
-    world_select(world_id);
-    world_reset();
-    world_apply_policy();
-    if (world_load() != 0) {
-        return false;
-    }
-    printf("[World] Runtime hot-switched to World %u: %s\n",
-           s_world_id, world_selected_title());
-    fflush(stdout);
-    return true;
-}
-
-bool world_reload(void) {
-    if (s_world_id == 0u) {
-        return false;
-    }
-    if (s_world_id == 8u) {
-        bool ok = terrain_reload();
-        lighting_invalidate_history();
-        printf("[World] Hot-reloaded World 8 (%s) terrain & survey dataset\n",
-               world_selected_title());
-        fflush(stdout);
-        return ok;
-    }
-    world_reset();
-    world_apply_policy();
-    if (world_load() != 0) {
-        return false;
-    }
-    const char *src = world_source_path();
-    printf("[World] Hot-reloaded World %u (%s) from %s\n",
-           s_world_id, world_selected_title(),
-           src != nullptr ? src : "builtin");
-    fflush(stdout);
-    return true;
-}
+static uint32_t     s_removed_n = 0u;
 
 void world_removed_clear(void) {
-    s_removed_n = 0;
+    s_removed_n = 0u;
 }
 
 void world_removed_push(const WorldRemoved *item) {
@@ -341,16 +55,15 @@ static bool snap_removed(const WorldObj *o, WorldRemoved *out) {
     if (o == nullptr || o->ops == nullptr || out == nullptr) {
         return false;
     }
-    WorldRemoved g = {0};
-    g.at = o->at;
+    WorldRemoved g = { .at = o->at };
     if (o->spin != nullptr) {
         g.yaw_milli = o->spin->live_milli;
-        g.spinning = o->spin->spinning;
-        g.infinite = o->spin->infinite;
-        g.glow = o->spin->glow;
+        g.spinning  = o->spin->spinning;
+        g.infinite  = o->spin->infinite;
+        g.glow      = o->spin->glow;
     }
     if (o->ops == cube_ops()) {
-        g.kind = k_removed_cube;
+        g.kind        = k_removed_cube;
         g.restitution = cube_kind_restitution(o);
     } else if (o->ops == solid_ops()) {
         const char *name = o->ops->name != nullptr ? o->ops->name(o) : nullptr;
@@ -358,8 +71,8 @@ static bool snap_removed(const WorldObj *o, WorldRemoved *out) {
         if (kind < 0) {
             return false;
         }
-        g.kind = k_removed_solid;
-        g.solid = kind;
+        g.kind        = k_removed_solid;
+        g.solid       = kind;
         g.restitution = solid_kind_restitution(o);
     } else if (o->ops == mesh_ops()) {
         g.kind = k_removed_mesh;
@@ -371,7 +84,7 @@ static bool snap_removed(const WorldObj *o, WorldRemoved *out) {
 }
 
 void world_reset(void) {
-    grab_clear();
+    world_interact_reset();
     world_removed_clear();
     table_reset();
     ground_reset();
@@ -381,13 +94,15 @@ void world_reset(void) {
     solid_kind_reset();
     mesh_kind_reset();
     terrain_kind_reset();
+    model_kind_reset();
     terrain_set_contours(false);
     scene_invalidate_hiz();
     lighting_reset();
+    post_reset_exposure();
     physics_reset();
     spin_clear();
     camera_reset();
-    if (s_world_id == 0u) {
+    if (world_selected_id() == 0u) {
         ground_set_visible(false);
         gimbal_set_visible(false);
         hud_set_visible(false);
@@ -398,7 +113,7 @@ void world_reset(void) {
         ground_set_visible(true);
         gimbal_set_visible(true);
         hud_set_visible(true);
-        plot_set_visible(s_world_id == 9u);
+        plot_set_visible(world_selected_id() == 9u);
         text_set_visible(true);
         world_set_clear_color(0.08f, 0.24f, 0.48f, 1.0f);
     }
@@ -408,7 +123,6 @@ void world_reset(void) {
 
 void world_record(VkCommandBuffer cmd, uint32_t heat_dt, bool live) {
     physics_record_compute(cmd);
-    // 2D keeps the fillet heat and the 128³ lattice off the queue.
     if (policy_mode() == MODE_2D) {
         return;
     }
@@ -457,7 +171,7 @@ bool world_simulation(uint32_t time_ms, uint32_t sim_dt_ms, uint32_t *heat_dt) {
     bool pulse = false;
     if (policy_mode() == MODE_2D) {
         if (heat_dt != nullptr) {
-            *heat_dt = 0;
+            *heat_dt = 0u;
         }
     } else {
         pulse = table_simulate(time_ms, sim_dt_ms, heat_dt);
@@ -508,178 +222,13 @@ void world_adopt_mesh(void) {
 }
 
 bool world_apply_mesh(bool has, bool bytes) {
-    bool was = table_find(mesh_ops()) != nullptr;
+    bool was     = table_find(mesh_ops()) != nullptr;
     bool changed = mesh_kind_apply(has, bytes);
-    bool now = table_find(mesh_ops()) != nullptr;
+    bool now     = table_find(mesh_ops()) != nullptr;
     if (was != now) {
         world_store();
     }
     return changed;
-}
-
-bool world_click(float screen_x, float screen_y) {
-    WorkspaceMode mode = policy_mode();
-    CameraRay ray;
-    camera_click_ray(screen_x, screen_y, &ray);
-    if (mode != MODE_3D && policy_allows(PERM_OBJ_SELECT)) {
-        Coord ground = {0};
-        if (coord_ground_hit(&ray, &ground, nullptr) && sheet_click(ground.x, ground.y)) {
-            table_clear_selection();
-            return true;
-        }
-    }
-    if (mode != MODE_2D) {
-        Coord hit = {0};
-        int index = table_pick(&ray, &hit, nullptr);
-        if (index >= 0) {
-            // A rejected select must not fall through into a face spawn.
-            if (!policy_allows(PERM_OBJ_SELECT)) {
-                return false;
-            }
-            sheet_clear();
-            bool changed = table_select(index);
-            WorldObj *o = table_at(index);
-            if (o != nullptr && o->ops != nullptr && o->ops->on_click != nullptr &&
-                o->ops->on_click(o, hit)) {
-                changed = true;
-            }
-            return changed;
-        }
-    } else if (face_chain_count() == 0u) {
-        Coord hit = {0};
-        int index = table_pick(&ray, &hit, nullptr);
-        if (index >= 0) {
-            WorldObj *o = table_at(index);
-            if (o != nullptr && o->ops == face_ops()) {
-                if (!policy_allows(PERM_OBJ_SELECT)) {
-                    return false;
-                }
-                sheet_clear();
-                bool changed = table_select(index);
-                if (o->ops->on_click != nullptr && o->ops->on_click(o, hit)) {
-                    changed = true;
-                }
-                return changed;
-            }
-        }
-    }
-    Coord ground = {0};
-    if (!coord_ground_hit(&ray, &ground, nullptr)) {
-        return false;
-    }
-    if (!policy_allows(PERM_DRAW)) {
-        return false;
-    }
-    return face_spawn(ground);
-}
-
-bool world_pointer_drag_poll(void) {
-    if ((pointer_buttons() & ENG_BUTTON_LEFT) != 0u) {
-        return false;
-    }
-    if (s_grab.active) {
-        return grab_release();
-    }
-    s_grab.empty_orbit = false;
-    return false;
-}
-
-bool world_pointer_drag(float dx, float dy, uint32_t buttons) {
-    if ((buttons & ENG_BUTTON_LEFT) == 0u || policy_mode() == MODE_2D ||
-        terrain_is_active() || pointer_key_down(KEY_T)) {
-        bool released = grab_release();
-        return camera_pointer_drag(dx, dy, buttons) || released;
-    }
-    int32_t ox = 0;
-    int32_t oy = 0;
-    bool have_origin = pointer_left_drag_origin(&ox, &oy);
-    if (s_grab.empty_orbit) {
-        if (!have_origin || (ox == s_grab.origin_x && oy == s_grab.origin_y)) {
-            return camera_pointer_drag(dx, dy, ENG_BUTTON_RIGHT);
-        }
-        s_grab.empty_orbit = false;
-    }
-    if (!s_grab.active) {
-        float sx = 0.0f;
-        float sy = 0.0f;
-        if (policy_allows(PERM_OBJ_SELECT) && have_origin &&
-            grab_screen_from_client(ox, oy, &sx, &sy)) {
-            CameraRay ray = {0};
-            camera_click_ray(sx, sy, &ray);
-            int idx = table_pick(&ray, nullptr, nullptr);
-            if (idx >= 0) {
-                WorldObj *o = table_at(idx);
-                if (o != nullptr && o->alive &&
-                    (o->ops == cube_ops() || o->ops == solid_ops())) {
-                    float px0 = o->at.x;
-                    float py0 = o->at.y;
-                    (void)grab_ray_plane_z(&ray, o->at.z, &px0, &py0);
-                    sheet_clear();
-                    (void)table_select(idx);
-                    s_grab = (GrabState){
-                        .active      = true,
-                        .empty_orbit = false,
-                        .index       = idx,
-                        .generation  = o->generation,
-                        .origin_x    = ox,
-                        .origin_y    = oy,
-                        .plane_z     = o->at.z,
-                        .off_x       = o->at.x - px0,
-                        .off_y       = o->at.y - py0,
-                        .last_x      = o->at.x,
-                        .last_y      = o->at.y,
-                        .vx          = 0.0f,
-                        .vy          = 0.0f,
-                        .last_ns     = ring_mono_ns(),
-                    };
-                }
-            }
-        }
-        if (!s_grab.active) {
-            s_grab.empty_orbit = true;
-            s_grab.origin_x    = ox;
-            s_grab.origin_y    = oy;
-            return camera_pointer_drag(dx, dy, ENG_BUTTON_RIGHT);
-        }
-    }
-
-    WorldObj *o = table_at(s_grab.index);
-    if (o == nullptr || !o->alive || o->generation != s_grab.generation) {
-        grab_clear();
-        return false;
-    }
-    int32_t cx = 0;
-    int32_t cy = 0;
-    float   sx = 0.0f;
-    float   sy = 0.0f;
-    if (!pointer_client_xy(&cx, &cy) || !grab_screen_from_client(cx, cy, &sx, &sy)) {
-        return false;
-    }
-    CameraRay ray = {0};
-    camera_click_ray(sx, sy, &ray);
-    float wx = 0.0f;
-    float wy = 0.0f;
-    if (!grab_ray_plane_z(&ray, s_grab.plane_z, &wx, &wy)) {
-        return false;
-    }
-    float nx = wx + s_grab.off_x;
-    float ny = wy + s_grab.off_y;
-    uint64_t now_ns = ring_mono_ns();
-    float dt = (now_ns > s_grab.last_ns) ? ((float)(now_ns - s_grab.last_ns) * 1.0e-9f) : 0.016f;
-    if (dt < 0.004f) {
-        dt = 0.004f;
-    } else if (dt > 0.080f) {
-        dt = 0.080f;
-    }
-    float ivx = (nx - s_grab.last_x) / dt;
-    float ivy = (ny - s_grab.last_y) / dt;
-    s_grab.vx = s_grab.vx * 0.55f + ivx * 0.45f;
-    s_grab.vy = s_grab.vy * 0.55f + ivy * 0.45f;
-    s_grab.last_x  = nx;
-    s_grab.last_y  = ny;
-    s_grab.last_ns = now_ns;
-    Coord target = { nx, ny, s_grab.plane_z + k_grab_lift_z };
-    return grab_move_obj(o, target, 0.0f, 0.0f, false);
 }
 
 bool world_close_face(void) {
@@ -687,9 +236,9 @@ bool world_close_face(void) {
 }
 
 bool world_cancel(void) {
-    (void)grab_release();
-    bool sheet = policy_mode() != MODE_3D && sheet_cancel();
-    bool corners = face_chain_count() > 0u;
+    (void)world_interact_release();
+    bool sheet    = policy_mode() != MODE_3D && sheet_cancel();
+    bool corners  = face_chain_count() > 0u;
     bool selected = table_selected() != nullptr;
     face_cancel_chain();
     table_clear_selection();
@@ -749,8 +298,6 @@ bool world_delete(void) {
     if (face_pop_corner()) {
         return true;
     }
-    // Nothing selected and no open corner: the first placed cube is the
-    // fallback, the same object R and G reach when the selection is empty.
     return delete_obj(table_fallback());
 }
 
@@ -761,8 +308,8 @@ bool world_restore(void) {
         return false;
     }
     WorldRemoved g = s_removed[--s_removed_n];
-    int before = table_count();
-    bool ok = false;
+    int  before = table_count();
+    bool ok     = false;
     if (g.kind == k_removed_cube) {
         ok = cube_kind_spawn_elastic(g.at, g.yaw_milli, g.spinning, g.infinite, g.glow, g.restitution);
     } else if (g.kind == k_removed_solid) {
@@ -817,14 +364,22 @@ bool world_raise_solid(uint32_t kind) {
     return changed;
 }
 
-bool world_toggle_spin(void) {
+static bool invoke_selected_or_fallback(bool (*fn)(WorldObj *)) {
     WorldObj *o = table_selected();
-    if (o != nullptr && o->ops != nullptr && o->ops->toggle_spin != nullptr) {
-        bool changed = o->ops->toggle_spin(o);
+    if (o != nullptr && o->ops != nullptr && fn != nullptr) {
+        bool changed = fn(o);
         if (changed) {
             world_store();
         }
         return changed;
+    }
+    return false;
+}
+
+bool world_toggle_spin(void) {
+    WorldObj *o = table_selected();
+    if (o != nullptr && o->ops != nullptr && o->ops->toggle_spin != nullptr) {
+        return invoke_selected_or_fallback(o->ops->toggle_spin);
     }
     o = table_fallback();
     if (o == nullptr || o->ops == nullptr || o->ops->toggle_spin == nullptr) {
@@ -840,11 +395,7 @@ bool world_toggle_spin(void) {
 bool world_toggle_glow(void) {
     WorldObj *o = table_selected();
     if (o != nullptr && o->ops != nullptr && o->ops->toggle_glow != nullptr) {
-        bool changed = o->ops->toggle_glow(o);
-        if (changed) {
-            world_store();
-        }
-        return changed;
+        return invoke_selected_or_fallback(o->ops->toggle_glow);
     }
     o = table_fallback();
     if (o == nullptr || o->ops == nullptr || o->ops->toggle_glow == nullptr) {
@@ -864,8 +415,7 @@ bool world_toggle_smooth(void) {
 }
 
 bool world_busy(void) {
-    bool busy = camera_busy() || text_busy() || physics_any_inflight() ||
-                s_grab.active || s_grab.empty_orbit;
+    bool busy = camera_busy() || text_busy() || physics_any_inflight() || world_interact_busy();
     if (policy_mode() == MODE_2D) {
         busy = busy || plot_wants_frame() || sheet_busy() || sheet_has_pending_gpu_steps() ||
                face_chain_busy() || table_busy_ops(face_ops());
@@ -908,7 +458,6 @@ void world_commit(void) {
 }
 
 bool world_consume_spin(void) {
-    // 2D freezes the 3D turn. Do not call it finished, and do not hold the lattice.
     if (policy_mode() == MODE_2D && (table_busy() || table_record_poke_pending())) {
         return false;
     }
@@ -919,12 +468,36 @@ bool world_consume_spin(void) {
     return true;
 }
 
-void world_prepare_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height, bool live) {
-    if (world_selected_id() == 0u) {
+typedef struct WorldPrepCtx {
+    uint32_t width;
+    uint32_t height;
+    bool     live;
+} WorldPrepCtx;
+
+static WorldPrepCtx s_prep_ctx = {0};
+
+static void exec_world_scene_cull(VkCommandBuffer cmd, void *user) {
+    const WorldPrepCtx *ctx = (const WorldPrepCtx *)user;
+    scene_prepare_draw(cmd, ctx->width, ctx->height);
+}
+
+static void exec_world_shadow_map(VkCommandBuffer cmd, void *user) {
+    const WorldPrepCtx *ctx = (const WorldPrepCtx *)user;
+    float light_clip_vp[16];
+    if (lighting_shadow_begin(cmd, light_clip_vp)) {
+        table_draw_shadow(cmd, light_clip_vp, ctx->live);
+        scene_draw_shadow(cmd, light_clip_vp);
+        lighting_shadow_end(cmd);
+    }
+}
+
+void world_prepare_draw(RgGraph *g, VkCommandBuffer cmd, uint32_t width, uint32_t height, bool live) {
+    if (g == nullptr || world_selected_id() == 0u) {
         return;
     }
     if (policy_mode() == MODE_2D) {
-        lighting_prepare(cmd, 0u, 0u);
+        lighting_prepare(g, 0u, 0u);
+        rg_flush(g, cmd);
         return;
     }
     camera_bind(live);
@@ -952,7 +525,6 @@ void world_prepare_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height, bo
         lighting_set_ground_plane(true, 0.0f, ground_alb);
     }
 
-    // Re-fetch ViewPush now that lighting_begin_frame rotated the active LightingEnvBlock slice
     view_push_fill(&vp, 0u);
     SceneViewParams sv = {
         .materials_bda = vp.materials,
@@ -968,22 +540,21 @@ void world_prepare_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height, bo
         .zoom          = vp.zoom,
     };
     scene_begin_frame(width, height, &sv);
+    table_sync_ecs(live);
     table_prepare_scene(live);
-    scene_prepare_draw(cmd, width, height);
 
-    // Hardware directional shadow map pass (Vulkan 1.4 dynamic depth-only rendering)
-    float light_clip_vp[16];
-    if (lighting_shadow_begin(cmd, light_clip_vp)) {
-        table_draw_shadow(cmd, light_clip_vp, live);
-        scene_draw_shadow(cmd, light_clip_vp);
-        lighting_shadow_end(cmd);
-    }
+    s_prep_ctx = (WorldPrepCtx){ .width = width, .height = height, .live = live };
+    rg_add_pass(g, "SceneCull", RG_PASS_COMPUTE, nullptr, 0u, exec_world_scene_cull, &s_prep_ctx);
+    rg_add_pass(g, "ShadowMap", RG_PASS_SHADOW,  nullptr, 0u, exec_world_shadow_map, &s_prep_ctx);
+    rg_flush(g, cmd);
 
-    lighting_prepare(cmd, width, height);
+    lighting_prepare(g, width, height);
+    rg_flush(g, cmd);
 }
 
 void world_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height, bool live) {
     camera_bind(live);
+    table_sync_ecs(live);
     ground_draw(cmd, width, height);
     if (policy_mode() != MODE_2D) {
         table_draw(cmd, width, height, live);

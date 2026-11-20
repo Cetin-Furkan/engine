@@ -1,22 +1,38 @@
 // Shared Slang 2026 Unified Scene Meshlet, Subgroup Hi-Z, and Visibility Buffer Math
-// Matches include/scene/scene.h byte-for-byte.
+// Matches include/scene/scene.h and src/scene/gpu/scene_gpu.c byte-for-byte.
 
 #include "camera.slang"
 #include "material.slang"
 
-static const uint k_scene_max_draws     = 1024u;
-static const uint k_scene_max_instances = 256u;
-static const uint k_scene_hiz_max_mips  = 12u;
-static const uint k_scene_flag_two_sided = 1u;
+static const uint k_scene_max_draws      = 16384u;
+static const uint k_scene_max_blend      = 4096u;
+static const uint k_scene_max_instances  = 512u;
+static const uint k_scene_hiz_max_mips   = 12u;
 
+static const uint k_scene_flag_two_sided    = 1u << 0u;
+static const uint k_scene_flag_alpha_mask   = 1u << 1u;
+static const uint k_scene_flag_alpha_blend  = 1u << 2u;
+static const uint k_scene_flag_pbr          = 1u << 3u;
+static const uint k_scene_flag_flip_winding = 1u << 4u;
+
+static const uint k_vert_flag_tan_neg_sign = 1u << 0u;
+static const uint k_vert_flag_has_tangent  = 1u << 1u;
+static const uint k_vert_flag_has_uv       = 1u << 2u;
+
+// 32-byte quantized PBR vertex (matches ScenePackedVertex in include/scene/scene.h).
 struct ScenePackedVertex {
     uint16_t px;
     uint16_t py;
     uint16_t pz;
-    uint16_t pad_u16;
+    uint16_t tan_flags;
     int16_t  oct_nx;
     int16_t  oct_ny;
+    int16_t  oct_tx;
+    int16_t  oct_ty;
+    float    u;
+    float    v;
     uint     rgba8;
+    uint     pad0;
 };
 
 struct SceneMeshlet {
@@ -36,22 +52,21 @@ struct SceneMeshlet {
 };
 
 struct SceneInstance {
-    float origin_x;
-    float origin_y;
-    float origin_z;
-    float uniform_scale;
-    float pitch_rad;
-    float yaw_rad;
-    float squash;
-    float roughness;
-    float selected;
-    float depth_bias;
-    uint  mat_index;
-    uint  mesh_id;
-    uint  first_meshlet;
-    uint  meshlet_count;
-    uint  flags;
-    uint  pad0;
+    float4 world_r0;
+    float4 world_r1;
+    float4 world_r2;
+    float  squash;
+    float  roughness;
+    float  depth_bias;
+    float  bound_scale;
+    uint   mat_index;
+    uint   mesh_id;
+    uint   first_meshlet;
+    uint   meshlet_count;
+    uint   flags;
+    uint   entity_id;
+    uint   pbr_mat_id;
+    uint   pad1;
 };
 
 struct SceneHizMipInfo {
@@ -79,21 +94,37 @@ struct SceneDrawIndirectCmd {
     uint firstInstance;
 };
 
-// Byte offsets inside SceneCullSlot (must match SceneCullSlot in src/scene/gpu/scene_gpu.c):
-//   0:     header counters (16 uints = 64B)
-//   64:    single fallback cmds (64B)
-//   128:   phase1_cmds[1024] (16384B)
-//   16512: phase2_cmds[1024] (16384B)
-//   32896: rejected_pairs[1024] (4096B)
-//   36992: work_pairs[1024] (4096B)
-//   41088: instances[256] (16384B)
+// 112-byte unified draw push block (matches SceneDrawPush in src/scene/gpu/scene_gpu.c).
+struct SceneDrawPush {
+    uint64_t meshlets_bda;
+    uint64_t vertices_bda;
+    uint64_t triangles_bda;
+    uint64_t cull_slot_bda;
+    uint64_t pbr_mats_bda;
+    uint     width;
+    uint     height;
+    uint     phase_cmd_mode; // 0 = firstInstance pair, 1 = p1_cmds, 2 = p2_cmds, 3 = blend_pairs
+    uint     draw_flags;     // bit 0: cull_none active (software backface check for single-sided)
+    ViewPush view;
+};
+
+// Byte offsets inside SceneCullSlot (must match static_asserts in src/scene/gpu/scene_gpu.c):
+//   0:      header counters (16 uints = 64B)
+//   64:     single fallback cmds (64B)
+//   128:    phase1_cmds[16384] (262144B)
+//   262272: phase2_cmds[16384] (262144B)
+//   524416: rejected_pairs[16384] (65536B)
+//   589952: work_pairs[16384] (65536B)
+//   655488: blend_pairs[4096] (16384B)
+//   671872: instances[512] (49152B)
 static const uint64_t k_slot_off_single1   = 64ull;
 static const uint64_t k_slot_off_single2   = 80ull;
 static const uint64_t k_slot_off_cmds1     = 128ull;
-static const uint64_t k_slot_off_cmds2     = 16512ull;
-static const uint64_t k_slot_off_rejected  = 32896ull;
-static const uint64_t k_slot_off_work      = 36992ull;
-static const uint64_t k_slot_off_instances = 41088ull;
+static const uint64_t k_slot_off_cmds2     = 262272ull;
+static const uint64_t k_slot_off_rejected  = 524416ull;
+static const uint64_t k_slot_off_work      = 589952ull;
+static const uint64_t k_slot_off_blend     = 655488ull;
+static const uint64_t k_slot_off_instances = 671872ull;
 
 float2 scene_sign_not_zero(float2 v) {
     return float2(v.x >= 0.0 ? 1.0 : -1.0, v.y >= 0.0 ? 1.0 : -1.0);
@@ -122,66 +153,104 @@ float4 scene_unpack_rgba8(uint packed) {
     ) * (1.0 / 255.0);
 }
 
-// Inverse pose rotation R_pose^T(ax, ay): undoes Y-yaw then X-pitch.
-float3 scene_inv_rotate_pose(float3 v, float ax, float ay) {
-    float cy = cos(ay), sy = sin(ay);
-    float3 ry = float3(v.x * cy - v.z * sy, v.y, v.x * sy + v.z * cy);
-    float cx = cos(ax), sx = sin(ax);
-    return float3(ry.x, ry.y * cx + ry.z * sx, -ry.y * sx + ry.z * cx);
-}
-
-// Inverse camera quaternion rotation R_view^T = view_rotate(conj(q), v).
 float3 scene_inv_view_rotate(float4 q, float3 v) {
     return view_rotate(float4(-q.xyz, q.w), v);
 }
 
-void scene_transform_vertex(
+float3 scene_transform_point_squash(float3 local_p, SceneInstance inst) {
+    float sz  = clamp(1.0 + inst.squash, 0.45, 1.85);
+    float sxy = rsqrt(sz);
+    float3 off = float3(
+        dot(inst.world_r0.xyz, local_p) * sxy,
+        dot(inst.world_r1.xyz, local_p) * sxy,
+        dot(inst.world_r2.xyz, local_p) * sz);
+    return off + float3(inst.world_r0.w, inst.world_r1.w, inst.world_r2.w);
+}
+
+float3 scene_transform_dir_squash(float3 local_d, SceneInstance inst) {
+    float sz  = clamp(1.0 + inst.squash, 0.45, 1.85);
+    float sxy = rsqrt(sz);
+    float3 wd = float3(
+        dot(inst.world_r0.xyz, local_d) * sxy,
+        dot(inst.world_r1.xyz, local_d) * sxy,
+        dot(inst.world_r2.xyz, local_d) * sz);
+    float l2 = dot(wd, wd);
+    return l2 > 1.0e-12 ? wd * rsqrt(l2) : float3(1.0, 0.0, 0.0);
+}
+
+float3 scene_transform_normal_squash(float3 local_n, SceneInstance inst) {
+    float sz  = clamp(1.0 + inst.squash, 0.45, 1.85);
+    float sxy = rsqrt(sz);
+    float3 a0 = inst.world_r0.xyz * sxy;
+    float3 a1 = inst.world_r1.xyz * sxy;
+    float3 a2 = inst.world_r2.xyz * sz;
+    float3 c0 = cross(a1, a2);
+    float3 c1 = cross(a2, a0);
+    float3 c2 = cross(a0, a1);
+    float  ds = dot(a0, c0) < 0.0 ? -1.0 : 1.0;
+    float3 wn = float3(dot(c0, local_n), dot(c1, local_n), dot(c2, local_n)) * ds;
+    float  l2 = dot(wn, wn);
+    return l2 > 1.0e-12 ? wn * rsqrt(l2) : float3(0.0, 0.0, 1.0);
+}
+
+struct SceneVertXform {
+    float4 clip;
+    float3 view_pos;
+    float3 view_nrm;
+    float3 view_tan;
+    float  bitan_sign;
+    bool   has_tan;
+    float2 uv;
+    float4 rgba;
+    float3 emit;
+    float  roughness;
+};
+
+SceneVertXform scene_transform_vertex_pbr(
     ScenePackedVertex pv,
     SceneMeshlet      ml,
     SceneInstance     inst,
     ViewPush          view,
     uint              width,
-    uint              height,
-    out float4        out_clip,
-    out float3        out_view_nrm,
-    out float3        out_albedo,
-    out float3        out_emit,
-    out float         out_roughness,
-    out float         out_view_z)
+    uint              height)
 {
+    SceneVertXform r;
     float3 local_p = scene_dequantize_pos(pv, ml);
     float3 local_n = scene_oct_decode(pv.oct_nx, pv.oct_ny);
+    float3 local_t = scene_oct_decode(pv.oct_tx, pv.oct_ty);
     float4 rgba    = scene_unpack_rgba8(pv.rgba8);
 
-    float3 posed_p = rotate_pose(local_p, inst.pitch_rad, inst.yaw_rad);
-    float3 posed_n = rotate_pose(local_n, inst.pitch_rad, inst.yaw_rad);
+    float3 world_p = scene_transform_point_squash(local_p, inst);
+    float3 world_n = scene_transform_normal_squash(local_n, inst);
+    float3 world_t = scene_transform_dir_squash(local_t, inst);
+    float3 vpos    = view_of(world_p, view.q, view.cam);
 
-    float sz  = clamp(1.0 + inst.squash, 0.45, 1.85);
-    float sxy = rsqrt(sz);
+    uint tf = uint(pv.tan_flags);
+    float tsign = ((tf & k_vert_flag_tan_neg_sign) != 0u) ? -1.0 : 1.0;
+    if ((inst.flags & k_scene_flag_flip_winding) != 0u) {
+        tsign = -tsign;
+    }
 
-    float3 world_p = posed_p * inst.uniform_scale;
-    world_p.x *= sxy;
-    world_p.y *= sxy;
-    world_p.z *= sz;
-    world_p += float3(inst.origin_x, inst.origin_y, inst.origin_z);
-
-    float3 scaled_n = normalize(float3(posed_n.x / sxy, posed_n.y / sxy, posed_n.z / sz));
-    float3 vpos     = view_of(world_p, view.q, view.cam);
-
-    out_clip      = view_ndc_persp(vpos, view.zoom, view.persp, width, height, inst.depth_bias);
-    out_view_nrm  = view_rotate(view.q, scaled_n);
-    out_albedo    = lerp(rgba.rgb, float3(1.0), clamp(inst.selected, 0.0, 1.0) * 0.42);
-    out_emit      = material_emit(view.materials, inst.mat_index);
-    out_roughness = inst.roughness > 0.0 ? inst.roughness : rgba.a;
-    out_view_z    = vpos.z;
+    r.clip       = view_ndc_persp(vpos, view.zoom, view.persp, width, height, inst.depth_bias);
+    r.view_pos   = vpos;
+    r.view_nrm   = view_rotate(view.q, world_n);
+    r.view_tan   = view_rotate(view.q, world_t);
+    r.bitan_sign = tsign;
+    r.has_tan    = (tf & k_vert_flag_has_tangent) != 0u;
+    r.uv         = float2(pv.u, pv.v);
+    r.rgba       = rgba;
+    r.emit       = material_emit(view.materials, inst.mat_index);
+    r.roughness  = inst.roughness > 0.0 ? inst.roughness : rgba.a;
+    return r;
 }
 
+// 11:14:7 packing: ((inst_id + 1) : 11) | (meshlet_id : 14) | (prim_id : 7)
 uint scene_visbuf_pack_id(uint inst_id, uint meshlet_id, uint prim_id) {
-    return (((inst_id + 1u) & 0x3FFFu) << 18u) | ((meshlet_id & 0x7FFu) << 7u) | (prim_id & 0x7Fu);
+    return (((inst_id + 1u) & 0x7FFu) << 21u) | ((meshlet_id & 0x3FFFu) << 7u) | (prim_id & 0x7Fu);
 }
 
 bool scene_visbuf_unpack_id(uint vis_id, out uint inst_id, out uint meshlet_id, out uint prim_id) {
-    uint inst_p1 = (vis_id >> 18u) & 0x3FFFu;
+    uint inst_p1 = (vis_id >> 21u) & 0x7FFu;
     if (inst_p1 == 0u) {
         inst_id    = 0u;
         meshlet_id = 0u;
@@ -189,7 +258,7 @@ bool scene_visbuf_unpack_id(uint vis_id, out uint inst_id, out uint meshlet_id, 
         return false;
     }
     inst_id    = inst_p1 - 1u;
-    meshlet_id = (vis_id >> 7u) & 0x7FFu;
+    meshlet_id = (vis_id >> 7u) & 0x3FFFu;
     prim_id    = vis_id & 0x7Fu;
     return true;
 }
@@ -199,6 +268,7 @@ struct SceneBaryResult {
     float3 dlambda_dx;
     float3 dlambda_dy;
     float  z_ndc;
+    bool   front_face;
     bool   valid;
 };
 
@@ -213,7 +283,8 @@ SceneBaryResult scene_eval_barycentrics(
     r.lambda     = float3(1.0, 0.0, 0.0);
     r.dlambda_dx = float3(0.0);
     r.dlambda_dy = float3(0.0);
-    r.z_ndc      = 1.0;
+    r.z_ndc      = 0.0;
+    r.front_face = true;
     r.valid      = false;
 
     float iw0 = 1.0 / c0.w;
@@ -261,6 +332,7 @@ SceneBaryResult scene_eval_barycentrics(
     r.dlambda_dx   = (dn_dx - r.lambda * dzi_dx) * z_persp;
     r.dlambda_dy   = (dn_dy - r.lambda * dzi_dy) * z_persp;
     r.z_ndc        = w_scr * (c0.z * iw0) + u_scr * (c1.z * iw1) + v_scr * (c2.z * iw2);
+    r.front_face   = (det < 0.0);
     r.valid        = true;
     return r;
 }

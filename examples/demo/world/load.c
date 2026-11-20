@@ -809,6 +809,9 @@ static int open_document(char *buf, size_t cap, size_t *len) {
         // World 0 is the pure empty engine canvas: literally nothing is loaded.
         return 4;
     }
+    if (wid == k_world_model_studio) {
+        return 5;
+    }
     if (wid == k_world_custom_file) {
         const char *custom = world_custom_path();
         if (custom == nullptr || custom[0] == '\0') {
@@ -877,6 +880,25 @@ static bool match_kw(const char *p, const char *kw) {
 }
 
 static bool resolve_world_file(const char *name, char *out, size_t cap);
+
+static int place_model(const char *line, int number) {
+    char  path[256] = {0};
+    float x = 0.0f, y = 0.0f, z = 0.0f, scale = 0.0f;
+    char  tail = 0;
+    int got_s = sscanf(line, "model %255s %f %f %f scale %f %c", path, &x, &y, &z, &scale, &tail);
+    int got_p = (got_s == 5) ? 5 : sscanf(line, "model %255s %f %f %f %c", path, &x, &y, &z, &tail);
+    int got_1 = (got_p >= 4) ? got_p : sscanf(line, "model %255s %c", path, &tail);
+    if ((got_s != 5 && got_p != 4 && got_1 != 1) || path[0] == '\0' ||
+        !isfinite(x) || !isfinite(y) || !isfinite(z) || !isfinite(scale)) {
+        fprintf(stderr, "[World] %s:%d model needs <path.blend|.glb|.gltf> [x y z [scale S]]\n",
+                source_name(), number);
+        return -1;
+    }
+    char resolved[1024];
+    const char *use_path = resolve_world_file(path, resolved, sizeof resolved) ? resolved : path;
+    bool auto_fit = (got_s != 5) || (scale <= 0.0f);
+    return model_kind_spawn(use_path, (Coord){ x, y, z }, scale, auto_fit) ? 0 : -1;
+}
 
 static int place_terrain(const char *line, int number) {
     char path[256] = {0};
@@ -994,6 +1016,8 @@ static int parse_document(char *buf, size_t len) {
                 step = place_solid(p, number);
             } else if (match_kw(p, "terrain")) {
                 step = place_terrain(p, number);
+            } else if (match_kw(p, "model")) {
+                step = place_model(p, number);
             } else if (match_kw(p, "mesh")) {
                 step = place_mesh(p, number);
             } else if (match_kw(p, "gone")) {
@@ -1035,6 +1059,7 @@ int world_load_string(const char *doc, const char *source_label) {
         solid_kind_reset();
         mesh_kind_reset();
         terrain_kind_reset();
+        model_kind_reset();
         spin_clear();
     }
     ground_set(2, 0.0f);
@@ -1057,6 +1082,7 @@ int world_load_string(const char *doc, const char *source_label) {
         solid_kind_reset();
         mesh_kind_reset();
         terrain_kind_reset();
+        model_kind_reset();
         spin_clear();
         world_removed_clear();
     }
@@ -1090,6 +1116,25 @@ int world_load(void) {
             printf("[World] Pure Engine booted with literally nothing (0 objects, 0 overlays). Pass --world=1..9 to construct a world.\n");
             fflush(stdout);
             rc = 0;
+        } else if (doc == 5) {
+            // Clean glTF 2.0 / Blender PBR Model Studio
+            ground_set(2, 0.0f);
+            ground_set_visible(true);
+            gimbal_set_visible(true);
+            hud_set_visible(true);
+            plot_set_visible(false);
+            text_set_visible(false);
+            world_set_clear_color(0.08f, 0.24f, 0.48f, 1.0f);
+            const char *mpath = world_cli_model_path();
+            char resolved[1024];
+            const char *use_path = (mpath != nullptr && resolve_world_file(mpath, resolved, sizeof resolved))
+                ? resolved : mpath;
+            if (use_path != nullptr && model_kind_spawn(use_path, (Coord){ 0.0f, 0.0f, 0.0f }, 0.0f, true)) {
+                table_publish();
+                rc = 0;
+            } else {
+                rc = -1;
+            }
         } else if (doc == 1) {
             table_publish();
             rc = 0;
@@ -1123,6 +1168,19 @@ int world_load(void) {
                     printf("[World] Loaded World %u (%s) from %s\n",
                            world_selected_id(), world_selected_title(), source_name());
                     fflush(stdout);
+                }
+            }
+        }
+        // If --model=<path> was also passed alongside a preset or custom world, place it in the world!
+        if (rc == 0 && doc != 4 && doc != 5) {
+            const char *mpath = world_cli_model_path();
+            if (mpath != nullptr && mpath[0] != '\0') {
+                char resolved[1024];
+                const char *use_path = resolve_world_file(mpath, resolved, sizeof resolved) ? resolved : mpath;
+                if (model_kind_spawn(use_path, (Coord){ 0.0f, 0.0f, 0.0f }, 0.0f, true)) {
+                    table_publish();
+                } else {
+                    rc = -1;
                 }
             }
         }

@@ -173,8 +173,10 @@ typedef struct VulkanDeviceInfo {
     bool supports_maintenance5;
     bool supports_maintenance6;
     bool supports_push_descriptors;
+    bool supports_bindless_textures;
     bool supports_host_image_copy;
     bool supports_dynamic_rendering_local_read;
+    bool supports_storage_write_without_format;
     bool supports_shader_int16;
     bool supports_shader_int64;
     bool supports_storage_buffer_16bit;

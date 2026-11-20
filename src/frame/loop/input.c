@@ -68,5 +68,15 @@ bool loop_take_input(WaylandContext *wl, VulkanContext *vk,
         app->drag(drag_x, drag_y, drag_buttons)) {
         frame_note_picture();
     }
+    int32_t hover_x = 0;
+    int32_t hover_y = 0;
+    if (pointer_take_hover(&hover_x, &hover_y) &&
+        app != nullptr && app->hover != nullptr) {
+        float ox = (float)hover_x - (float)shown()->image.width * 0.5f;
+        float oy = (float)shown()->image.height * 0.5f - (float)hover_y;
+        if (app->hover(ox, oy)) {
+            frame_note_picture();
+        }
+    }
     return false;
 }

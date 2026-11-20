@@ -105,8 +105,8 @@ VSOutput main(uint vert_id : SV_VulkanVertexID, uint inst_id : SV_VulkanInstance
     float3 view_pos  = view_of(world_pos, pc.view.q, pc.view.cam);
 
     float4 ndc = view_ndc(view_pos, pc.view.zoom, pc.width, pc.height, 0.0);
-    // +0.45 m view-depth bias prevents self-z-fighting against parent DEM triangles while foreground ridges occlude cleanly
-    ndc.z = clamp(0.5 - (view_pos.z + 0.45) / 65536.0, 0.001, 0.999);
+    // Reverse-Z: +0.45 m closer bias places surfels cleanly in front of parent DEM while ridges occlude
+    ndc.z = clamp(0.5 + (view_pos.z + 0.45) / 65536.0, 0.001, 0.999);
 
     float4 rgba = float4(
         float( s.rgba_opa_packed         & 0xFFu) * (1.0 / 255.0),

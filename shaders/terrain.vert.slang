@@ -190,7 +190,8 @@ VSOutput main(uint vert_id : SV_VulkanVertexID, uint inst_id : SV_VulkanInstance
     float3 view_pos  = view_of(world_pos, pc.view.q, pc.view.cam);
 
     float4 ndc       = view_ndc(view_pos, pc.view.zoom, pc.width, pc.height, 0.0);
-    ndc.z            = clamp(0.5 - view_pos.z / 65536.0, 0.001, 0.999);
+    // Reverse-Z: closer (+view_pos.z) -> larger z_ndc (clear=0.0, GREATER_OR_EQUAL)
+    ndc.z            = clamp(0.5 + view_pos.z / 65536.0, 0.001, 0.999);
     out.sv_pos       = ndc;
     out.view_nrm     = normalize(view_rotate(pc.view.q, world_nrm));
     out.world_pos    = world_pos;

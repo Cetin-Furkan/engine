@@ -26,6 +26,6 @@ bool mesh_sphere(float *cx, float *cy, float *radius);
 bool mesh_wants_frame(void);
 void mesh_commit(void);
 
-void mesh_submit_scene(float yaw_deg, bool selected);
+void mesh_submit_scene(const float world_m[12], uint32_t entity_id);
 
 #endif /* ENGINE_FRAME_MESH_H */

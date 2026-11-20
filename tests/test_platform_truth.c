@@ -217,6 +217,13 @@ static void test_minimal_symbol_and_library_purity(const char *minimal_bin) {
             "physics_",
             "avbd_",
             "lighting_",
+            "rg_",
+            "post_",
+            "ecs_",
+            "gizmo_",
+            "texture_",
+            "gltf_",
+            "json_",
             "scene_init",
             "scene_shutdown",
             "scene_upload",
@@ -228,6 +235,8 @@ static void test_minimal_symbol_and_library_purity(const char *minimal_bin) {
             "hb_",
             "FcConfig",
             "png_",
+            "jpeg_",
+            "WebP",
         };
         uint32_t sym_lines = 0u;
         char line[512];
@@ -270,6 +279,8 @@ static void test_minimal_symbol_and_library_purity(const char *minimal_bin) {
             CHECK(strstr(line, "harfbuzz") == nullptr);
             CHECK(strstr(line, "fontconfig") == nullptr);
             CHECK(strstr(line, "libpng") == nullptr);
+            CHECK(strstr(line, "libjpeg") == nullptr);
+            CHECK(strstr(line, "libwebp") == nullptr);
         }
         int status = pclose(fp);
         CHECK(status == 0);
@@ -499,7 +510,7 @@ int main(void) {
     if (build_rc == 0) {
         uint32_t engine_spv  = count_spv_in_dir("build/truth_clean_release/gen");
         uint32_t minimal_spv = count_spv_in_dir("build/truth_clean_release/gen_minimal");
-        CHECK(engine_spv == 43u);
+        CHECK(engine_spv == 49u);
         CHECK(minimal_spv == 2u);
 
         char spv_needle[64];

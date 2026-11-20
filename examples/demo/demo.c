@@ -20,9 +20,14 @@
 #include "frame/text.h"
 #include "frame/world.h"
 #include "frame/frame.h"
+#include "ecs/ecs.h"
+#include "gizmo/gizmo.h"
+#include "graph/graph.h"
 #include "lighting/lighting.h"
 #include "physics/physics.h"
+#include "post/post.h"
 #include "scene/scene.h"
+#include "texture/texture.h"
 #include "ring/ring.h"
 #include "vulkan/core.h"
 #include "input/pointer.h"
@@ -54,6 +59,7 @@ enum : uint32_t { k_target_cap = 16 };
 typedef struct TargetEntry {
     PassDepth    depth;
     PassCoverage coverage;
+    PassHdr      hdr;
     uint32_t     width;
     uint32_t     height;
     uint32_t     generation;
@@ -63,6 +69,10 @@ typedef struct TargetEntry {
 static TargetEntry s_targets[k_target_cap];
 static uint32_t    s_target_generation = 1;
 static bool        s_prepare_live      = true;
+static RgGraph     s_rg                = {0};
+static uint32_t    s_rg_frame_slot     = 0u;
+static bool        s_rg_open           = false;
+static uint64_t    s_post_last_ns      = 0u;
 
 static TargetEntry *target_find_by_depth(VkImage depth_image) {
     if (depth_image == VK_NULL_HANDLE) {
@@ -102,9 +112,11 @@ static int demo_create_targets(VulkanContext *vk, EngineTargets *targets,
         return -1;
     }
     if (pass_depth_create(vk, &entry->depth, width, height) != 0 ||
-        pass_coverage_create(vk, &entry->coverage, width, height) != 0) {
+        pass_coverage_create(vk, &entry->coverage, width, height) != 0 ||
+        pass_hdr_create(vk, &entry->hdr, width, height) != 0) {
         pass_depth_destroy(vk, &entry->depth);
         pass_coverage_destroy(vk, &entry->coverage);
+        pass_hdr_destroy(vk, &entry->hdr);
         entry->used = false;
         *targets = (EngineTargets){0};
         return -1;
@@ -120,8 +132,12 @@ static int demo_create_targets(VulkanContext *vk, EngineTargets *targets,
     targets->depth_view      = entry->depth.view;
     targets->coverage_image  = entry->coverage.image;
     targets->coverage_view   = entry->coverage.view;
+    targets->hdr_image       = entry->hdr.image;
+    targets->hdr_view        = entry->hdr.view;
     targets->depth_format    = pass_depth_format();
+    targets->hdr_format      = pass_hdr_format();
     targets->samples         = pass_raster_samples();
+    targets->reverse_z       = true;
     return 0;
 }
 
@@ -133,6 +149,7 @@ static void demo_destroy_targets(VulkanContext *vk, EngineTargets *targets) {
     if (entry != nullptr) {
         pass_depth_destroy(vk, &entry->depth);
         pass_coverage_destroy(vk, &entry->coverage);
+        pass_hdr_destroy(vk, &entry->hdr);
         entry->used = false;
         // Poison: a copied EngineTargets still naming these handles must
         // not match a future entry that recycles the same image handle
@@ -204,6 +221,24 @@ static void emit_bench_summary(uint32_t width, uint32_t height, uint64_t modifie
     lighting_get_stats(&lstat);
     PhysicsBenchStats pstat = {0};
     physics_get_stats(&pstat);
+    PostBenchStats post_st = {0};
+    post_get_stats(&post_st);
+    TextureBenchStats tstat = {0};
+    texture_get_stats(&tstat);
+    RgProfileSnapshot rg_prof = {0};
+    rg_get_profile(&rg_prof);
+    char rg_buf[512];
+    size_t rg_pos = 0u;
+    rg_buf[0] = '\0';
+    for (uint32_t p = 0u; p < rg_prof.pass_count && rg_pos + 32u < sizeof rg_buf; ++p) {
+        int n = snprintf(rg_buf + rg_pos, sizeof rg_buf - rg_pos, "%s%s:%u",
+                         p == 0u ? "" : ",", rg_prof.passes[p].name, rg_prof.passes[p].gpu_us);
+        if (n > 0) {
+            rg_pos += (size_t)n;
+        }
+    }
+    const char *hdr_fmt_str = (post_st.hdr_format == VK_FORMAT_B10G11R11_UFLOAT_PACK32)
+        ? "B10G11R11_UFLOAT" : "R16G16B16A16_SFLOAT";
     bool visbuf_on = scene_visbuf_active();
     bool phys_on   = physics_gpu_active();
     bool gs_on     = backend_2dgs_active();
@@ -213,6 +248,10 @@ static void emit_bench_summary(uint32_t width, uint32_t height, uint64_t modifie
     uint32_t objects = 0u;
     uint32_t verts = 0u;
     world_stats(&objects, &verts);
+    uint32_t ecs_ents = 0u;
+    uint32_t ecs_hier = 0u;
+    world_ecs_stats(&ecs_ents, &ecs_hier);
+    const char *dbg_name = lighting_debug_view_name(lighting_debug_view());
     VulkanContext *vk = vulkan_get_context();
 
     printf("[Bench] world=%u res=%ux%u msaa=%ux frames=%u samples=%u wall_ms=%.2f "
@@ -225,6 +264,8 @@ static void emit_bench_summary(uint32_t width, uint32_t height, uint64_t modifie
            "scene_slab_kib=%.1f meshlets=%u/%u(p1=%u,p2=%u,cone=%u,frust=%u,hiz=%u) visbuf=%u hiz_pass=%u "
            "gi=%u gi_oracle=%u gi_res=%ux%u gi_rays=%u gi_proxies=%u gi_mib=%.2f "
            "phys_gpu=%u phys_iters=%u phys_verts=%u phys_cons=%u phys_colors=%u phys_disp=%u phys_kib=%.1f "
+           "hdr=%s bloom=%u auto_exp=%u exp_scale=%.2f post_mib=%.2f rg_us=%u rg_passes=\"%s\" "
+           "ecs_ents=%u ecs_hier=%u dbg_view=\"%s\" tex_cnt=%u pbr_mats=%u tex_mib=%.2f "
            "rss_mib=%.2f hwm_mib=%.2f objs=%u verts=%u mod=0x%llx gpu=\"%s\" profile=\"%s\"\n",
            world_selected_id(),
            width, height,
@@ -271,6 +312,16 @@ static void emit_bench_summary(uint32_t width, uint32_t height, uint64_t modifie
            pstat.num_colors,
            pstat.dispatches_frame,
            (double)pstat.bda_bytes / 1024.0,
+           hdr_fmt_str,
+           post_st.bloom_enabled ? 1u : 0u,
+           post_st.auto_exposure_enabled ? 1u : 0u,
+           (double)post_st.last_exposure_scale,
+           (double)post_st.vram_bytes / (1024.0 * 1024.0),
+           rg_prof.total_us,
+           rg_buf,
+           ecs_ents, ecs_hier, dbg_name,
+           tstat.texture_count, tstat.material_count,
+           (double)tstat.vram_bytes / (1024.0 * 1024.0),
            (double)rss_kib / 1024.0,
            (double)hwm_kib / 1024.0,
            objects, verts,
@@ -283,7 +334,7 @@ static void emit_bench_summary(uint32_t width, uint32_t height, uint64_t modifie
 // ------------------------------------------------------------------- hooks
 
 static void print_worlds_usage(const char *prog) {
-    printf("Usage: %s [--world=<0..9|name|file.world> | -w <0..9|name|file.world>] [--image=<path.png|jpg>] [--bench[=<frames>]] [--list-worlds] [--help]\n\n"
+    printf("Usage: %s [--world=<0..9|name|file.world> | -w <0..9|name|file.world>] [--model=<file.blend|.glb|.gltf> | -m <file>] [--image=<path.png|jpg>] [--bench[=<frames>]] [--list-worlds] [--help]\n\n"
            "Pure Engine Default & Built-On-Top Worlds:\n"
            "  --world=0  [Pure    | Empty Canvas  | Sealed    ] Pure Empty Engine (Default: 0 objects, 0 grid, 0 HUD)\n"
            "  --world=1  [3D-Only | PERM_DRAW=on  | Tab=locked] Click-to-Draw Studio (Points -> Lines -> Faces)\n"
@@ -296,6 +347,7 @@ static void print_worlds_usage(const char *prog) {
            "  --world=8  [3D/Map  | RelPtr2D+SSD  | Tab=locked] Baklan & Beşparmak Dağı Real DEM + Satellite Map\n"
            "  --world=9  [Sandbox | Full 3D/2D/Hyb| Tab=open  ] Interactive Full Sandbox (opening.world + sheet + Plots)\n"
            "  --world=<path.world>                              Load a custom .world DSL scene file on top of the engine\n"
+           "  --model=<path.blend|.glb|.gltf>                   Load a Blender .blend or glTF 2.0 PBR model with full ECS hierarchy\n"
            "  --image=<path.png|jpg>                            Load a custom bird's-eye image overlay into World 8 (50%% transparent)\n",
            prog != nullptr ? prog : "engine");
     fflush(stdout);
@@ -367,8 +419,10 @@ static bool parse_world_arg(const char *arg, uint32_t *out_id) {
 }
 
 static int demo_configure(int argc, char **argv) {
-    uint32_t chosen = 0u;
-    const char *custom_path = nullptr;
+    uint32_t    chosen         = 0u;
+    bool        explicit_world = false;
+    const char *custom_path    = nullptr;
+    const char *model_path     = nullptr;
     for (int i = 1; i < argc; ++i) {
         const char *a = argv[i];
         if (a == nullptr) {
@@ -392,6 +446,22 @@ static int demo_configure(int argc, char **argv) {
             }
             s_bench_target = (uint32_t)n;
             frame_set_bench_mode(true);
+            continue;
+        }
+        if (strncmp(a, "--model=", 8) == 0) {
+            model_path = a + 8;
+            continue;
+        }
+        if (strncmp(a, "-m=", 3) == 0) {
+            model_path = a + 3;
+            continue;
+        }
+        if (strcmp(a, "--model") == 0 || strcmp(a, "-m") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "[Engine] Missing model path after '%s'\n", a);
+                return -1;
+            }
+            model_path = argv[++i];
             continue;
         }
         if (strncmp(a, "--image=", 8) == 0) {
@@ -431,17 +501,23 @@ static int demo_configure(int argc, char **argv) {
             return -1;
         }
         if (parse_world_arg(val, &chosen)) {
-            custom_path = nullptr;
+            custom_path    = nullptr;
+            explicit_world = true;
         } else if (strcmp(val, "alptal") == 0) {
-            custom_path = "examples/demo/world/alptal.world";
+            custom_path    = "examples/demo/world/alptal.world";
+            explicit_world = true;
         } else if (strcmp(val, "luquillo") == 0) {
-            custom_path = "examples/demo/world/luquillo.world";
+            custom_path    = "examples/demo/world/luquillo.world";
+            explicit_world = true;
         } else if (strcmp(val, "hj_andrews") == 0) {
-            custom_path = "examples/demo/world/hj_andrews.world";
+            custom_path    = "examples/demo/world/hj_andrews.world";
+            explicit_world = true;
         } else if (strcmp(val, "wuestebach") == 0) {
-            custom_path = "examples/demo/world/wuestebach.world";
+            custom_path    = "examples/demo/world/wuestebach.world";
+            explicit_world = true;
         } else if (has_world_suffix_or_sep(val)) {
-            custom_path = val;
+            custom_path    = val;
+            explicit_world = true;
         } else {
             fprintf(stderr, "[Engine] Invalid world '%s' (expected 0..%u, preset name, or .world path)\n",
                     val, k_world_preset_max);
@@ -454,18 +530,35 @@ static int demo_configure(int argc, char **argv) {
             fprintf(stderr, "[Engine] Invalid world file path '%s'\n", custom_path);
             return -1;
         }
+        if (model_path != nullptr && !world_select_model(model_path, false)) {
+            fprintf(stderr, "[Engine] Invalid model path '%s'\n", model_path);
+            return -1;
+        }
+    } else if (model_path != nullptr && !explicit_world) {
+        if (!world_select_model(model_path, true)) {
+            fprintf(stderr, "[Engine] Invalid model path '%s'\n", model_path);
+            return -1;
+        }
     } else {
         world_select(chosen);
+        if (model_path != nullptr && !world_select_model(model_path, false)) {
+            fprintf(stderr, "[Engine] Invalid model path '%s'\n", model_path);
+            return -1;
+        }
     }
     return 0;
 }
 
 static int demo_init(VulkanContext *vk, RingCqeFn forward_cqe, void *forward_user) {
     world_apply_policy();
-    if (pass_init(vk) != 0 ||
+    rg_init(vk);
+    if (post_init(vk) != 0 ||
+        gizmo_gpu_init(vk) != 0 ||
+        pass_init(vk) != 0 ||
         lighting_init(vk) != 0 ||
         physics_init(vk) != 0 ||
-        scene_init(vk, pass_depth_format(), pass_raster_samples()) != 0 ||
+        texture_init(vk) != 0 ||
+        scene_init(vk, pass_hdr_format(), pass_depth_format(), pass_raster_samples()) != 0 ||
         chrome_gpu_bind_pass(vk, pass_depth_format(), pass_raster_samples()) != 0 ||
         cube_init(vk) != 0 || solid_init(vk) != 0 || shape_init(vk) != 0 ||
         plane_init(vk) != 0 || material_init(vk) != 0 ||
@@ -496,8 +589,12 @@ static void demo_shutdown(VulkanContext *vk) {
     solid_shutdown(vk);
     cube_shutdown(vk);
     scene_shutdown(vk);
+    texture_shutdown(vk);
     physics_shutdown(vk);
     lighting_shutdown(vk);
+    gizmo_gpu_shutdown(vk);
+    post_shutdown(vk);
+    rg_shutdown(vk);
     pass_shutdown(vk);
 }
 
@@ -507,10 +604,12 @@ static void demo_record_compute(VkCommandBuffer cmd, uint32_t heat_dt, bool live
 }
 
 static void demo_prepare_draw(VkCommandBuffer cmd, VkImage depth_image) {
+    rg_begin_frame(&s_rg, s_rg_frame_slot);
+    s_rg_open = true;
     plot_prepare(cmd);
     const TargetEntry *entry = target_find_by_depth(depth_image);
     if (entry != nullptr) {
-        world_prepare_draw(cmd, entry->width, entry->height, s_prepare_live);
+        world_prepare_draw(&s_rg, cmd, entry->width, entry->height, s_prepare_live);
     }
 }
 
@@ -519,7 +618,9 @@ static void demo_claim_frame(VkSemaphore acquire, uint64_t signal_point) {
     bda_transient_begin_frame(acquire, signal_point);
     lighting_claim_frame(acquire, signal_point);
     physics_claim_frame(acquire, signal_point);
+    texture_claim_frame(acquire, signal_point);
     scene_claim_frame(acquire, signal_point);
+    post_claim_frame(acquire, signal_point);
     cube_bind_acquire(acquire);
     shape_begin(acquire, signal_point);
     text_begin(acquire, signal_point);
@@ -537,13 +638,77 @@ static void demo_release_frame(uint64_t signal_point) {
 
 static void demo_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height, bool live) {
     s_bench_live_draw = live;
+    if (s_rg_open) {
+        rg_begin_external_pass(&s_rg, cmd, "SceneHDR", RG_PASS_SCENE);
+    }
     world_draw(cmd, width, height, live);
+    if (s_rg_open) {
+        rg_end_external_pass(&s_rg, cmd);
+    }
+}
+
+static void demo_post_process(VkCommandBuffer cmd, uint32_t slot_index,
+                              VkImage hdr_image, VkImageView hdr_view,
+                              VkImage swap_image, VkImageView swap_view, VkFormat swap_format,
+                              uint32_t width, uint32_t height,
+                              bool unified_internal, bool unified_swap) {
+    if (!s_rg_open) {
+        rg_begin_frame(&s_rg, slot_index);
+        s_rg_open = true;
+    }
+
+    uint64_t now_ns = ring_mono_ns();
+    float dt_s = 1.0f / 60.0f;
+    if (s_post_last_ns != 0u && now_ns > s_post_last_ns) {
+        double raw = (double)(now_ns - s_post_last_ns) * 1.0e-9;
+        if (raw < 0.001) raw = 0.001;
+        if (raw > 0.100) raw = 0.100;
+        dt_s = (float)raw;
+    }
+    s_post_last_ns = now_ns;
+
+    const VkImageLayout hdr_lay = unified_internal
+        ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    RgResHandle hdr_res = rg_import_image(&s_rg, "SceneHDR", hdr_image,
+                                          VK_IMAGE_ASPECT_COLOR_BIT, 0u, 1u,
+                                          hdr_lay, nullptr, unified_internal);
+    rg_set_prior_access(&s_rg, hdr_res,
+                        VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                        VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                        VK_PIPELINE_STAGE_2_NONE);
+    RgResHandle swap_res = rg_import_image(&s_rg, "Swapchain", swap_image,
+                                           VK_IMAGE_ASPECT_COLOR_BIT, 0u, 1u,
+                                           VK_IMAGE_LAYOUT_UNDEFINED, nullptr, unified_swap);
+
+    const bool hdr_active = (world_selected_id() != 0u) && (policy_mode() != MODE_2D) &&
+                            (lighting_debug_view() == LIGHTING_DEBUG_LIT);
+    post_add_graph_passes(&s_rg, hdr_res, hdr_view, swap_res, swap_view, swap_format,
+                          width, height, hdr_active, hdr_active, dt_s);
+    rg_flush(&s_rg, cmd);
+    rg_end_frame(&s_rg);
+    s_rg_open = false;
+    s_rg_frame_slot ^= 1u;
 }
 
 static void demo_draw_overlay(VkCommandBuffer cmd, uint32_t width, uint32_t height,
                               VkFormat format, VkFormat depth_format,
                               VkSampleCountFlagBits samples, uint32_t frame_ms,
                               bool have_stamp, uint64_t modifier) {
+    if (world_selected_id() != 0u && policy_mode() != MODE_2D) {
+        const GizmoState *gz  = world_gizmo();
+        EcsEntity         sel = world_selected_entity();
+        if (gz != nullptr && (gz->debug_draw || (sel != ECS_NULL_ENTITY && gz->mode != GIZMO_MODE_NONE))) {
+            camera_bind(s_bench_live_draw);
+            ViewPush vp = {0};
+            view_push_fill(&vp, 0u);
+            GizmoCamera gcam = {0};
+            const float q[4]   = { vp.qx, vp.qy, vp.qz, vp.qw };
+            const float cam[3] = { vp.cam_x, vp.cam_y, vp.cam_z };
+            gizmo_camera_fill(&gcam, q, cam, vp.zoom, vp.persp);
+            gizmo_gpu_draw(cmd, width, height, format, &vp, sizeof vp,
+                           gz, world_ecs(), sel, &gcam);
+        }
+    }
     hud_prepare(frame_ms, have_stamp, modifier);
     hud_draw(cmd, width, height, format, depth_format, samples);
     text_draw(cmd, width, height, format, depth_format, samples);
@@ -627,6 +792,10 @@ static bool demo_click(float origin_x, float origin_y) {
     return world_click(origin_x, origin_y);
 }
 
+static bool demo_hover(float origin_x, float origin_y) {
+    return world_hover(origin_x, origin_y);
+}
+
 static bool demo_text(const char *utf8, uint32_t bytes) {
     if (!text_is_visible()) {
         return false;
@@ -652,9 +821,12 @@ static uint8_t demo_route_key(uint32_t key) {
     if (key == KEY_T && text_is_visible()) {
         return ENGINE_KEY_HOLD;
     }
-    if ((key >= KEY_F1 && key <= KEY_F10) || key == KEY_0 ||
+    if (key == KEY_LEFTCTRL || key == KEY_RIGHTCTRL) {
+        return ENGINE_KEY_HOLD;
+    }
+    if ((key >= KEY_F1 && key <= KEY_F12) || key == KEY_0 || key == KEY_SPACE ||
         key == KEY_K || key == KEY_KP0 || key == KEY_Y || key == KEY_H ||
-        key == KEY_7 || key == KEY_8) {
+        key == KEY_7 || key == KEY_8 || key == KEY_9) {
         return ENGINE_KEY_TAP;
     }
     if (terrain_is_active()) {
@@ -665,6 +837,9 @@ static uint8_t demo_route_key(uint32_t key) {
             key == KEY_B || key == KEY_ENTER || key == KEY_KPENTER) {
             return ENGINE_KEY_TAP;
         }
+    } else if (key == KEY_W || key == KEY_U || key == KEY_I ||
+               key == KEY_O || key == KEY_P || key == KEY_N || key == KEY_B) {
+        return ENGINE_KEY_TAP;
     }
     KeyRoute route = policy_route(policy_active(), (uint16_t)key, demo_shift_down());
     if (route == KEY_ROUTE_HOLD) {
@@ -705,6 +880,42 @@ static bool demo_key(uint32_t key, EngineKeyContext *ctx) {
     }
     if (key == KEY_8) {
         return physics_toggle_gpu();
+    }
+    if (key == KEY_9) {
+        return demo_shift_down() ? post_toggle_auto_exposure() : post_toggle_bloom();
+    }
+    if (key == KEY_F11) {
+        return demo_shift_down() ? world_gizmo_toggle_debug_draw() : hud_toggle_profiler();
+    }
+    if (key == KEY_F12) {
+        (void)lighting_cycle_debug_view(demo_shift_down());
+        return true;
+    }
+    if (key == KEY_SPACE) {
+        return demo_shift_down() ? world_gizmo_toggle_space() : world_gizmo_cycle_mode();
+    }
+    if (!terrain_is_active()) {
+        if (key == KEY_W) {
+            return world_gizmo_set_mode(GIZMO_MODE_TRANSLATE);
+        }
+        if (key == KEY_U) {
+            return world_gizmo_set_mode(GIZMO_MODE_ROTATE);
+        }
+        if (key == KEY_I) {
+            return world_gizmo_set_mode(GIZMO_MODE_SCALE);
+        }
+        if (key == KEY_O) {
+            return world_gizmo_toggle_space();
+        }
+        if (key == KEY_B) {
+            return world_gizmo_toggle_debug_draw();
+        }
+        if (key == KEY_P) {
+            return demo_shift_down() ? world_unparent_selected() : world_parent_selected();
+        }
+        if (key == KEY_N) {
+            return world_select_cycle(demo_shift_down() ? -1 : 1);
+        }
     }
     if (terrain_is_active()) {
         bool shift = demo_shift_down();
@@ -900,8 +1111,13 @@ static const EngineApp s_app = {
             "H toggles 2026 SSILVB + Split Radiance Cascade Global Illumination. "
             "7 toggles Oriented 2D Gaussian Splatting (2DGS) geodetic surfels in World 8. "
             "8 toggles GPU Augmented Vertex Block Descent (AVBD) physics compute. "
+            "9 toggles Physically-Based Bloom (Shift+9 toggles 256-Bin Histogram Auto-Exposure). "
+            "F11 toggles the Render Graph per-pass GPU microsecond profiler overlay (Shift+F11 or B toggles 3D AABB/Hierarchy/Triad overlays). "
+            "F12 cycles GPU Debug Views (Albedo/Normals/Roughness/Depth/GI/AO/Shadow/Meshlets; Shift+F12 resets to Lit). "
+            "Space/W/U/I switch 3D Transform Gizmos (Move/Rotate/Scale), O or Shift+Space toggles World/Local, Ctrl snaps while dragging. "
+            "N/Shift+N cycle ECS entities, P parents selected entity preserving world pose, Shift+P detaches to root. "
             "A click on a mesh "
-            "selects it. A cube click plants heat for five seconds and shoves the cube. "
+            "selects it. A cube click shoves the cube. "
             "It stops on the ground and against other cubes, and that place is saved. "
             "It can be selected while other meshes are up. Its colors sweep on that clock, then hold. "
             "Keys 1-6 raise a tetrahedron, octahedron, icosahedron, cylinder, cone, and torus. "
@@ -932,6 +1148,7 @@ static const EngineApp s_app = {
     .prepare_draw      = demo_prepare_draw,
     .claim_frame       = demo_claim_frame,
     .draw              = demo_draw,
+    .post_process      = demo_post_process,
     .draw_overlay      = demo_draw_overlay,
     .record_abort      = world_record_abort,
     .record_ok         = world_record_ok,
@@ -950,6 +1167,7 @@ static const EngineApp s_app = {
     .on_cqe            = backend_on_cqe,
     .turn_report       = hud_turn_report,
     .click             = demo_click,
+    .hover             = demo_hover,
     .drag              = demo_drag,
     .scroll            = demo_scroll,
     .text              = demo_text,

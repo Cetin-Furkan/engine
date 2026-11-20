@@ -113,10 +113,10 @@ static bool gimbal_ensure_ready(void) {
         .cull          = VK_CULL_MODE_NONE,
         .depth_test    = VK_FALSE,
         .depth_write   = VK_FALSE,
-        .depth_compare = VK_COMPARE_OP_LESS,
+        .depth_compare = VK_COMPARE_OP_GREATER_OR_EQUAL,
         .blend         = VK_FALSE,
     };
-    vulkan_gfx_arm(&s_gfx, &gfx, VK_FORMAT_B8G8R8A8_SRGB, nullptr);
+    vulkan_gfx_arm(&s_gfx, &gfx, pass_hdr_format(), nullptr);
     if (!s_logged) {
         printf("[Gimbal] View ball in the corner. Numpad 7 shows or hides it.\n");
         fflush(stdout);

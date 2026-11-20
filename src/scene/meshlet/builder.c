@@ -39,33 +39,40 @@ static uint32_t morton3d_unit(float ux, float uy, float uz) {
     return (expand_bits_10(ix) << 2u) | (expand_bits_10(iy) << 1u) | expand_bits_10(iz);
 }
 
-static uint64_t hash_corner_bits(const SceneCorner *c) {
-    uint32_t words[9];
+static uint64_t hash_pbr_corner_bits(const ScenePbrCorner *c) {
+    uint32_t words[16];
     memcpy(words, c, sizeof words);
     // Normalize -0.0f to +0.0f so bitwise-identical zero coordinates weld cleanly.
-    for (uint32_t i = 0u; i < 9u; ++i) {
+    for (uint32_t i = 0u; i < 16u; ++i) {
         if (words[i] == 0x80000000u) {
             words[i] = 0u;
         }
     }
     uint64_t h = 1469598103934665603ull;
-    for (uint32_t i = 0u; i < 9u; ++i) {
+    for (uint32_t i = 0u; i < 16u; ++i) {
         h ^= (uint64_t)words[i];
         h *= 1099511628211ull;
     }
     return h;
 }
 
-static bool corners_equal(const SceneCorner *a, const SceneCorner *b) {
-    return fabsf(a->x - b->x) <= 1.0e-6f &&
-           fabsf(a->y - b->y) <= 1.0e-6f &&
-           fabsf(a->z - b->z) <= 1.0e-6f &&
+static bool pbr_corners_equal(const ScenePbrCorner *a, const ScenePbrCorner *b) {
+    return fabsf(a->x  - b->x)  <= 1.0e-6f &&
+           fabsf(a->y  - b->y)  <= 1.0e-6f &&
+           fabsf(a->z  - b->z)  <= 1.0e-6f &&
            fabsf(a->nx - b->nx) <= 1.0e-5f &&
            fabsf(a->ny - b->ny) <= 1.0e-5f &&
            fabsf(a->nz - b->nz) <= 1.0e-5f &&
-           fabsf(a->r - b->r) <= 1.0e-4f &&
-           fabsf(a->g - b->g) <= 1.0e-4f &&
-           fabsf(a->b - b->b) <= 1.0e-4f;
+           fabsf(a->tx - b->tx) <= 1.0e-4f &&
+           fabsf(a->ty - b->ty) <= 1.0e-4f &&
+           fabsf(a->tz - b->tz) <= 1.0e-4f &&
+           fabsf(a->tw - b->tw) <= 1.0e-3f &&
+           fabsf(a->u  - b->u)  <= 1.0e-5f &&
+           fabsf(a->v  - b->v)  <= 1.0e-5f &&
+           fabsf(a->r  - b->r)  <= 1.0e-4f &&
+           fabsf(a->g  - b->g)  <= 1.0e-4f &&
+           fabsf(a->b  - b->b)  <= 1.0e-4f &&
+           fabsf(a->a  - b->a)  <= 1.0e-4f;
 }
 
 static int cmp_tri_morton(const void *pa, const void *pb) {
@@ -112,8 +119,9 @@ void scene_meshlet_build_free(SceneMeshletBuild *build) {
     *build = (SceneMeshletBuild){0};
 }
 
-int scene_build_meshlets(const SceneCorner *corners, uint32_t corner_count,
-                         float default_roughness, SceneMeshletBuild *out_build) {
+int scene_build_meshlets_pbr(const ScenePbrCorner *corners, uint32_t corner_count,
+                             bool has_uv, bool has_tangent,
+                             SceneMeshletBuild *out_build) {
     if (out_build == nullptr) {
         return -1;
     }
@@ -125,13 +133,13 @@ int scene_build_meshlets(const SceneCorner *corners, uint32_t corner_count,
 
     // 1. Weld shared corners into unique vertices via open-addressed power-of-two hash table.
     uint32_t hash_cap = 64u;
-    while (hash_cap < corner_count * 2u) {
+    while (hash_cap < corner_count * 2u && hash_cap < (1u << 26u)) {
         hash_cap <<= 1u;
     }
-    HashEntry   *htab      = calloc(hash_cap, sizeof(*htab));
-    SceneCorner *uniq_v    = malloc((size_t)corner_count * sizeof(*uniq_v));
-    uint32_t    *tri_idx   = malloc((size_t)tri_total * 3u * sizeof(*tri_idx));
-    TriMeta     *tris      = malloc((size_t)tri_total * sizeof(*tris));
+    HashEntry      *htab    = calloc(hash_cap, sizeof(*htab));
+    ScenePbrCorner *uniq_v  = malloc((size_t)corner_count * sizeof(*uniq_v));
+    uint32_t       *tri_idx = malloc((size_t)tri_total * 3u * sizeof(*tri_idx));
+    TriMeta        *tris    = malloc((size_t)tri_total * sizeof(*tris));
     if (htab == nullptr || uniq_v == nullptr || tri_idx == nullptr || tris == nullptr) {
         free(htab);
         free(uniq_v);
@@ -143,12 +151,12 @@ int scene_build_meshlets(const SceneCorner *corners, uint32_t corner_count,
     uint32_t uniq_count = 0u;
     uint32_t mask = hash_cap - 1u;
     for (uint32_t i = 0u; i < tri_total * 3u; ++i) {
-        const SceneCorner *c = &corners[i];
-        uint32_t slot = (uint32_t)hash_corner_bits(c) & mask;
+        const ScenePbrCorner *c = &corners[i];
+        uint32_t slot = (uint32_t)hash_pbr_corner_bits(c) & mask;
         uint32_t found = UINT32_MAX;
         while (htab[slot].occupied) {
             uint32_t cand = htab[slot].vert_idx;
-            if (corners_equal(&uniq_v[cand], c)) {
+            if (pbr_corners_equal(&uniq_v[cand], c)) {
                 found = cand;
                 break;
             }
@@ -171,9 +179,9 @@ int scene_build_meshlets(const SceneCorner *corners, uint32_t corner_count,
         uint32_t i0 = tri_idx[t * 3u + 0u];
         uint32_t i1 = tri_idx[t * 3u + 1u];
         uint32_t i2 = tri_idx[t * 3u + 2u];
-        const SceneCorner *v0 = &uniq_v[i0];
-        const SceneCorner *v1 = &uniq_v[i1];
-        const SceneCorner *v2 = &uniq_v[i2];
+        const ScenePbrCorner *v0 = &uniq_v[i0];
+        const ScenePbrCorner *v1 = &uniq_v[i1];
+        const ScenePbrCorner *v2 = &uniq_v[i2];
 
         tris[t].v[0] = i0;
         tris[t].v[1] = i1;
@@ -213,11 +221,11 @@ int scene_build_meshlets(const SceneCorner *corners, uint32_t corner_count,
     qsort(tris, tri_total, sizeof(*tris), cmp_tri_morton);
 
     // 3. Greedy spatial + vertex-reuse + normal-aligned 64v / 124t meshlet clusterizer.
-    uint32_t max_meshlets = tri_total; // Upper bound (1 tri per meshlet worst case)
-    SceneMeshlet      *out_ml = calloc(max_meshlets, sizeof(*out_ml));
-    ScenePackedVertex *out_vx = malloc((size_t)tri_total * 3u * sizeof(*out_vx));
-    uint32_t          *out_tr = malloc((size_t)tri_total * sizeof(*out_tr));
-    uint8_t           *used_t = calloc(tri_total, sizeof(*used_t));
+    uint32_t max_meshlets = tri_total;
+    SceneMeshlet      *out_ml  = calloc(max_meshlets, sizeof(*out_ml));
+    ScenePackedVertex *out_vx  = malloc((size_t)tri_total * 3u * sizeof(*out_vx));
+    uint32_t          *out_tr  = malloc((size_t)tri_total * sizeof(*out_tr));
+    uint8_t           *used_t  = calloc(tri_total, sizeof(*used_t));
     uint32_t          *v_stamp = calloc(uniq_count, sizeof(*v_stamp));
     uint8_t           *v_local = calloc(uniq_count, sizeof(*v_local));
     if (out_ml == nullptr || out_vx == nullptr || out_tr == nullptr ||
@@ -253,7 +261,6 @@ int scene_build_meshlets(const SceneCorner *corners, uint32_t corner_count,
         uint32_t lt_count = 0u;
         float    nsum_x = 0.0f, nsum_y = 0.0f, nsum_z = 0.0f;
 
-        // Seed meshlet with cursor triangle.
         used_t[cursor] = 1u;
         for (uint32_t k = 0u; k < 3u; ++k) {
             uint32_t gv = tris[cursor].v[k];
@@ -309,7 +316,6 @@ int scene_build_meshlets(const SceneCorner *corners, uint32_t corner_count,
                 float dist_pen = sqrtf(dx * dx + dy * dy + dz * dz) /
                                  fmaxf(span[0] + span[1] + span[2], 1.0e-4f);
 
-                // Strongly reward shared vertices, aligned normal cone, and spatial locality.
                 float score = (float)shared * 2.5f + ndot * 0.85f - dist_pen * 1.25f;
                 if (ndot < -0.15f && shared == 0u) {
                     score -= 1.5f;
@@ -342,12 +348,12 @@ int scene_build_meshlets(const SceneCorner *corners, uint32_t corner_count,
             lt_count++;
         }
 
-        // 4. Compute local meshlet AABB and quantize unique vertices to 16 bytes each.
+        // 4. Compute local meshlet AABB and quantize unique vertices to 32 bytes each.
         SceneMeshlet *ml = &out_ml[ml_count];
         float vmin[3] = {  1.0e30f,  1.0e30f,  1.0e30f };
         float vmax[3] = { -1.0e30f, -1.0e30f, -1.0e30f };
         for (uint32_t i = 0u; i < lv_count; ++i) {
-            const SceneCorner *cv = &uniq_v[local_gverts[i]];
+            const ScenePbrCorner *cv = &uniq_v[local_gverts[i]];
             if (cv->x < vmin[0]) vmin[0] = cv->x;
             if (cv->x > vmax[0]) vmax[0] = cv->x;
             if (cv->y < vmin[1]) vmin[1] = cv->y;
@@ -369,21 +375,42 @@ int scene_build_meshlets(const SceneCorner *corners, uint32_t corner_count,
         float dequant_pos[K_SCENE_MESHLET_MAX_VERTS][3];
         float bcenter[3] = { 0.0f, 0.0f, 0.0f };
         for (uint32_t i = 0u; i < lv_count; ++i) {
-            const SceneCorner *cv = &uniq_v[local_gverts[i]];
+            const ScenePbrCorner *cv = &uniq_v[local_gverts[i]];
             float p_in[3] = { cv->x, cv->y, cv->z };
             uint16_t q_p[3] = {0};
             int16_t  oct_n[2] = {0};
+            int16_t  oct_t[2] = {0};
             scene_quantize_pos16(p_in, ml->origin, ml->scale, q_p);
             scene_oct_encode_snorm16(cv->nx, cv->ny, cv->nz, oct_n);
 
+            uint16_t tflags = 0u;
+            if (has_uv) {
+                tflags |= SCENE_VERT_FLAG_HAS_UV;
+            }
+            float tlen2 = cv->tx * cv->tx + cv->ty * cv->ty + cv->tz * cv->tz;
+            if (has_tangent && tlen2 > 1.0e-8f && fabsf(cv->tw) > 0.1f) {
+                scene_oct_encode_snorm16(cv->tx, cv->ty, cv->tz, oct_t);
+                tflags |= SCENE_VERT_FLAG_HAS_TANGENT;
+                if (cv->tw < 0.0f) {
+                    tflags |= SCENE_VERT_FLAG_TAN_NEG_SIGN;
+                }
+            } else {
+                scene_oct_encode_snorm16(1.0f, 0.0f, 0.0f, oct_t);
+            }
+
             ScenePackedVertex *pv = &out_vx[total_vx + i];
-            pv->px      = q_p[0];
-            pv->py      = q_p[1];
-            pv->pz      = q_p[2];
-            pv->pad_u16 = 0u;
-            pv->oct_nx  = oct_n[0];
-            pv->oct_ny  = oct_n[1];
-            pv->rgba8   = scene_pack_rgba8(cv->r, cv->g, cv->b, default_roughness);
+            pv->px        = q_p[0];
+            pv->py        = q_p[1];
+            pv->pz        = q_p[2];
+            pv->tan_flags = tflags;
+            pv->oct_nx    = oct_n[0];
+            pv->oct_ny    = oct_n[1];
+            pv->oct_tx    = oct_t[0];
+            pv->oct_ty    = oct_t[1];
+            pv->u         = cv->u;
+            pv->v         = cv->v;
+            pv->rgba8     = scene_pack_rgba8(cv->r, cv->g, cv->b, cv->a);
+            pv->pad0      = 0u;
 
             scene_dequantize_pos16(q_p, ml->origin, ml->scale, dequant_pos[i]);
             bcenter[0] += dequant_pos[i][0];
@@ -391,7 +418,6 @@ int scene_build_meshlets(const SceneCorner *corners, uint32_t corner_count,
             bcenter[2] += dequant_pos[i][2];
         }
         float inv_lv = 1.0f / (float)lv_count;
-        // Blend AABB midpoint and vertex centroid for tight sphere center.
         ml->center[0] = 0.5f * ((vmin[0] + vmax[0]) * 0.5f + bcenter[0] * inv_lv);
         ml->center[1] = 0.5f * ((vmin[1] + vmax[1]) * 0.5f + bcenter[1] * inv_lv);
         ml->center[2] = 0.5f * ((vmin[2] + vmax[2]) * 0.5f + bcenter[2] * inv_lv);
@@ -485,4 +511,36 @@ int scene_build_meshlets(const SceneCorner *corners, uint32_t corner_count,
     out_build->triangles      = out_tr;
     out_build->triangle_count = total_tr;
     return 0;
+}
+
+int scene_build_meshlets(const SceneCorner *corners, uint32_t corner_count,
+                         float default_roughness, SceneMeshletBuild *out_build) {
+    if (out_build == nullptr) {
+        return -1;
+    }
+    *out_build = (SceneMeshletBuild){0};
+    if (corners == nullptr || corner_count < 3u) {
+        return 0;
+    }
+    ScenePbrCorner *tmp = malloc((size_t)corner_count * sizeof(*tmp));
+    if (tmp == nullptr) {
+        return -1;
+    }
+    for (uint32_t i = 0u; i < corner_count; ++i) {
+        tmp[i] = (ScenePbrCorner){
+            .x  = corners[i].x,
+            .y  = corners[i].y,
+            .z  = corners[i].z,
+            .nx = corners[i].nx,
+            .ny = corners[i].ny,
+            .nz = corners[i].nz,
+            .r  = corners[i].r,
+            .g  = corners[i].g,
+            .b  = corners[i].b,
+            .a  = default_roughness,
+        };
+    }
+    int rc = scene_build_meshlets_pbr(tmp, corner_count, false, false, out_build);
+    free(tmp);
+    return rc;
 }

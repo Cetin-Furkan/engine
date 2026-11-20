@@ -83,33 +83,60 @@ $(GEN_DIR)/survey_2dgs_cull.comp.spv: shaders/survey_2dgs_cull.comp.slang
 	@mkdir -p $(dir $@)
 	$(SLANGC) -target spirv -profile spirv_1_6+spvGroupNonUniform+spvGroupNonUniformBallot+spvGroupNonUniformArithmetic -stage compute -entry main -fvk-use-entrypoint-name -depfile "$(GEN_DIR)/survey_2dgs_cull.comp.d" -Ishaders -o "$@" "$<"
 
+$(GEN_DIR)/post_bloom_down.comp.spv: shaders/post_bloom_down.comp.slang
+	@mkdir -p $(dir $@)
+	$(SLANGC) -target spirv -profile spirv_1_6+spvGroupNonUniform+spvGroupNonUniformShuffle+spvGroupNonUniformArithmetic -stage compute -entry main -fvk-use-entrypoint-name -depfile "$(GEN_DIR)/post_bloom_down.comp.d" -Ishaders -o "$@" "$<"
+
+$(GEN_DIR)/post_exposure.comp.spv: shaders/post_exposure.comp.slang
+	@mkdir -p $(dir $@)
+	$(SLANGC) -target spirv -profile spirv_1_6+spvGroupNonUniform+spvGroupNonUniformArithmetic -stage compute -entry main -fvk-use-entrypoint-name -depfile "$(GEN_DIR)/post_exposure.comp.d" -Ishaders -o "$@" "$<"
+
+LIGHTING_HDRS := shaders/lighting.slang shaders/lighting_types.slang shaders/lighting_proxy.slang shaders/lighting_gi_shadow.slang
+
+# Bindless PBR fragment shaders use NonUniformResourceIndex across Texture2D/SamplerState arrays.
+$(GEN_DIR)/scene_visbuf.frag.spv: shaders/scene_visbuf.frag.slang shaders/scene_common.slang shaders/pbr_bindless.slang
+	@mkdir -p $(dir $@)
+	$(SLANGC) -target spirv -profile spirv_1_6 -warnings-disable 41012 -stage fragment -entry main -fvk-use-entrypoint-name -depfile "$(GEN_DIR)/scene_visbuf.frag.d" -Ishaders -o "$@" "$<"
+
+$(GEN_DIR)/scene_visbuf_resolve.frag.spv: shaders/scene_visbuf_resolve.frag.slang shaders/scene_common.slang $(LIGHTING_HDRS) shaders/pbr_bindless.slang
+	@mkdir -p $(dir $@)
+	$(SLANGC) -target spirv -profile spirv_1_6 -warnings-disable 41012 -stage fragment -entry main -fvk-use-entrypoint-name -depfile "$(GEN_DIR)/scene_visbuf_resolve.frag.d" -Ishaders -o "$@" "$<"
+
+$(GEN_DIR)/scene_meshlet.frag.spv: shaders/scene_meshlet.frag.slang shaders/scene_common.slang $(LIGHTING_HDRS) shaders/pbr_bindless.slang
+	@mkdir -p $(dir $@)
+	$(SLANGC) -target spirv -profile spirv_1_6 -warnings-disable 41012 -stage fragment -entry main -fvk-use-entrypoint-name -depfile "$(GEN_DIR)/scene_meshlet.frag.d" -Ishaders -o "$@" "$<"
+
 $(GEN_DIR)/bevel.comp.spv: shaders/face_grid.slang
 $(GEN_DIR)/heat.comp.spv: shaders/heat_nbr.slang shaders/face_grid.slang
 $(GEN_DIR)/cube.vert.spv: shaders/camera.slang shaders/material.slang shaders/face_grid.slang
-$(GEN_DIR)/cube.frag.spv: shaders/lighting.slang
+$(GEN_DIR)/cube.frag.spv: $(LIGHTING_HDRS)
 $(GEN_DIR)/cube_shadow.vert.spv: shaders/camera.slang shaders/face_grid.slang
-$(GEN_DIR)/plane.frag.spv: shaders/camera.slang shaders/lighting.slang
+$(GEN_DIR)/plane.frag.spv: shaders/camera.slang $(LIGHTING_HDRS)
 $(GEN_DIR)/shape.vert.spv: shaders/camera.slang shaders/material.slang
 $(GEN_DIR)/plot.vert.spv: shaders/camera.slang
 $(GEN_DIR)/gimbal.vert.spv: shaders/camera.slang
 $(GEN_DIR)/terrain_filter.comp.spv: shaders/terrain_math.slang
 $(GEN_DIR)/terrain_cull.comp.spv: shaders/camera.slang shaders/terrain_math.slang
 $(GEN_DIR)/terrain.vert.spv: shaders/camera.slang shaders/terrain_math.slang
-$(GEN_DIR)/terrain.frag.spv: shaders/camera.slang shaders/terrain_math.slang shaders/lighting.slang
+$(GEN_DIR)/terrain.frag.spv: shaders/camera.slang shaders/terrain_math.slang $(LIGHTING_HDRS)
 $(GEN_DIR)/scene_cull.comp.spv: shaders/scene_common.slang shaders/camera.slang shaders/material.slang
 $(GEN_DIR)/scene_hiz.comp.spv: shaders/scene_common.slang shaders/camera.slang shaders/material.slang
 $(GEN_DIR)/scene_visbuf.vert.spv: shaders/scene_common.slang shaders/camera.slang shaders/material.slang
 $(GEN_DIR)/scene_visbuf.frag.spv: shaders/scene_common.slang shaders/camera.slang shaders/material.slang
-$(GEN_DIR)/scene_visbuf_resolve.frag.spv: shaders/scene_common.slang shaders/camera.slang shaders/material.slang shaders/lighting.slang
+$(GEN_DIR)/scene_visbuf_resolve.frag.spv: shaders/scene_common.slang shaders/camera.slang shaders/material.slang $(LIGHTING_HDRS)
 $(GEN_DIR)/scene_meshlet.vert.spv: shaders/scene_common.slang shaders/camera.slang shaders/material.slang
-$(GEN_DIR)/scene_meshlet.frag.spv: shaders/lighting.slang
+$(GEN_DIR)/scene_meshlet.frag.spv: $(LIGHTING_HDRS)
 $(GEN_DIR)/scene_shadow.vert.spv: shaders/scene_common.slang shaders/camera.slang shaders/material.slang
-$(GEN_DIR)/lighting_gbuf.comp.spv: shaders/lighting_gi_common.slang shaders/camera.slang shaders/terrain_math.slang shaders/lighting.slang
-$(GEN_DIR)/lighting_hrc.comp.spv: shaders/lighting_gi_common.slang shaders/camera.slang shaders/terrain_math.slang shaders/lighting.slang
-$(GEN_DIR)/lighting_ssilvb.comp.spv: shaders/lighting_gi_common.slang shaders/camera.slang shaders/terrain_math.slang shaders/lighting.slang
+$(GEN_DIR)/lighting_gbuf.comp.spv: shaders/lighting_gi_common.slang shaders/camera.slang shaders/terrain_math.slang $(LIGHTING_HDRS)
+$(GEN_DIR)/lighting_hrc.comp.spv: shaders/lighting_gi_common.slang shaders/camera.slang shaders/terrain_math.slang $(LIGHTING_HDRS)
+$(GEN_DIR)/lighting_ssilvb.comp.spv: shaders/lighting_gi_common.slang shaders/camera.slang shaders/terrain_math.slang $(LIGHTING_HDRS)
 $(GEN_DIR)/survey_2dgs_cull.comp.spv: shaders/camera.slang
 $(GEN_DIR)/survey_2dgs.vert.spv: shaders/camera.slang
-$(GEN_DIR)/survey_2dgs.frag.spv: shaders/camera.slang shaders/terrain_math.slang shaders/lighting.slang
+$(GEN_DIR)/survey_2dgs.frag.spv: shaders/camera.slang shaders/terrain_math.slang $(LIGHTING_HDRS)
+$(GEN_DIR)/post_bloom_down.comp.spv: shaders/post_common.slang
+$(GEN_DIR)/post_exposure.comp.spv: shaders/post_common.slang
+$(GEN_DIR)/post_composite.frag.spv: shaders/post_common.slang
+$(GEN_DIR)/gizmo.vert.spv: shaders/camera.slang
 
 -include $(wildcard $(GEN_DIR)/*.d)
 
@@ -150,15 +177,20 @@ $(OBJ_DIR)/examples/minimal/minimal.o: $(MINIMAL_GEN_DIR)/minimal.vert.spv $(MIN
 $(OBJ_DIR)/src/chrome/gpu.o: $(GEN_DIR)/chrome.vert.spv $(GEN_DIR)/chrome.frag.spv
 $(OBJ_DIR)/src/backend/math/gpu/directory.o: $(GEN_DIR)/terrain_filter.comp.spv $(GEN_DIR)/terrain_cull.comp.spv
 $(OBJ_DIR)/src/backend/terrain/survey/gpu_survey.o: $(GEN_DIR)/survey_mvs.comp.spv $(GEN_DIR)/survey_2dgs_cull.comp.spv $(GEN_DIR)/survey_2dgs.vert.spv $(GEN_DIR)/survey_2dgs.frag.spv
-$(OBJ_DIR)/src/scene/gpu/scene_gpu.o: $(GEN_DIR)/scene_cull.comp.spv $(GEN_DIR)/scene_hiz.comp.spv $(GEN_DIR)/scene_visbuf.vert.spv $(GEN_DIR)/scene_visbuf.frag.spv $(GEN_DIR)/scene_visbuf_resolve.vert.spv $(GEN_DIR)/scene_visbuf_resolve.frag.spv $(GEN_DIR)/scene_meshlet.vert.spv $(GEN_DIR)/scene_meshlet.frag.spv $(GEN_DIR)/scene_shadow.vert.spv
+$(OBJ_DIR)/src/scene/gpu/pipelines.o: $(GEN_DIR)/scene_cull.comp.spv $(GEN_DIR)/scene_hiz.comp.spv $(GEN_DIR)/scene_visbuf.vert.spv $(GEN_DIR)/scene_visbuf.frag.spv $(GEN_DIR)/scene_visbuf_resolve.vert.spv $(GEN_DIR)/scene_visbuf_resolve.frag.spv $(GEN_DIR)/scene_meshlet.vert.spv $(GEN_DIR)/scene_meshlet.frag.spv $(GEN_DIR)/scene_shadow.vert.spv
 $(OBJ_DIR)/src/lighting/gpu/lighting_gpu.o: $(GEN_DIR)/lighting_gbuf.comp.spv $(GEN_DIR)/lighting_hrc.comp.spv $(GEN_DIR)/lighting_ssilvb.comp.spv
 $(OBJ_DIR)/src/physics/gpu/avbd_gpu.o: $(GEN_DIR)/physics_avbd.comp.spv
+$(OBJ_DIR)/src/post/post.o: $(GEN_DIR)/post_bloom_down.comp.spv $(GEN_DIR)/post_exposure.comp.spv $(GEN_DIR)/post_bloom_up.comp.spv $(GEN_DIR)/plane.vert.spv $(GEN_DIR)/post_composite.frag.spv
+$(OBJ_DIR)/src/gizmo/gizmo_gpu.o: $(GEN_DIR)/gizmo.vert.spv $(GEN_DIR)/gizmo.frag.spv
 
 # Scoped Platform vs Hosted-Program Dependencies
 XKB_CFLAGS    := $(shell pkg-config --cflags xkbcommon)
 XKB_LIBS      := $(shell pkg-config --libs xkbcommon)
 PNG_CFLAGS    := $(shell pkg-config --cflags libpng)
-DEMO_PKGS     := freetype2 harfbuzz fontconfig libpng
+IMG_PKGS      := libpng libjpeg libwebp
+IMG_CFLAGS    := $(shell pkg-config --cflags $(IMG_PKGS))
+IMG_LIBS      := $(shell pkg-config --libs $(IMG_PKGS))
+DEMO_PKGS     := freetype2 harfbuzz fontconfig $(IMG_PKGS)
 DEMO_INCLUDES := -Iexamples/demo/include -Iexamples/demo
 DEMO_CFLAGS   := $(DEMO_INCLUDES) $(shell pkg-config --cflags $(DEMO_PKGS))
 DEMO_LIBS     := $(shell pkg-config --libs $(DEMO_PKGS))
@@ -175,6 +207,7 @@ CFLAGS ?= $(C23_FLAGS) -D_GNU_SOURCE -Wall -Wextra -Wunused-function -Werror=unu
           -DENGINE_BUILD_MODE=\"$(MODE)\"
 
 $(OBJ_DIR)/src/backend/%.o: EXTRA_CFLAGS := $(PNG_CFLAGS)
+$(OBJ_DIR)/src/texture/%.o: EXTRA_CFLAGS := $(IMG_CFLAGS)
 $(OBJ_DIR)/examples/demo/%.o: EXTRA_CFLAGS := $(DEMO_CFLAGS)
 $(OBJ_DIR)/examples/minimal/%.o: EMBED_DIR := $(MINIMAL_GEN_DIR)
 
@@ -220,7 +253,7 @@ $(TARGET): $(OBJS)
 		cat $(BUILD_DIR)/link.log >&2; \
 		exit 1; \
 	fi
-	@dead=$$(grep -E "removing unused section '\.text\.[^']*' in file '.*(src/vulkan|src/frame|src/ring|src/wayland|src/input|src/chrome|src/system|src/backend|src/scene|src/lighting|src/physics)" $(BUILD_DIR)/link.log || true); \
+	@dead=$$(grep -E "removing unused section '\.text\.[^']*' in file '.*(src/vulkan|src/frame|src/ring|src/wayland|src/input|src/chrome|src/system|src/backend|src/scene|src/lighting|src/physics|src/graph|src/post|src/ecs|src/gizmo|src/texture|src/gltf)" $(BUILD_DIR)/link.log || true); \
 	if [ -n "$$dead" ]; then \
 		echo -e "\033[0;31m[Link Error] Dead/hallucinated functions detected:\033[0m" >&2; \
 		echo "$$dead" >&2; rm -f $@; exit 1; \
@@ -299,7 +332,7 @@ help:
 	@echo "    make run                     Build and execute debug binary"
 	@echo "    make run-minimal             Build and execute debug minimal binary"
 	@echo "    make run-release             Build and execute release binary"
-	@echo "    make test                    Build and run all 16 automated unit, failure, and truth tests"
+	@echo "    make test                    Build and run all 21 automated unit, failure, and truth tests"
 	@echo ""
 	@echo -e "  \033[1mCleanup & Cache:\033[0m"
 	@echo "    make clean                   Remove build/ directory (preserves prerequisite cache)"
@@ -336,7 +369,7 @@ test: $(CONFIG_MK)
 	./build/test_handles
 	$(CC) $(CFLAGS) -o build/test_clock tests/test_clock.c src/frame/clock/clock.c
 	./build/test_clock
-	$(CC) $(CFLAGS) $(DEMO_CFLAGS) -o build/test_world tests/test_world.c examples/demo/world/table.c examples/demo/world/spin.c -lm
+	$(CC) $(CFLAGS) $(DEMO_CFLAGS) -o build/test_world tests/test_world.c examples/demo/world/table.c examples/demo/world/spin.c src/ecs/ecs.c src/ecs/transform.c -lm
 	./build/test_world
 	$(CC) $(CFLAGS) $(DEMO_CFLAGS) -o build/test_motion tests/test_motion.c examples/demo/world/motion.c examples/demo/world/fillet.c src/physics/math/avbd_math.c -lm
 	./build/test_motion
@@ -376,6 +409,38 @@ test: $(CONFIG_MK)
 		src/physics/math/avbd_math.c \
 		-lm
 	./build/test_physics
+	$(CC) $(CFLAGS) -o build/test_graph tests/test_graph.c \
+		src/graph/graph.c \
+		src/vulkan/core/types.c \
+		$(LDFLAGS) -lvulkan
+	./build/test_graph
+	$(CC) $(CFLAGS) -o build/test_ecs tests/test_ecs.c \
+		src/ecs/ecs.c \
+		src/ecs/transform.c \
+		-lm
+	./build/test_ecs
+	$(CC) $(CFLAGS) -o build/test_gizmo tests/test_gizmo.c \
+		src/gizmo/gizmo_math.c \
+		src/ecs/ecs.c \
+		src/ecs/transform.c \
+		-lm
+	./build/test_gizmo
+	$(CC) $(CFLAGS) $(IMG_CFLAGS) -o build/test_texture tests/test_texture.c \
+		src/texture/decode.c \
+		$(IMG_LIBS) -lm
+	./build/test_texture
+	$(CC) $(CFLAGS) $(IMG_CFLAGS) -o build/test_gltf tests/test_gltf.c \
+		src/gltf/json.c \
+		src/gltf/blend.c \
+		src/gltf/geom.c \
+		src/gltf/gltf.c \
+		src/texture/decode.c \
+		src/ecs/ecs.c \
+		src/ecs/transform.c \
+		src/scene/meshlet/quantize.c \
+		src/scene/meshlet/builder.c \
+		$(IMG_LIBS) -lm
+	./build/test_gltf
 	$(CC) $(CFLAGS) -o build/test_ring_dispatch tests/test_ring_dispatch.c \
 		$(shell find src/ring src/system -name '*.c')
 	./build/test_ring_dispatch

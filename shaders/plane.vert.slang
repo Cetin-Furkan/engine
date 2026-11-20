@@ -15,6 +15,6 @@ struct VSOutput {
 [shader("vertex")]
 VSOutput main(uint vert_id : SV_VulkanVertexID) {
     VSOutput out;
-    out.sv_pos = float4(k_ndc[vert_id], 1.0, 1.0);
+    out.sv_pos = float4(k_ndc[vert_id], 0.0, 1.0);
     return out;
 }

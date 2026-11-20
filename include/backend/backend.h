@@ -81,6 +81,7 @@ bool               backend_overlay_get_center(float *out_wx, float *out_wy);
 void               backend_record_draw_surfels(VkCommandBuffer       cmd,
                                                uint32_t              width,
                                                uint32_t              height,
+                                               VkFormat              color_format,
                                                VkFormat              depth_format,
                                                VkSampleCountFlagBits samples,
                                                float                 elev_base_m,

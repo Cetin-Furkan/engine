@@ -152,10 +152,10 @@ static int terrain_ensure_ready(void) {
         .cull          = VK_CULL_MODE_NONE,
         .depth_test    = VK_TRUE,
         .depth_write   = VK_TRUE,
-        .depth_compare = VK_COMPARE_OP_LESS_OR_EQUAL,
+        .depth_compare = VK_COMPARE_OP_GREATER_OR_EQUAL,
         .blend         = VK_FALSE,
     };
-    vulkan_gfx_arm(&s_gfx, &gfx, VK_FORMAT_B8G8R8A8_SRGB, nullptr);
+    vulkan_gfx_arm(&s_gfx, &gfx, pass_hdr_format(), nullptr);
     s_backend_ready = true;
     const char *active_pack = backend_active_pack_path();
     const char *pack_base   = strrchr(active_pack, '/');
@@ -311,6 +311,7 @@ void terrain_draw(VkCommandBuffer cmd,
     backend_record_draw_surfels(cmd,
                                 width,
                                 height,
+                                pass_hdr_format(),
                                 pass_depth_format(),
                                 pass_raster_samples(),
                                 elev_base,

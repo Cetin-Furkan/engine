@@ -76,6 +76,10 @@ bool pointer_take_scroll(float *steps);
 // camera motion. A leave or a new enter clears every held key.
 bool pointer_key_down(uint32_t key);
 
+// Motion since the last take while no pointer button is held on the scene surface,
+// in physical surface pixels. Returns false when the pointer has not moved.
+bool pointer_take_hover(int32_t *x, int32_t *y);
+
 // Last pointer position in surface pixels, top-left origin. False before
 // the pointer has entered this surface.
 bool pointer_client_xy(int32_t *x, int32_t *y);

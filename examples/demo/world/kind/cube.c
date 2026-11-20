@@ -136,12 +136,15 @@ static bool cube_hit(const WorldObj *o, const CameraRay *ray, float *t, Coord *a
     }
     // The slab remains until the bake has stored the mesh the vertex shader poses.
     if (cube_surface_ready()) {
-        float yaw_deg = (float)c->spin.shown_milli / 1000.0f;
+        float world_m[12];
+        if (!ecs_get_world_matrix(world_ecs(), o->entity, world_m)) {
+            return false;
+        }
         float ht = 0.0f;
         float hx = 0.0f;
         float hy = 0.0f;
         float hz = 0.0f;
-        if (!cube_surface_hit(c->heat, yaw_deg, o->at.x, o->at.y, o->at.z, ray, &ht, &hx, &hy, &hz)) {
+        if (!cube_surface_hit_matrix(c->heat, world_m, ray, &ht, &hx, &hy, &hz)) {
             return false;
         }
         if (t != nullptr) {
@@ -220,28 +223,29 @@ static void cube_prepare_scene(const WorldObj *o, bool live) {
     float cy      = k * (base[0] - base[2]);
     float cz      = k * (base[1] - base[0]);
 
-    float sel = table_highlight(o, live);
-    float alb[3] = {
+    const float alb[3] = {
         fminf(fmaxf(base[0] * ca + cx * sa + k * dot_kb * (1.0f - ca), 0.0f), 1.0f),
         fminf(fmaxf(base[1] * ca + cy * sa + k * dot_kb * (1.0f - ca), 0.0f), 1.0f),
         fminf(fmaxf(base[2] * ca + cz * sa + k * dot_kb * (1.0f - ca), 0.0f), 1.0f),
     };
-    for (int i = 0; i < 3; ++i) {
-        alb[i] = alb[i] + (1.0f - alb[i]) * (sel * 0.42f);
-    }
 
     float emi[3] = {0};
     lighting_material_get_emissive(c->mat, emi);
-    if (!cube_heat_held(c->heat)) {
-        emi[0] += 0.88f;
-        emi[1] += 0.34f;
-        emi[2] += 0.08f;
-    }
 
-    const float center[3]  = { o->at.x, o->at.y, o->at.z };
-    const float extents[3] = { k_fillet_half, k_fillet_half, k_fillet_half };
-    const float pitch_rad  = 28.0f * (3.14159265359f / 180.0f);
-    const float yaw_rad    = spin_deg(&c->spin, live) * (3.14159265359f / 180.0f);
+    EcsAabb aabb = {0};
+    float center[3]  = { o->at.x, o->at.y, o->at.z };
+    float extents[3] = { k_fillet_half, k_fillet_half, k_fillet_half };
+    float pitch_rad  = 0.0f;
+    float yaw_rad    = 0.0f;
+    if (ecs_get_world_aabb(world_ecs(), o->entity, &aabb)) {
+        for (int a = 0; a < 3; ++a) {
+            center[a]  = 0.5f * (aabb.min_v[a] + aabb.max_v[a]);
+            extents[a] = fmaxf(0.5f * (aabb.max_v[a] - aabb.min_v[a]), 1.0f);
+        }
+    } else {
+        pitch_rad = 28.0f * (3.14159265359f / 180.0f);
+        yaw_rad   = spin_deg(&c->spin, live) * (3.14159265359f / 180.0f);
+    }
 
     LightingProxy proxy = {0};
     lighting_proxy_fill(&proxy, LIGHTING_PROXY_OBB, center, extents,
@@ -251,12 +255,16 @@ static void cube_prepare_scene(const WorldObj *o, bool live) {
 
 static void cube_draw_shadow_obj(const WorldObj *o, VkCommandBuffer cmd,
                                  const float light_clip_vp[16], bool live) {
+    (void)live;
     const CubeData *c = o->data;
     if (c == nullptr) {
         return;
     }
-    cube_draw_shadow(cmd, light_clip_vp, spin_deg(&c->spin, live),
-                     o->at.x, o->at.y, o->at.z, c->heat);
+    float world_m[12];
+    if (!ecs_get_world_matrix(world_ecs(), o->entity, world_m)) {
+        return;
+    }
+    cube_draw_shadow(cmd, light_clip_vp, world_m, c->heat);
 }
 
 static void cube_draw_obj(const WorldObj *o, VkCommandBuffer cmd, uint32_t width, uint32_t height, bool live) {
@@ -264,11 +272,14 @@ static void cube_draw_obj(const WorldObj *o, VkCommandBuffer cmd, uint32_t width
     if (c == nullptr) {
         return;
     }
+    float world_m[12];
+    if (!ecs_get_world_matrix(world_ecs(), o->entity, world_m)) {
+        return;
+    }
     bool glow = live ? c->spin.glow : c->spin.shown_glow;
     material_set(c->mat, glow);
     float phase = live ? c->phase : c->phase_shown;
-    cube_draw(cmd, width, height, spin_deg(&c->spin, live), o->at.x, o->at.y, o->at.z, 0.0f,
-              phase, table_highlight(o, live), c->mat, c->heat);
+    cube_draw(cmd, width, height, world_m, 0.0f, phase, c->mat, c->heat, o->entity);
 }
 
 static bool cube_toggle_spin(WorldObj *o) {
@@ -338,12 +349,11 @@ static const char *cube_name(const WorldObj *o) {
 
 static bool cube_on_click(WorldObj *o, Coord hit) {
     CubeData *c = o->data;
-    if (c == nullptr) {
+    if (c == nullptr || ecs_get_parent(world_ecs(), o->entity) != ECS_NULL_ENTITY) {
         return false;
     }
-    bool poked = cube_heat_poke(c->heat, hit.x - o->at.x, hit.y - o->at.y, hit.z - o->at.z);
     cube_shove(o, hit);
-    return poked || c->awake;
+    return c->awake;
 }
 
 static uint32_t cube_vertices(const WorldObj *o) {
@@ -441,6 +451,8 @@ bool cube_kind_spawn_elastic(Coord at, int32_t yaw_milli, bool spinning, bool in
         fprintf(stderr, "[World] No room for the cube.\n");
         return false;
     }
+    const float ext[3] = { k_fillet_half, k_fillet_half, k_fillet_half };
+    table_configure_entity(index, ECS_KIND_CUBE, ext, k_fillet_half * 1.7320508f, 28.0f);
     if (spinning) {
         table_mark_spun();
     }
@@ -470,6 +482,8 @@ bool cube_kind_grab_move(WorldObj *o, Coord pos, float vx, float vy, bool releas
     }
     CubeData *c = o->data;
     o->at = pos;
+    table_sync_entity_world_pos(o);
+    ecs_propagate_transforms(world_ecs());
     if (!release) {
         c->vx    = 0.0f;
         c->vy    = 0.0f;
@@ -608,7 +622,8 @@ static uint32_t gather_motion_bodies(MotionBody *bodies, WorldObj **objs,
     int count = table_count();
     for (int i = 0; i < count && cube_n < k_cube_cap; ++i) {
         WorldObj *o = table_at(i);
-        if (o == nullptr || !o->alive || o->ops != &s_ops) {
+        if (o == nullptr || !o->alive || o->ops != &s_ops ||
+            ecs_get_parent(world_ecs(), o->entity) != ECS_NULL_ENTITY) {
             continue;
         }
         CubeData *c = o->data;
@@ -651,6 +666,7 @@ static void scatter_motion_bodies(const MotionBody *bodies, WorldObj *const *obj
         o->at.x  = bodies[i].x;
         o->at.y  = bodies[i].y;
         o->at.z  = bodies[i].z;
+        table_sync_entity_world_pos(o);
         c->vx    = bodies[i].vx;
         c->vy    = bodies[i].vy;
         c->vz    = bodies[i].vz;

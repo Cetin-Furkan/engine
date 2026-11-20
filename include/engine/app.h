@@ -28,10 +28,14 @@ typedef struct EngineTargets {
     VkImageView           depth_view;
     VkImage               coverage_image;
     VkImageView           coverage_view;
+    VkImage               hdr_image;
+    VkImageView           hdr_view;
     // The pass the color image is cleared in. Zero means a 1-sample pass
     // with no depth attachment. Overlay pipelines must match this pair.
     VkFormat              depth_format;
+    VkFormat              hdr_format;
     VkSampleCountFlagBits samples;
+    bool                  reverse_z;
 } EngineTargets;
 
 // File-reload relay state. Reloading a file on the io_uring thread can
@@ -124,6 +128,13 @@ typedef struct EngineApp {
     // are already set; matches EngineTargets when create_targets is provided, or
     // 1-sample VK_FORMAT_B8G8R8A8_SRGB with VK_FORMAT_UNDEFINED depth otherwise).
     void (*draw)(VkCommandBuffer cmd, uint32_t width, uint32_t height, bool live);
+    // [OPTIONAL] Linear HDR -> swapchain post-processing pass invoked right after
+    // the HDR scene dynamic rendering pass ends and before draw_overlay (default: nullptr).
+    void (*post_process)(VkCommandBuffer cmd, uint32_t slot_index,
+                         VkImage hdr_image, VkImageView hdr_view,
+                         VkImage swap_image, VkImageView swap_view, VkFormat swap_format,
+                         uint32_t width, uint32_t height,
+                         bool unified_internal, bool unified_swap);
     // [OPTIONAL] HUD/overlay draw at the end of the rendering pass (default: no-op).
     void (*draw_overlay)(VkCommandBuffer cmd, uint32_t width, uint32_t height,
                          VkFormat format, VkFormat depth_format,
@@ -174,7 +185,10 @@ typedef struct EngineApp {
     // +X right, +Y up; Linux key codes). True when the picture changed.
     // [REQUIRED] Left-button press at content-centered (origin_x, origin_y).
     bool (*click)(float origin_x, float origin_y);
-    // [OPTIONAL] Motion while right/middle button is held (default: false).
+    // [OPTIONAL] Unpressed pointer hover at content-centered (origin_x, origin_y);
+    // return true only when visual state changed (e.g. gizmo handle highlight).
+    bool (*hover)(float origin_x, float origin_y);
+    // [OPTIONAL] Motion while a pointer button is held (default: false).
     bool (*drag)(float dx, float dy, uint32_t buttons);
     // [OPTIONAL] Wheel or touchpad notches; positive zooms in (default: false).
     bool (*scroll)(float steps);

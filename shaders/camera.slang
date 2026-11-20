@@ -16,9 +16,6 @@ struct ViewPush {
 };
 
 static const float k_persp_w_near = 0.08;
-static const float k_persp_w_far  = 24.0;
-static const float k_persp_z_a    = k_persp_w_far / (k_persp_w_far - k_persp_w_near);
-static const float k_persp_z_b    = (k_persp_w_far * k_persp_w_near) / (k_persp_w_far - k_persp_w_near);
 
 float3 view_rotate(float4 q, float3 v) {
     float3 t = 2.0 * cross(q.xyz, v);
@@ -29,15 +26,19 @@ float3 view_of(float3 world, float4 q, float3 cam) {
     return view_rotate(q, world - cam);
 }
 
+// Reverse-Z orthographic NDC: closer (+view.z) maps to LARGER z_ndc [0..1] (clear=0.0, GREATER_OR_EQUAL)
 float4 view_ndc(float3 view, float zoom, uint width, uint height, float depth_bias) {
     float sx = max(float(width), 1.0);
     float sy = max(float(height), 1.0);
     return float4(view.x * zoom / (sx * 0.5),
                   -view.y * zoom / (sy * 0.5),
-                  0.5 - view.z / 4096.0 - depth_bias,
+                  0.5 + view.z / 8192.0 + depth_bias,
                   1.0);
 }
 
+// True Floating-Point Reverse-Z Infinite Perspective:
+// z_ndc = k_persp_w_near / w_clip + depth_bias -> 1.0 at near plane, 0.0 at infinity.
+// IEEE-754 float32 exponent density near 0.0 cancels hyperbolic 1/z compression for zero Z-fighting.
 float4 view_ndc_persp(float3 view, float zoom, float persp, uint width, uint height, float depth_bias) {
     if (persp <= 1.0e-7) {
         return view_ndc(view, zoom, width, height, depth_bias);
@@ -45,7 +46,7 @@ float4 view_ndc_persp(float3 view, float zoom, float persp, uint width, uint hei
     float sx = max(float(width), 1.0);
     float sy = max(float(height), 1.0);
     float w_clip = 1.0 - view.z * persp;
-    float z_clip = k_persp_z_a * w_clip - k_persp_z_b - depth_bias * max(w_clip, k_persp_w_near);
+    float z_clip = k_persp_w_near + depth_bias * max(w_clip, k_persp_w_near);
     return float4(view.x * zoom / (sx * 0.5),
                   -view.y * zoom / (sy * 0.5),
                   z_clip,

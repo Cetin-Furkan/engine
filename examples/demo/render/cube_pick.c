@@ -352,11 +352,6 @@ static void shown_disp(uint32_t id, float o[3]) {
     raw_disp(id, o);
 }
 
-static void pose_world(const float in[3], float yaw_deg, float origin_x, float origin_y,
-                       float origin_z, float o[3]) {
-    fillet_place(in, fillet_rad(yaw_deg), k_fillet_half, origin_x, origin_y, origin_z, o);
-}
-
 static bool ray_tri(const float o[3], const float d[3], const float a[3], const float b[3], const float c[3],
                     float *t_hit) {
     float e1[3] = { b[0] - a[0], b[1] - a[1], b[2] - a[2] };
@@ -424,15 +419,23 @@ bool cube_surface_ready(void) {
     return s_ready;
 }
 
-bool cube_surface_hit(uint32_t heat_slot, float yaw_deg, float origin_x, float origin_y,
-                      float origin_z, const CameraRay *ray, float *t_hit, float *hx, float *hy,
-                      float *hz) {
-    if (!s_ready || ray == nullptr || heat_slot >= k_cube_heat_slots) {
+static float cube_mat_bound_scale(const float m[12]) {
+    float c0 = sqrtf(m[0]*m[0] + m[4]*m[4] + m[8]*m[8]);
+    float c1 = sqrtf(m[1]*m[1] + m[5]*m[5] + m[9]*m[9]);
+    float c2 = sqrtf(m[2]*m[2] + m[6]*m[6] + m[10]*m[10]);
+    return fmaxf(c0, fmaxf(c1, c2));
+}
+
+bool cube_surface_hit_matrix(uint32_t heat_slot, const float world_m[12],
+                             const CameraRay *ray, float *t_hit,
+                             float *hx, float *hy, float *hz) {
+    if (!s_ready || world_m == nullptr || ray == nullptr || heat_slot >= k_cube_heat_slots) {
         return false;
     }
     // Instant circumsphere early-out before transforming 3,858 vertices / 7,168 triangles
-    const float bound_r = k_fillet_half * 1.88f;
-    const float rel[3]  = { ray->ox - origin_x, ray->oy - origin_y, ray->oz - origin_z };
+    const float sc      = fmaxf(cube_mat_bound_scale(world_m), 1.0e-3f);
+    const float bound_r = k_fillet_half * sc * 1.95f;
+    const float rel[3]  = { ray->ox - world_m[3], ray->oy - world_m[7], ray->oz - world_m[11] };
     const float dir[3]  = { ray->dx, ray->dy, ray->dz };
     const float a_sph   = v3_dot(dir, dir);
     const float b_sph   = v3_dot(rel, dir);
@@ -448,12 +451,13 @@ bool cube_surface_hit(uint32_t heat_slot, float yaw_deg, float origin_x, float o
     for (uint32_t i = 0; i < k_verts; ++i) {
         float disp[3];
         shown_disp(i, disp);
-        float local[3] = {
-            s_rest[(size_t)i * 3u] + disp[0],
-            s_rest[(size_t)i * 3u + 1u] + disp[1],
-            s_rest[(size_t)i * 3u + 2u] + disp[2],
-        };
-        pose_world(local, yaw_deg, origin_x, origin_y, origin_z, s_world + (size_t)i * 3u);
+        float lx = (s_rest[(size_t)i * 3u]      + disp[0]) * k_fillet_half;
+        float ly = (s_rest[(size_t)i * 3u + 1u] + disp[1]) * k_fillet_half;
+        float lz = (s_rest[(size_t)i * 3u + 2u] + disp[2]) * k_fillet_half;
+        float *dst = s_world + (size_t)i * 3u;
+        dst[0] = world_m[0] * lx + world_m[1] * ly + world_m[2]  * lz + world_m[3];
+        dst[1] = world_m[4] * lx + world_m[5] * ly + world_m[6]  * lz + world_m[7];
+        dst[2] = world_m[8] * lx + world_m[9] * ly + world_m[10] * lz + world_m[11];
     }
     float origin[3] = { ray->ox, ray->oy, ray->oz };
     float best = 0.0f;
@@ -494,6 +498,21 @@ bool cube_surface_hit(uint32_t heat_slot, float yaw_deg, float origin_x, float o
         *hz = ray->oz + ray->dz * best;
     }
     return true;
+}
+
+bool cube_surface_hit(uint32_t heat_slot, float yaw_deg, float origin_x, float origin_y,
+                      float origin_z, const CameraRay *ray, float *t_hit, float *hx, float *hy,
+                      float *hz) {
+    const float ax = k_fillet_pitch;
+    const float ay = fillet_rad(yaw_deg);
+    const float cx = cosf(ax), sx = sinf(ax);
+    const float cy = cosf(ay), sy = sinf(ay);
+    const float world_m[12] = {
+         cy,  sy * sx,  sy * cx, origin_x,
+        0.0f, cx,      -sx,      origin_y,
+        -sy,  cy * sx,  cy * cx, origin_z,
+    };
+    return cube_surface_hit_matrix(heat_slot, world_m, ray, t_hit, hx, hy, hz);
 }
 
 static bool tri_probe(void) {

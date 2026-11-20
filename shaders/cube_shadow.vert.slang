@@ -4,13 +4,21 @@
 #include "camera.slang"
 #include "face_grid.slang"
 
+struct CubeXform {
+    float4 world_r0;
+    float4 world_r1;
+    float4 world_r2;
+    uint   entity_id;
+    uint   pad0;
+    uint   pad1;
+    uint   pad2;
+};
+
 struct CubeShadowPush {
     uint64_t verts;
     uint64_t heat;
-    float    yaw_deg;
-    float    origin_x;
-    float    origin_y;
-    float    origin_z;
+    uint64_t xform;
+    uint64_t pad0;
     float4   vp_row0;
     float4   vp_row1;
     float4   vp_row2;
@@ -68,11 +76,12 @@ float4 main(uint vert_id : SV_VulkanVertexID) : SV_Position {
         }
     }
 
-    float3 in_pos    = mv.pos + disp;
-    const float ax   = radians(28.0);
-    float ay         = radians(pc.yaw_deg);
-    float3 posed_pos = rotate_pose(in_pos, ax, ay);
-    float3 world_p   = posed_pos * (k_edge_px * 0.5) + float3(pc.origin_x, pc.origin_y, pc.origin_z);
+    CubeXform xf   = ((CubeXform *)pc.xform)[0];
+    float3 local_p = (mv.pos + disp) * (k_edge_px * 0.5);
+    float3 world_p = float3(
+        dot(xf.world_r0.xyz, local_p) + xf.world_r0.w,
+        dot(xf.world_r1.xyz, local_p) + xf.world_r1.w,
+        dot(xf.world_r2.xyz, local_p) + xf.world_r2.w);
 
     float4 wp = float4(world_p, 1.0);
     return float4(dot(pc.vp_row0, wp),

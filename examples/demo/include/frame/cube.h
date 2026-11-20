@@ -35,11 +35,11 @@ void cube_shutdown(VulkanContext *vk);
 // selected lightens the cube the same way a selected solid is lightened.
 // mat is that fillet's look. The first uses slot 0. The rest use 40..62.
 // heat_slot picks that fillet's temperature field. It is the pool index.
-void cube_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height, float yaw_deg,
-               float origin_x, float origin_y, float origin_z, float depth_bias, float phase,
-               bool selected, uint32_t mat, uint32_t heat_slot);
-void cube_draw_shadow(VkCommandBuffer cmd, const float light_clip_vp[16], float yaw_deg,
-                      float origin_x, float origin_y, float origin_z, uint32_t heat_slot);
+void cube_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height,
+               const float world_m[12], float depth_bias, float phase,
+               uint32_t mat, uint32_t heat_slot, uint32_t entity_id);
+void cube_draw_shadow(VkCommandBuffer cmd, const float light_clip_vp[16],
+                      const float world_m[12], uint32_t heat_slot);
 
 // Remember the interval the frame clock issued for this slot. The returned
 // value is what a submit records. Zero is a held slot or an issued interval
@@ -73,6 +73,9 @@ void cube_bind_acquire(VkSemaphore acquire);
 // cube_draw takes. origin_x, origin_y, and origin_z are the draw's offset.
 // hx, hy, hz are the world point on the displaced surface. False when the
 // ray misses, or the bake has not stored the mesh yet.
+bool cube_surface_hit_matrix(uint32_t heat_slot, const float world_m[12],
+                             const CameraRay *ray, float *t_hit,
+                             float *hx, float *hy, float *hz);
 bool cube_surface_hit(uint32_t heat_slot, float yaw_deg, float origin_x, float origin_y,
                       float origin_z, const CameraRay *ray, float *t_hit, float *hx, float *hy,
                       float *hz);

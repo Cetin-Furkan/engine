@@ -195,6 +195,7 @@ static struct {
     VkPipeline            cull_pipe;
     VkPipelineLayout      draw_layout;
     VulkanGfxLive         draw_gfx;
+    VkFormat              armed_color_format;
     VkFormat              armed_depth_format;
     VkSampleCountFlagBits armed_samples;
     uint32_t              surfel_cap;
@@ -842,6 +843,7 @@ void backend_gpu_survey_record_compute(VkCommandBuffer cmd, const TerrainCullPar
 void backend_record_draw_surfels(VkCommandBuffer       cmd,
                                  uint32_t              width,
                                  uint32_t              height,
+                                 VkFormat              color_format,
                                  VkFormat              depth_format,
                                  VkSampleCountFlagBits samples,
                                  float                 elev_base_m,
@@ -854,7 +856,9 @@ void backend_record_draw_surfels(VkCommandBuffer       cmd,
         return;
     }
 
+    VkFormat use_color = (color_format != VK_FORMAT_UNDEFINED) ? color_format : VK_FORMAT_B8G8R8A8_SRGB;
     if (!s_gs.draw_gfx.armed ||
+        s_gs.armed_color_format != use_color ||
         s_gs.armed_depth_format != depth_format ||
         s_gs.armed_samples != samples) {
         vulkan_gfx_disarm(s_gs.vk, &s_gs.draw_gfx);
@@ -869,10 +873,11 @@ void backend_record_draw_surfels(VkCommandBuffer       cmd,
             .cull          = VK_CULL_MODE_NONE,
             .depth_test    = VK_TRUE,
             .depth_write   = VK_FALSE,
-            .depth_compare = VK_COMPARE_OP_LESS_OR_EQUAL,
+            .depth_compare = VK_COMPARE_OP_GREATER_OR_EQUAL,
             .blend         = VK_TRUE,
         };
-        vulkan_gfx_arm(&s_gs.draw_gfx, &gfx, VK_FORMAT_B8G8R8A8_SRGB, nullptr);
+        vulkan_gfx_arm(&s_gs.draw_gfx, &gfx, use_color, nullptr);
+        s_gs.armed_color_format = use_color;
         s_gs.armed_depth_format = depth_format;
         s_gs.armed_samples      = samples;
     }

@@ -67,13 +67,19 @@ static_assert(sizeof k_shadow_vert_spv % 4u == 0u, "shadow vert spirv");
 static_assert(sizeof k_bevel_spv % 4u == 0u, "bevel spirv");
 static_assert(sizeof k_heat_spv % 4u == 0u, "heat spirv");
 
+typedef struct CubeXform {
+    alignas(16) float world_m[12];
+    uint32_t          entity_id;
+    uint32_t          pad[3];
+} CubeXform;
+
+static_assert(sizeof(CubeXform) == 64u, "cube xform");
+
 typedef struct CubeShadowPush {
     uint64_t verts;
     uint64_t heat;
-    float    yaw_deg;
-    float    origin_x;
-    float    origin_y;
-    float    origin_z;
+    uint64_t xform;
+    uint64_t pad0;
     float    light_vp[16];
 } CubeShadowPush;
 
@@ -81,18 +87,17 @@ static_assert(sizeof(CubeShadowPush) == 96u, "cube shadow push");
 
 typedef struct DrawPush {
     uint64_t verts;
+    uint64_t heat;
+    uint64_t xform;
+    uint64_t grid;
     uint32_t width;
     uint32_t height;
-    float    yaw_deg;
-    float    origin_x;
-    float    origin_y;
-    float    depth_bias;
-    uint64_t heat;
-    float    phase;
-    float    selected;
-    uint64_t grid;
     uint32_t grid_n;
-    float    origin_z;
+    float    depth_bias;
+    float    phase;
+    uint32_t entity_id;
+    uint32_t pad0;
+    uint32_t pad1;
     ViewPush view;
 } DrawPush;
 
@@ -131,16 +136,13 @@ typedef struct HeatPush {
     uint32_t pad;
 } HeatPush;
 
-static_assert(offsetof(DrawPush, yaw_deg) == 16u, "yaw offset");
-static_assert(offsetof(DrawPush, origin_x) == 20u, "origin x");
-static_assert(offsetof(DrawPush, origin_y) == 24u, "origin y");
-static_assert(offsetof(DrawPush, depth_bias) == 28u, "depth bias");
-static_assert(offsetof(DrawPush, heat) == 32u, "heat address");
-static_assert(offsetof(DrawPush, phase) == 40u, "hue phase");
-static_assert(offsetof(DrawPush, selected) == 44u, "cube selected");
-static_assert(offsetof(DrawPush, grid) == 48u, "grid address");
-static_assert(offsetof(DrawPush, grid_n) == 56u, "grid n");
-static_assert(offsetof(DrawPush, origin_z) == 60u, "origin z");
+static_assert(offsetof(DrawPush, heat) == 8u, "heat address");
+static_assert(offsetof(DrawPush, xform) == 16u, "xform address");
+static_assert(offsetof(DrawPush, grid) == 24u, "grid address");
+static_assert(offsetof(DrawPush, width) == 32u, "width");
+static_assert(offsetof(DrawPush, depth_bias) == 44u, "depth bias");
+static_assert(offsetof(DrawPush, phase) == 48u, "hue phase");
+static_assert(offsetof(DrawPush, entity_id) == 52u, "entity id");
 static_assert(offsetof(DrawPush, view) == 64u, "cube view");
 static_assert(offsetof(ViewPush, qx) == 16u, "view quat");
 static_assert(sizeof(ViewPush) == 48u, "view push");
@@ -756,10 +758,10 @@ static int cube_ensure_ready(void) {
         .cull          = VK_CULL_MODE_BACK_BIT,
         .depth_test    = VK_TRUE,
         .depth_write   = VK_TRUE,
-        .depth_compare = VK_COMPARE_OP_LESS,
+        .depth_compare = VK_COMPARE_OP_GREATER_OR_EQUAL,
         .blend         = VK_FALSE,
     };
-    vulkan_gfx_arm(&s_gfx, &gfx, VK_FORMAT_B8G8R8A8_SRGB, nullptr);
+    vulkan_gfx_arm(&s_gfx, &gfx, pass_hdr_format(), nullptr);
 
     VkPushConstantRange shadow_push = {
         .stageFlags = VK_SHADER_STAGE_VERTEX_BIT,
@@ -942,11 +944,28 @@ void cube_shutdown(VulkanContext *vk) {
     da_buffer_destroy(vk, &s_index_buf);
 }
 
-void cube_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height, float yaw_deg,
-               float origin_x, float origin_y, float origin_z, float depth_bias, float phase,
-               bool selected, uint32_t mat, uint32_t heat_slot) {
-    if (cmd == VK_NULL_HANDLE || width == 0 || height == 0 || !heat_slot_ok(heat_slot) ||
-        cube_ensure_ready() != 0) {
+static VkDeviceAddress upload_cube_xform(const float world_m[12], uint32_t entity_id) {
+    BdaSlice sl = bda_alloc_transient(s_vk, sizeof(CubeXform), 16u);
+    if (sl.cpu == nullptr || sl.gpu == 0ull) {
+        return 0ull;
+    }
+    CubeXform xf = {
+        .entity_id = entity_id,
+    };
+    memcpy(xf.world_m, world_m, sizeof xf.world_m);
+    memcpy(sl.cpu, &xf, sizeof xf);
+    return sl.gpu;
+}
+
+void cube_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height,
+               const float world_m[12], float depth_bias, float phase,
+               uint32_t mat, uint32_t heat_slot, uint32_t entity_id) {
+    if (cmd == VK_NULL_HANDLE || world_m == nullptr || width == 0 || height == 0 ||
+        !heat_slot_ok(heat_slot) || cube_ensure_ready() != 0) {
+        return;
+    }
+    VkDeviceAddress xform_bda = upload_cube_xform(world_m, entity_id);
+    if (xform_bda == 0ull) {
         return;
     }
     if (!vulkan_gfx_bind(s_vk, cmd, &s_gfx)) {
@@ -956,18 +975,17 @@ void cube_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height, float yaw_d
     int heat_copy = live->draw >= 0 ? live->draw : live->read;
     DrawPush draw_push = {
         .verts      = s_mesh_addr,
+        .heat       = heat_at(heat_copy, heat_slot),
+        .xform      = xform_bda,
+        .grid       = grid_field_addr(),
         .width      = width,
         .height     = height,
-        .yaw_deg    = yaw_deg,
-        .origin_x   = origin_x,
-        .origin_y   = origin_y,
-        .depth_bias = depth_bias,
-        .heat       = heat_at(heat_copy, heat_slot),
-        .phase      = phase,
-        .selected   = selected ? 1.0f : 0.0f,
-        .grid       = grid_field_addr(),
         .grid_n     = grid_n(),
-        .origin_z   = origin_z,
+        .depth_bias = depth_bias,
+        .phase      = phase,
+        .entity_id  = entity_id,
+        .pad0       = 0u,
+        .pad1       = 0u,
     };
     view_push_fill(&draw_push.view, mat);
     lighting_bind_shadow(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_layout);
@@ -978,10 +996,14 @@ void cube_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height, float yaw_d
     vkCmdDrawIndexed(cmd, k_indices, 1, 0, 0, 0);
 }
 
-void cube_draw_shadow(VkCommandBuffer cmd, const float light_clip_vp[16], float yaw_deg,
-                      float origin_x, float origin_y, float origin_z, uint32_t heat_slot) {
-    if (cmd == VK_NULL_HANDLE || light_clip_vp == nullptr || !heat_slot_ok(heat_slot) ||
-        cube_ensure_ready() != 0) {
+void cube_draw_shadow(VkCommandBuffer cmd, const float light_clip_vp[16],
+                      const float world_m[12], uint32_t heat_slot) {
+    if (cmd == VK_NULL_HANDLE || light_clip_vp == nullptr || world_m == nullptr ||
+        !heat_slot_ok(heat_slot) || cube_ensure_ready() != 0) {
+        return;
+    }
+    VkDeviceAddress xform_bda = upload_cube_xform(world_m, 0u);
+    if (xform_bda == 0ull) {
         return;
     }
     if (!vulkan_gfx_bind(s_vk, cmd, &s_shadow_gfx)) {
@@ -990,12 +1012,10 @@ void cube_draw_shadow(VkCommandBuffer cmd, const float light_clip_vp[16], float 
     const HeatLive *live = &s_live[heat_slot];
     int heat_copy = live->draw >= 0 ? live->draw : live->read;
     CubeShadowPush push = {
-        .verts    = s_mesh_addr,
-        .heat     = heat_at(heat_copy, heat_slot),
-        .yaw_deg  = yaw_deg,
-        .origin_x = origin_x,
-        .origin_y = origin_y,
-        .origin_z = origin_z,
+        .verts = s_mesh_addr,
+        .heat  = heat_at(heat_copy, heat_slot),
+        .xform = xform_bda,
+        .pad0  = 0ull,
     };
     memcpy(push.light_vp, light_clip_vp, sizeof push.light_vp);
     vkCmdBindIndexBuffer2(cmd, s_index_buf.buffer, s_index_buf.offset,

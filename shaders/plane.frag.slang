@@ -128,6 +128,7 @@ float4 main(float4 frag : SV_Position) : SV_Target0 {
     float  ground_z    = 0.0;
     bool   has_hdr     = false;
     bool   gi_on       = false;
+    uint   debug_view  = 0u;
     LightingShadowBlock sb = {};
 
     if (pc.view.materials != 0ull) {
@@ -135,6 +136,7 @@ float4 main(float4 frag : SV_Position) : SV_Target0 {
         if (hdr->magic == k_lighting_magic) {
             has_hdr     = true;
             gi_on       = (hdr->gi_enabled != 0u);
+            debug_view  = (hdr->scene_flags >> k_lighting_debug_shift) & 0xFu;
             ground_z    = hdr->ground_z;
             sb          = ((LightingShadowBlock *)(pc.view.materials + k_lighting_shadow_offset))[0];
             sun_dir     = sb.sun_dir;
@@ -145,12 +147,14 @@ float4 main(float4 frag : SV_Position) : SV_Target0 {
         }
     }
 
-    float3 sky_hdr = lighting_eval_sky_studio(rd, sun_dir, sky_top, sky_horizon, sky_ground, 0.16);
+    float3 sky_hdr = (debug_view != 0u)
+        ? float3(0.018, 0.022, 0.032)
+        : lighting_eval_sky_studio(rd, sun_dir, sky_top, sky_horizon, sky_ground, 0.16);
 
     // Ray-plane intersection with z = ground_z
     bool hit_ground = (rd.z < -0.002) && (ro.z > ground_z);
     if (!hit_ground) {
-        return float4(lighting_agx_tonemap(sky_hdr), 1.0);
+        return float4(max(sky_hdr, float3(0.0)), 1.0);
     }
 
     float  tg      = (ground_z - ro.z) / rd.z;
@@ -162,7 +166,7 @@ float4 main(float4 frag : SV_Position) : SV_Target0 {
     float  sky_mix = clamp(max(fog_t, grazing), 0.0, 1.0);
 
     if (sky_mix >= 0.998) {
-        return float4(lighting_agx_tonemap(sky_hdr), 1.0);
+        return float4(max(sky_hdr, float3(0.0)), 1.0);
     }
 
     // World-space derivative anti-aliased multi-scale architectural grid
@@ -198,13 +202,25 @@ float4 main(float4 frag : SV_Position) : SV_Target0 {
     float3 bent_n   = vnrm;
     float3 ind_rgb  = float3(0.0);
     bool   have_gi  = false;
+    float3 vp_floor = view_of(wp, pc.view.q, pc.view.cam);
     if (gi_on && pc.view.materials != 0ull) {
-        float3 vp = view_of(wp, pc.view.q, pc.view.cam);
-        have_gi   = lighting_sample_gi(pc.view.materials, frag.xy, vp.z, vnrm, ao, bent_n, ind_rgb);
+        have_gi = lighting_sample_gi(pc.view.materials, frag.xy, vp_floor.z, vnrm, ao, bent_n, ind_rgb);
     }
 
     // Cook-Torrance floor BRDF (matte architectural studio surface, roughness = 0.58)
     const float rgh  = lerp(0.56, 0.42, grid_w);
+    if (debug_view != 0u) {
+        float3 dbg_c = float3(0.018, 0.022, 0.032);
+        if (debug_view == k_lighting_debug_albedo)    dbg_c = alb_lin;
+        if (debug_view == k_lighting_debug_normals)   dbg_c = lighting_srgb_to_linear(wnrm * 0.5 + 0.5);
+        if (debug_view == k_lighting_debug_roughness) dbg_c = lighting_debug_roughness_ramp(rgh);
+        if (debug_view == k_lighting_debug_depth)     dbg_c = lighting_debug_depth_ramp(vp_floor.z, pc.view.persp, zoom);
+        if (debug_view == k_lighting_debug_gi)        dbg_c = ind_rgb / (float3(1.0) + ind_rgb);
+        if (debug_view == k_lighting_debug_ao)        dbg_c = lighting_srgb_to_linear(float3(ao));
+        if (debug_view == k_lighting_debug_shadow)    dbg_c = lighting_srgb_to_linear(float3(sun_vis));
+        if (debug_view == k_lighting_debug_meshlets)  dbg_c = lerp(float3(0.022, 0.028, 0.040), float3(0.06, 0.08, 0.11), grid_w);
+        return float4(lerp(dbg_c, sky_hdr, sky_mix), 1.0);
+    }
     const float3 f0  = float3(0.04);
     float3 half_v    = normalize(sun_dir + view_dir);
     float  ndh       = max(dot(wnrm, half_v), 0.0);
@@ -231,5 +247,5 @@ float4 main(float4 frag : SV_Position) : SV_Target0 {
 
     float3 floor_hdr = direct + ibl + gi_bounce;
     float3 final_hdr = lerp(floor_hdr, sky_hdr, sky_mix);
-    return float4(lighting_agx_tonemap(final_hdr), 1.0);
+    return float4(max(final_hdr, float3(0.0)), 1.0);
 }

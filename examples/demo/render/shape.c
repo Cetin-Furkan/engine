@@ -196,10 +196,10 @@ static bool shape_ensure_ready(void) {
         .cull          = VK_CULL_MODE_NONE,
         .depth_test    = VK_TRUE,
         .depth_write   = VK_TRUE,
-        .depth_compare = VK_COMPARE_OP_LESS,
+        .depth_compare = VK_COMPARE_OP_GREATER_OR_EQUAL,
         .blend         = VK_FALSE,
     };
-    vulkan_gfx_arm(&s_gfx, &gfx, VK_FORMAT_B8G8R8A8_SRGB, nullptr);
+    vulkan_gfx_arm(&s_gfx, &gfx, pass_hdr_format(), nullptr);
     return true;
 }
 

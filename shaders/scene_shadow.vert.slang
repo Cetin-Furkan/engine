@@ -35,16 +35,7 @@ float4 main(uint vert_id : SV_VulkanVertexID, uint vulkan_inst_id : SV_VulkanIns
     SceneInstance    inst = ((SceneInstance *)(pc.cull_slot_bda + k_slot_off_instances))[inst_id];
 
     float3 local_p = scene_dequantize_pos(pv, ml);
-    float3 posed_p = rotate_pose(local_p, inst.pitch_rad, inst.yaw_rad);
-
-    float sz  = clamp(1.0 + inst.squash, 0.45, 1.85);
-    float sxy = rsqrt(sz);
-
-    float3 world_p = posed_p * inst.uniform_scale;
-    world_p.x *= sxy;
-    world_p.y *= sxy;
-    world_p.z *= sz;
-    world_p += float3(inst.origin_x, inst.origin_y, inst.origin_z);
+    float3 world_p = scene_transform_point_squash(local_p, inst);
 
     float4 wp = float4(world_p, 1.0);
     return float4(dot(pc.vp_row0, wp),

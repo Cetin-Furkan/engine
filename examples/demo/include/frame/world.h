@@ -1,6 +1,8 @@
 #ifndef ENGINE_FRAME_WORLD_H
 #define ENGINE_FRAME_WORLD_H
 
+#include "ecs/ecs.h"
+#include "gizmo/gizmo.h"
 #include "vulkan/types.h"
 #include <stdint.h>
 
@@ -26,12 +28,15 @@
 // then hold. The sweep does not arm a frame by itself.
 
 enum : uint32_t {
-    k_world_preset_max  = 9u,
-    k_world_custom_file = 10u,
+    k_world_preset_max   = 9u,
+    k_world_custom_file  = 10u,
+    k_world_model_studio = 11u,
 };
 
 void world_select(uint32_t world_id);
 bool world_select_file(const char *path);
+bool world_select_model(const char *path, bool standalone_studio);
+const char *world_cli_model_path(void);
 const char *world_custom_path(void);
 const char *world_source_path(void);
 uint32_t world_selected_id(void);
@@ -63,10 +68,24 @@ void world_reset(void);
 // selection or a corner changed and a frame should be presented.
 bool world_click(float screen_x, float screen_y);
 
-// Tactile 3D pointer drag: grabs and moves cubes/solids on the horizontal
-// plane when left-dragging an object, or orbits/pans the camera otherwise.
+// Tactile 3D pointer drag: drags active 3D gizmo handle first, else grabs and
+// moves cubes/solids on the horizontal plane, or orbits/pans the camera.
+bool world_hover(float screen_x, float screen_y);
 bool world_pointer_drag(float dx, float dy, uint32_t buttons);
 bool world_pointer_drag_poll(void);
+
+// SoA ECS, 3D Transform Hierarchy & 3D Transform Gizmo controls.
+EcsWorld   *world_ecs(void);
+GizmoState *world_gizmo(void);
+EcsEntity   world_selected_entity(void);
+bool        world_gizmo_cycle_mode(void);
+bool        world_gizmo_set_mode(GizmoMode mode);
+bool        world_gizmo_toggle_space(void);
+bool        world_gizmo_toggle_debug_draw(void);
+bool        world_parent_selected(void);
+bool        world_unparent_selected(void);
+bool        world_select_cycle(int dir);
+void        world_ecs_stats(uint32_t *out_entities, uint32_t *out_hier_links);
 
 // Key 1 is kind 0. Raises that mesh, or selects it if it is already up.
 // True when the picture changed.
@@ -145,8 +164,10 @@ void world_commit(void);
 // A static corner preview does not count. Clears that pending notice.
 bool world_consume_spin(void);
 
-// Prepare unified GPU scene culling / Hi-Z / VisBuf passes before vkCmdBeginRendering.
-void world_prepare_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height, bool live);
+struct RgGraph;
+
+// Prepare unified GPU scene culling / Hi-Z / VisBuf / Shadow / GI passes inside RgGraph before vkCmdBeginRendering.
+void world_prepare_draw(struct RgGraph *g, VkCommandBuffer cmd, uint32_t width, uint32_t height, bool live);
 
 // live draws the pose world_advance just computed. Otherwise the shown pose.
 void world_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height, bool live);

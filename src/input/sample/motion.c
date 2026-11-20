@@ -78,6 +78,7 @@ bool input_on_pointer(WaylandContext *w, uint16_t opcode,
         s_ptr.left_dragged = false;
         s_ptr.rel_frame_seen = false;
         s_ptr.lock_wanted = false;
+        s_ptr.hover_dirty = false;
         return true;
     }
     if (opcode == 2u) {
@@ -120,6 +121,9 @@ bool input_on_pointer(WaylandContext *w, uint16_t opcode,
             s_drag_dx += dx * scale;
             s_drag_dy += dy * scale;
             s_drag_buttons |= drag;
+        } else if (s_ptr.focus == w->surface_id && s_ptr.buttons == 0u &&
+                   (dx != 0.0f || dy != 0.0f)) {
+            s_ptr.hover_dirty = true;
         }
         s_ptr.x = nx;
         s_ptr.y = ny;
@@ -316,6 +320,21 @@ bool pointer_take_scroll(float *steps) {
     s_scroll = 0.0;
     input_page_publish();
     return *steps != 0.0f;
+}
+
+bool pointer_take_hover(int32_t *x, int32_t *y) {
+    if (x == nullptr || y == nullptr || !s_ptr.hover_dirty || s_ptr.focus == 0u) {
+        return false;
+    }
+    s_ptr.hover_dirty = false;
+    const WaylandContext *w = wayland_get_context();
+    if (w == nullptr || s_ptr.focus != w->surface_id) {
+        return false;
+    }
+    float scale = wayland_scale_factor(w);
+    *x = px_floor_i32(s_ptr.x * scale);
+    *y = px_floor_i32(s_ptr.y * scale);
+    return true;
 }
 
 bool pointer_client_xy(int32_t *x, int32_t *y) {

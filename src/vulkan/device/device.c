@@ -63,6 +63,7 @@ typedef struct GpuCandidate {
     bool                             supports_maintenance5;
     bool                             supports_maintenance6;
     bool                             supports_push_descriptors;
+    bool                             supports_bindless_textures;
     bool                             supports_host_image_copy;
     bool                             supports_dynamic_rendering_local_read;
     bool                             supports_shader_int8;
@@ -74,6 +75,7 @@ typedef struct GpuCandidate {
     bool                             supports_vulkan_memory_model;
     bool                             supports_vulkan_memory_model_device_scope;
     bool                             supports_fragment_stores_atomics;
+    bool                             supports_storage_write_without_format;
     bool                             supports_vertex_stores_atomics;
     bool                             supports_shader_expect_assume;
     bool                             supports_shader_float_controls2;
@@ -539,6 +541,12 @@ static VulkanResult evaluate_device(GpuCandidate *candidate) {
     candidate->supports_maintenance5                 = (feat14.maintenance5 == VK_TRUE);
     candidate->supports_maintenance6                 = (feat14.maintenance6 == VK_TRUE);
     candidate->supports_push_descriptors             = (feat14.pushDescriptor == VK_TRUE);
+    candidate->supports_bindless_textures            =
+        (feat12.descriptorIndexing == VK_TRUE) &&
+        (feat12.descriptorBindingSampledImageUpdateAfterBind == VK_TRUE) &&
+        (feat12.descriptorBindingPartiallyBound == VK_TRUE) &&
+        (feat12.shaderSampledImageArrayNonUniformIndexing == VK_TRUE) &&
+        (feat12.runtimeDescriptorArray == VK_TRUE);
     candidate->supports_host_image_copy              = (feat14.hostImageCopy == VK_TRUE);
     candidate->supports_dynamic_rendering_local_read = (feat14.dynamicRenderingLocalRead == VK_TRUE);
     candidate->supports_shader_int8                  = (feat12.shaderInt8 == VK_TRUE);
@@ -552,6 +560,8 @@ static VulkanResult evaluate_device(GpuCandidate *candidate) {
         (feat12.vulkanMemoryModelDeviceScope == VK_TRUE);
     candidate->supports_fragment_stores_atomics      =
         (features2.features.fragmentStoresAndAtomics == VK_TRUE);
+    candidate->supports_storage_write_without_format =
+        (features2.features.shaderStorageImageWriteWithoutFormat == VK_TRUE);
     candidate->supports_vertex_stores_atomics        =
         (features2.features.vertexPipelineStoresAndAtomics == VK_TRUE);
     candidate->supports_shader_expect_assume         = (feat14.shaderExpectAssume == VK_TRUE);
@@ -809,7 +819,7 @@ static void print_candidate(uint32_t index, const GpuCandidate *candidate) {
                candidate->supports_shader_subgroup_rotate_clustered ? "yes" : "no",
                candidate->supports_shader_demote ? "yes" : "no",
                candidate->supports_shader_draw_parameters ? "yes" : "no");
-        printf("      Features: DynRender=%s, LocalRead=%s, Sync2=%s, BDA=%s, ScalarLayout=%s, Timeline=%s, Anisotropy=%s, Maint5=%s, Maint6=%s, PushDesc=%s, HostImageCopy=%s, MultiDrawIndirect=%s, DrawIndirectCount=%s, Int16=%s, Int64=%s, Storage16=%s, Float16=%s\n",
+        printf("      Features: DynRender=%s, LocalRead=%s, Sync2=%s, BDA=%s, ScalarLayout=%s, Timeline=%s, Anisotropy=%s, Maint5=%s, Maint6=%s, PushDesc=%s, Bindless=%s, HostImageCopy=%s, MultiDrawIndirect=%s, DrawIndirectCount=%s, Int16=%s, Int64=%s, Storage16=%s, Float16=%s\n",
                candidate->supports_dyn_render ? "yes" : "no",
                candidate->supports_dynamic_rendering_local_read ? "yes" : "no",
                candidate->supports_sync2 ? "yes" : "no",
@@ -820,6 +830,7 @@ static void print_candidate(uint32_t index, const GpuCandidate *candidate) {
                candidate->supports_maintenance5 ? "yes" : "no",
                candidate->supports_maintenance6 ? "yes" : "no",
                candidate->supports_push_descriptors ? "yes" : "no",
+               candidate->supports_bindless_textures ? "yes" : "no",
                candidate->supports_host_image_copy ? "yes" : "no",
                candidate->supports_multi_draw_indirect ? "yes" : "no",
                candidate->supports_draw_indirect_count ? "yes" : "no",
@@ -1167,8 +1178,10 @@ static VulkanResult open_candidate(VulkanContext *ctx, const GpuCandidate *chose
     ctx->device_info.supports_maintenance5 = best.supports_maintenance5;
     ctx->device_info.supports_maintenance6 = best.supports_maintenance6;
     ctx->device_info.supports_push_descriptors = best.supports_push_descriptors;
+    ctx->device_info.supports_bindless_textures = best.supports_bindless_textures;
     ctx->device_info.supports_host_image_copy = best.supports_host_image_copy;
     ctx->device_info.supports_dynamic_rendering_local_read = best.supports_dynamic_rendering_local_read;
+    ctx->device_info.supports_storage_write_without_format = best.supports_storage_write_without_format;
     ctx->device_info.supports_shader_int16 = best.supports_shader_int16;
     ctx->device_info.supports_shader_int64 = best.supports_shader_int64;
     ctx->device_info.supports_storage_buffer_16bit = best.supports_storage_buffer_16bit;
@@ -1396,6 +1409,13 @@ static VulkanResult open_candidate(VulkanContext *ctx, const GpuCandidate *chose
         .storageBuffer8BitAccess      = best.supports_storage_buffer_8bit ? VK_TRUE : VK_FALSE,
         .shaderFloat16                = VK_TRUE,
         .shaderInt8                   = best.supports_shader_int8 ? VK_TRUE : VK_FALSE,
+        .descriptorIndexing           = best.supports_bindless_textures ? VK_TRUE : VK_FALSE,
+        .shaderSampledImageArrayNonUniformIndexing =
+            best.supports_bindless_textures ? VK_TRUE : VK_FALSE,
+        .descriptorBindingSampledImageUpdateAfterBind =
+            best.supports_bindless_textures ? VK_TRUE : VK_FALSE,
+        .descriptorBindingPartiallyBound = best.supports_bindless_textures ? VK_TRUE : VK_FALSE,
+        .runtimeDescriptorArray       = best.supports_bindless_textures ? VK_TRUE : VK_FALSE,
         .scalarBlockLayout            = VK_TRUE,
         .hostQueryReset               = best.supports_host_query_reset ? VK_TRUE : VK_FALSE,
         .timelineSemaphore            = VK_TRUE,
@@ -1420,7 +1440,8 @@ static VulkanResult open_candidate(VulkanContext *ctx, const GpuCandidate *chose
             .drawIndirectFirstInstance      = best.supports_draw_indirect_first_instance ? VK_TRUE : VK_FALSE,
             .samplerAnisotropy              = best.supports_anisotropy ? VK_TRUE : VK_FALSE,
             .vertexPipelineStoresAndAtomics = best.supports_vertex_stores_atomics ? VK_TRUE : VK_FALSE,
-            .fragmentStoresAndAtomics       = best.supports_fragment_stores_atomics ? VK_TRUE : VK_FALSE,
+            .fragmentStoresAndAtomics             = best.supports_fragment_stores_atomics ? VK_TRUE : VK_FALSE,
+            .shaderStorageImageWriteWithoutFormat = best.supports_storage_write_without_format ? VK_TRUE : VK_FALSE,
             .shaderInt16                    = VK_TRUE,
             .shaderInt64                    = VK_TRUE,
         },
@@ -1632,7 +1653,7 @@ void vulkan_device_log(const VulkanContext *ctx) {
            ctx->device_info.supports_shader_subgroup_rotate_clustered ? "yes" : "no",
            ctx->device_info.supports_shader_demote ? "yes" : "no",
            ctx->device_info.supports_shader_draw_parameters ? "yes" : "no");
-    printf("[Vulkan] Capabilities: DMA-BUF=%s, DRM-Modifiers=%s, ForeignQueue=%s, Syncobj=%s, BDA=%s, ScalarLayout=%s, Anisotropy=%s, DynRender=%s, LocalRead=%s, Sync2=%s, Timeline=%s, Maint5=%s, Maint6=%s, PushDesc=%s, HostImageCopy=%s, MultiDrawIndirect=%s, DrawIndirectCount=%s, RayQuery=%s, Int16=%s, Int64=%s, Storage16=%s, Float16=%s\n",
+    printf("[Vulkan] Capabilities: DMA-BUF=%s, DRM-Modifiers=%s, ForeignQueue=%s, Syncobj=%s, BDA=%s, ScalarLayout=%s, Anisotropy=%s, DynRender=%s, LocalRead=%s, Sync2=%s, Timeline=%s, Maint5=%s, Maint6=%s, PushDesc=%s, Bindless=%s, HostImageCopy=%s, MultiDrawIndirect=%s, DrawIndirectCount=%s, RayQuery=%s, Int16=%s, Int64=%s, Storage16=%s, Float16=%s\n",
            ctx->device_info.supports_dma_buf ? "yes" : "no",
            ctx->device_info.supports_drm_format_modifiers ? "yes" : "no",
            ctx->device_info.supports_queue_family_foreign ? "yes" : "no",
@@ -1647,6 +1668,7 @@ void vulkan_device_log(const VulkanContext *ctx) {
            ctx->device_info.supports_maintenance5 ? "yes" : "no",
            ctx->device_info.supports_maintenance6 ? "yes" : "no",
            ctx->device_info.supports_push_descriptors ? "yes" : "no",
+           ctx->device_info.supports_bindless_textures ? "yes" : "no",
            ctx->device_info.supports_host_image_copy ? "yes" : "no",
            ctx->device_info.supports_multi_draw_indirect ? "yes" : "no",
            ctx->device_info.supports_draw_indirect_count ? "yes" : "no",

@@ -130,7 +130,7 @@ static bool plane_ensure_ready(void) {
         .depth_compare = VK_COMPARE_OP_ALWAYS,
         .blend         = VK_FALSE,
     };
-    vulkan_gfx_arm(&s_gfx, &gfx, VK_FORMAT_B8G8R8A8_SRGB, nullptr);
+    vulkan_gfx_arm(&s_gfx, &gfx, pass_hdr_format(), nullptr);
     if (!s_logged) {
         printf("[Plane] Screen-space metric grid behind the scene (live 10^k subdivisions).\n");
         fflush(stdout);

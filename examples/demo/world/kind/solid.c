@@ -80,7 +80,14 @@ static int find_kind(uint32_t kind) {
 }
 
 static bool solid_hit(const WorldObj *o, const CameraRay *ray, float *t, Coord *at) {
-    if (!coord_sphere_hit(ray, o->at, k_radius, t)) {
+    Coord center = o->at;
+    float radius = k_radius;
+    EcsSphere sph = {0};
+    if (ecs_get_world_sphere(world_ecs(), o->entity, &sph) && sph.radius > 1.0f) {
+        center = (Coord){ sph.center[0], sph.center[1], sph.center[2] };
+        radius = sph.radius;
+    }
+    if (!coord_sphere_hit(ray, center, radius, t)) {
         return false;
     }
     if (at != nullptr && t != nullptr) {
@@ -95,7 +102,7 @@ static bool solid_hit(const WorldObj *o, const CameraRay *ray, float *t, Coord *
 
 static bool solid_on_click(WorldObj *o, Coord hit) {
     SolidData *s = o->data;
-    if (s == nullptr) {
+    if (s == nullptr || ecs_get_parent(world_ecs(), o->entity) != ECS_NULL_ENTITY) {
         return false;
     }
     float dx = o->at.x - hit.x;
@@ -158,12 +165,15 @@ static bool solid_simulate(WorldObj *o, uint32_t time_ms, uint32_t sim_dt_ms, ui
 
 static void solid_prepare_obj(const WorldObj *o, bool live) {
     const SolidData *s = o->data;
+    float world_m[12];
+    if (s == nullptr || !ecs_get_world_matrix(world_ecs(), o->entity, world_m)) {
+        return;
+    }
     bool glow = live ? s->spin.glow : s->spin.shown_glow;
     material_set(k_mat_solid0 + s->kind, glow);
     bool curved = live ? s_curved : s_shown_curved;
     float squash = live ? s->squash : s->shown_squash;
-    solid_submit_scene(s->kind, curved, spin_deg(&s->spin, live),
-                       o->at.x, o->at.y, o->at.z, squash, table_highlight(o, live));
+    solid_submit_scene(s->kind, curved, world_m, squash, o->entity);
 }
 
 static bool solid_toggle_spin(WorldObj *o) {
@@ -319,6 +329,9 @@ bool solid_kind_place_elastic(uint32_t kind, Coord at, int32_t yaw_milli,
         fprintf(stderr, "[World] No room for %s.\n", k_name[kind]);
         return false;
     }
+    float sr = solid_rest_radius(kind);
+    const float ext[3] = { sr, sr, sr };
+    table_configure_entity(index, ECS_KIND_SOLID, ext, sr, 28.0f);
     if (spinning) {
         table_mark_spun();
     }
@@ -344,6 +357,8 @@ bool solid_kind_grab_move(WorldObj *o, Coord pos, float vx, float vy, bool relea
     }
     SolidData *s = o->data;
     o->at = pos;
+    table_sync_entity_world_pos(o);
+    ecs_propagate_transforms(world_ecs());
     if (!release) {
         s->vx    = 0.0f;
         s->vy    = 0.0f;
@@ -372,7 +387,8 @@ uint32_t solid_kind_gather_motion(MotionBody *out, WorldObj **objs, uint32_t cap
     int count = table_count();
     for (int i = 0; i < count && n < cap; ++i) {
         WorldObj *o = table_at(i);
-        if (o == nullptr || !o->alive || o->ops != &s_ops || o->data == nullptr) {
+        if (o == nullptr || !o->alive || o->ops != &s_ops || o->data == nullptr ||
+            ecs_get_parent(world_ecs(), o->entity) != ECS_NULL_ENTITY) {
             continue;
         }
         SolidData *s = o->data;
@@ -417,6 +433,7 @@ bool solid_kind_apply_motion(const MotionBody *bodies, WorldObj *const *objs, ui
         o->at.x = bodies[i].x;
         o->at.y = bodies[i].y;
         o->at.z = bodies[i].z;
+        table_sync_entity_world_pos(o);
         s->vx = bodies[i].vx;
         s->vy = bodies[i].vy;
         s->vz = bodies[i].vz;

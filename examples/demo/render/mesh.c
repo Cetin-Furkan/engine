@@ -284,20 +284,10 @@ void mesh_commit(void) {
     s_shown_gen = s_gen;
 }
 
-void mesh_submit_scene(float yaw_deg, bool selected) {
-    if (!mesh_ensure_ready() || s_count < 3u || s_mesh_id == K_SCENE_INVALID_MESH) {
+void mesh_submit_scene(const float world_m[12], uint32_t entity_id) {
+    if (!mesh_ensure_ready() || world_m == nullptr || s_count < 3u || s_mesh_id == K_SCENE_INVALID_MESH) {
         return;
     }
-    const float k_deg_to_rad = 0.017453292519943295f;
-    scene_submit_instance(s_mesh_id,
-                          k_fit_x, k_fit_y, 0.0f,
-                          1.0f,
-                          0.0f,
-                          yaw_deg * k_deg_to_rad,
-                          0.0f,
-                          0.42f,
-                          selected ? 1.0f : 0.0f,
-                          0.0f,
-                          k_mat_mesh,
-                          0u);
+    scene_submit_instance(s_mesh_id, world_m, 0.0f, 0.42f, 0.0f,
+                          k_mat_mesh, 0u, entity_id);
 }

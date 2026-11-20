@@ -71,5 +71,5 @@ float4 main(FSInput input) : SV_Target0 {
     float haze       = smoothstep(9000.0, 26000.0, cam_dist_m) * 0.16;
     lit_color        = lerp(lit_color, float3(0.52, 0.62, 0.74), haze);
 
-    return float4(clamp(lit_color, float3(0.0), float3(1.0)), alpha);
+    return float4(max(lit_color, float3(0.0)), alpha);
 }

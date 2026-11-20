@@ -28,6 +28,7 @@ void hud_turn_report(uint32_t *frames, uint32_t *missed);
 
 void hud_set_visible(bool visible);
 bool hud_is_visible(void);
+bool hud_toggle_profiler(void);
 
 void hud_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height, VkFormat format,
               VkFormat depth_format, VkSampleCountFlagBits samples);

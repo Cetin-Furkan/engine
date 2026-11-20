@@ -34,14 +34,14 @@ float fast_atan2_gpu(float y, float x) {
     return y < 0.0 ? -r : r;
 }
 
-uint ssilvb_sector_mask_gpu(float a_min, float a_max) {
+uint ssilvb_sector_mask_gpu(float a_min, float a_max, float bit_jit) {
     float a0 = clamp(a_min, 0.0, 1.0);
     float a1 = clamp(a_max, 0.0, 1.0);
-    if (a1 <= a0) {
+    if (a1 - a0 <= 1.0e-4) {
         return 0u;
     }
-    uint b0 = uint(floor(a0 * 32.0));
-    uint b1 = min(uint(ceil(a1 * 32.0)), 32u);
+    uint b0 = min(uint(floor(a0 * 32.0 + bit_jit)), 32u);
+    uint b1 = min(uint(floor(a1 * 32.0 + bit_jit)), 32u);
     if (b0 >= 32u || b1 <= b0) {
         return 0u;
     }
@@ -52,11 +52,17 @@ uint ssilvb_sector_mask_gpu(float a_min, float a_max) {
     return ((1u << cnt) - 1u) << b0;
 }
 
-float2 ssilvb_noise(uint2 px, uint frame_idx) {
-    uint  f  = frame_idx & 63u;
-    float n1 = frac(52.9829189 * frac(0.06711056 * float(px.x + f * 5u) + 0.00583715 * float(px.y + f * 3u)));
-    float n2 = frac(float(px.x) * 0.754877666 + float(px.y) * 0.569840291 + float(f) * 0.618033989);
-    return float2(n1, n2);
+float ssilvb_ign(float2 p) {
+    return frac(52.9829189 * frac(dot(p, float2(0.06711056, 0.00583715))));
+}
+
+float3 ssilvb_noise(uint2 px, uint frame_idx) {
+    float  f  = float(frame_idx & 63u);
+    float2 q  = float2(px) + float2(f * 5.588238, f * 3.141592);
+    float  n1 = ssilvb_ign(q);
+    float  n2 = ssilvb_ign(q + float2(17.0, 29.0));
+    float  n3 = ssilvb_ign(q + float2(43.0, 11.0));
+    return float3(n1, n2, n3);
 }
 
 float3 hrc_c0_dir_jit(uint m, uint2 probe, uint frame_idx, bool ground_probe) {
@@ -169,7 +175,7 @@ void run_seamless_denoise_pass(LightingFrameHeader hdr, uint3 tid, uint3 gtid, u
     }
 
     float3 center_nrm = s_halo_nrm[cslot];
-    float  inv_sig_z  = max(hdr.zoom * 0.085, 0.005);
+    float  inv_sig_z  = max(hdr.zoom * 0.055, 0.004);
     float  sw_sum     = 1.0;
     float  ao_filt    = s_halo_ao[cslot];
     float3 bent_filt  = s_halo_bent[cslot];
@@ -191,7 +197,7 @@ void run_seamless_denoise_pass(LightingFrameHeader hdr, uint3 tid, uint3 gtid, u
             float  dz_s = abs(nvz - center_vz) * inv_sig_z;
             float  wz   = rcp(1.0 + dz_s + 0.45 * dz_s * dz_s);
             float  nd   = max(dot(s_halo_nrm[nslot], center_nrm), 0.0);
-            float  wn   = nd * nd * nd * nd;
+            float  wn   = nd * nd * nd;
             float  w    = kw * wz * wn;
 
             sw_sum    += w;
@@ -274,7 +280,7 @@ void main(uint3 tid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID, uint3 
 
     uint   num_slices = clamp(hdr.ssilvb_slices, 1u, 8u);
     uint   num_steps  = clamp(hdr.ssilvb_steps,  2u, 16u);
-    float2 jitter     = ssilvb_noise(tid.xy, hdr.frame_index);
+    float3 jitter     = ssilvb_noise(tid.xy, hdr.frame_index);
 
     float gi_scale   = float(hdr.gi_width) / max(float(hdr.full_width), 1.0);
     float max_r_tex  = max(hdr.ssilvb_radius_px * gi_scale, 4.0);
@@ -283,8 +289,12 @@ void main(uint3 tid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID, uint3 
     float thick_w    = max(hdr.thickness_world, 1.0e-3);
     float2 inv_gi_wh = float2(float(hdr.full_width)  / max(float(hdr.gi_width),  1.0),
                               float(hdr.full_height) / max(float(hdr.gi_height), 1.0));
+    float3 view_v    = (sb.persp > 1.0e-7)
+        ? normalize(float3(0.0, 0.0, 1.0 / sb.persp) - center_vpos)
+        : float3(0.0, 0.0, 1.0);
 
     float  vis_accum  = 0.0;
+    float  vis_weight = 0.0;
     float3 bent_accum = float3(0.0);
     float3 ind_accum  = float3(0.0);
 
@@ -293,18 +303,21 @@ void main(uint3 tid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID, uint3 
         float  scos       = cos(phi);
         float  ssin       = sin(phi);
         float2 s_step_dir = float2(scos, -ssin);
+        float3 slice_v    = float3(scos, ssin, 0.0);
 
-        float  pnx      = -ssin;
-        float  pny      =  scos;
-        float  ndp      = center_vnrm.x * pnx + center_vnrm.y * pny;
-        float3 proj_n   = float3(center_vnrm.x - ndp * pnx, center_vnrm.y - ndp * pny, center_vnrm.z);
+        float3 side_raw = cross(view_v, slice_v);
+        float  side_l2  = dot(side_raw, side_raw);
+        if (side_l2 < 1.0e-6) {
+            continue;
+        }
+        float3 side_n   = side_raw * rsqrt(side_l2);
+        float3 proj_n   = center_vnrm - side_n * dot(center_vnrm, side_n);
         float  proj_len = length(proj_n);
         if (proj_len < 1.0e-4) {
             continue;
         }
-        float n_t   = (proj_n.x * scos + proj_n.y * ssin) / proj_len;
-        float n_v   = proj_n.z / proj_len;
-        float n_ang = fast_atan2_gpu(n_t, max(n_v, 1.0e-4));
+        float3 n_dir = proj_n / proj_len;
+        float3 t_nrm = cross(side_n, n_dir);
 
         uint vis_mask = 0u;
 
@@ -334,20 +347,33 @@ void main(uint3 tid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID, uint3 
                     continue;
                 }
 
-                float dist     = sqrt(dist2);
-                float falloff  = saturate(1.0 - dist / (max_r_w * 1.35));
-                float eff_thk  = thick_w * lerp(0.55, 1.45, u_step);
-                float dz_front = delta.z;
-                float dz_back  = delta.z - eff_thk;
-                float d_tan    = delta.x * scos + delta.y * ssin;
+                float dist = sqrt(dist2);
+                // Reject coplanar & convex self-occlusion below the surface tangent plane
+                if (dot(delta, center_vnrm) <= dist * 0.045) {
+                    continue;
+                }
 
-                float ang_f = fast_atan2_gpu(d_tan, dz_front) - n_ang;
-                float ang_b = fast_atan2_gpu(d_tan, dz_back)  - n_ang;
+                float fn = dot(delta, n_dir);
+                if (fn <= 1.0e-5) {
+                    continue;
+                }
+
+                float  falloff    = saturate(1.0 - dist / (max_r_w * 1.35));
+                float  eff_thk    = thick_w * lerp(0.55, 1.45, u_step);
+                float3 delta_back = delta - view_v * eff_thk;
+                float  ft         = dot(delta, t_nrm);
+                float  bn         = dot(delta_back, n_dir);
+                float  bt         = dot(delta_back, t_nrm);
+
+                // Angles measured directly in (n_dir, t_nrm) stay in [-pi/2, +pi/2] with zero branch-cut wrap
+                float ang_f = fast_atan2_gpu(ft, fn);
+                float ang_b = (bn > 1.0e-5) ? fast_atan2_gpu(bt, bn)
+                                            : ((ft >= 0.0) ? k_gi_half_pi : -k_gi_half_pi);
                 float a_min = (min(ang_f, ang_b) + k_gi_half_pi) * (1.0 / k_gi_pi);
                 float a_max = (max(ang_f, ang_b) + k_gi_half_pi) * (1.0 / k_gi_pi);
                 a_max = lerp(a_min, a_max, smoothstep(0.0, 0.25, falloff));
 
-                uint hit_bits       = ssilvb_sector_mask_gpu(a_min, a_max);
+                uint hit_bits       = ssilvb_sector_mask_gpu(a_min, a_max, jitter.z);
                 uint newly_occluded = hit_bits & ~vis_mask;
                 if (newly_occluded != 0u) {
                     float  sec_w    = float(countbits(newly_occluded)) * (1.0 / 32.0);
@@ -357,28 +383,29 @@ void main(uint3 tid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID, uint3 
                     float  recv_cos = saturate(dot(center_vnrm, dir_in) * 0.85 + 0.15);
                     float  emit_cos = saturate(dot(nb_vnrm, -dir_in) * 0.80 + 0.20);
 
-                    ind_accum += nb_rad * (sec_w * recv_cos * emit_cos * falloff);
+                    ind_accum += nb_rad * (sec_w * recv_cos * emit_cos * falloff * proj_len);
                     vis_mask  |= hit_bits;
                 }
             }
         }
 
         uint  occ_bits = countbits(vis_mask);
-        float sl_vis   = clamp(proj_len * (1.0 - float(occ_bits) * (1.0 / 32.0)), 0.0, 1.0);
+        float sl_vis   = 1.0 - float(occ_bits) * (1.0 / 32.0);
         uint  unocc_lo = 16u - countbits(vis_mask & 0x0000FFFFu);
         uint  unocc_hi = 16u - countbits((vis_mask >> 16u) & 0x0000FFFFu);
         float tilt     = (float(unocc_hi) - float(unocc_lo)) * (1.0 / 16.0);
 
-        vis_accum  += sl_vis;
-        bent_accum += normalize(center_vnrm + float3(scos, ssin, 0.0) * (tilt * 0.85));
+        vis_accum  += sl_vis * proj_len;
+        vis_weight += proj_len;
+        bent_accum += normalize(center_vnrm + t_nrm * (tilt * 0.72)) * proj_len;
     }
 
-    float  inv_slices   = 1.0 / float(num_slices);
-    float  ao_cur       = clamp(vis_accum * inv_slices, 0.0, 1.0);
+    float  inv_w        = (vis_weight > 1.0e-4) ? (1.0 / vis_weight) : (1.0 / float(num_slices));
+    float  ao_cur       = (vis_weight > 1.0e-4) ? clamp(vis_accum * inv_w, 0.0, 1.0) : 1.0;
     float3 bent_cur     = dot(bent_accum, bent_accum) > 1.0e-5 ? normalize(bent_accum) : center_vnrm;
     bool   ground_probe = (hdr.has_ground != 0u && hdr.terrain_dir_bda == 0ull &&
                            (ctex.alb_flags >> 24u) == 3u && center_wnrm.z > 0.5);
-    float3 local_bounce = ind_accum * inv_slices * 1.65;
+    float3 local_bounce = ind_accum * inv_w * 1.65;
     float3 far_hrc_irr  = sample_hrc_c0_irradiance(hdr, center_uv, center_wnrm, ao_cur, ground_probe);
     float3 irr_cur      = max(local_bounce + far_hrc_irr, float3(0.0));
 

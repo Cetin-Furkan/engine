@@ -174,16 +174,19 @@ void main(uint3 tid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID, uint3 
         }
     }
 
-    // 2. SSD-streamed .epack DEM heightfield (1-tap scalar search + 1 full hit decode)
+    // 2. SSD-streamed .epack DEM heightfield (1-tap scalar search + secant-refined bisection + 1 full hit decode)
     if (hdr.terrain_dir_bda != 0ull) {
         float t0 = 0.0, t1 = 0.0;
         if (ray_terrain_slab(hdr.terrain_dir_bda, hdr.elev_base_m, hdr.vertical_scale,
                              ro, rd, best_t, t0, t1)) {
-            uint  steps     = hdr.oracle_mode != 0u ? 12u : 7u;
+            uint  steps     = hdr.oracle_mode != 0u ? 20u : 14u;
             float dt        = (t1 - t0) / float(steps);
             float t_prev    = t0;
+            float h_prev    = 0.0;
+            bool  have_prev = false;
             bool  bracketed = false;
             float t_hi      = t1;
+            float h_hi      = 0.0;
 
             for (uint s = 0u; s <= steps; ++s) {
                 float  tc = t0 + dt * float(s);
@@ -191,32 +194,47 @@ void main(uint3 tid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID, uint3 
                 float  dz = 0.0;
                 if (lighting_sample_terrain_height_fast(
                         hdr.terrain_dir_bda, hdr.elev_base_m, hdr.vertical_scale, wp.xy, 3, dz)) {
-                    if (wp.z <= dz) {
+                    float diff = wp.z - dz;
+                    if (diff <= 0.0) {
                         t_hi      = tc;
+                        h_hi      = diff;
                         bracketed = true;
                         break;
                     }
-                    t_prev = tc;
+                    t_prev    = tc;
+                    h_prev    = diff;
+                    have_prev = true;
                 }
             }
 
             if (bracketed) {
-                float ta = t_prev;
+                float ta = have_prev ? t_prev : t0;
                 float tb = t_hi;
-                [unroll]
-                for (int r = 0; r < 3; ++r) {
-                    float  tm = 0.5 * (ta + tb);
-                    float3 wp = ro + rd * tm;
-                    float  dz = 0.0;
-                    if (lighting_sample_terrain_height_fast(
-                            hdr.terrain_dir_bda, hdr.elev_base_m, hdr.vertical_scale, wp.xy, 4, dz) &&
-                        wp.z <= dz) {
-                        tb = tm;
-                    } else {
-                        ta = tm;
+                float ha = have_prev ? h_prev : 0.0;
+                float hb = h_hi;
+                if (have_prev) {
+                    [unroll]
+                    for (int r = 0; r < 4; ++r) {
+                        float  tm = 0.5 * (ta + tb);
+                        float3 wp = ro + rd * tm;
+                        float  dz = 0.0;
+                        if (lighting_sample_terrain_height_fast(
+                                hdr.terrain_dir_bda, hdr.elev_base_m, hdr.vertical_scale, wp.xy, 4, dz)) {
+                            float dm = wp.z - dz;
+                            if (dm <= 0.0) {
+                                tb = tm;
+                                hb = dm;
+                            } else {
+                                ta = tm;
+                                ha = dm;
+                            }
+                        } else {
+                            ta = tm;
+                        }
                     }
                 }
-                float  t_final = 0.5 * (ta + tb);
+                float  frac_t  = (ha > 0.0 && hb < 0.0) ? clamp(ha / max(ha - hb, 1.0e-4), 0.0, 1.0) : 0.5;
+                float  t_final = lerp(ta, tb, frac_t);
                 float3 wp_hit  = ro + rd * t_final;
                 float  dz_hit  = 0.0;
                 float3 dn_hit  = float3(0.0, 0.0, 1.0);

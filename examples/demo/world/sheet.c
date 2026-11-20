@@ -1234,8 +1234,8 @@ static float soft_strain(const Soft *p) {
     return worst;
 }
 
-static void poly_escape(const Poly *poly, float px, float py,
-                        float *out_nx, float *out_ny, float *out_pen) {
+static bool poly_escape_margin(const Poly *poly, float px, float py, float margin,
+                               float *out_nx, float *out_ny, float *out_pen) {
     float best = 1.0e30f;
     float nx = 0.0f;
     float ny = 1.0f;
@@ -1250,16 +1250,23 @@ static void poly_escape(const Poly *poly, float px, float py,
         float ox = ey / len;
         float oy = -ex / len;
         float dist = (px - poly->x[e]) * ox + (py - poly->y[e]) * oy;
-        float pen = -dist;
+        if (dist >= margin) {
+            return false;
+        }
+        float pen = margin - dist;
         if (pen < best) {
             best = pen;
             nx = ox;
             ny = oy;
         }
     }
+    if (!(best < 1.0e20f) || !(best > 0.0f)) {
+        return false;
+    }
     *out_nx  = nx;
     *out_ny  = ny;
-    *out_pen = (best < 1.0e20f && best > 0.0f) ? best : 0.0f;
+    *out_pen = best;
+    return true;
 }
 
 static bool point_in_tri_2d(float px, float py,
@@ -1293,9 +1300,10 @@ static bool point_in_tri_2d(float px, float py,
     return true;
 }
 
-static bool soft_point_hit(const Soft *p, float px, float py,
-                           uint32_t out_tri[3], float out_bary[3],
-                           float *out_nx, float *out_ny, float *out_pen) {
+static bool soft_point_hit_dir(const Soft *p, float px, float py,
+                               float pref_soft_nx, float pref_soft_ny,
+                               uint32_t out_tri[3], float out_bary[3],
+                               float *out_nx, float *out_ny, float *out_pen) {
     uint32_t count = p->cols * p->rows;
     if (count == 0u || p->cols < 2u || p->rows < 2u) {
         return false;
@@ -1335,7 +1343,9 @@ static bool soft_point_hit(const Soft *p, float px, float py,
         return false;
     }
 
-    // Shortest escape vector to soft mesh perimeter edges (CCW outer loop)
+    // Shortest escape vector to soft mesh perimeter edges (CCW outer loop).
+    // When a preferred outward separation direction is supplied (e.g. a rigid ramp corner),
+    // reject perimeter escapes that would pull the soft body deeper into the obstacle.
     uint32_t perim_n = 0u;
     uint32_t ea[k_soft_pts];
     uint32_t eb[k_soft_pts];
@@ -1358,9 +1368,14 @@ static bool soft_point_hit(const Soft *p, float px, float py,
         perim_n++;
     }
 
-    float best_d2 = 1.0e30f;
-    float best_nx = 0.0f;
-    float best_ny = 1.0f;
+    bool  use_pref    = (pref_soft_nx * pref_soft_nx + pref_soft_ny * pref_soft_ny) > 0.25f;
+    float best_d2     = 1.0e30f;
+    float best_nx     = 0.0f;
+    float best_ny     = 1.0f;
+    float pref_d2     = 1.0e30f;
+    float pref_nx     = 0.0f;
+    float pref_ny     = 1.0f;
+    bool  have_pref   = false;
     for (uint32_t e = 0u; e < perim_n; ++e) {
         float ax = p->x[ea[e]], ay = p->y[ea[e]];
         float bx = p->x[eb[e]], by = p->y[eb[e]];
@@ -1374,23 +1389,44 @@ static bool soft_point_hit(const Soft *p, float px, float py,
         float dx = qx - px;
         float dy = qy - py;
         float d2 = dx * dx + dy * dy;
+        float cnx, cny;
+        if (d2 > 1.0e-6f) {
+            float inv_d = 1.0f / sqrtf(d2);
+            cnx = dx * inv_d;
+            cny = dy * inv_d;
+        } else {
+            float elen = sqrtf(ab2);
+            cnx = elen > 1.0e-4f ? (aby / elen) : 0.0f;
+            cny = elen > 1.0e-4f ? (-abx / elen) : 1.0f;
+        }
         if (d2 < best_d2) {
             best_d2 = d2;
-            if (d2 > 1.0e-6f) {
-                float inv_d = 1.0f / sqrtf(d2);
-                best_nx = dx * inv_d;
-                best_ny = dy * inv_d;
-            } else {
-                float elen = sqrtf(ab2);
-                best_nx = elen > 1.0e-4f ? (aby / elen) : 0.0f;
-                best_ny = elen > 1.0e-4f ? (-abx / elen) : 1.0f;
-            }
+            best_nx = cnx;
+            best_ny = cny;
+        }
+        if (use_pref && ((-cnx) * pref_soft_nx + (-cny) * pref_soft_ny) > 0.15f && d2 < pref_d2) {
+            pref_d2   = d2;
+            pref_nx   = cnx;
+            pref_ny   = cny;
+            have_pref = true;
         }
     }
-    *out_nx  = best_nx;
-    *out_ny  = best_ny;
-    *out_pen = sqrtf(best_d2);
+    if (have_pref) {
+        *out_nx  = pref_nx;
+        *out_ny  = pref_ny;
+        *out_pen = sqrtf(pref_d2);
+    } else {
+        *out_nx  = best_nx;
+        *out_ny  = best_ny;
+        *out_pen = sqrtf(best_d2);
+    }
     return true;
+}
+
+static bool soft_point_hit(const Soft *p, float px, float py,
+                           uint32_t out_tri[3], float out_bary[3],
+                           float *out_nx, float *out_ny, float *out_pen) {
+    return soft_point_hit_dir(p, px, py, 0.0f, 0.0f, out_tri, out_bary, out_nx, out_ny, out_pen);
 }
 
 static void apply_pair_impulse(float *avx, float *avy,
@@ -1536,16 +1572,14 @@ static void collide_soft_poly(Soft *p, Poly *poly, bool soft_frozen) {
         return;
     }
     float bounce = clamp_bounce(0.5f * (p->bounce + poly->bounce));
+    // Visual border skin for static obstacles so soft-body outlines kiss cleanly without overpainting fixed ramps
+    float skin   = poly->fixed ? (k_stroke * 0.90f) : 0.0f;
     uint32_t n   = p->cols * p->rows;
 
-    // 1. Soft vertices inside convex Poly
+    // 1. Soft vertices inside convex Poly (with visual border skin for fixed solids)
     for (uint32_t k = 0u; k < n; ++k) {
-        if (!inside_poly(poly->x, poly->y, poly->n, p->x[k], p->y[k])) {
-            continue;
-        }
         float nx = 0.0f, ny = 1.0f, pen = 0.0f;
-        poly_escape(poly, p->x[k], p->y[k], &nx, &ny, &pen);
-        if (pen <= 0.0f) {
+        if (!poly_escape_margin(poly, p->x[k], p->y[k], skin, &nx, &ny, &pen)) {
             continue;
         }
         float frac_s = w_s / w_sum;
@@ -1581,64 +1615,90 @@ static void collide_soft_poly(Soft *p, Poly *poly, bool soft_frozen) {
         mark_moved();
     }
 
-    // 2. Poly vertices & edge midpoints inside Soft mesh triangles
-    uint32_t sample_cnt = poly->n * 2u;
-    for (uint32_t si = 0u; si < sample_cnt; ++si) {
-        float px, py;
-        if (si < poly->n) {
-            px = poly->x[si];
-            py = poly->y[si];
-        } else {
-            uint32_t e0 = si - poly->n;
-            uint32_t e1 = (e0 + 1u < poly->n) ? (e0 + 1u) : 0u;
-            px = 0.5f * (poly->x[e0] + poly->x[e1]);
-            py = 0.5f * (poly->y[e0] + poly->y[e1]);
-        }
-        uint32_t tri[3];
-        float    bary[3];
-        float    nx = 0.0f, ny = 1.0f, pen = 0.0f;
-        if (!soft_point_hit(p, px, py, tri, bary, &nx, &ny, &pen)) {
+    // 2. Poly corners & densely sampled edges inside Soft mesh triangles
+    for (uint32_t e0 = 0u; e0 < poly->n; ++e0) {
+        uint32_t e1    = (e0 + 1u < poly->n) ? (e0 + 1u) : 0u;
+        uint32_t eprev = (e0 > 0u) ? (e0 - 1u) : (poly->n - 1u);
+        float ex = poly->x[e1] - poly->x[e0];
+        float ey = poly->y[e1] - poly->y[e0];
+        float elen = hypotf(ex, ey);
+        if (elen < 1.0e-4f) {
             continue;
         }
-        float frac_s = w_s / w_sum;
-        float frac_p = w_p / w_sum;
-        float sep    = pen + k_slop * 0.5f;
-        if (!poly->fixed) {
-            float pdx = nx * (sep * frac_p);
-            float pdy = ny * (sep * frac_p);
-            *poly->cx += pdx;
-            *poly->cy += pdy;
-            for (uint32_t v = 0u; v < poly->n; ++v) {
-                poly->x[v] += pdx;
-                poly->y[v] += pdy;
-            }
-            *poly->awake = true;
-        }
-        float bsum2 = bary[0] * bary[0] + bary[1] * bary[1] + bary[2] * bary[2];
-        float inv_b2 = bsum2 > 1.0e-4f ? (1.0f / bsum2) : 1.0f;
-        float tri_vx = bary[0] * p->vx[tri[0]] + bary[1] * p->vx[tri[1]] + bary[2] * p->vx[tri[2]];
-        float tri_vy = bary[0] * p->vy[tri[0]] + bary[1] * p->vy[tri[1]] + bary[2] * p->vy[tri[2]];
-        float poly_vx = *poly->vx, poly_vy = *poly->vy;
-        float old_tvx = tri_vx, old_tvy = tri_vy;
-        apply_pair_impulse(&poly_vx, &poly_vy, &tri_vx, &tri_vy, nx, ny, w_p, w_s, bounce);
-        float dtvx = tri_vx - old_tvx;
-        float dtvy = tri_vy - old_tvy;
+        float enx = ey / elen;
+        float eny = -ex / elen;
 
-        if (!soft_frozen) {
-            for (int vi = 0; vi < 3; ++vi) {
-                float wv = bary[vi] * inv_b2;
-                p->x[tri[vi]]  -= nx * (sep * frac_s * wv);
-                p->y[tri[vi]]  -= ny * (sep * frac_s * wv);
-                p->vx[tri[vi]] += dtvx * bary[vi];
-                p->vy[tri[vi]] += dtvy * bary[vi];
+        float pex = poly->x[e0] - poly->x[eprev];
+        float pey = poly->y[e0] - poly->y[eprev];
+        float plen = hypotf(pex, pey);
+        float pnx = plen > 1.0e-4f ? (pey / plen) : enx;
+        float pny = plen > 1.0e-4f ? (-pex / plen) : eny;
+        float cnx = enx + pnx;
+        float cny = eny + pny;
+        float clen = hypotf(cnx, cny);
+        if (clen > 1.0e-4f) {
+            cnx /= clen;
+            cny /= clen;
+        } else {
+            cnx = enx;
+            cny = eny;
+        }
+
+        uint32_t sub = (uint32_t)ceilf(elen / 14.0f);
+        if (sub < 2u)  sub = 2u;
+        if (sub > 24u) sub = 24u;
+        for (uint32_t s = 0u; s < sub; ++s) {
+            float t = (float)s / (float)sub;
+            float onx = (s == 0u) ? cnx : enx;
+            float ony = (s == 0u) ? cny : eny;
+            float px  = poly->x[e0] + ex * t + onx * skin;
+            float py  = poly->y[e0] + ey * t + ony * skin;
+            uint32_t tri[3];
+            float    bary[3];
+            float    nx = 0.0f, ny = 1.0f, pen = 0.0f;
+            if (!soft_point_hit_dir(p, px, py, onx, ony, tri, bary, &nx, &ny, &pen)) {
+                continue;
             }
-            p->awake = true;
+            float frac_s = w_s / w_sum;
+            float frac_p = w_p / w_sum;
+            float sep    = pen + k_slop * 0.5f;
+            if (!poly->fixed) {
+                float pdx = nx * (sep * frac_p);
+                float pdy = ny * (sep * frac_p);
+                *poly->cx += pdx;
+                *poly->cy += pdy;
+                for (uint32_t v = 0u; v < poly->n; ++v) {
+                    poly->x[v] += pdx;
+                    poly->y[v] += pdy;
+                }
+                *poly->awake = true;
+            }
+            float bsum2 = bary[0] * bary[0] + bary[1] * bary[1] + bary[2] * bary[2];
+            float inv_b2 = bsum2 > 1.0e-4f ? (1.0f / bsum2) : 1.0f;
+            float tri_vx = bary[0] * p->vx[tri[0]] + bary[1] * p->vx[tri[1]] + bary[2] * p->vx[tri[2]];
+            float tri_vy = bary[0] * p->vy[tri[0]] + bary[1] * p->vy[tri[1]] + bary[2] * p->vy[tri[2]];
+            float poly_vx = *poly->vx, poly_vy = *poly->vy;
+            float old_tvx = tri_vx, old_tvy = tri_vy;
+            apply_pair_impulse(&poly_vx, &poly_vy, &tri_vx, &tri_vy, nx, ny, w_p, w_s, bounce);
+            float dtvx = tri_vx - old_tvx;
+            float dtvy = tri_vy - old_tvy;
+
+            if (!soft_frozen) {
+                for (int vi = 0; vi < 3; ++vi) {
+                    float wv = bary[vi] * inv_b2;
+                    p->x[tri[vi]]  -= nx * (sep * frac_s * wv);
+                    p->y[tri[vi]]  -= ny * (sep * frac_s * wv);
+                    p->vx[tri[vi]] += dtvx * bary[vi];
+                    p->vy[tri[vi]] += dtvy * bary[vi];
+                }
+                p->awake = true;
+            }
+            if (!poly->fixed) {
+                *poly->vx = poly_vx;
+                *poly->vy = poly_vy;
+            }
+            mark_moved();
         }
-        if (!poly->fixed) {
-            *poly->vx = poly_vx;
-            *poly->vy = poly_vy;
-        }
-        mark_moved();
     }
 }
 
@@ -1700,22 +1760,27 @@ static void collide_soft_soft(Soft *a, Soft *b, bool a_frozen, bool b_frozen) {
     collide_soft_soft_dir(b, a, b_frozen, a_frozen);
 }
 
+static void clamp_soft_bounds_one(Soft *p);
+
 static void resolve_soft_collisions_one(Soft *p) {
     if (p == nullptr || !p->alive) {
         return;
     }
     Poly solids[k_poly_cap];
     uint32_t sn = gather(solids);
-    for (uint32_t s = 0u; s < sn; ++s) {
-        collide_soft_poly(p, &solids[s], false);
-    }
-    for (uint32_t j = 0u; j < k_soft_cap; ++j) {
-        Soft *other = &s_sheet.soft[j];
-        if (other != p && other->alive) {
-            collide_soft_soft(p, other, false, false);
+    for (uint32_t pass = 0u; pass < k_passes; ++pass) {
+        enforce_soft_self_unfold(p);
+        for (uint32_t s = 0u; s < sn; ++s) {
+            collide_soft_poly(p, &solids[s], false);
         }
+        for (uint32_t j = 0u; j < k_soft_cap; ++j) {
+            Soft *other = &s_sheet.soft[j];
+            if (other != p && other->alive) {
+                collide_soft_soft(p, other, false, false);
+            }
+        }
+        clamp_soft_bounds_one(p);
     }
-    enforce_soft_self_unfold(p);
 }
 
 static void clamp_bounds(void) {
@@ -1960,6 +2025,78 @@ bool sheet_integrate(float dt) {
                                           p->cols, p->rows, p->spacing, stiff,
                                           s_gpu_verts[qslot], &gvn,
                                           s_gpu_cons[qslot], &gcn);
+                if (gvn > 0u) {
+                    const float skin = k_stroke * 0.90f;
+                    const float pad  = fmaxf(p->spacing * 0.65f, 16.0f);
+                    for (uint32_t rb = 0u; rb < k_rigid_cap && gcn < K_AVBD_MAX_CONS; ++rb) {
+                        const Rigid *b = &s_sheet.rigid[rb];
+                        if (!b->alive || !b->fixed) {
+                            continue;
+                        }
+                        const float ux   = cosf(b->yaw);
+                        const float uy   = sinf(b->yaw);
+                        const float vx   = -uy;
+                        const float vy   = ux;
+                        const float hx_s = b->hx + skin;
+                        const float hy_s = b->hy + skin;
+                        for (uint32_t k = 0u; k < gvn && gcn < K_AVBD_MAX_CONS; ++k) {
+                            float px = p->x[k] + p->vx[k] * step_dt;
+                            float py = p->y[k] + p->vy[k] * step_dt;
+                            float dx = px - b->x;
+                            float dy = py - b->y;
+                            float lx = dx * ux + dy * uy;
+                            float ly = dx * vx + dy * vy;
+                            if (fabsf(lx) > hx_s + pad || fabsf(ly) > hy_s + pad) {
+                                continue;
+                            }
+                            float nx = 0.0f, ny = 0.0f, offset = 0.0f;
+                            bool  emit = false;
+                            if (fabsf(lx) <= hx_s) {
+                                float sgn = (ly >= 0.0f) ? 1.0f : -1.0f;
+                                nx     = vx * sgn;
+                                ny     = vy * sgn;
+                                offset = b->x * nx + b->y * ny + hy_s;
+                                emit   = true;
+                            } else if (fabsf(ly) <= hy_s) {
+                                float sgn = (lx >= 0.0f) ? 1.0f : -1.0f;
+                                nx     = ux * sgn;
+                                ny     = uy * sgn;
+                                offset = b->x * nx + b->y * ny + hx_s;
+                                emit   = true;
+                            } else {
+                                float clx  = copysignf(hx_s, lx);
+                                float cly  = copysignf(hy_s, ly);
+                                float dlx  = lx - clx;
+                                float dly  = ly - cly;
+                                float dlen = hypotf(dlx, dly);
+                                if (dlen > 1.0e-3f && dlen < pad) {
+                                    float nlx = dlx / dlen;
+                                    float nly = dly / dlen;
+                                    nx = nlx * ux + nly * vx;
+                                    ny = nlx * uy + nly * vy;
+                                    float cwx = b->x + clx * ux + cly * vx;
+                                    float cwy = b->y + clx * uy + cly * vy;
+                                    offset = cwx * nx + cwy * ny;
+                                    emit   = true;
+                                }
+                            }
+                            if (emit) {
+                                s_gpu_cons[qslot][gcn++] = (AvbdConstraint){
+                                    .kind = AVBD_CON_CONTACT_PLANE,
+                                    .vert_a = k,
+                                    .vert_b = UINT32_MAX,
+                                    .hash_key = 0x71000000u + (rb << 8u) + k,
+                                    .normal_or_target = { nx, ny, 0.0f },
+                                    .rest_or_offset = offset,
+                                    .stiffness_min = 1.0e5f,
+                                    .stiffness_max = 1.0e9f,
+                                    .penalty_k = 1.0e5f,
+                                    .beta_ramp = 8.0f,
+                                };
+                            }
+                        }
+                    }
+                }
                 if (gvn > 0u && s_sheet.has_bounds) {
                     const float bx = s_sheet.bound_x;
                     const float by = s_sheet.bound_y;
@@ -2039,6 +2176,11 @@ bool sheet_integrate(float dt) {
                 separate(&solids[i], &solids[j]);
             }
         }
+        if (!s_gpu_pose_owner) {
+            for (uint32_t i = 0u; i < k_soft_cap; ++i) {
+                enforce_soft_self_unfold(&s_sheet.soft[i]);
+            }
+        }
         for (uint32_t s = 0u; s < k_soft_cap; ++s) {
             Soft *ps = &s_sheet.soft[s];
             if (!ps->alive) {
@@ -2053,9 +2195,6 @@ bool sheet_integrate(float dt) {
                 for (uint32_t j = i + 1u; j < k_soft_cap; ++j) {
                     collide_soft_soft(&s_sheet.soft[i], &s_sheet.soft[j], false, false);
                 }
-            }
-            for (uint32_t i = 0u; i < k_soft_cap; ++i) {
-                enforce_soft_self_unfold(&s_sheet.soft[i]);
             }
         }
         clamp_bounds();

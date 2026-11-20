@@ -343,7 +343,7 @@ void terrain_set_active(bool active) {
 }
 
 bool terrain_is_active(void) {
-    return s_world_terrain_active || s_backend_ready;
+    return s_world_terrain_active;
 }
 
 bool terrain_reload(void) {

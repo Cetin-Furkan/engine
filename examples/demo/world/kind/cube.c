@@ -232,19 +232,42 @@ static void cube_prepare_scene(const WorldObj *o, bool live) {
     float emi[3] = {0};
     lighting_material_get_emissive(c->mat, emi);
 
+    EcsTrs wt = {0};
     EcsAabb aabb = {0};
     float center[3]  = { o->at.x, o->at.y, o->at.z };
     float extents[3] = { k_fillet_half, k_fillet_half, k_fillet_half };
-    float pitch_rad  = 0.0f;
-    float yaw_rad    = 0.0f;
-    if (ecs_get_world_aabb(world_ecs(), o->entity, &aabb)) {
+    float pitch_rad  = 28.0f * (3.14159265359f / 180.0f);
+    float yaw_rad    = spin_deg(&c->spin, live) * (3.14159265359f / 180.0f);
+    if (ecs_get_world_trs(world_ecs(), o->entity, &wt)) {
+        // Decompose unit world quaternion into exact Ry(yaw)*Rx(pitch) matching lighting_local_to_pose_fast.
+        float qx = wt.rot[0], qy = wt.rot[1], qz = wt.rot[2], qw = wt.rot[3];
+        float r10 = 2.0f * (qx * qy + qw * qz);
+        if (fabsf(r10) < 0.08f) {
+            float r00 = 1.0f - 2.0f * (qy * qy + qz * qz);
+            float r20 = 2.0f * (qx * qz - qw * qy);
+            float r11 = 1.0f - 2.0f * (qx * qx + qz * qz);
+            float r12 = 2.0f * (qy * qz - qw * qx);
+            for (int a = 0; a < 3; ++a) {
+                center[a]  = wt.pos[a];
+                extents[a] = fmaxf(k_fillet_half * fabsf(wt.scale[a]), 1.0f);
+            }
+            pitch_rad = atan2f(-r12, r11);
+            yaw_rad   = atan2f(-r20, r00);
+        } else if (ecs_get_world_aabb(world_ecs(), o->entity, &aabb)) {
+            for (int a = 0; a < 3; ++a) {
+                center[a]  = 0.5f * (aabb.min_v[a] + aabb.max_v[a]);
+                extents[a] = fmaxf(0.5f * (aabb.max_v[a] - aabb.min_v[a]), 1.0f);
+            }
+            pitch_rad = 0.0f;
+            yaw_rad   = 0.0f;
+        }
+    } else if (ecs_get_world_aabb(world_ecs(), o->entity, &aabb)) {
         for (int a = 0; a < 3; ++a) {
             center[a]  = 0.5f * (aabb.min_v[a] + aabb.max_v[a]);
             extents[a] = fmaxf(0.5f * (aabb.max_v[a] - aabb.min_v[a]), 1.0f);
         }
-    } else {
-        pitch_rad = 28.0f * (3.14159265359f / 180.0f);
-        yaw_rad   = spin_deg(&c->spin, live) * (3.14159265359f / 180.0f);
+        pitch_rad = 0.0f;
+        yaw_rad   = 0.0f;
     }
 
     LightingProxy proxy = {0};

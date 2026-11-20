@@ -107,10 +107,12 @@ static LightingCameraParams  s_curr_cam       = { .qw = 1.0f, .zoom = 1.0f };
 static LightingCameraParams  s_prev_cam       = { .qw = 1.0f, .zoom = 1.0f };
 
 static bool                  s_has_ground     = false;
+static bool                  s_prev_has_ground = false;
 static float                 s_ground_z       = 0.0f;
 static float                 s_ground_alb[3]  = { 0.14f, 0.16f, 0.20f };
 
 static uint64_t              s_terrain_bda    = 0ull;
+static uint64_t              s_prev_terrain_bda = 0ull;
 static float                 s_elev_base_m    = 0.0f;
 static float                 s_vert_scale     = 1.0f;
 static uint64_t              s_scene_hiz_bda  = 0ull;
@@ -144,7 +146,7 @@ static void select_profile_params(const VulkanContext *vk) {
     } else {
         s_oracle_mode   = LIGHTING_ORACLE_ANALYTICAL_UMA;
         s_ssilvb_slices = 2u;
-        s_ssilvb_steps  = 5u;
+        s_ssilvb_steps  = 6u;
         s_shadow_dim    = k_shadow_dim_uma;
     }
 }
@@ -684,10 +686,12 @@ void lighting_shutdown(VulkanContext *vk) {
         da_buffer_destroy(ctx, &s_gi_slab);
         da_buffer_destroy(ctx, &s_env_buf);
     }
-    s_shadow_layout   = VK_IMAGE_LAYOUT_UNDEFINED;
-    s_shadow_ready    = false;
-    s_shadow_rendered = false;
-    s_env_ready       = false;
+    s_shadow_layout    = VK_IMAGE_LAYOUT_UNDEFINED;
+    s_shadow_ready     = false;
+    s_shadow_rendered  = false;
+    s_env_ready        = false;
+    s_prev_terrain_bda = 0ull;
+    s_prev_has_ground  = false;
     s_gi_frame_live   = false;
     s_history_valid   = false;
     s_acquire_sem     = VK_NULL_HANDLE;
@@ -1200,6 +1204,12 @@ void lighting_prepare(RgGraph *g, uint32_t width, uint32_t height) {
     const bool has_3d_content = (s_proxy_count > 0u) || (s_scene_geom.inst_count > 0u) || (s_terrain_bda != 0ull);
     const bool run_gi         = s_gi_user_on && has_3d_content &&
                                 ensure_compute_pipelines() && ensure_gi_slab(width, height);
+
+    if ((s_terrain_bda != 0ull) != (s_prev_terrain_bda != 0ull) || s_has_ground != s_prev_has_ground) {
+        s_history_valid = false;
+    }
+    s_prev_terrain_bda = s_terrain_bda;
+    s_prev_has_ground  = s_has_ground;
 
     const uint32_t curr_ping = s_ping_index & 1u;
     const uint32_t prev_ping = (curr_ping ^ 1u);

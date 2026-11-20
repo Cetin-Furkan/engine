@@ -401,6 +401,131 @@ static void test_soft_self_unfold(void) {
     CHECK(min_sep >= 0.30f * 32.0f);
 }
 
+static bool point_in_oriented_box(float px, float py, float bx, float by,
+                                  float hx, float hy, float yaw_deg, float margin) {
+    float rad = yaw_deg * 0.017453292519943295f;
+    float c   = cosf(rad);
+    float s   = sinf(rad);
+    float dx  = px - bx;
+    float dy  = py - by;
+    float lx  =  dx * c + dy * s;
+    float ly  = -dx * s + dy * c;
+    return fabsf(lx) < (hx + margin) && fabsf(ly) < (hy + margin);
+}
+
+static bool point_in_soft_mesh(uint32_t soft_idx, float px, float py) {
+    uint32_t cols = 0u, rows = 0u;
+    float spacing = 0.0f;
+    sheet_soft_layout(soft_idx, &cols, &rows, &spacing);
+    uint32_t n = cols * rows;
+    float sx[64], sy[64];
+    for (uint32_t k = 0u; k < n; ++k) {
+        sheet_soft_pos(soft_idx, k, &sx[k], &sy[k]);
+    }
+    for (uint32_t r = 0u; r + 1u < rows; ++r) {
+        for (uint32_t c = 0u; c + 1u < cols; ++c) {
+            uint32_t i00 = r * cols + c;
+            uint32_t i10 = i00 + 1u;
+            uint32_t i01 = i00 + cols;
+            uint32_t i11 = i01 + 1u;
+            const uint32_t tris[2][3] = { { i00, i10, i11 }, { i00, i11, i01 } };
+            for (int t = 0; t < 2; ++t) {
+                float ax = sx[tris[t][0]], ay = sy[tris[t][0]];
+                float bx = sx[tris[t][1]], by = sy[tris[t][1]];
+                float cx = sx[tris[t][2]], cy = sy[tris[t][2]];
+                float det = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
+                if (fabsf(det) < 1.0e-4f) {
+                    continue;
+                }
+                float inv = 1.0f / det;
+                float u = ((bx - px) * (cy - py) - (by - py) * (cx - px)) * inv;
+                float v = ((cx - px) * (ay - py) - (cy - py) * (ax - px)) * inv;
+                float w = 1.0f - u - v;
+                if (u > 1.0e-3f && v > 1.0e-3f && w > 1.0e-3f) {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+typedef struct TestRamp {
+    float x, y, hx, hy, yaw_deg;
+} TestRamp;
+
+static void check_sheet3_no_ramp_overlap(void) {
+    static constexpr TestRamp k_ramps[3] = {
+        { -330.0f, -120.0f, 110.0f, 18.0f, -16.0f },
+        {  330.0f, -120.0f, 110.0f, 18.0f,  16.0f },
+        {    0.0f, -285.0f, 520.0f, 16.0f,   0.0f },
+    };
+
+    for (uint32_t si = 0u; si < 3u; ++si) {
+        CHECK(soft_all_tris_ccw(si, nullptr, nullptr, nullptr, nullptr));
+        uint32_t cols = 0u, rows = 0u;
+        float spacing = 0.0f;
+        sheet_soft_layout(si, &cols, &rows, &spacing);
+        uint32_t n = cols * rows;
+        for (uint32_t k = 0u; k < n; ++k) {
+            float sx = 0.0f, sy = 0.0f;
+            sheet_soft_pos(si, k, &sx, &sy);
+            for (int ri = 0; ri < 3; ++ri) {
+                CHECK(!point_in_oriented_box(sx, sy,
+                                             k_ramps[ri].x, k_ramps[ri].y,
+                                             k_ramps[ri].hx, k_ramps[ri].hy,
+                                             k_ramps[ri].yaw_deg, 0.0f));
+            }
+        }
+        // Check all 4 corners of each fixed ramp against every soft triangle
+        for (int ri = 0; ri < 3; ++ri) {
+            float rad = k_ramps[ri].yaw_deg * 0.017453292519943295f;
+            float c = cosf(rad), s = sinf(rad);
+            const float lx[4] = { -k_ramps[ri].hx, k_ramps[ri].hx, k_ramps[ri].hx, -k_ramps[ri].hx };
+            const float ly[4] = { -k_ramps[ri].hy, -k_ramps[ri].hy, k_ramps[ri].hy, k_ramps[ri].hy };
+            for (int ci = 0; ci < 4; ++ci) {
+                float wx = k_ramps[ri].x + c * lx[ci] - s * ly[ci];
+                float wy = k_ramps[ri].y + s * lx[ci] + c * ly[ci];
+                CHECK(!point_in_soft_mesh(si, wx, wy));
+            }
+        }
+    }
+}
+
+static void test_sheet3_ramp_no_overlap(void) {
+    // 1. CPU AVBD path
+    sheet_set_gpu_pose_owner(false);
+    CHECK(sheet_load_path("examples/demo/world/sheet3.world") == 0);
+    for (int step = 0; step < 500; ++step) {
+        (void)sheet_integrate(0.008f);
+    }
+    check_sheet3_no_ramp_overlap();
+
+    // 2. GPU AVBD owner path (verifies fixed-ramp AVBD_CON_CONTACT_PLANE + multi-pass post-resolve)
+    sheet_set_gpu_pose_owner(true);
+    CHECK(sheet_load_path("examples/demo/world/sheet3.world") == 0);
+    for (int step = 0; step < 500; ++step) {
+        (void)sheet_integrate(0.008f);
+        SheetGpuStep gs = {0};
+        while (sheet_pop_gpu_step(&gs)) {
+            AvbdVertex     verts[64];
+            AvbdConstraint cons[K_AVBD_MAX_CONS];
+            uint32_t vn = gs.vert_count <= 64u ? gs.vert_count : 64u;
+            uint32_t cn = gs.con_count <= K_AVBD_MAX_CONS ? gs.con_count : K_AVBD_MAX_CONS;
+            memcpy(verts, gs.verts, (size_t)vn * sizeof(AvbdVertex));
+            memcpy(cons,  gs.cons,  (size_t)cn * sizeof(AvbdConstraint));
+            (void)avbd_solve_step(verts, vn, cons, cn, gs.dt, gs.gravity, 6u);
+            for (uint32_t k = 0u; k < vn; ++k) {
+                verts[k].vel[0] *= gs.damp_keep;
+                verts[k].vel[1] *= gs.damp_keep;
+            }
+            CHECK(sheet_apply_gpu_soft_step(gs.soft_index, gs.epoch, verts, vn, gs.dt));
+        }
+    }
+    check_sheet3_no_ramp_overlap();
+    sheet_set_gpu_pose_owner(false);
+}
+
 int main(void) {
     sheet_hold_save(true);
     test_document();
@@ -415,6 +540,7 @@ int main(void) {
     test_rigid_rests_on_soft();
     test_soft_soft_disjoint();
     test_soft_self_unfold();
+    test_sheet3_ramp_no_overlap();
     if (s_failures != 0) {
         fprintf(stderr, "%d check(s) failed\n", s_failures);
         return 1;

@@ -38,6 +38,8 @@ void cube_shutdown(VulkanContext *vk);
 void cube_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height, float yaw_deg,
                float origin_x, float origin_y, float origin_z, float depth_bias, float phase,
                bool selected, uint32_t mat, uint32_t heat_slot);
+void cube_draw_shadow(VkCommandBuffer cmd, const float light_clip_vp[16], float yaw_deg,
+                      float origin_x, float origin_y, float origin_z, uint32_t heat_slot);
 
 // Remember the interval the frame clock issued for this slot. The returned
 // value is what a submit records. Zero is a held slot or an issued interval

@@ -1,4 +1,5 @@
 #include "backend/backend.h"
+#include "backend/internal.h"
 #include "backend/math/cell64.h"
 #include "backend/math/relptr2d.h"
 #include "backend/terrain/pack.h"
@@ -985,10 +986,27 @@ int main(void) {
     double elev_rmse_m = sqrt(sum_sq_elev / (double)interior_cnt);
     double rgb_mse     = sum_sq_rgb / (double)(k_gmpack_tile_dim * k_gmpack_tile_dim);
     double rgb_psnr_db = (rgb_mse > 1.0e-9) ? (10.0 * log10((255.0 * 255.0) / rgb_mse)) : 99.0;
-    if (elev_rmse_m > 0.12 || rgb_psnr_db < 32.0) {
+    if (elev_rmse_m > 0.12 || rgb_psnr_db < 34.0) {
         fprintf(stderr, "FAIL: .epack quality out of bounds (elev_rmse=%.4f m, psnr=%.2f dB)\n",
                 elev_rmse_m, rgb_psnr_db);
         return 1;
+    }
+
+    // 12a-bis. Verify lossless RGB565 perimeter border match between decoded .epack and .gmpack
+    for (uint32_t i = 0u; i < k_gmpack_tile_dim; ++i) {
+        uint32_t edge_coords[4][2] = {{i, 0u}, {i, 255u}, {0u, i}, {255u, i}};
+        for (uint32_t e = 0u; e < 4u; ++e) {
+            uint32_t cx = edge_coords[e][0], cy = edge_coords[e][1];
+            uint32_t c_raw = raw_summit.imagery_rgba8[cy * k_gmpack_tile_dim + cx];
+            uint32_t c_dec = backend_epack_load_rgba8(&enc_summit, cx, cy);
+            int dr = abs((int)(c_raw & 0xFFu) - (int)(c_dec & 0xFFu));
+            int dg = abs((int)((c_raw >> 8u) & 0xFFu) - (int)((c_dec >> 8u) & 0xFFu));
+            int db = abs((int)((c_raw >> 16u) & 0xFFu) - (int)((c_dec >> 16u) & 0xFFu));
+            if (dr > 5 || dg > 3 || db > 5) {
+                fprintf(stderr, "FAIL: border color drift at (%u,%u): diff=(%d,%d,%d)\n", cx, cy, dr, dg, db);
+                return 1;
+            }
+        }
     }
 
     // 12b. Synthesize baklan_besparmak.epack and verify RelPtr2D 25-block stride + non-blocking io_uring fixed read
@@ -1132,7 +1150,233 @@ int main(void) {
         return 1;
     }
 
-    printf("test_backend: ok (RelPtr2D + Lilliput64 + Cell64 + .epack 3.84x [RMSE %.4f m, border 0.0000 m, %.1f dB, fixed_buf=%u] + Survey MVS/GCP fused %u posts [%u MVS @ ZNCC %.3f] & %u ortho texels + 2DGS %u+%u surfels)\n",
+    // 14. .epack v2 Sparse Deep-Quadtree Archive + Zoom LOD Cut + DEM/RGB Binding Verification
+    {
+        const char *v2_path = "/tmp/test_epack_v2_ut.epack";
+        static GpuMathArchiveHeader v2_write_hdr;
+        static GpuMathTileBlock     v2_raw_tile;
+        static EpackTileBlock       v2_enc_tiles[9];
+        EpackDiskNode               v2_disk_nodes[9];
+        memset(&v2_write_hdr, 0, sizeof(v2_write_hdr));
+        memset(&v2_raw_tile, 0, sizeof(v2_raw_tile));
+        memset(v2_enc_tiles, 0, sizeof(v2_enc_tiles));
+        memset(v2_disk_nodes, 0, sizeof(v2_disk_nodes));
+
+        v2_write_hdr.dir.magic             = k_epack_v2_magic;
+        v2_write_hdr.dir.version           = k_epack_v2_version;
+        v2_write_hdr.dir.node_count        = 1u;
+        v2_write_hdr.dir.tile_dim          = k_gmpack_tile_dim;
+        v2_write_hdr.dir.world_half_extent = 10000.0f;
+        v2_write_hdr.dir.elev_min_m        = 500.0f;
+        v2_write_hdr.dir.elev_max_m        = 1500.0f;
+        v2_write_hdr.dir.vertical_scale    = 1.0f;
+        v2_write_hdr.dir.lat_min_deg       = 47.000;
+        v2_write_hdr.dir.lat_max_deg       = 47.180;
+        v2_write_hdr.dir.lon_min_deg       = 8.650;
+        v2_write_hdr.dir.lon_max_deg       = 8.910;
+
+        uint64_t disk_off = k_gmpack_header_bytes;
+        uint64_t data_off = disk_off + (uint64_t)sizeof(v2_disk_nodes);
+        data_off          = (data_off + 4095ull) & ~4095ull;
+
+        EpackV2Meta *wmeta       = backend_epack_v2_meta(&v2_write_hdr);
+        wmeta->v2_magic          = k_epack_v2_magic;
+        wmeta->total_node_count  = 9u;
+        wmeta->max_lod           = 2u;
+        wmeta->flags             = k_epack_v2_flag_real;
+        wmeta->disk_table_offset = disk_off;
+        wmeta->tile_data_offset  = data_off;
+        wmeta->epsg_code         = 2056u;
+        wmeta->center_east_m     = 2697000.0f;
+        wmeta->center_north_m    = 1213000.0f;
+        wmeta->dem_res_mm        = 500u;
+        wmeta->ortho_res_mm      = 100u;
+
+        // Encode tiles 0..4 (DEM+RGB) and 5..8 (RGB-only with distinct blue/green markers)
+        uint64_t cur_off = data_off;
+        for (uint32_t n = 0u; n < 9u; ++n) {
+            for (uint32_t sy = 0u; sy < k_gmpack_tile_dim; ++sy) {
+                for (uint32_t sx = 0u; sx < k_gmpack_tile_dim; ++sx) {
+                    uint32_t idx = sy * k_gmpack_tile_dim + sx;
+                    float h_m = 600.0f + (float)n * 25.0f + 0.5f * (float)sx + 0.25f * (float)sy;
+                    v2_raw_tile.height_u16[idx]    = (uint16_t)lroundf(h_m * 16.0f);
+                    v2_raw_tile.imagery_rgba8[idx] = 0xFF000000u |
+                                                     ((40u + n * 20u) << 16u) |
+                                                     (((sy / 2u) + 30u) << 8u) |
+                                                     ((sx / 2u) + 20u);
+                }
+            }
+            backend_epack_encode_tile(&v2_raw_tile, &v2_enc_tiles[n]);
+
+            uint8_t  lod = (n == 0u) ? 0u : (n <= 4u ? 1u : 2u);
+            uint16_t gx  = (n == 0u) ? 0u : (uint16_t)((n <= 4u) ? ((n - 1u) & 1u) : ((n - 5u) & 1u));
+            uint16_t gy  = (n == 0u) ? 0u : (uint16_t)((n <= 4u) ? ((n - 1u) >> 1u) : ((n - 5u) >> 1u));
+            uint8_t  tk  = (n <= 4u) ? k_epack_v2_tile_dem_rgb : k_epack_v2_tile_rgb;
+            uint32_t sz  = (tk == k_epack_v2_tile_dem_rgb) ? k_epack_v2_dem_rgb_bytes : k_epack_v2_rgb_bytes;
+
+            v2_disk_nodes[n] = (EpackDiskNode){
+                .ssd_offset_bytes = cur_off,
+                .first_child_idx  = (n == 0u) ? 1u : ((n == 1u) ? 5u : UINT32_MAX),
+                .grid_x           = gx,
+                .grid_y           = gy,
+                .elev_min_m       = 600.0f + (float)n * 25.0f,
+                .elev_max_m       = 800.0f + (float)n * 25.0f,
+                .elev_mean_m      = 700.0f + (float)n * 25.0f,
+                .lod              = lod,
+                .tile_kind        = tk,
+                .has_dem          = (tk == k_epack_v2_tile_dem_rgb) ? 1u : 0u,
+                .has_rgb          = 1u,
+            };
+            cur_off += sz;
+        }
+
+        FILE *vf = fopen(v2_path, "wb");
+        if (vf == nullptr) {
+            fprintf(stderr, "FAIL: could not create synthetic %s\n", v2_path);
+            return 1;
+        }
+        bool w_ok = fwrite(&v2_write_hdr, sizeof(v2_write_hdr), 1u, vf) == 1u &&
+                    fwrite(v2_disk_nodes, sizeof(v2_disk_nodes), 1u, vf) == 1u;
+        if (w_ok && fseeko(vf, (off_t)data_off, SEEK_SET) != 0) {
+            w_ok = false;
+        }
+        for (uint32_t n = 0u; n < 9u && w_ok; ++n) {
+            if (v2_disk_nodes[n].tile_kind == k_epack_v2_tile_dem_rgb) {
+                w_ok = fwrite(&v2_enc_tiles[n], k_epack_v2_dem_rgb_bytes, 1u, vf) == 1u;
+            } else {
+                const uint8_t *rgb_ptr = (const uint8_t *)&v2_enc_tiles[n] + k_epack_v2_rgb_offset;
+                w_ok = fwrite(rgb_ptr, k_epack_v2_rgb_bytes, 1u, vf) == 1u;
+            }
+        }
+        fclose(vf);
+        if (!w_ok) {
+            unlink(v2_path);
+            fprintf(stderr, "FAIL: writing synthetic .epack v2 failed\n");
+            return 1;
+        }
+
+        static GpuMathArchiveHeader v2_read_hdr;
+        EpackDiskNode *loaded_nodes = nullptr;
+        uint32_t       loaded_count = 0u;
+        if (backend_terrain_read_epack_v2(v2_path, &v2_read_hdr, &loaded_nodes, &loaded_count) != 0 ||
+            loaded_count != 9u || !backend_archive_is_v2(&v2_read_hdr)) {
+            free(loaded_nodes);
+            unlink(v2_path);
+            fprintf(stderr, "FAIL: backend_terrain_read_epack_v2 failed\n");
+            return 1;
+        }
+
+        // Verify both DEM+RGB node 1 and sparse RGB-only node 5 decode identically
+        static EpackTileBlock v2_dec_blk;
+        if (backend_terrain_read_epack_tile_v2(v2_path, &loaded_nodes[1], &v2_dec_blk) != 0) {
+            free(loaded_nodes);
+            unlink(v2_path);
+            fprintf(stderr, "FAIL: backend_terrain_read_epack_tile_v2 DEM+RGB failed\n");
+            return 1;
+        }
+        float dec_h1 = backend_epack_load_height_m(&v2_dec_blk, 64u, 64u);
+        if (fabsf(dec_h1 - (600.0f + 25.0f + 32.0f + 16.0f)) > 0.25f) {
+            free(loaded_nodes);
+            unlink(v2_path);
+            fprintf(stderr, "FAIL: .epack v2 DEM+RGB height decode mismatch (%.3f)\n", (double)dec_h1);
+            return 1;
+        }
+        if (backend_terrain_read_epack_tile_v2(v2_path, &loaded_nodes[5], &v2_dec_blk) != 0) {
+            free(loaded_nodes);
+            unlink(v2_path);
+            fprintf(stderr, "FAIL: backend_terrain_read_epack_tile_v2 RGB-only failed\n");
+            return 1;
+        }
+        uint32_t rgb5  = backend_epack_load_rgba8(&v2_dec_blk, 100u, 80u);
+        uint32_t exp5  = backend_epack_load_rgba8(&v2_enc_tiles[5], 100u, 80u);
+        if (rgb5 != exp5) {
+            free(loaded_nodes);
+            unlink(v2_path);
+            fprintf(stderr, "FAIL: .epack v2 sparse RGB-only read mismatch (0x%08x vs 0x%08x)\n", rgb5, exp5);
+            return 1;
+        }
+
+        // Verify zoom-driven LOD selection & leaf binding without polluting global backend state afterward
+        static EpackTileBlock v2_pool[16];
+        uint32_t v2_n2s[9];
+        uint8_t  v2_inf[9] = {0};
+        memset(&g_backend, 0, sizeof(g_backend));
+        g_backend.gpu_hdr         = &v2_read_hdr;
+        g_backend.gpu_tiles       = v2_pool;
+        g_backend.slot_cap        = 16u;
+        g_backend.is_v2           = true;
+        g_backend.v2_nodes        = loaded_nodes;
+        g_backend.v2_node_count   = loaded_count;
+        g_backend.v2_max_lod      = 2u;
+        g_backend.v2_flags        = k_epack_v2_flag_real;
+        g_backend.v2_node_to_slot = v2_n2s;
+        g_backend.v2_node_inflight= v2_inf;
+        for (uint32_t i = 0u; i < 9u; ++i) {
+            v2_n2s[i] = i;
+        }
+
+        uint32_t needed[64] = {0};
+        uint32_t needed_cnt = 0u;
+        // Low zoom: stays coarse (LOD 1 = 4 leaves, not subdividing into LOD 2)
+        (void)backend_stream_update_lod(&v2_read_hdr, -7500.0f, -7500.0f, 0.01f, needed, &needed_cnt);
+        if (v2_read_hdr.dir.deepest_lod_active != 1u || v2_read_hdr.dir.active_leaf_count != 4u) {
+            free(loaded_nodes);
+            unlink(v2_path);
+            fprintf(stderr, "FAIL: .epack v2 low-zoom expected LOD 1 & 4 leaves (got lod=%u leaves=%u)\n",
+                    v2_read_hdr.dir.deepest_lod_active, v2_read_hdr.dir.active_leaf_count);
+            return 1;
+        }
+        // Zoomed-in SW corner (-7500, -7500): refines down to LOD 2 and requests RGB leaf + DEM ancestor
+        (void)backend_stream_update_lod(&v2_read_hdr, -7500.0f, -7500.0f, 0.80f, needed, &needed_cnt);
+        if (v2_read_hdr.dir.deepest_lod_active != 2u || v2_read_hdr.dir.active_leaf_count != 7u) {
+            free(loaded_nodes);
+            unlink(v2_path);
+            fprintf(stderr, "FAIL: .epack v2 focal zoom expected LOD 2 & 7 leaves (got lod=%u leaves=%u)\n",
+                    v2_read_hdr.dir.deepest_lod_active, v2_read_hdr.dir.active_leaf_count);
+            return 1;
+        }
+        bool saw_leaf5 = false, saw_dem_anc1 = false;
+        for (uint32_t i = 0u; i < needed_cnt; ++i) {
+            if (needed[i] == 5u) saw_leaf5 = true;
+            if (needed[i] == 1u) saw_dem_anc1 = true;
+        }
+        if (!saw_leaf5 || !saw_dem_anc1) {
+            free(loaded_nodes);
+            unlink(v2_path);
+            fprintf(stderr, "FAIL: .epack v2 needed_nodes missing RGB leaf5=%d or DEM ancestor1=%d\n",
+                    (int)saw_leaf5, (int)saw_dem_anc1);
+            return 1;
+        }
+        // Check CPU frustum cull on active v2 cut
+        TerrainCullParams v2_cull = {
+            .width = 1280u, .height = 720u,
+            .elev_base_m = 500.0f, .vertical_scale = 1.0f, .verts_per_tile = 32u * 32u * 6u,
+            .qx = 0.0f, .qy = 0.0f, .qz = 0.0f, .qw = 1.0f,
+            .cam_x = -7500.0f, .cam_y = -7500.0f, .cam_z = 900.0f, .zoom = 0.80f,
+        };
+        static GpuMathIndirectBuffer v2_ind;
+        uint32_t v2_vis = backend_stream_cull_frustum(&v2_read_hdr, &v2_cull, &v2_ind);
+        if (v2_vis == 0u || v2_ind.draw_count != v2_vis) {
+            free(loaded_nodes);
+            unlink(v2_path);
+            fprintf(stderr, "FAIL: .epack v2 frustum cull emitted 0 visible leaves\n");
+            return 1;
+        }
+
+        // Verify RelPtr2D DEM ancestor binding + >4 GiB SSD address preservation check
+        if ((v2_disk_nodes[5].ssd_offset_bytes + (1ull << 33u)) < (1ull << 32u)) {
+            free(loaded_nodes);
+            unlink(v2_path);
+            fprintf(stderr, "FAIL: 64-bit SSD offset arithmetic overflow\n");
+            return 1;
+        }
+
+        memset(&g_backend, 0, sizeof(g_backend));
+        free(loaded_nodes);
+        unlink(v2_path);
+    }
+
+    printf("test_backend: ok (RelPtr2D + Lilliput64 + Cell64 + .epack 3.84x [RMSE %.4f m, border 0.0000 m, %.1f dB, fixed_buf=%u] + .epack v2 deep quadtree + Survey MVS/GCP fused %u posts [%u MVS @ ZNCC %.3f] & %u ortho texels + 2DGS %u+%u surfels)\n",
            elev_rmse_m, rgb_psnr_db, 1u,
            fuse_stats.dem_posts_refined, fuse_stats.mvs_elev_posts_refined,
            (double)fuse_stats.mean_mvs_ncc, fuse_stats.texels_orthorectified,

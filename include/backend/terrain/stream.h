@@ -15,8 +15,8 @@ typedef struct TerrainSampleInfo {
     float    slope_deg;
     uint32_t node_index;
     uint8_t  lod;
-    uint8_t  tile_gx;
-    uint8_t  tile_gy;
+    uint16_t tile_gx;
+    uint16_t tile_gy;
 } TerrainSampleInfo;
 
 typedef struct TerrainProfileInfo {

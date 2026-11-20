@@ -84,6 +84,14 @@ typedef struct BackendState {
     char                   epack_path[1024];
     char                   survey_manifest_path[1024];
     TerrainSurveyDataset   survey;
+    bool                   is_v2;
+    uint32_t               v2_node_count;
+    uint32_t               v2_max_lod;
+    uint32_t               v2_flags;
+    uint32_t               v2_leaf_disk_ids[k_epack_v2_cut_cap];
+    EpackDiskNode         *v2_nodes;
+    uint8_t               *v2_node_inflight;
+    uint32_t              *v2_node_to_slot;
     alignas(64) GpuMathStreamCell cells[k_backend_cell_ring_cap];
 } BackendState;
 
@@ -101,6 +109,14 @@ void backend_gpu_directory_shutdown(VulkanContext *vk);
 void backend_gpu_directory_sync(void);
 void backend_gpu_record_filter(VkCommandBuffer cmd);
 void backend_gpu_record_cull(VkCommandBuffer cmd, const TerrainCullParams *cull);
+
+// terrain/storage/pack_io.c
+[[nodiscard]] int backend_terrain_read_epack_tile_v2(const char          *epack_path,
+                                                     const EpackDiskNode *node,
+                                                     EpackTileBlock      *out_tile);
+
+// terrain/stream/lod_select.c
+void backend_stream_refresh_v2_leaf_bindings(GpuMathArchiveHeader *hdr);
 
 // terrain/storage/synth_besparmak.c
 float backend_eval_besparmak_elevation_m(double lat, double lon);

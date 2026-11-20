@@ -265,8 +265,9 @@ bool input_on_relative_pointer(WaylandContext *w, uint16_t opcode,
     if (s_ptr.focus == w->surface_id &&
         (s_ptr.buttons & ENG_BUTTON_RIGHT) != 0u &&
         (s_ptr.buttons & (ENG_BUTTON_MIDDLE | ENG_BUTTON_LEFT)) == 0u) {
-        float rdx = fixed_to_px(dx_unaccel);
-        float rdy = fixed_to_px(dy_unaccel);
+        float scale = wayland_scale_factor(w);
+        float rdx   = fixed_to_px(dx_unaccel) * scale;
+        float rdy   = fixed_to_px(dy_unaccel) * scale;
         if (rdx != 0.0f || rdy != 0.0f) {
             s_drag_dx += rdx;
             s_drag_dy += rdy;
@@ -331,4 +332,20 @@ bool pointer_client_xy(int32_t *x, int32_t *y) {
     *x = px_floor_i32(lx * scale);
     *y = px_floor_i32(ly * scale);
     return true;
+}
+
+bool pointer_left_drag_origin(int32_t *x, int32_t *y) {
+    if (x == nullptr || y == nullptr ||
+        !s_ptr.left_dragged || (s_ptr.buttons & ENG_BUTTON_LEFT) == 0u) {
+        return false;
+    }
+    const WaylandContext *w = wayland_get_context();
+    float scale = wayland_scale_factor(w);
+    *x = px_floor_i32(s_ptr.left_down_x * scale);
+    *y = px_floor_i32(s_ptr.left_down_y * scale);
+    return true;
+}
+
+uint32_t pointer_buttons(void) {
+    return s_ptr.buttons;
 }

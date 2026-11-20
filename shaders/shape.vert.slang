@@ -102,7 +102,7 @@ VSOutput main(uint inst_id : SV_VulkanInstanceID, uint vert_id : SV_VulkanVertex
         out.sv_pos = float4(0.0, 0.0, -2.0, 1.0);
     } else {
         float3 view = view_of(float3(world, 0.0), pc.view.q, pc.view.cam);
-        out.sv_pos = view_ndc(view, pc.view.zoom, pc.width, pc.height, pc.depth);
+        out.sv_pos = view_ndc_persp(view, pc.view.zoom, pc.view.persp, pc.width, pc.height, pc.depth);
     }
     out.v_emit = material_emit(pc.view.materials, pc.view.mat_index);
     return out;

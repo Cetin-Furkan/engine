@@ -499,7 +499,7 @@ int main(void) {
     if (build_rc == 0) {
         uint32_t engine_spv  = count_spv_in_dir("build/truth_clean_release/gen");
         uint32_t minimal_spv = count_spv_in_dir("build/truth_clean_release/gen_minimal");
-        CHECK(engine_spv == 42u);
+        CHECK(engine_spv == 43u);
         CHECK(minimal_spv == 2u);
 
         char spv_needle[64];

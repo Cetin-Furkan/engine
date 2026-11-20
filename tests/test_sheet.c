@@ -306,6 +306,101 @@ static void test_single_owner_gpu_pose_contract(void) {
     sheet_set_gpu_pose_owner(false);
 }
 
+static bool soft_all_tris_ccw(uint32_t soft_idx, float *out_min_sep,
+                              float *out_min_y, float *out_max_y, float *out_cy) {
+    uint32_t cols = 0u, rows = 0u;
+    float    spacing = 0.0f;
+    sheet_soft_layout(soft_idx, &cols, &rows, &spacing);
+    uint32_t n = cols * rows;
+    float px[64], py[64];
+    float min_y = 1.0e30f, max_y = -1.0e30f, cy = 0.0f;
+    for (uint32_t k = 0u; k < n; ++k) {
+        sheet_soft_pos(soft_idx, k, &px[k], &py[k]);
+        if (py[k] < min_y) min_y = py[k];
+        if (py[k] > max_y) max_y = py[k];
+        cy += py[k];
+    }
+    if (out_min_y) *out_min_y = min_y;
+    if (out_max_y) *out_max_y = max_y;
+    if (out_cy)    *out_cy    = cy / (float)n;
+
+    float min_sep = 1.0e30f;
+    for (uint32_t a = 0u; a < n; ++a) {
+        for (uint32_t b = a + 1u; b < n; ++b) {
+            float d = hypotf(px[b] - px[a], py[b] - py[a]);
+            if (d < min_sep) min_sep = d;
+        }
+    }
+    if (out_min_sep) *out_min_sep = min_sep;
+
+    for (uint32_t r = 0u; r + 1u < rows; ++r) {
+        for (uint32_t c = 0u; c + 1u < cols; ++c) {
+            uint32_t i00 = r * cols + c;
+            uint32_t i10 = i00 + 1u;
+            uint32_t i01 = i00 + cols;
+            uint32_t i11 = i01 + 1u;
+            float c0 = (px[i10] - px[i00]) * (py[i11] - py[i00]) - (py[i10] - py[i00]) * (px[i11] - px[i00]);
+            float c1 = (px[i11] - px[i00]) * (py[i01] - py[i00]) - (py[i11] - py[i00]) * (px[i01] - px[i00]);
+            if (c0 <= 0.0f || c1 <= 0.0f) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static void test_rigid_rests_on_soft(void) {
+    const char *text =
+        "bounds 600 400\n"
+        "gravity 0 -980\n"
+        "soft 0 -330 4 3 32\n"
+        "rigid 0 -100 38 24 12\n";
+    CHECK(sheet_load_memory(text, strlen(text)) == 0);
+    for (int step = 0; step < 120; ++step) {
+        (void)sheet_integrate(0.008f);
+    }
+    float rx = 0.0f, ry = 0.0f;
+    sheet_rigid_pos(0u, &rx, &ry);
+    float s_min_y = 0.0f, s_max_y = 0.0f, s_cy = 0.0f, s_min_sep = 0.0f;
+    bool ccw = soft_all_tris_ccw(0u, &s_min_sep, &s_min_y, &s_max_y, &s_cy);
+    CHECK(isfinite(rx) && isfinite(ry));
+    CHECK(ccw);
+    CHECK(ry > s_cy + 15.0f && ry >= s_max_y - 12.0f);
+}
+
+static void test_soft_soft_disjoint(void) {
+    const char *text =
+        "bounds 600 400\n"
+        "gravity 0 -980\n"
+        "soft 0 -330 4 3 32\n"
+        "soft 0 -120 4 3 32\n";
+    CHECK(sheet_load_memory(text, strlen(text)) == 0);
+    for (int step = 0; step < 140; ++step) {
+        (void)sheet_integrate(0.008f);
+    }
+    float min0 = 0.0f, max0 = 0.0f, cy0 = 0.0f, sep0 = 0.0f;
+    float min1 = 0.0f, max1 = 0.0f, cy1 = 0.0f, sep1 = 0.0f;
+    CHECK(soft_all_tris_ccw(0u, &sep0, &min0, &max0, &cy0));
+    CHECK(soft_all_tris_ccw(1u, &sep1, &min1, &max1, &cy1));
+    CHECK(cy1 > cy0 + 40.0f);
+    CHECK(min1 >= max0 - 6.0f);
+}
+
+static void test_soft_self_unfold(void) {
+    const char *text =
+        "bounds 600 400\n"
+        "gravity 0 -980\n"
+        "soft 0 -340 4 3 32\n";
+    CHECK(sheet_load_memory(text, strlen(text)) == 0);
+    sheet_soft_move(0u, 8u, 0.0f, -90.0f);
+    for (int step = 0; step < 80; ++step) {
+        (void)sheet_integrate(0.008f);
+    }
+    float min_sep = 0.0f;
+    CHECK(soft_all_tris_ccw(0u, &min_sep, nullptr, nullptr, nullptr));
+    CHECK(min_sep >= 0.30f * 32.0f);
+}
+
 int main(void) {
     sheet_hold_save(true);
     test_document();
@@ -317,6 +412,9 @@ int main(void) {
     test_shove_and_delete();
     test_gravity_and_elastic_presets();
     test_single_owner_gpu_pose_contract();
+    test_rigid_rests_on_soft();
+    test_soft_soft_disjoint();
+    test_soft_self_unfold();
     if (s_failures != 0) {
         fprintf(stderr, "%d check(s) failed\n", s_failures);
         return 1;

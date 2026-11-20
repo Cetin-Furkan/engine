@@ -250,7 +250,7 @@ VSOutput main(uint vert_id : SV_VulkanVertexID) {
 
     float3 view = view_of(p, screen.view.q, screen.view.cam);
     VSOutput out;
-    out.sv_pos = view_ndc(view, screen.view.zoom, screen.width, screen.height, screen.depth_bias);
+    out.sv_pos = view_ndc_persp(view, screen.view.zoom, screen.view.persp, screen.width, screen.height, screen.depth_bias);
     out.v_nrm = view_rotate(screen.view.q, posed_nrm);
     out.v_view_z = view.z;
     out.v_env_bda = screen.view.materials;
@@ -264,13 +264,29 @@ VSOutput main(uint vert_id : SV_VulkanVertexID) {
     float3 cool = graded;
 
     if (screen.grid != 0ul && screen.grid_n > 1u) {
-        float edge = float(screen.grid_n - 1u);
-        uint ix = uint(clamp(in_pos.x * 0.5 + 0.5, 0.0, 1.0) * edge);
-        uint iy = uint(clamp(in_pos.y * 0.5 + 0.5, 0.0, 1.0) * edge);
-        uint iz = uint(clamp(in_pos.z * 0.5 + 0.5, 0.0, 1.0) * edge);
-        uint id = ix + iy * screen.grid_n + iz * screen.grid_n * screen.grid_n;
-        half* field_v = (half*)screen.grid;
-        float cell = clamp(float(field_v[id]), 0.0, 1.0);
+        uint  n    = screen.grid_n;
+        float edge = float(n - 1u);
+        float3 gp  = clamp(in_pos * 0.5 + float3(0.5), float3(0.0), float3(1.0)) * edge;
+        uint3  p0  = min(uint3(floor(gp)), uint3(n - 1u));
+        uint3  p1  = min(p0 + uint3(1u),   uint3(n - 1u));
+        float3 fr  = gp - float3(p0);
+        uint   nn  = n * n;
+        half*  fv  = (half*)screen.grid;
+
+        float c000 = float(fv[p0.x + p0.y * n + p0.z * nn]);
+        float c100 = float(fv[p1.x + p0.y * n + p0.z * nn]);
+        float c010 = float(fv[p0.x + p1.y * n + p0.z * nn]);
+        float c110 = float(fv[p1.x + p1.y * n + p0.z * nn]);
+        float c001 = float(fv[p0.x + p0.y * n + p1.z * nn]);
+        float c101 = float(fv[p1.x + p0.y * n + p1.z * nn]);
+        float c011 = float(fv[p0.x + p1.y * n + p1.z * nn]);
+        float c111 = float(fv[p1.x + p1.y * n + p1.z * nn]);
+
+        float c00  = lerp(c000, c100, fr.x);
+        float c10  = lerp(c010, c110, fr.x);
+        float c01  = lerp(c001, c101, fr.x);
+        float c11  = lerp(c011, c111, fr.x);
+        float cell = clamp(lerp(lerp(c00, c10, fr.y), lerp(c01, c11, fr.y), fr.z), 0.0, 1.0);
         cool = lerp(graded, float3(0.45, 0.72, 1.0), cell);
     }
 

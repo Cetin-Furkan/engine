@@ -146,7 +146,8 @@ void scene_transform_vertex(
     out float3        out_view_nrm,
     out float3        out_albedo,
     out float3        out_emit,
-    out float         out_roughness)
+    out float         out_roughness,
+    out float         out_view_z)
 {
     float3 local_p = scene_dequantize_pos(pv, ml);
     float3 local_n = scene_oct_decode(pv.oct_nx, pv.oct_ny);
@@ -167,11 +168,12 @@ void scene_transform_vertex(
     float3 scaled_n = normalize(float3(posed_n.x / sxy, posed_n.y / sxy, posed_n.z / sz));
     float3 vpos     = view_of(world_p, view.q, view.cam);
 
-    out_clip      = view_ndc(vpos, view.zoom, width, height, inst.depth_bias);
+    out_clip      = view_ndc_persp(vpos, view.zoom, view.persp, width, height, inst.depth_bias);
     out_view_nrm  = view_rotate(view.q, scaled_n);
     out_albedo    = lerp(rgba.rgb, float3(1.0), clamp(inst.selected, 0.0, 1.0) * 0.42);
     out_emit      = material_emit(view.materials, inst.mat_index);
     out_roughness = inst.roughness > 0.0 ? inst.roughness : rgba.a;
+    out_view_z    = vpos.z;
 }
 
 uint scene_visbuf_pack_id(uint inst_id, uint meshlet_id, uint prim_id) {

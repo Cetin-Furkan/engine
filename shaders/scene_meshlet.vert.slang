@@ -65,7 +65,6 @@ MeshletVSOut main(uint vert_id : SV_VulkanVertexID, uint vulkan_inst_id : SV_Vul
     SceneInstance     inst = ((SceneInstance *)(pc.cull_slot_bda + k_slot_off_instances))[inst_id];
 
     scene_transform_vertex(pv, ml, inst, pc.view, pc.width, pc.height,
-                           out.sv_pos, out.v_nrm, out.v_albedo, out.v_emit, out.v_roughness);
-    out.v_view_z = (0.5 - out.sv_pos.z - inst.depth_bias) * 4096.0;
+                           out.sv_pos, out.v_nrm, out.v_albedo, out.v_emit, out.v_roughness, out.v_view_z);
     return out;
 }

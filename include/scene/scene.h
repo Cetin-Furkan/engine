@@ -60,7 +60,7 @@ static_assert(sizeof(SceneMeshlet) == 64u, "SceneMeshlet must be 64 bytes");
 typedef struct SceneViewParams {
     uint64_t materials_bda;
     uint32_t mat_index;
-    uint32_t mat_pad;
+    float    persp;
     float    qx, qy, qz, qw;
     float    cam_x, cam_y, cam_z;
     float    zoom;
@@ -212,6 +212,7 @@ void scene_submit_instance(uint32_t mesh_id, float origin_x, float origin_y, flo
                            float depth_bias, uint32_t mat_index, uint32_t flags);
 
 void scene_prepare_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height);
+void scene_draw_shadow(VkCommandBuffer cmd, const float light_clip_vp[16]);
 void scene_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height);
 
 bool scene_visbuf_active(void);

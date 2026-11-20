@@ -138,8 +138,7 @@ static void minimal_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height, b
     if (s_vk == nullptr || s_layout == VK_NULL_HANDLE || width == 0u || height == 0u) {
         return;
     }
-    VkPipeline pipe = vulkan_gfx_use(s_vk, &s_pipe_srgb);
-    if (pipe == VK_NULL_HANDLE) {
+    if (!vulkan_gfx_bind(s_vk, cmd, &s_pipe_srgb)) {
         return;
     }
 
@@ -180,7 +179,6 @@ static void minimal_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height, b
         .fb_w         = width,
         .fb_h         = height,
     };
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
     vulkan_cmd_push(cmd, s_layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                     sizeof(push), &push);
     vkCmdDraw(cmd, k_vert_count, 1u, 0u, 0u);

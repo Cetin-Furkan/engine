@@ -18,8 +18,14 @@ void               terrain_draw(VkCommandBuffer cmd,
                                 bool            marker_b_active);
 [[nodiscard]] bool terrain_reload(void);
 [[nodiscard]] uint32_t terrain_active_vertices(void);
+void               terrain_set_pack_path(const char *path);
+void               terrain_set_active(bool active);
+[[nodiscard]] bool terrain_is_active(void);
 void               terrain_set_contours(bool enabled);
 [[nodiscard]] bool terrain_toggle_contours(void);
 [[nodiscard]] bool terrain_contours_enabled(void);
+void               terrain_set_contour_mode(uint32_t mode);
+[[nodiscard]] uint32_t terrain_toggle_contour_mode(void);
+[[nodiscard]] uint32_t terrain_contour_mode(void);
 
 #endif /* ENGINE_FRAME_TERRAIN_H */

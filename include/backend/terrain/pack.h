@@ -52,6 +52,17 @@ enum : uint32_t {
     k_epack_tile_bytes      = 102400u,     // 3.84x smaller than 393,216 B .gmpack tile
     k_epack_tile_words      = 25600u,      // 25,600 uint32_t words per tile
     k_epack_total_bytes     = 24576u + 341u * 102400u, // 34,942,976 B (33.32 MiB)
+
+    // v0.3 .epack v2 Sparse Deep-Quadtree Sub-Meter Archive (>4 GiB safe, DEM+RGB split)
+    k_epack_v2_magic        = 0x324B5045u, // "EPK2"
+    k_epack_v2_version      = 2u,
+    k_epack_v2_cut_cap      = 192u,        // Max active quadtree leaves (supports LOD 10+ focal cut)
+    k_epack_v2_flag_real    = 1u << 0u,    // Measured real terrain + imagery (disable synthetic FBM/karst)
+    k_epack_v2_tile_dem_rgb = 0u,          // Full 86,016 B (21 x 4 KiB): elev_patches + borders + color_blocks
+    k_epack_v2_tile_rgb     = 1u,          // Sparse 36,864 B (9 x 4 KiB): border placeholder + border_rgb + color_blocks
+    k_epack_v2_dem_rgb_bytes= 86016u,      // 21 * 4096 B
+    k_epack_v2_rgb_bytes    = 36864u,      //  9 * 4096 B
+    k_epack_v2_rgb_offset   = 49152u,      // 12 * 4096 B offset inside EpackTileBlock
 };
 
 static constexpr double k_besparmak_lat_min  = 37.857507156252030;
@@ -207,6 +218,64 @@ static_assert(offsetof(GpuMathArchiveHeader, ortho_layer_count) == 22144u, "orth
 static_assert(offsetof(GpuMathArchiveHeader, ortho_layers) == 22208u, "ortho_layers offset must be 22,208");
 static_assert(sizeof(GpuMathArchiveHeader) == k_gmpack_header_bytes, "Archive header must be 24,576 bytes");
 
+// 32-Byte On-Disk Deep Quadtree Descriptor for .epack v2
+typedef struct EpackDiskNode {
+    uint64_t ssd_offset_bytes; // 4 KiB aligned payload offset on SSD (0 = empty sparse sibling)
+    uint32_t first_child_idx;  // Index of (dx=0,dy=0) child in disk node table, or UINT32_MAX if leaf
+    uint16_t grid_x;           // Tile column 0..(2^lod - 1)
+    uint16_t grid_y;           // Tile row    0..(2^lod - 1)
+    float    elev_min_m;       // Tile minimum elevation (m)
+    float    elev_max_m;       // Tile maximum elevation (m)
+    float    elev_mean_m;      // Tile mean elevation (m)
+    uint8_t  lod;              // Quadtree LOD 0..15
+    uint8_t  tile_kind;        // k_epack_v2_tile_dem_rgb (0) or k_epack_v2_tile_rgb (1)
+    uint8_t  has_dem;          // 1 when payload contains valid DEM elevation patches
+    uint8_t  has_rgb;          // 1 when payload contains valid BC1 RGB imagery
+} EpackDiskNode;
+
+static_assert(sizeof(EpackDiskNode) == 32u, "EpackDiskNode must be 32 bytes");
+
+// 1,344-Byte .epack v2 Extension Window packed inside GpuMathArchiveHeader::pad_to_24k (offset 23,232)
+typedef struct EpackV2Meta {
+    uint32_t v2_magic;             // k_epack_v2_magic ("EPK2")
+    uint32_t total_node_count;     // Total EpackDiskNode entries stored after header
+    uint32_t max_lod;              // Deepest quadtree LOD in archive
+    uint32_t flags;                // k_epack_v2_flag_* bitmask
+    uint64_t disk_table_offset;    // Byte offset of EpackDiskNode table (24,576)
+    uint64_t tile_data_offset;     // Byte offset of 4 KiB-aligned tile payloads
+    uint32_t epsg_code;            // Projected CRS EPSG code (e.g. 2056, 26920, 26910, 25832)
+    float    center_east_m;        // CRS Easting (m) of map center (world 0,0)
+    float    center_north_m;       // CRS Northing (m) of map center (world 0,0)
+    uint32_t dem_res_mm;           // Finest native DEM posting (mm)
+    uint32_t ortho_res_mm;         // Finest native orthophoto GSD (mm)
+    uint32_t active_leaf_ext_cnt;  // Active leaf count mirror for GPU directory window
+    uint16_t active_leaves_hi[k_epack_v2_cut_cap - k_gmpack_active_cut_cap]; // Leaves [64..191]
+    uint32_t reserved_pad[(k_gmpack_header_bytes - 23232u - 56u -
+                           (k_epack_v2_cut_cap - k_gmpack_active_cut_cap) * 2u) / 4u];
+} EpackV2Meta;
+
+static_assert(sizeof(EpackV2Meta) == k_gmpack_header_bytes - 23232u,
+              "EpackV2Meta must match pad_to_24k (1,344 bytes)");
+
+static inline const EpackV2Meta *backend_epack_v2_meta_const(const GpuMathArchiveHeader *hdr) {
+    return (const EpackV2Meta *)(const void *)hdr->pad_to_24k;
+}
+
+static inline EpackV2Meta *backend_epack_v2_meta(GpuMathArchiveHeader *hdr) {
+    return (EpackV2Meta *)(void *)hdr->pad_to_24k;
+}
+
+static inline bool backend_archive_is_v2(const GpuMathArchiveHeader *hdr) {
+    if (hdr == nullptr) {
+        return false;
+    }
+    const EpackV2Meta *m = backend_epack_v2_meta_const(hdr);
+    return hdr->dir.magic == k_epack_v2_magic &&
+           hdr->dir.version == k_epack_v2_version &&
+           m->v2_magic == k_epack_v2_magic &&
+           m->total_node_count >= 1u;
+}
+
 // 16-Byte Indirect Draw Command Record (matches VkDrawIndirectCommand layout)
 typedef struct GpuMathDrawCmd {
     uint32_t vertex_count;
@@ -217,7 +286,7 @@ typedef struct GpuMathDrawCmd {
 
 static_assert(sizeof(GpuMathDrawCmd) == 16u, "GpuMathDrawCmd must be 16 bytes");
 
-// 1,344-Byte (21 x 64B cache lines) GPU-Driven Indirect Culling & Draw Buffer
+// 3,904-Byte (61 x 64B cache lines) GPU-Driven Indirect Culling & Draw Buffer
 // Written by shaders/terrain_cull.comp.slang and consumed by vkCmdDrawIndirectCount
 // (or vkCmdDrawIndirect fallback) + shaders/terrain.vert.slang via BDA.
 typedef struct GpuMathIndirectBuffer {
@@ -226,12 +295,12 @@ typedef struct GpuMathIndirectBuffer {
     uint32_t             active_leaf_total;                   // Offset 8:   Total active leaves before frustum culling
     uint32_t             pad0;                                // Offset 12
     GpuMathDrawCmd       single_cmd;                          // Offset 16:  Single instanced VkDrawIndirectCommand fallback
-    uint32_t             visible_nodes[k_gmpack_active_cut_cap]; // Offset 32:  Compacted visible quadtree leaf node indices
-    GpuMathDrawCmd       cmds[k_gmpack_active_cut_cap];       // Offset 288: Multi-draw VkDrawIndirectCommand array (64 * 16B)
-    uint32_t             pad_tail[8];                         // Offset 1312..1343: Pad to 64-byte multiple (1,344 B)
+    uint32_t             visible_nodes[k_epack_v2_cut_cap];   // Offset 32:  Compacted visible quadtree leaf node indices (192 * 4B)
+    GpuMathDrawCmd       cmds[k_epack_v2_cut_cap];            // Offset 800: Multi-draw VkDrawIndirectCommand array (192 * 16B)
+    uint32_t             pad_tail[8];                         // Offset 3872..3903: Pad to 64-byte multiple (3,904 B)
 } GpuMathIndirectBuffer;
 
-static_assert(sizeof(GpuMathIndirectBuffer) == 1344u, "GpuMathIndirectBuffer must be 1,344 bytes");
+static_assert(sizeof(GpuMathIndirectBuffer) == 3904u, "GpuMathIndirectBuffer must be 3,904 bytes");
 
 [[nodiscard]] uint32_t backend_quadtree_level_base(uint8_t lod);
 [[nodiscard]] uint32_t backend_quadtree_node_index(uint8_t lod, uint8_t gx, uint8_t gy);
@@ -249,5 +318,11 @@ void                   backend_epack_decode_tile(const EpackTileBlock *src, GpuM
 [[nodiscard]] int      backend_terrain_read_epack_header(const char *epack_path, const char *gmpack_path, GpuMathArchiveHeader *out_hdr);
 [[nodiscard]] int      backend_terrain_read_epack_tile(const char *epack_path, uint32_t node_index, EpackTileBlock *out_tile);
 [[nodiscard]] int      backend_terrain_write_epack_tile(const char *epack_path, uint32_t node_index, const EpackTileBlock *in_tile);
+
+// .epack v2 Archive Reader (Header + On-Disk Deep Quadtree Descriptor Table)
+[[nodiscard]] int      backend_terrain_read_epack_v2(const char           *epack_path,
+                                                     GpuMathArchiveHeader *out_hdr,
+                                                     EpackDiskNode       **out_nodes,
+                                                     uint32_t             *out_node_count);
 
 #endif /* ENGINE_BACKEND_TERRAIN_PACK_H */

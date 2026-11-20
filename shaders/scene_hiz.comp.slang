@@ -18,7 +18,7 @@ struct SceneHizPush {
     float    zoom;
     uint     mode;        // 0 = Mip 0..4 tile pass, 1 = Mip 5..N coarse tail pass
     uint     commit_prev; // 1 = GPU-predicated Phase-2 rebuild + publish camera pose into SceneHizHeader
-    uint     pad0;
+    float    persp;
     uint     pad1;
 };
 
@@ -201,6 +201,7 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 wg : SV_GroupID) {
         hdr_ptr[0].prev_cam_y = pc.cam_y;
         hdr_ptr[0].prev_cam_z = pc.cam_z;
         hdr_ptr[0].prev_zoom  = pc.zoom;
+        hdr_ptr[0].pad0       = asuint(pc.persp);
         hdr_ptr[0].valid      = 1u;
     }
 }

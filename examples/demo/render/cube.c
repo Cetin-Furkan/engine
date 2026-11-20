@@ -3,6 +3,7 @@
 #include "frame/camera.h"
 #include "frame/grid.h"
 #include "frame/pass.h"
+#include "lighting/lighting.h"
 #include "render/cube_int.h"
 #include "vulkan/bda.h"
 #include "vulkan/pipe.h"
@@ -16,6 +17,9 @@ alignas(uint32_t) static const unsigned char k_vert_spv[] = {
 };
 alignas(uint32_t) static const unsigned char k_frag_spv[] = {
 #embed "cube.frag.spv"
+};
+alignas(uint32_t) static const unsigned char k_shadow_vert_spv[] = {
+#embed "cube_shadow.vert.spv"
 };
 alignas(uint32_t) static const unsigned char k_bevel_spv[] = {
 #embed "bevel.comp.spv"
@@ -59,8 +63,21 @@ static_assert(k_verts >= k_quads, "one bake dispatch covers quads");
 static_assert(k_verts < 65536u, "uint16 index");
 static_assert(sizeof k_vert_spv % 4u == 0u, "vert spirv");
 static_assert(sizeof k_frag_spv % 4u == 0u, "frag spirv");
+static_assert(sizeof k_shadow_vert_spv % 4u == 0u, "shadow vert spirv");
 static_assert(sizeof k_bevel_spv % 4u == 0u, "bevel spirv");
 static_assert(sizeof k_heat_spv % 4u == 0u, "heat spirv");
+
+typedef struct CubeShadowPush {
+    uint64_t verts;
+    uint64_t heat;
+    float    yaw_deg;
+    float    origin_x;
+    float    origin_y;
+    float    origin_z;
+    float    light_vp[16];
+} CubeShadowPush;
+
+static_assert(sizeof(CubeShadowPush) == 96u, "cube shadow push");
 
 typedef struct DrawPush {
     uint64_t verts;
@@ -142,6 +159,8 @@ static_assert(sizeof(HeatPush) == 56u, "heat push");
 static VulkanContext   *s_vk = nullptr;
 static VkPipelineLayout s_layout = VK_NULL_HANDLE;
 static VulkanGfxLive    s_gfx;
+static VkPipelineLayout s_shadow_layout = VK_NULL_HANDLE;
+static VulkanGfxLive    s_shadow_gfx;
 static VkPipelineLayout s_compute_layout = VK_NULL_HANDLE;
 static VkPipeline       s_compute = VK_NULL_HANDLE;
 static DaBuffer         s_mesh_buf = {0};
@@ -274,13 +293,21 @@ static void copy_heat_slot(VkCommandBuffer cmd, int copy, uint32_t slot) {
         s_heat_host.buffer == VK_NULL_HANDLE || s_heat_bufs[copy].buffer == VK_NULL_HANDLE) {
         return;
     }
-    VkBufferCopy region = {
+    VkBufferCopy2 region = {
+        .sType     = VK_STRUCTURE_TYPE_BUFFER_COPY_2,
         .srcOffset = s_heat_bufs[copy].offset + (VkDeviceSize)slot * (VkDeviceSize)k_heat_stride,
         .dstOffset = s_heat_host.offset +
                      ((VkDeviceSize)copy * k_heat_slots + slot) * (VkDeviceSize)k_heat_stride,
-        .size = (VkDeviceSize)k_verts * 32u,
+        .size      = (VkDeviceSize)k_verts * 32u,
     };
-    vkCmdCopyBuffer(cmd, s_heat_bufs[copy].buffer, s_heat_host.buffer, 1, &region);
+    VkCopyBufferInfo2 copy_info = {
+        .sType       = VK_STRUCTURE_TYPE_COPY_BUFFER_INFO_2,
+        .srcBuffer   = s_heat_bufs[copy].buffer,
+        .dstBuffer   = s_heat_host.buffer,
+        .regionCount = 1u,
+        .pRegions    = &region,
+    };
+    vkCmdCopyBuffer2(cmd, &copy_info);
 }
 
 // The draw reads this slot. A mapped device copy is visible to the CPU
@@ -388,13 +415,8 @@ static bool host_sees(uint64_t point) {
         (!heat_direct() && s_heat_host.map == nullptr)) {
         return false;
     }
-    VkSemaphoreWaitInfo wait_info = {
-        .sType          = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
-        .semaphoreCount = 1,
-        .pSemaphores    = &s_acquire,
-        .pValues        = &point,
-    };
-    return vkWaitSemaphores(s_device, &wait_info, 0) == VK_SUCCESS;
+    uint64_t done = 0u;
+    return vkGetSemaphoreCounterValue(s_device, s_acquire, &done) == VK_SUCCESS && done >= point;
 }
 
 static void copy_slot_disp(uint32_t slot, int copy, float *xyz) {
@@ -555,18 +577,34 @@ static int bake_mesh(VulkanContext *vk) {
         .pMemoryBarriers    = &to_copy,
     };
     vkCmdPipelineBarrier2(cmd, &copy_dep);
-    VkBufferCopy mesh_region = {
+    VkBufferCopy2 mesh_region = {
+        .sType     = VK_STRUCTURE_TYPE_BUFFER_COPY_2,
         .srcOffset = s_mesh_buf.offset,
         .dstOffset = mesh_host.offset,
         .size      = (VkDeviceSize)k_verts * 36u,
     };
-    VkBufferCopy index_region = {
+    VkCopyBufferInfo2 mesh_copy = {
+        .sType       = VK_STRUCTURE_TYPE_COPY_BUFFER_INFO_2,
+        .srcBuffer   = s_mesh_buf.buffer,
+        .dstBuffer   = mesh_host.buffer,
+        .regionCount = 1u,
+        .pRegions    = &mesh_region,
+    };
+    VkBufferCopy2 index_region = {
+        .sType     = VK_STRUCTURE_TYPE_BUFFER_COPY_2,
         .srcOffset = s_index_buf.offset,
         .dstOffset = index_host.offset,
         .size      = (VkDeviceSize)k_indices * sizeof(uint16_t),
     };
-    vkCmdCopyBuffer(cmd, s_mesh_buf.buffer, mesh_host.buffer, 1, &mesh_region);
-    vkCmdCopyBuffer(cmd, s_index_buf.buffer, index_host.buffer, 1, &index_region);
+    VkCopyBufferInfo2 index_copy = {
+        .sType       = VK_STRUCTURE_TYPE_COPY_BUFFER_INFO_2,
+        .srcBuffer   = s_index_buf.buffer,
+        .dstBuffer   = index_host.buffer,
+        .regionCount = 1u,
+        .pRegions    = &index_region,
+    };
+    vkCmdCopyBuffer2(cmd, &mesh_copy);
+    vkCmdCopyBuffer2(cmd, &index_copy);
     if (heat_direct()) {
         VkMemoryBarrier2 host = {
             .sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
@@ -689,8 +727,11 @@ static int cube_ensure_ready(void) {
         .offset     = 0,
         .size       = k_draw_push_bytes,
     };
+    VkDescriptorSetLayout shadow_dsl = lighting_shadow_set_layout();
     VkPipelineLayoutCreateInfo layout_info = {
         .sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .setLayoutCount         = shadow_dsl != VK_NULL_HANDLE ? 1u : 0u,
+        .pSetLayouts            = shadow_dsl != VK_NULL_HANDLE ? &shadow_dsl : nullptr,
         .pushConstantRangeCount = 1,
         .pPushConstantRanges    = &push,
     };
@@ -719,6 +760,42 @@ static int cube_ensure_ready(void) {
         .blend         = VK_FALSE,
     };
     vulkan_gfx_arm(&s_gfx, &gfx, VK_FORMAT_B8G8R8A8_SRGB, nullptr);
+
+    VkPushConstantRange shadow_push = {
+        .stageFlags = VK_SHADER_STAGE_VERTEX_BIT,
+        .offset     = 0,
+        .size       = sizeof(CubeShadowPush),
+    };
+    VkPipelineLayoutCreateInfo shadow_layout_info = {
+        .sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .pushConstantRangeCount = 1,
+        .pPushConstantRanges    = &shadow_push,
+    };
+    res = vkCreatePipelineLayout(vk->device, &shadow_layout_info, nullptr, &s_shadow_layout);
+    if (res != VK_SUCCESS) {
+        cube_fail("vkCreatePipelineLayout shadow", res);
+        cube_shutdown(vk);
+        s_vk = vk;
+        s_device = vk->device;
+        s_cube_failed = true;
+        return -1;
+    }
+    VulkanGfxPipe shadow_gfx = {
+        .vert              = k_shadow_vert_spv,
+        .vert_bytes        = sizeof k_shadow_vert_spv,
+        .frag              = nullptr,
+        .frag_bytes        = 0u,
+        .layout            = s_shadow_layout,
+        .depth_format      = VK_FORMAT_D32_SFLOAT,
+        .samples           = VK_SAMPLE_COUNT_1_BIT,
+        .cull              = VK_CULL_MODE_NONE,
+        .depth_test        = VK_TRUE,
+        .depth_write       = VK_TRUE,
+        .depth_compare     = VK_COMPARE_OP_LESS_OR_EQUAL,
+        .blend             = VK_FALSE,
+        .depth_bias_enable = true,
+    };
+    vulkan_gfx_arm(&s_shadow_gfx, &shadow_gfx, VK_FORMAT_UNDEFINED, nullptr);
 
     VkPushConstantRange compute_push = {
         .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
@@ -822,9 +899,11 @@ void cube_shutdown(VulkanContext *vk) {
     s_index_addr = 0;
     s_cube_failed = false;
     vulkan_gfx_disarm(vk, &s_gfx);
+    vulkan_gfx_disarm(vk, &s_shadow_gfx);
     s_vk = nullptr;
     if (vk == nullptr || vk->device == VK_NULL_HANDLE) {
         s_layout = VK_NULL_HANDLE;
+        s_shadow_layout = VK_NULL_HANDLE;
         s_compute = VK_NULL_HANDLE;
         s_compute_layout = VK_NULL_HANDLE;
         s_heat_pipe = VK_NULL_HANDLE;
@@ -841,6 +920,10 @@ void cube_shutdown(VulkanContext *vk) {
     if (s_layout != VK_NULL_HANDLE) {
         vkDestroyPipelineLayout(vk->device, s_layout, nullptr);
         s_layout = VK_NULL_HANDLE;
+    }
+    if (s_shadow_layout != VK_NULL_HANDLE) {
+        vkDestroyPipelineLayout(vk->device, s_shadow_layout, nullptr);
+        s_shadow_layout = VK_NULL_HANDLE;
     }
     if (s_compute_layout != VK_NULL_HANDLE) {
         vkDestroyPipelineLayout(vk->device, s_compute_layout, nullptr);
@@ -866,8 +949,7 @@ void cube_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height, float yaw_d
         cube_ensure_ready() != 0) {
         return;
     }
-    VkPipeline pipeline = vulkan_gfx_use(s_vk, &s_gfx);
-    if (pipeline == VK_NULL_HANDLE) {
+    if (!vulkan_gfx_bind(s_vk, cmd, &s_gfx)) {
         return;
     }
     const HeatLive *live = &s_live[heat_slot];
@@ -888,11 +970,38 @@ void cube_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height, float yaw_d
         .origin_z   = origin_z,
     };
     view_push_fill(&draw_push.view, mat);
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+    lighting_bind_shadow(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_layout);
     vkCmdBindIndexBuffer2(cmd, s_index_buf.buffer, s_index_buf.offset,
                           (VkDeviceSize)k_indices * sizeof(uint16_t),
                           VK_INDEX_TYPE_UINT16);
     vulkan_cmd_push(cmd, s_layout, VK_SHADER_STAGE_VERTEX_BIT, k_draw_push_bytes, &draw_push);
+    vkCmdDrawIndexed(cmd, k_indices, 1, 0, 0, 0);
+}
+
+void cube_draw_shadow(VkCommandBuffer cmd, const float light_clip_vp[16], float yaw_deg,
+                      float origin_x, float origin_y, float origin_z, uint32_t heat_slot) {
+    if (cmd == VK_NULL_HANDLE || light_clip_vp == nullptr || !heat_slot_ok(heat_slot) ||
+        cube_ensure_ready() != 0) {
+        return;
+    }
+    if (!vulkan_gfx_bind(s_vk, cmd, &s_shadow_gfx)) {
+        return;
+    }
+    const HeatLive *live = &s_live[heat_slot];
+    int heat_copy = live->draw >= 0 ? live->draw : live->read;
+    CubeShadowPush push = {
+        .verts    = s_mesh_addr,
+        .heat     = heat_at(heat_copy, heat_slot),
+        .yaw_deg  = yaw_deg,
+        .origin_x = origin_x,
+        .origin_y = origin_y,
+        .origin_z = origin_z,
+    };
+    memcpy(push.light_vp, light_clip_vp, sizeof push.light_vp);
+    vkCmdBindIndexBuffer2(cmd, s_index_buf.buffer, s_index_buf.offset,
+                          (VkDeviceSize)k_indices * sizeof(uint16_t),
+                          VK_INDEX_TYPE_UINT16);
+    vulkan_cmd_push(cmd, s_shadow_layout, VK_SHADER_STAGE_VERTEX_BIT, sizeof push, &push);
     vkCmdDrawIndexed(cmd, k_indices, 1, 0, 0, 0);
 }
 

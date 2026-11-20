@@ -13,12 +13,12 @@ static const char *k_name[k_kinds] = {
     "Tetrahedron", "Octahedron", "Icosahedron", "Cylinder", "Cone", "Torus",
 };
 static const Coord k_at[k_kinds] = {
-    { -500.0f, 150.0f, 0.0f },
-    { -500.0f, -180.0f, 0.0f },
-    { 500.0f, 150.0f, 0.0f },
-    { 500.0f, -180.0f, 0.0f },
-    { 0.0f, 230.0f, 0.0f },
-    { 0.0f, -250.0f, 0.0f },
+    { -500.0f, 150.0f, 84.0f },
+    { -500.0f, -180.0f, 84.0f },
+    { 500.0f, 150.0f, 84.0f },
+    { 500.0f, -180.0f, 87.0f },
+    { 0.0f, 230.0f, 93.0f },
+    { 0.0f, -250.0f, 84.0f },
 };
 static const float k_default_bounce[k_kinds] = {
     0.40f, // Tetrahedron
@@ -29,6 +29,16 @@ static const float k_default_bounce[k_kinds] = {
     0.82f, // Torus (elastic ring)
 };
 static const float k_radius = 84.0f;
+
+static float solid_rest_radius(uint32_t kind) {
+    if (kind == 3u) {
+        return 87.0f;
+    }
+    if (kind == 4u) {
+        return 93.0f;
+    }
+    return k_radius;
+}
 
 typedef struct SolidData {
     bool     used;
@@ -301,7 +311,7 @@ bool solid_kind_place_elastic(uint32_t kind, Coord at, int32_t yaw_milli,
         e = 0.95f;
     }
     s->restitution = e;
-    s->awake = (at.z > k_radius + 1.0f);
+    s->awake = (at.z > solid_rest_radius(kind) + 1.0f);
     s->spin = spin_pose(yaw_milli, spinning, infinite, glow);
     int index = table_add(&s_ops, s, at, &s->spin);
     if (index < 0) {
@@ -328,6 +338,35 @@ float solid_kind_restitution(const WorldObj *o) {
     return s->restitution;
 }
 
+bool solid_kind_grab_move(WorldObj *o, Coord pos, float vx, float vy, bool release) {
+    if (o == nullptr || !o->alive || o->ops != &s_ops || o->data == nullptr) {
+        return false;
+    }
+    SolidData *s = o->data;
+    o->at = pos;
+    if (!release) {
+        s->vx    = 0.0f;
+        s->vy    = 0.0f;
+        s->vz    = 0.0f;
+        s->awake = false;
+    } else {
+        float spd = sqrtf(vx * vx + vy * vy);
+        if (spd > 1600.0f) {
+            float k = 1600.0f / spd;
+            vx *= k;
+            vy *= k;
+        }
+        s->vx         = vx;
+        s->vy         = vy;
+        s->vz         = 0.0f;
+        s->squash_vel = 1.6f;
+        s->awake      = true;
+    }
+    s_motion_drew = true;
+    world_note_motion_epoch();
+    return true;
+}
+
 uint32_t solid_kind_gather_motion(MotionBody *out, WorldObj **objs, uint32_t cap) {
     uint32_t n = 0;
     int count = table_count();
@@ -346,7 +385,7 @@ uint32_t solid_kind_gather_motion(MotionBody *out, WorldObj **objs, uint32_t cap
             .vz          = s->vz,
             .yaw         = rad_of(s->spin.live_milli),
             .restitution = s->restitution,
-            .radius      = k_radius,
+            .radius      = solid_rest_radius(s->kind),
             .spherical   = true,
             .awake       = s->awake,
         };

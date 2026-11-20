@@ -22,7 +22,7 @@ Rather than marketing claims, every section below compares **what actually happe
 
 | Subsystem / Metric | Commercial Engines (UE5 / Unity / Godot) | Standard Native Stack (`SDL3`/`GLFW` + Vulkan WSI) | **`Engine` (`v0.3.0`)** |
 | :--- | :--- | :--- | :--- |
-| **Release Binary Size** | `80 MiB` – `500+ MiB` (+ external `.pak`/shader dirs) | `5 MiB` – `30 MiB` + dynamic `.so` wrappers + `.spv` files | **`3.02 MiB` demo ELF** (`42` `#embed`ded SPIR-V 1.6 modules) · **`0.42 MiB` `minimal` ELF** |
+| **Release Binary Size** | `80 MiB` – `500+ MiB` (+ external `.pak`/shader dirs) | `5 MiB` – `30 MiB` + dynamic `.so` wrappers + `.spv` files | **`3.39 MiB` demo ELF** (`43` `#embed`ded SPIR-V 1.6 modules) · **`0.41 MiB` `minimal` ELF** |
 | **Windowing & IPC** | SDL / custom wrapper $\to$ `libwayland-client` + X11 fallback | `SDL3` / `GLFW` $\to$ `libwayland-client` (`pthread` locks + proxy heap) | **Zero `libwayland`**. Hand-rolled binary wire codec directly on `io_uring` socket (`16 KiB` packet ring) |
 | **Kernel I/O & Polling** | Multi-thread job system + `epoll`/`poll` + `futex` wakes | `poll()`/`epoll_wait()` per frame + blocking `read()` on files | **Single-issuer `io_uring`** (`NO_MMAP`, `DEFER_TASKRUN`, `REGISTERED_FD_ONLY`, `NO_IOWAIT`, `1 ns` timer slack) |
 | **Idle Scene Behavior** | Continuous `60–240 Hz` tick & present loop (measurable CPU/GPU watts) | Usually continuous `while (!quit)` loop or coarse `WaitEvents` | **True `0.0%` CPU & `0.0%` GPU**. Cancels multishot `IORING_OP_TIMEOUT`, logs `Loop idle`, sleeps in kernel |

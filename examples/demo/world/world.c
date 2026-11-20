@@ -1,5 +1,6 @@
 #include "world/world_int.h"
 #include "backend/backend.h"
+#include "engine/app.h"
 #include "frame/camera.h"
 #include "frame/gimbal.h"
 #include "frame/hud.h"
@@ -8,9 +9,13 @@
 #include "frame/sheet.h"
 #include "frame/terrain.h"
 #include "frame/text.h"
+#include "input/pointer.h"
 #include "lighting/lighting.h"
 #include "physics/physics.h"
+#include "ring/ring.h"
 #include "scene/scene.h"
+#include <linux/input-event-codes.h>
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -25,6 +30,89 @@ static uint32_t     s_removed_n = 0;
 static uint32_t     s_world_id  = 0;
 static char         s_custom_file[1024];
 static float        s_clear_rgba[4] = { 0.015f, 0.018f, 0.024f, 1.0f };
+
+static constexpr float k_grab_lift_z = 24.0f;
+
+typedef struct GrabState {
+    bool     active;
+    bool     empty_orbit;
+    int      index;
+    uint32_t generation;
+    int32_t  origin_x;
+    int32_t  origin_y;
+    float    plane_z;
+    float    off_x;
+    float    off_y;
+    float    last_x;
+    float    last_y;
+    float    vx;
+    float    vy;
+    uint64_t last_ns;
+} GrabState;
+
+static GrabState s_grab = { .index = -1 };
+
+static void grab_clear(void) {
+    s_grab = (GrabState){ .index = -1 };
+}
+
+static bool grab_move_obj(WorldObj *o, Coord pos, float vx, float vy, bool release) {
+    if (o == nullptr || !o->alive) {
+        return false;
+    }
+    if (o->ops == cube_ops()) {
+        return cube_kind_grab_move(o, pos, vx, vy, release);
+    }
+    if (o->ops == solid_ops()) {
+        return solid_kind_grab_move(o, pos, vx, vy, release);
+    }
+    return false;
+}
+
+static bool grab_screen_from_client(int32_t px, int32_t py, float *sx, float *sy) {
+    const WaylandContext *w = wayland_get_context();
+    if (w == nullptr || sx == nullptr || sy == nullptr) {
+        return false;
+    }
+    uint32_t sw = w->scene_phys_w != 0u ? w->scene_phys_w : w->scene_opaque_w;
+    uint32_t sh = w->scene_phys_h != 0u ? w->scene_phys_h : w->scene_opaque_h;
+    if (sw == 0u || sh == 0u) {
+        return false;
+    }
+    *sx = (float)px - (float)sw * 0.5f;
+    *sy = (float)sh * 0.5f - (float)py;
+    return true;
+}
+
+static bool grab_ray_plane_z(const CameraRay *ray, float z, float *wx, float *wy) {
+    if (ray == nullptr || wx == nullptr || wy == nullptr || fabsf(ray->dz) < 0.04f) {
+        return false;
+    }
+    float t = (z - ray->oz) / ray->dz;
+    if (!isfinite(t) || t <= 0.0f || t > 24000.0f) {
+        return false;
+    }
+    *wx = ray->ox + t * ray->dx;
+    *wy = ray->oy + t * ray->dy;
+    return isfinite(*wx) && isfinite(*wy);
+}
+
+static bool grab_release(void) {
+    if (!s_grab.active) {
+        s_grab.empty_orbit = false;
+        return false;
+    }
+    int      idx = s_grab.index;
+    uint32_t gen = s_grab.generation;
+    float    vx  = s_grab.vx;
+    float    vy  = s_grab.vy;
+    grab_clear();
+    WorldObj *o = table_at(idx);
+    if (o == nullptr || !o->alive || o->generation != gen) {
+        return false;
+    }
+    return grab_move_obj(o, o->at, vx, vy, true);
+}
 
 void world_set_clear_color(float r, float g, float b, float a) {
     s_clear_rgba[0] = r;
@@ -107,52 +195,69 @@ void world_apply_policy(void) {
     case 0u:
         // World 0: Pure Empty Engine canvas. Revoke all permissions and seal.
         policy_apply_world(MODE_3D, PERM_NONE, 0xFFFFu, true);
+        camera_set_scene_3d(false, false, false);
         return;
     case 1u:
         // World 1: 3D-only, click-to-draw (PERM_DRAW) enabled at boot, mode switching locked.
         policy_apply_world(MODE_3D, PERM_DRAW, PERM_MODE_SWITCH | PERM_PLOT_CYCLE, false);
+        camera_set_scene_3d(true, true, false);
+        camera_set_home_pose(0.0f, 0.0f, 60.0f, -0.46f, 0.96f, 0.76f);
         break;
     case 2u:
         // World 2: 3D-only gravity & elastic non-cube solids, mode switching locked.
         policy_apply_world(MODE_3D, PERM_NONE, PERM_MODE_SWITCH | PERM_PLOT_CYCLE, false);
+        camera_set_scene_3d(true, true, false);
+        camera_set_home_pose(0.0f, 0.0f, 70.0f, -0.46f, 0.96f, 0.74f);
         break;
     case 3u:
         // World 3: 2D-only gravity & deformable soft patches, mode switching locked.
         policy_apply_world(MODE_2D, PERM_NONE, PERM_MODE_SWITCH | PERM_PLOT_CYCLE, false);
+        camera_set_scene_3d(false, false, false);
         (void)camera_snap_front();
         camera_commit();
         break;
     case 4u:
         // World 4: 2D-only with click-to-draw (PERM_DRAW) enabled at boot, mode switching locked.
         policy_apply_world(MODE_2D, PERM_DRAW, PERM_MODE_SWITCH | PERM_PLOT_CYCLE, false);
+        camera_set_scene_3d(false, false, false);
         (void)camera_snap_front();
         camera_commit();
         break;
     case 5u:
         // World 5: Hybrid 3D+2D with click-to-draw enabled at boot, Tab mode switch allowed.
         policy_apply_world(MODE_HYBRID, PERM_DRAW, PERM_PLOT_CYCLE, false);
+        camera_set_scene_3d(true, true, false);
+        camera_set_home_pose(0.0f, 0.0f, 60.0f, -0.46f, 0.96f, 0.72f);
         break;
     case 6u:
         // World 6: 3D+2D switchable restitution staircase & bumper lab, Tab mode switch allowed.
         policy_apply_world(MODE_3D, PERM_NONE, PERM_PLOT_CYCLE, false);
+        camera_set_scene_3d(true, true, false);
+        camera_set_home_pose(0.0f, 0.0f, 70.0f, -0.42f, 0.94f, 0.70f);
         break;
     case 7u:
         // World 7: Procedural C23 WorldBuilder (Hybrid 3D+2D + click-to-draw + Tab mode switch).
         policy_apply_world(MODE_HYBRID, PERM_DRAW, PERM_PLOT_CYCLE, false);
+        camera_set_scene_3d(true, true, false);
+        camera_set_home_pose(0.0f, 0.0f, 90.0f, -0.46f, 0.94f, 0.62f);
         break;
     case 8u:
         // World 8: Baklan & Beşparmak Dağı SSD-Streamed DEM + Satellite Map (Pure 3D Map, Z-up turntable mouse controls).
         policy_apply_world(MODE_3D, PERM_NONE, PERM_PLOT_CYCLE | PERM_OBJ_SPAWN | PERM_MODE_SWITCH, false);
-        camera_set_turntable_mode(true);
+        camera_set_scene_3d(true, false, true);
         camera_set_home_pose(1595.0f, -650.0f, 520.0f, -0.18f, 0.52f, 0.16f);
         printf("[Bird's-Eye Overlay] Active at 50%% transparency | Keys: 'O'=+Transparency, 'P'=-Transparency, 'W/A/S/D'=Move parallel to map, 'Shift+WASD' (or I/U, J/N, ]/[)=0.5%% 2D Stretch, 'B'=Top-Down Bird's-Eye View, 'Enter'=Upload & Bake onto Map\n");
         break;
     case k_world_custom_file:
         policy_boot();
+        camera_set_scene_3d(true, true, false);
+        camera_set_home_pose(0.0f, 0.0f, 60.0f, -0.46f, 0.96f, 0.74f);
         return;
     case 9u:
     default:
         policy_boot();
+        camera_set_scene_3d(true, true, false);
+        camera_set_home_pose(0.0f, 0.0f, 60.0f, -0.46f, 0.96f, 0.74f);
         break;
     }
     const WorkspacePolicy *pol = policy_active();
@@ -266,6 +371,7 @@ static bool snap_removed(const WorldObj *o, WorldRemoved *out) {
 }
 
 void world_reset(void) {
+    grab_clear();
     world_removed_clear();
     table_reset();
     ground_reset();
@@ -467,11 +573,121 @@ bool world_click(float screen_x, float screen_y) {
     return face_spawn(ground);
 }
 
+bool world_pointer_drag_poll(void) {
+    if ((pointer_buttons() & ENG_BUTTON_LEFT) != 0u) {
+        return false;
+    }
+    if (s_grab.active) {
+        return grab_release();
+    }
+    s_grab.empty_orbit = false;
+    return false;
+}
+
+bool world_pointer_drag(float dx, float dy, uint32_t buttons) {
+    if ((buttons & ENG_BUTTON_LEFT) == 0u || policy_mode() == MODE_2D ||
+        terrain_is_active() || pointer_key_down(KEY_T)) {
+        bool released = grab_release();
+        return camera_pointer_drag(dx, dy, buttons) || released;
+    }
+    int32_t ox = 0;
+    int32_t oy = 0;
+    bool have_origin = pointer_left_drag_origin(&ox, &oy);
+    if (s_grab.empty_orbit) {
+        if (!have_origin || (ox == s_grab.origin_x && oy == s_grab.origin_y)) {
+            return camera_pointer_drag(dx, dy, ENG_BUTTON_RIGHT);
+        }
+        s_grab.empty_orbit = false;
+    }
+    if (!s_grab.active) {
+        float sx = 0.0f;
+        float sy = 0.0f;
+        if (policy_allows(PERM_OBJ_SELECT) && have_origin &&
+            grab_screen_from_client(ox, oy, &sx, &sy)) {
+            CameraRay ray = {0};
+            camera_click_ray(sx, sy, &ray);
+            int idx = table_pick(&ray, nullptr, nullptr);
+            if (idx >= 0) {
+                WorldObj *o = table_at(idx);
+                if (o != nullptr && o->alive &&
+                    (o->ops == cube_ops() || o->ops == solid_ops())) {
+                    float px0 = o->at.x;
+                    float py0 = o->at.y;
+                    (void)grab_ray_plane_z(&ray, o->at.z, &px0, &py0);
+                    sheet_clear();
+                    (void)table_select(idx);
+                    s_grab = (GrabState){
+                        .active      = true,
+                        .empty_orbit = false,
+                        .index       = idx,
+                        .generation  = o->generation,
+                        .origin_x    = ox,
+                        .origin_y    = oy,
+                        .plane_z     = o->at.z,
+                        .off_x       = o->at.x - px0,
+                        .off_y       = o->at.y - py0,
+                        .last_x      = o->at.x,
+                        .last_y      = o->at.y,
+                        .vx          = 0.0f,
+                        .vy          = 0.0f,
+                        .last_ns     = ring_mono_ns(),
+                    };
+                }
+            }
+        }
+        if (!s_grab.active) {
+            s_grab.empty_orbit = true;
+            s_grab.origin_x    = ox;
+            s_grab.origin_y    = oy;
+            return camera_pointer_drag(dx, dy, ENG_BUTTON_RIGHT);
+        }
+    }
+
+    WorldObj *o = table_at(s_grab.index);
+    if (o == nullptr || !o->alive || o->generation != s_grab.generation) {
+        grab_clear();
+        return false;
+    }
+    int32_t cx = 0;
+    int32_t cy = 0;
+    float   sx = 0.0f;
+    float   sy = 0.0f;
+    if (!pointer_client_xy(&cx, &cy) || !grab_screen_from_client(cx, cy, &sx, &sy)) {
+        return false;
+    }
+    CameraRay ray = {0};
+    camera_click_ray(sx, sy, &ray);
+    float wx = 0.0f;
+    float wy = 0.0f;
+    if (!grab_ray_plane_z(&ray, s_grab.plane_z, &wx, &wy)) {
+        return false;
+    }
+    float nx = wx + s_grab.off_x;
+    float ny = wy + s_grab.off_y;
+    uint64_t now_ns = ring_mono_ns();
+    float dt = (now_ns > s_grab.last_ns) ? ((float)(now_ns - s_grab.last_ns) * 1.0e-9f) : 0.016f;
+    if (dt < 0.004f) {
+        dt = 0.004f;
+    } else if (dt > 0.080f) {
+        dt = 0.080f;
+    }
+    float ivx = (nx - s_grab.last_x) / dt;
+    float ivy = (ny - s_grab.last_y) / dt;
+    s_grab.vx = s_grab.vx * 0.55f + ivx * 0.45f;
+    s_grab.vy = s_grab.vy * 0.55f + ivy * 0.45f;
+    s_grab.last_x  = nx;
+    s_grab.last_y  = ny;
+    s_grab.last_ns = now_ns;
+    Coord target = { nx, ny, s_grab.plane_z + k_grab_lift_z };
+    return grab_move_obj(o, target, 0.0f, 0.0f, false);
+}
+
 bool world_close_face(void) {
     return face_close();
 }
 
 bool world_cancel(void) {
+    (void)grab_release();
     bool sheet = policy_mode() != MODE_3D && sheet_cancel();
     bool corners = face_chain_count() > 0u;
     bool selected = table_selected() != nullptr;
@@ -648,7 +864,8 @@ bool world_toggle_smooth(void) {
 }
 
 bool world_busy(void) {
-    bool busy = camera_busy() || text_busy() || physics_any_inflight();
+    bool busy = camera_busy() || text_busy() || physics_any_inflight() ||
+                s_grab.active || s_grab.empty_orbit;
     if (policy_mode() == MODE_2D) {
         busy = busy || plot_wants_frame() || sheet_busy() || sheet_has_pending_gpu_steps() ||
                face_chain_busy() || table_busy_ops(face_ops());
@@ -703,7 +920,11 @@ bool world_consume_spin(void) {
 }
 
 void world_prepare_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height, bool live) {
-    if (policy_mode() == MODE_2D || world_selected_id() == 0u) {
+    if (world_selected_id() == 0u) {
+        return;
+    }
+    if (policy_mode() == MODE_2D) {
+        lighting_prepare(cmd, 0u, 0u);
         return;
     }
     camera_bind(live);
@@ -718,15 +939,16 @@ void world_prepare_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height, bo
         .cam_y = vp.cam_y,
         .cam_z = vp.cam_z,
         .zoom  = vp.zoom,
+        .persp = vp.persp,
     };
     lighting_begin_frame(width, height, &lcam);
-    if (world_selected_id() == 8u) {
+    if (terrain_is_active()) {
         uint64_t dir_bda = backend_directory_bda();
         if (dir_bda != 0ull) {
-            lighting_set_terrain_field(dir_bda, k_besparmak_elev_min, 1.15f);
+            lighting_set_terrain_field(dir_bda, backend_elev_base_m(), backend_vertical_scale());
         }
     } else if (ground_is_visible() && coord_ground_set()) {
-        const float ground_alb[3] = { 0.08f, 0.20f, 0.38f };
+        const float ground_alb[3] = { 0.145f, 0.162f, 0.195f };
         lighting_set_ground_plane(true, 0.0f, ground_alb);
     }
 
@@ -735,7 +957,7 @@ void world_prepare_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height, bo
     SceneViewParams sv = {
         .materials_bda = vp.materials,
         .mat_index     = vp.mat_index,
-        .mat_pad       = vp.mat_pad,
+        .persp         = vp.persp,
         .qx            = vp.qx,
         .qy            = vp.qy,
         .qz            = vp.qz,
@@ -748,6 +970,15 @@ void world_prepare_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height, bo
     scene_begin_frame(width, height, &sv);
     table_prepare_scene(live);
     scene_prepare_draw(cmd, width, height);
+
+    // Hardware directional shadow map pass (Vulkan 1.4 dynamic depth-only rendering)
+    float light_clip_vp[16];
+    if (lighting_shadow_begin(cmd, light_clip_vp)) {
+        table_draw_shadow(cmd, light_clip_vp, live);
+        scene_draw_shadow(cmd, light_clip_vp);
+        lighting_shadow_end(cmd);
+    }
+
     lighting_prepare(cmd, width, height);
 }
 

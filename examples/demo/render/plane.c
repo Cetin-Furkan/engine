@@ -2,6 +2,7 @@
 #include "frame/camera.h"
 #include "frame/grid_math.h"
 #include "frame/pass.h"
+#include "frame/policy.h"
 #include "lighting/lighting.h"
 #include "vulkan/pipe.h"
 #include <math.h>
@@ -86,11 +87,9 @@ static bool plane_ensure_ready(void) {
         fprintf(stderr, "[Plane Error] The render pass has no depth format yet\n");
         return false;
     }
-    VkPhysicalDeviceProperties props = {0};
-    vkGetPhysicalDeviceProperties(s_vk->physical_device, &props);
-    if (props.limits.maxPushConstantsSize < sizeof(PlanePush)) {
+    if (s_vk->device_info.limits.maxPushConstantsSize < sizeof(PlanePush)) {
         fprintf(stderr, "[Plane Error] Push constants are %u bytes, the plane needs %zu\n",
-                props.limits.maxPushConstantsSize, sizeof(PlanePush));
+                s_vk->device_info.limits.maxPushConstantsSize, sizeof(PlanePush));
         return false;
     }
 
@@ -99,8 +98,11 @@ static bool plane_ensure_ready(void) {
         .offset     = 0,
         .size       = sizeof(PlanePush),
     };
+    VkDescriptorSetLayout shadow_dsl = lighting_shadow_set_layout();
     VkPipelineLayoutCreateInfo layout_info = {
         .sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .setLayoutCount         = shadow_dsl != VK_NULL_HANDLE ? 1u : 0u,
+        .pSetLayouts            = shadow_dsl != VK_NULL_HANDLE ? &shadow_dsl : nullptr,
         .pushConstantRangeCount = 1,
         .pPushConstantRanges    = &push,
     };
@@ -141,15 +143,12 @@ void plane_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height) {
     if (cmd == VK_NULL_HANDLE || width == 0 || height == 0 || !plane_ensure_ready()) {
         return;
     }
-    VkPipeline pipeline = vulkan_gfx_use(s_vk, &s_gfx);
-    if (pipeline == VK_NULL_HANDLE) {
+    if (!vulkan_gfx_bind(s_vk, cmd, &s_gfx)) {
         return;
     }
     ViewPush view;
     view_push_fill(&view, 0u);
     PlaneGrid grid = plane_grid_for(width, height, view.zoom);
-
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
 
     PlanePush push = {
         .width      = width,
@@ -160,10 +159,11 @@ void plane_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height) {
         .origin_y   = plane_grid_wrap(view.cam_y, grid.coarse),
         .zoom       = view.zoom,
         .coarse     = grid.coarse,
-        .is_3d      = lighting_gi_active() ? 1u : 0u,
+        .is_3d      = (policy_mode() != MODE_2D) ? 1u : 0u,
         .pad0       = 0u,
         .view       = view,
     };
+    lighting_bind_shadow(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_layout);
     vulkan_cmd_push(cmd, s_layout, VK_SHADER_STAGE_FRAGMENT_BIT, sizeof push, &push);
     vkCmdDraw(cmd, 3u, 1u, 0u, 0u);
 }

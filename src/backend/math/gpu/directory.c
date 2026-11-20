@@ -1,4 +1,5 @@
 #include "backend/internal.h"
+#include <math.h>
 #include <stddef.h>
 #include <stdio.h>
 
@@ -157,16 +158,35 @@ void backend_gpu_record_filter(VkCommandBuffer cmd) {
         }
         g_backend.slot_dirty[slot] = 0u;
         uint32_t node_idx = g_backend.slot_to_node[slot];
-        if (node_idx >= k_gmpack_node_count) {
-            continue;
+        RelPtr2D rel_tile = k_relptr2d_null;
+        uint8_t  lod      = 0u;
+        if (g_backend.is_v2) {
+            if (g_backend.v2_nodes == nullptr || node_idx >= g_backend.v2_node_count) {
+                continue;
+            }
+            const EpackDiskNode *dn = &g_backend.v2_nodes[node_idx];
+            if (dn->has_dem == 0u) {
+                continue;
+            }
+            lod = dn->lod;
+            rel_tile = relptr2d_pack(
+                (int32_t)(k_gmpack_header_blocks + slot * k_epack_tile_blocks_4k),
+                (int16_t)dn->grid_x, (int16_t)dn->grid_y, lod, 1u);
+        } else {
+            if (node_idx >= k_gmpack_node_count) {
+                continue;
+            }
+            GpuMathQuadNode *node = &g_backend.gpu_hdr->nodes[node_idx];
+            lod      = node->lod;
+            rel_tile = node->rel_gpu_payload;
         }
-        GpuMathQuadNode *node = &g_backend.gpu_hdr->nodes[node_idx];
-        uint32_t grid_n = 1u << node->lod;
-        float spacing_m = 24000.0f / (float)(grid_n * (k_gmpack_tile_dim - 1u));
+        uint32_t grid_n   = 1u << (lod & 15u);
+        float    world_w  = 2.0f * fmaxf(g_backend.gpu_hdr->dir.world_half_extent, 1.0f);
+        float    spacing_m = world_w / (float)(grid_n * (k_gmpack_tile_dim - 1u));
 
         FilterPush push = {
             .dir_bda          = g_backend.bda_buf.address,
-            .rel_tile_ptr     = node->rel_gpu_payload,
+            .rel_tile_ptr     = rel_tile,
             .sample_spacing_m = spacing_m,
             .slot_index       = slot,
             .pad0             = 0u,

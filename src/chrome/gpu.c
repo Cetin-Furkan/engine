@@ -95,11 +95,9 @@ int chrome_gpu_init(VulkanContext *vk) {
         return 0;
     }
 
-    VkPhysicalDeviceProperties props = {0};
-    vkGetPhysicalDeviceProperties(vk->physical_device, &props);
-    if (props.limits.maxPushConstantsSize < sizeof(ChromeGpuPush)) {
+    if (vk->device_info.limits.maxPushConstantsSize < sizeof(ChromeGpuPush)) {
         fprintf(stderr, "[Chrome Error] Push constants are %u bytes, chrome needs %zu\n",
-                props.limits.maxPushConstantsSize, sizeof(ChromeGpuPush));
+                vk->device_info.limits.maxPushConstantsSize, sizeof(ChromeGpuPush));
         return -1;
     }
 
@@ -156,11 +154,11 @@ int chrome_gpu_bind_pass(VulkanContext *vk, VkFormat depth_format,
     return 0;
 }
 
-static VkPipeline pick_pipeline(VulkanContext *vk, VkFormat format, VkFormat depth_format,
-                                VkSampleCountFlagBits samples) {
+static bool bind_pipeline(VulkanContext *vk, VkCommandBuffer cmd, VkFormat format,
+                          VkFormat depth_format, VkSampleCountFlagBits samples) {
     bool scene = depth_format != VK_FORMAT_UNDEFINED;
     if (scene && (depth_format != s_scene_depth || samples != s_scene_samples)) {
-        return VK_NULL_HANDLE;
+        return false;
     }
     VulkanGfxLive *live = nullptr;
     if (format == VK_FORMAT_B8G8R8A8_SRGB) {
@@ -169,9 +167,9 @@ static VkPipeline pick_pipeline(VulkanContext *vk, VkFormat format, VkFormat dep
         live = scene ? &s_scene_unorm : &s_overlay_unorm;
     }
     if (live == nullptr) {
-        return VK_NULL_HANDLE;
+        return false;
     }
-    return vulkan_gfx_use(vk, live);
+    return vulkan_gfx_bind(vk, cmd, live);
 }
 
 void chrome_gpu_draw(VulkanContext *vk, VkCommandBuffer cmd,
@@ -180,14 +178,12 @@ void chrome_gpu_draw(VulkanContext *vk, VkCommandBuffer cmd,
                      uint32_t fb_w, uint32_t fb_h, VkFormat format,
                      VkFormat depth_format, VkSampleCountFlagBits samples) {
     if (vk == nullptr || cmd == VK_NULL_HANDLE || window_w == 0 || window_h == 0 ||
-        fb_w == 0 || fb_h == 0) {
+        fb_w == 0 || fb_h == 0 || s_layout == VK_NULL_HANDLE) {
         return;
     }
-    VkPipeline pipeline = pick_pipeline(vk, format, depth_format, samples);
-    if (pipeline == VK_NULL_HANDLE || s_layout == VK_NULL_HANDLE) {
+    if (!bind_pipeline(vk, cmd, format, depth_format, samples)) {
         return;
     }
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
 
     double sx = (double)fb_w / (double)window_w;
     uint32_t drawn = 0;

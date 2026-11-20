@@ -63,6 +63,11 @@ void world_reset(void);
 // selection or a corner changed and a frame should be presented.
 bool world_click(float screen_x, float screen_y);
 
+// Tactile 3D pointer drag: grabs and moves cubes/solids on the horizontal
+// plane when left-dragging an object, or orbits/pans the camera otherwise.
+bool world_pointer_drag(float dx, float dy, uint32_t buttons);
+bool world_pointer_drag_poll(void);
+
 // Key 1 is kind 0. Raises that mesh, or selects it if it is already up.
 // True when the picture changed.
 bool world_raise_solid(uint32_t kind);

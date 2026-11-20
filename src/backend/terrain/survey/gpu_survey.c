@@ -877,8 +877,7 @@ void backend_record_draw_surfels(VkCommandBuffer       cmd,
         s_gs.armed_samples      = samples;
     }
 
-    VkPipeline pipe = vulkan_gfx_use(s_gs.vk, &s_gs.draw_gfx);
-    if (pipe == VK_NULL_HANDLE) {
+    if (!vulkan_gfx_bind(s_gs.vk, cmd, &s_gs.draw_gfx)) {
         return;
     }
 
@@ -892,13 +891,11 @@ void backend_record_draw_surfels(VkCommandBuffer       cmd,
     };
     memcpy(push.view_bytes, view_push_ptr, 48u);
 
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
-    vkCmdPushConstants(cmd,
-                       s_gs.draw_layout,
-                       VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-                       0u,
-                       sizeof push,
-                       &push);
+    vulkan_cmd_push(cmd,
+                    s_gs.draw_layout,
+                    VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                    sizeof push,
+                    &push);
     vkCmdDrawIndirect(cmd,
                       s_gs.surfel_ind_buf.buffer,
                       s_gs.surfel_ind_buf.offset + 16u,

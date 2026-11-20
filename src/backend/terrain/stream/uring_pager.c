@@ -46,15 +46,82 @@ static void refresh_resident_tile_count(GpuMathArchiveHeader *hdr) {
     hdr->dir.resident_tile_count = res_cnt;
 }
 
+static inline uint32_t pager_node_cap(void) {
+    return (g_backend.is_v2 && g_backend.v2_node_count > 0u)
+        ? g_backend.v2_node_count
+        : k_gmpack_node_count;
+}
+
+static inline bool pager_node_inflight_get(uint32_t tid) {
+    if (g_backend.is_v2) {
+        return (g_backend.v2_node_inflight != nullptr && tid < g_backend.v2_node_count)
+            ? (g_backend.v2_node_inflight[tid] != 0u) : false;
+    }
+    return tid < k_gmpack_node_count ? (g_backend.node_inflight[tid] != 0u) : false;
+}
+
+static inline void pager_node_inflight_set(uint32_t tid, uint8_t v) {
+    if (g_backend.is_v2) {
+        if (g_backend.v2_node_inflight != nullptr && tid < g_backend.v2_node_count) {
+            g_backend.v2_node_inflight[tid] = v;
+        }
+    } else if (tid < k_gmpack_node_count) {
+        g_backend.node_inflight[tid] = v;
+    }
+}
+
+static inline uint32_t pager_v2_cell_dst_off(uint32_t tid) {
+    if (!g_backend.is_v2 || g_backend.v2_nodes == nullptr || tid >= g_backend.v2_node_count) {
+        return 0u;
+    }
+    return (g_backend.v2_nodes[tid].tile_kind == k_epack_v2_tile_rgb)
+        ? k_epack_v2_rgb_offset : 0u;
+}
+
 static int ssd_tile_cell_exec(GpuMathStreamCell *cell, void *user_ctx) {
     PagerExecCtx *ctx = (PagerExecCtx *)user_ctx;
     const uint32_t slot_cap = backend_slot_cap();
+    const uint32_t node_cap = pager_node_cap();
     if (cell == nullptr || ctx == nullptr ||
-        cell->tile_id >= k_gmpack_node_count || cell->slot_index >= slot_cap) {
+        cell->tile_id >= node_cap || cell->slot_index >= slot_cap) {
         return -1;
     }
 
     uint32_t tid = cell->tile_id;
+    if (g_backend.is_v2) {
+        const EpackDiskNode *dn = &g_backend.v2_nodes[tid];
+        if (ctx->fd < 0 || dn->ssd_offset_bytes < k_gmpack_header_bytes || cell->bytes == 0u) {
+            return -1;
+        }
+        uint32_t dst_off = pager_v2_cell_dst_off(tid);
+        uint64_t ssd_off = cell->ssd_file_offset;
+        uint8_t *dst     = (uint8_t *)&ctx->gpu_tile_pool[cell->slot_index] + dst_off;
+        size_t   done    = ctx->already_read <= cell->bytes ? ctx->already_read : 0u;
+        while (done < cell->bytes) {
+            ssize_t n = pread(ctx->fd, dst + done, cell->bytes - done, (off_t)(ssd_off + done));
+            if (n < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                return -1;
+            }
+            if (n == 0) {
+                return -1;
+            }
+            done += (size_t)n;
+        }
+        if (dst_off == k_epack_v2_rgb_offset) {
+            memset(&ctx->gpu_tile_pool[cell->slot_index], 0, k_epack_v2_rgb_offset);
+            memset(ctx->gpu_tile_pool[cell->slot_index].ao_grid, 255u, k_epack_ao_samples);
+        } else {
+            memset(ctx->gpu_tile_pool[cell->slot_index].ao_grid, 214u, k_epack_ao_samples);
+        }
+        if (g_backend.v2_node_to_slot != nullptr) {
+            g_backend.v2_node_to_slot[tid] = cell->slot_index;
+        }
+        return 0;
+    }
+
     // Fast path: if this tile was previously survey-fused, evicted, and spilled to fused_cache,
     // restore the 100 KiB .epack block directly in < 0.015 ms!
     if (!g_backend.survey.persist_gmpack &&
@@ -155,7 +222,7 @@ static int allocate_gpu_tile_slot(GpuMathArchiveHeader *hdr,
                                   const uint32_t       *needed,
                                   uint32_t              needed_count) {
     const uint32_t slot_cap = backend_slot_cap();
-    if (slot_cap >= k_gmpack_node_count && node_idx < slot_cap &&
+    if (!g_backend.is_v2 && slot_cap >= k_gmpack_node_count && node_idx < slot_cap &&
         g_backend.slot_inflight[node_idx] == 0u &&
         (g_backend.slot_to_node[node_idx] == UINT32_MAX || g_backend.slot_to_node[node_idx] == node_idx)) {
         return (int)node_idx;
@@ -186,7 +253,14 @@ static int allocate_gpu_tile_slot(GpuMathArchiveHeader *hdr,
         return -1;
     }
     uint32_t evicted_idx = g_backend.slot_to_node[best_slot];
-    if (evicted_idx < k_gmpack_node_count) {
+    if (g_backend.is_v2) {
+        if (g_backend.v2_node_to_slot != nullptr && evicted_idx < g_backend.v2_node_count) {
+            g_backend.v2_node_to_slot[evicted_idx] = UINT32_MAX;
+        }
+        if (hdr->dir.resident_tile_count > 1u) {
+            hdr->dir.resident_tile_count--;
+        }
+    } else if (evicted_idx < k_gmpack_node_count) {
         if (!g_backend.survey.persist_gmpack &&
             g_backend.node_fuse_state[evicted_idx] == 2u &&
             g_backend.fused_cache[evicted_idx] == nullptr &&
@@ -278,9 +352,10 @@ static void prepare_pager_sqe(RingContext             *ring,
     // Zero-GUP UMA fastpath: when g_backend.bda_buf is pinned in ENG_FBUF_UMA_BDA via
     // IORING_REGISTER_BUFFERS_UPDATE, NVMe DMAs straight into GPU UMA pages with 0 memcpy
     // and 0 get_user_pages_fast() page-table walks.
+    const uint32_t dst_off = pager_v2_cell_dst_off(cell->tile_id);
     if (g_backend.zero_copy_uma && ring != nullptr && ring->uma_buf_registered &&
         ring->uma_buf_base != nullptr) {
-        uintptr_t dst_addr = (uintptr_t)&gpu_tile_pool[cell->slot_index];
+        uintptr_t dst_addr = (uintptr_t)&gpu_tile_pool[cell->slot_index] + dst_off;
         uintptr_t uma_base = (uintptr_t)ring->uma_buf_base;
         if (dst_addr >= uma_base &&
             (dst_addr - uma_base) + cell->bytes <= ring->uma_buf_len) {
@@ -301,7 +376,7 @@ static void prepare_pager_sqe(RingContext             *ring,
     sqe->opcode    = IORING_OP_READ;
     sqe->flags     = IOSQE_FIXED_FILE;
     sqe->fd        = ENG_PACK_FD_SLOT;
-    sqe->addr      = (uint64_t)(uintptr_t)&gpu_tile_pool[cell->slot_index];
+    sqe->addr      = (uint64_t)((uintptr_t)&gpu_tile_pool[cell->slot_index] + dst_off);
     sqe->len       = cell->bytes;
     sqe->off       = cell->ssd_file_offset;
     sqe->buf_index = 0u;
@@ -370,7 +445,8 @@ static void submit_sync_boot_batch(RingContext       *ring,
                     if (g_backend.cell_uses_fixed_buf[idx] != 0u) {
                         const uint8_t *fbuf = ring_fixed_ptr(ring, ENG_FBUF_PAGER_BASE + idx);
                         if (fbuf != nullptr) {
-                            memcpy(&gpu_tile_pool[cells[idx].slot_index], fbuf, got);
+                            uint32_t dst_off = pager_v2_cell_dst_off(cells[idx].tile_id);
+                            memcpy((uint8_t *)&gpu_tile_pool[cells[idx].slot_index] + dst_off, fbuf, got);
                         }
                         g_backend.cell_uses_fixed_buf[idx] = 0u;
                     }
@@ -394,6 +470,90 @@ static void submit_sync_boot_batch(RingContext       *ring,
     }
 }
 
+static bool pager_node_is_resident(const GpuMathArchiveHeader *hdr,
+                                   uint32_t                    node_idx,
+                                   uint32_t                    slot_cap) {
+    if (g_backend.is_v2) {
+        if (g_backend.v2_node_to_slot == nullptr || node_idx >= g_backend.v2_node_count) {
+            return true;
+        }
+        uint32_t s = g_backend.v2_node_to_slot[node_idx];
+        if (s < slot_cap && g_backend.slot_to_node[s] == node_idx && g_backend.slot_inflight[s] == 0u) {
+            g_backend.slot_lru_clock[s] = ++g_backend.lru_tick;
+            return true;
+        }
+        return g_backend.v2_nodes[node_idx].ssd_offset_bytes == 0ull;
+    }
+    const GpuMathQuadNode *node = &hdr->nodes[node_idx];
+    if (node->resident != 0u && node->gpu_slot < slot_cap &&
+        g_backend.slot_to_node[node->gpu_slot] == node_idx) {
+        g_backend.slot_lru_clock[node->gpu_slot] = ++g_backend.lru_tick;
+        return true;
+    }
+    return false;
+}
+
+static bool pager_arm_tile_cell(const GpuMathArchiveHeader *hdr,
+                                uint32_t                    node_idx,
+                                uint32_t                    slot,
+                                GpuMathStreamCell          *cell) {
+    RelPtr2D rel_ssd = k_relptr2d_null;
+    uint64_t ssd_off = 0ull;
+    uint32_t rd_bytes = k_epack_tile_bytes;
+    uint32_t dst_off = 0u;
+    uint8_t  lod     = 0u;
+
+    if (g_backend.is_v2) {
+        if (g_backend.v2_nodes == nullptr || node_idx >= g_backend.v2_node_count) {
+            return false;
+        }
+        const EpackDiskNode *dn = &g_backend.v2_nodes[node_idx];
+        if (dn->ssd_offset_bytes == 0ull) {
+            return false;
+        }
+        rel_ssd  = relptr2d_pack(0, (int16_t)dn->grid_x, (int16_t)dn->grid_y, dn->lod, cell->epoch);
+        ssd_off  = dn->ssd_offset_bytes;
+        rd_bytes = (dn->tile_kind == k_epack_v2_tile_rgb)
+            ? k_epack_v2_rgb_bytes : k_epack_v2_dem_rgb_bytes;
+        dst_off  = (dn->tile_kind == k_epack_v2_tile_rgb) ? k_epack_v2_rgb_offset : 0u;
+        lod      = dn->lod;
+    } else {
+        const GpuMathQuadNode *node = &hdr->nodes[node_idx];
+        int32_t ssd_blk = relptr2d_block_delta(node->rel_ssd_payload);
+        rel_ssd = relptr2d_pack(ssd_blk, (int16_t)node->grid_x, (int16_t)node->grid_y,
+                                node->lod, cell->epoch);
+        ssd_off = relptr2d_resolve_addr(0ull, rel_ssd);
+        lod     = node->lod;
+    }
+
+    uint64_t gpu_dst = g_backend.bda_buf.address != 0ull
+        ? (g_backend.bda_buf.address + k_gmpack_header_bytes +
+           (uint64_t)slot * k_epack_tile_bytes + (uint64_t)dst_off)
+        : 0ull;
+    if (cell64_arm(cell, ssd_tile_cell_exec, rel_ssd, gpu_dst, ssd_off,
+                   node_idx, slot, lod) != 0) {
+        return false;
+    }
+    cell->bytes = rd_bytes;
+    return true;
+}
+
+static void pager_mark_slot_dirty_if_dem(uint32_t slot, uint32_t tid, uint64_t *dirty_mask) {
+    if (g_backend.is_v2 &&
+        (g_backend.v2_nodes == nullptr || tid >= g_backend.v2_node_count ||
+         g_backend.v2_nodes[tid].has_dem == 0u)) {
+        return;
+    }
+    if (dirty_mask != nullptr) {
+        *dirty_mask |= (1ull << (slot & 63u));
+    }
+    g_backend.dirty_slots_mask |= (1ull << (slot & 63u));
+    if (slot < backend_slot_cap()) {
+        g_backend.slot_dirty[slot] = 1u;
+        g_backend.dirty_slot_count++;
+    }
+}
+
 static uint32_t submit_async_needed_tiles(const char           *epack_path,
                                           GpuMathArchiveHeader *hdr,
                                           EpackTileBlock       *gpu_tile_pool,
@@ -408,9 +568,10 @@ static uint32_t submit_async_needed_tiles(const char           *epack_path,
         return 0u;
     }
 
-    const uint32_t slot_cap = backend_slot_cap();
-    uint32_t queued_async   = 0u;
-    uint32_t instant_cached = 0u;
+    const uint32_t slot_cap       = backend_slot_cap();
+    const uint32_t node_cap       = pager_node_cap();
+    uint32_t       queued_async   = 0u;
+    uint32_t       instant_cached = 0u;
 
     uint32_t clamp_n = needed_count > k_gmpack_gpu_slot_cap ? k_gmpack_gpu_slot_cap : needed_count;
     uint32_t local_needed[k_gmpack_gpu_slot_cap];
@@ -421,21 +582,17 @@ static uint32_t submit_async_needed_tiles(const char           *epack_path,
 
     for (uint32_t i = 0u; i < clamp_n; ++i) {
         uint32_t node_idx = local_needed[i];
-        if (node_idx >= k_gmpack_node_count) {
+        if (node_idx >= node_cap) {
             continue;
         }
-        GpuMathQuadNode *node = &hdr->nodes[node_idx];
-        if (node->resident != 0u && node->gpu_slot < slot_cap &&
-            g_backend.slot_to_node[node->gpu_slot] == node_idx) {
-            g_backend.slot_lru_clock[node->gpu_slot] = ++g_backend.lru_tick;
-            continue;
-        }
-        if (g_backend.node_inflight[node_idx] != 0u) {
+        if (pager_node_is_resident(hdr, node_idx, slot_cap) ||
+            pager_node_inflight_get(node_idx)) {
             continue;
         }
 
-        // Zero-syscall instant hit when tile is already cached in RAM from survey fusion
-        if (!g_backend.survey.persist_gmpack &&
+        // Zero-syscall instant hit when tile is already cached in RAM from survey fusion (v1 only)
+        if (!g_backend.is_v2 && !g_backend.survey.persist_gmpack &&
+            node_idx < k_gmpack_node_count &&
             g_backend.node_fuse_state[node_idx] == 2u &&
             g_backend.fused_cache[node_idx] != nullptr) {
             int slot = (node_idx == 0u)
@@ -446,15 +603,7 @@ static uint32_t submit_async_needed_tiles(const char           *epack_path,
             }
             GpuMathStreamCell tmp_cell;
             cell64_init(&tmp_cell, 1u);
-            int32_t  ssd_blk = relptr2d_block_delta(node->rel_ssd_payload);
-            RelPtr2D rel_ssd = relptr2d_pack(ssd_blk, (int16_t)node->grid_x, (int16_t)node->grid_y,
-                                             node->lod, tmp_cell.epoch);
-            uint64_t ssd_off = relptr2d_resolve_addr(0ull, rel_ssd);
-            uint64_t gpu_dst = g_backend.bda_buf.address != 0ull
-                ? (g_backend.bda_buf.address + k_gmpack_header_bytes + (uint64_t)slot * k_epack_tile_bytes)
-                : 0ull;
-            if (cell64_arm(&tmp_cell, ssd_tile_cell_exec, rel_ssd, gpu_dst, ssd_off,
-                           node_idx, (uint32_t)slot, node->lod) == 0) {
+            if (pager_arm_tile_cell(hdr, node_idx, (uint32_t)slot, &tmp_cell)) {
                 g_backend.slot_to_node[slot]   = node_idx;
                 g_backend.slot_lru_clock[slot] = ++g_backend.lru_tick;
                 PagerExecCtx exec_ctx = {
@@ -464,11 +613,7 @@ static uint32_t submit_async_needed_tiles(const char           *epack_path,
                     .gpu_tile_pool = gpu_tile_pool,
                 };
                 if (cell64_invoke(&tmp_cell, &exec_ctx) == 0) {
-                    if (io_dirty_mask != nullptr) {
-                        *io_dirty_mask |= (1ull << ((uint32_t)slot & 63u));
-                    }
-                    g_backend.slot_dirty[slot] = 1u;
-                    g_backend.dirty_slot_count++;
+                    pager_mark_slot_dirty_if_dem((uint32_t)slot, node_idx, io_dirty_mask);
                     hdr->dir.stream_loads_total++;
                     instant_cached++;
                 } else {
@@ -513,16 +658,7 @@ static uint32_t submit_async_needed_tiles(const char           *epack_path,
 
         uint32_t cidx           = (uint32_t)free_cell;
         GpuMathStreamCell *cell = &g_backend.cells[cidx];
-        int32_t  ssd_blk = relptr2d_block_delta(node->rel_ssd_payload);
-        RelPtr2D rel_ssd = relptr2d_pack(ssd_blk, (int16_t)node->grid_x, (int16_t)node->grid_y,
-                                         node->lod, cell->epoch);
-        uint64_t ssd_off = relptr2d_resolve_addr(0ull, rel_ssd);
-        uint64_t gpu_dst = g_backend.bda_buf.address != 0ull
-            ? (g_backend.bda_buf.address + k_gmpack_header_bytes + (uint64_t)slot * k_epack_tile_bytes)
-            : 0ull;
-
-        if (cell64_arm(cell, ssd_tile_cell_exec, rel_ssd, gpu_dst, ssd_off,
-                       node_idx, (uint32_t)slot, node->lod) != 0) {
+        if (!pager_arm_tile_cell(hdr, node_idx, (uint32_t)slot, cell)) {
             ring_sqe_unget(ring, 1u);
             continue;
         }
@@ -530,7 +666,7 @@ static uint32_t submit_async_needed_tiles(const char           *epack_path,
         g_backend.slot_to_node[slot]   = node_idx;
         g_backend.slot_lru_clock[slot] = ++g_backend.lru_tick;
         g_backend.slot_inflight[slot]  = 1u;
-        g_backend.node_inflight[node_idx] = 1u;
+        pager_node_inflight_set(node_idx, 1u);
         g_backend.cell_busy[cidx]      = 1u;
 
         prepare_pager_sqe(ring, sqe, cidx, cell, gpu_tile_pool);
@@ -548,6 +684,9 @@ static uint32_t submit_async_needed_tiles(const char           *epack_path,
     }
 
     if (instant_cached > 0u) {
+        if (g_backend.is_v2) {
+            backend_stream_refresh_v2_leaf_bindings(hdr);
+        }
         refresh_resident_tile_count(hdr);
     }
     return queued_async + instant_cached;
@@ -571,9 +710,7 @@ bool backend_on_cqe(const struct io_uring_cqe *cqe) {
     if (slot < k_gmpack_gpu_slot_cap) {
         g_backend.slot_inflight[slot] = 0u;
     }
-    if (tid < k_gmpack_node_count) {
-        g_backend.node_inflight[tid] = 0u;
-    }
+    pager_node_inflight_set(tid, 0u);
 
     if (g_backend.gpu_hdr == nullptr || g_backend.gpu_tiles == nullptr) {
         g_backend.cell_uses_fixed_buf[cidx] = 0u;
@@ -590,7 +727,8 @@ bool backend_on_cqe(const struct io_uring_cqe *cqe) {
         if (g_backend.cell_uses_fixed_buf[cidx] != 0u && slot < slot_cap) {
             const uint8_t *fbuf = ring_fixed_ptr(ring_get_context(), ENG_FBUF_PAGER_BASE + cidx);
             if (fbuf != nullptr) {
-                memcpy(&g_backend.gpu_tiles[slot], fbuf, got);
+                uint32_t dst_off = pager_v2_cell_dst_off(tid);
+                memcpy((uint8_t *)&g_backend.gpu_tiles[slot] + dst_off, fbuf, got);
             }
         }
     }
@@ -604,11 +742,7 @@ bool backend_on_cqe(const struct io_uring_cqe *cqe) {
         .gpu_tile_pool = g_backend.gpu_tiles,
     };
     if (cqe->res >= 0 && cell64_invoke(cell, &exec_ctx) == 0) {
-        g_backend.dirty_slots_mask |= (1ull << (slot & 63u));
-        if (slot < slot_cap) {
-            g_backend.slot_dirty[slot] = 1u;
-            g_backend.dirty_slot_count++;
-        }
+        pager_mark_slot_dirty_if_dem(slot, tid, nullptr);
         g_backend.gpu_hdr->dir.stream_loads_total++;
         g_backend.stream_async_cqes++;
         became_resident = true;
@@ -617,9 +751,12 @@ bool backend_on_cqe(const struct io_uring_cqe *cqe) {
     }
     cell64_poison_and_reincarnate(cell);
 
+    if (became_resident && g_backend.is_v2) {
+        backend_stream_refresh_v2_leaf_bindings(g_backend.gpu_hdr);
+    }
     refresh_resident_tile_count(g_backend.gpu_hdr);
     backend_gpu_directory_sync();
-    if (became_resident) {
+    if (became_resident && !g_backend.is_v2) {
         backend_gpu_survey_queue_mvs_tile(slot, tid);
         backend_gpu_survey_rebuild_surfels();
     }
@@ -637,13 +774,15 @@ bool backend_on_cqe(const struct io_uring_cqe *cqe) {
     }
 
     if (became_resident && getenv("ENGINE_DEBUG_STREAM") != nullptr) {
+        uint32_t dlod = 0u;
+        if (g_backend.is_v2 && g_backend.v2_nodes != nullptr && tid < g_backend.v2_node_count) {
+            dlod = g_backend.v2_nodes[tid].lod;
+        } else if (!g_backend.is_v2 && tid < k_gmpack_node_count) {
+            dlod = g_backend.gpu_hdr->nodes[tid].lod;
+        }
         printf("[Backend Async] Tile %u (LOD %u) resident in slot %u (async_cqes=%u, resident=%u/%u)\n",
-               tid,
-               tid < k_gmpack_node_count ? g_backend.gpu_hdr->nodes[tid].lod : 0u,
-               slot,
-               g_backend.stream_async_cqes,
-               g_backend.gpu_hdr->dir.resident_tile_count,
-               slot_cap);
+               tid, dlod, slot, g_backend.stream_async_cqes,
+               g_backend.gpu_hdr->dir.resident_tile_count, slot_cap);
         fflush(stdout);
     }
     return became_resident;
@@ -735,6 +874,9 @@ void backend_stream_drain_inflight(void) {
     memset(g_backend.cell_uses_fixed_buf, 0, sizeof g_backend.cell_uses_fixed_buf);
     memset(g_backend.slot_inflight, 0, sizeof g_backend.slot_inflight);
     memset(g_backend.node_inflight, 0, sizeof g_backend.node_inflight);
+    if (g_backend.v2_node_inflight != nullptr && g_backend.v2_node_count > 0u) {
+        memset(g_backend.v2_node_inflight, 0, g_backend.v2_node_count);
+    }
 
     if (g_backend.pack_fixed_registered && ring != nullptr && ring->is_initialized) {
         (void)ring_update_file(ring, ENG_PACK_FD_SLOT, -1);
@@ -777,6 +919,7 @@ int backend_stream_page_ssd_tiles(const char           *epack_path,
     uint32_t uring_turns = 0u;
 
     const uint32_t slot_cap = backend_slot_cap();
+    const uint32_t node_cap = pager_node_cap();
     uint32_t i = 0u;
     while (i < clamp_n) {
         uint32_t batch_count = 0u;
@@ -784,13 +927,10 @@ int backend_stream_page_ssd_tiles(const char           *epack_path,
 
         for (; i < clamp_n && batch_count < k_backend_cell_ring_cap; ++i) {
             uint32_t node_idx = needed_nodes[i];
-            if (node_idx >= k_gmpack_node_count) {
+            if (node_idx >= node_cap) {
                 continue;
             }
-            GpuMathQuadNode *node = &hdr->nodes[node_idx];
-            if (node->resident != 0u && node->gpu_slot < slot_cap &&
-                g_backend.slot_to_node[node->gpu_slot] == node_idx) {
-                g_backend.slot_lru_clock[node->gpu_slot] = ++g_backend.lru_tick;
+            if (pager_node_is_resident(hdr, node_idx, slot_cap)) {
                 continue;
             }
 
@@ -805,16 +945,7 @@ int backend_stream_page_ssd_tiles(const char           *epack_path,
             }
 
             GpuMathStreamCell *cell = &g_backend.cells[batch_count];
-            int32_t  ssd_blk = relptr2d_block_delta(node->rel_ssd_payload);
-            RelPtr2D rel_ssd = relptr2d_pack(ssd_blk, (int16_t)node->grid_x, (int16_t)node->grid_y,
-                                             node->lod, cell->epoch);
-            uint64_t ssd_off = relptr2d_resolve_addr(0ull, rel_ssd);
-            uint64_t gpu_dst = g_backend.bda_buf.address != 0ull
-                ? (g_backend.bda_buf.address + k_gmpack_header_bytes + (uint64_t)slot * k_epack_tile_bytes)
-                : 0ull;
-
-            if (cell64_arm(cell, ssd_tile_cell_exec, rel_ssd, gpu_dst, ssd_off,
-                           node_idx, (uint32_t)slot, node->lod) != 0) {
+            if (!pager_arm_tile_cell(hdr, node_idx, (uint32_t)slot, cell)) {
                 continue;
             }
             g_backend.slot_to_node[slot]   = node_idx;
@@ -850,11 +981,7 @@ int backend_stream_page_ssd_tiles(const char           *epack_path,
                 .gpu_tile_pool = gpu_tile_pool,
             };
             if (cell64_invoke(cell, &exec_ctx) == 0) {
-                *out_dirty_slots_mask |= (1ull << (slot & 63u));
-                if (slot < slot_cap) {
-                    g_backend.slot_dirty[slot] = 1u;
-                    g_backend.dirty_slot_count++;
-                }
+                pager_mark_slot_dirty_if_dem(slot, cell->tile_id, out_dirty_slots_mask);
                 hdr->dir.stream_loads_total++;
                 paged_in++;
             } else {
@@ -864,6 +991,9 @@ int backend_stream_page_ssd_tiles(const char           *epack_path,
         }
     }
 
+    if (paged_in > 0u && g_backend.is_v2) {
+        backend_stream_refresh_v2_leaf_bindings(hdr);
+    }
     refresh_resident_tile_count(hdr);
 
     if (paged_in > 0u && (hdr->dir.stream_loads_total <= k_gmpack_active_cut_cap || getenv("ENGINE_DEBUG_STREAM") != nullptr)) {

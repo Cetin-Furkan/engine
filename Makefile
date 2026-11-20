@@ -70,12 +70,6 @@ $(GEN_DIR)/%.spv: shaders/%.slang
 	esac; \
 	$(SLANGC) -target spirv -profile spirv_1_6 -stage "$$stage" -entry main -fvk-use-entrypoint-name -depfile "$(GEN_DIR)/$*.d" -Ishaders -o "$@" "$<"
 
-# plane.frag calls WaveRotate. The rotate profile keeps slangc from
-# auto-upgrading spirv_1_6 and warning on that one module.
-$(GEN_DIR)/plane.frag.spv: shaders/plane.frag.slang shaders/camera.slang shaders/lighting.slang
-	@mkdir -p $(dir $@)
-	$(SLANGC) -target spirv -profile spirv_1_6+spvGroupNonUniformRotateKHR -stage fragment -entry main -fvk-use-entrypoint-name -depfile "$(GEN_DIR)/plane.frag.d" -Ishaders -o "$@" "$<"
-
 # scene_cull.comp and scene_hiz.comp use Vulkan 1.4 subgroup ballot, arithmetic, and lane shuffles.
 $(GEN_DIR)/scene_cull.comp.spv: shaders/scene_cull.comp.slang
 	@mkdir -p $(dir $@)
@@ -93,6 +87,8 @@ $(GEN_DIR)/bevel.comp.spv: shaders/face_grid.slang
 $(GEN_DIR)/heat.comp.spv: shaders/heat_nbr.slang shaders/face_grid.slang
 $(GEN_DIR)/cube.vert.spv: shaders/camera.slang shaders/material.slang shaders/face_grid.slang
 $(GEN_DIR)/cube.frag.spv: shaders/lighting.slang
+$(GEN_DIR)/cube_shadow.vert.spv: shaders/camera.slang shaders/face_grid.slang
+$(GEN_DIR)/plane.frag.spv: shaders/camera.slang shaders/lighting.slang
 $(GEN_DIR)/shape.vert.spv: shaders/camera.slang shaders/material.slang
 $(GEN_DIR)/plot.vert.spv: shaders/camera.slang
 $(GEN_DIR)/gimbal.vert.spv: shaders/camera.slang
@@ -107,6 +103,7 @@ $(GEN_DIR)/scene_visbuf.frag.spv: shaders/scene_common.slang shaders/camera.slan
 $(GEN_DIR)/scene_visbuf_resolve.frag.spv: shaders/scene_common.slang shaders/camera.slang shaders/material.slang shaders/lighting.slang
 $(GEN_DIR)/scene_meshlet.vert.spv: shaders/scene_common.slang shaders/camera.slang shaders/material.slang
 $(GEN_DIR)/scene_meshlet.frag.spv: shaders/lighting.slang
+$(GEN_DIR)/scene_shadow.vert.spv: shaders/scene_common.slang shaders/camera.slang shaders/material.slang
 $(GEN_DIR)/lighting_gbuf.comp.spv: shaders/lighting_gi_common.slang shaders/camera.slang shaders/terrain_math.slang shaders/lighting.slang
 $(GEN_DIR)/lighting_hrc.comp.spv: shaders/lighting_gi_common.slang shaders/camera.slang shaders/terrain_math.slang shaders/lighting.slang
 $(GEN_DIR)/lighting_ssilvb.comp.spv: shaders/lighting_gi_common.slang shaders/camera.slang shaders/terrain_math.slang shaders/lighting.slang
@@ -116,7 +113,7 @@ $(GEN_DIR)/survey_2dgs.frag.spv: shaders/camera.slang shaders/terrain_math.slang
 
 -include $(wildcard $(GEN_DIR)/*.d)
 
-$(OBJ_DIR)/examples/demo/render/cube.o: $(GEN_DIR)/cube.vert.spv $(GEN_DIR)/cube.frag.spv $(GEN_DIR)/bevel.comp.spv $(GEN_DIR)/heat.comp.spv
+$(OBJ_DIR)/examples/demo/render/cube.o: $(GEN_DIR)/cube.vert.spv $(GEN_DIR)/cube.frag.spv $(GEN_DIR)/cube_shadow.vert.spv $(GEN_DIR)/bevel.comp.spv $(GEN_DIR)/heat.comp.spv
 $(OBJ_DIR)/examples/demo/render/solid.o: $(GEN_DIR)/solid.comp.spv
 $(OBJ_DIR)/examples/demo/render/shape.o: $(GEN_DIR)/shape.vert.spv $(GEN_DIR)/shape.frag.spv
 $(OBJ_DIR)/examples/demo/render/plane.o: $(GEN_DIR)/plane.vert.spv $(GEN_DIR)/plane.frag.spv
@@ -151,10 +148,9 @@ $(OBJ_DIR)/examples/demo/text/draw/draw.o: $(GEN_DIR)/text.vert.spv $(GEN_DIR)/t
 $(OBJ_DIR)/examples/demo/text/face/face.o: examples/demo/text/face/bundled/InterVariable.ttf
 $(OBJ_DIR)/examples/minimal/minimal.o: $(MINIMAL_GEN_DIR)/minimal.vert.spv $(MINIMAL_GEN_DIR)/minimal.frag.spv
 $(OBJ_DIR)/src/chrome/gpu.o: $(GEN_DIR)/chrome.vert.spv $(GEN_DIR)/chrome.frag.spv
-$(OBJ_DIR)/src/input/page/page.o: $(GEN_DIR)/input.comp.spv
 $(OBJ_DIR)/src/backend/math/gpu/directory.o: $(GEN_DIR)/terrain_filter.comp.spv $(GEN_DIR)/terrain_cull.comp.spv
 $(OBJ_DIR)/src/backend/terrain/survey/gpu_survey.o: $(GEN_DIR)/survey_mvs.comp.spv $(GEN_DIR)/survey_2dgs_cull.comp.spv $(GEN_DIR)/survey_2dgs.vert.spv $(GEN_DIR)/survey_2dgs.frag.spv
-$(OBJ_DIR)/src/scene/gpu/scene_gpu.o: $(GEN_DIR)/scene_cull.comp.spv $(GEN_DIR)/scene_hiz.comp.spv $(GEN_DIR)/scene_visbuf.vert.spv $(GEN_DIR)/scene_visbuf.frag.spv $(GEN_DIR)/scene_visbuf_resolve.vert.spv $(GEN_DIR)/scene_visbuf_resolve.frag.spv $(GEN_DIR)/scene_meshlet.vert.spv $(GEN_DIR)/scene_meshlet.frag.spv
+$(OBJ_DIR)/src/scene/gpu/scene_gpu.o: $(GEN_DIR)/scene_cull.comp.spv $(GEN_DIR)/scene_hiz.comp.spv $(GEN_DIR)/scene_visbuf.vert.spv $(GEN_DIR)/scene_visbuf.frag.spv $(GEN_DIR)/scene_visbuf_resolve.vert.spv $(GEN_DIR)/scene_visbuf_resolve.frag.spv $(GEN_DIR)/scene_meshlet.vert.spv $(GEN_DIR)/scene_meshlet.frag.spv $(GEN_DIR)/scene_shadow.vert.spv
 $(OBJ_DIR)/src/lighting/gpu/lighting_gpu.o: $(GEN_DIR)/lighting_gbuf.comp.spv $(GEN_DIR)/lighting_hrc.comp.spv $(GEN_DIR)/lighting_ssilvb.comp.spv
 $(OBJ_DIR)/src/physics/gpu/avbd_gpu.o: $(GEN_DIR)/physics_avbd.comp.spv
 

@@ -1,0 +1,16 @@
+# Pure Real-World Catchment Map: H.J. Andrews Experimental Forest (Oregon, USA)
+# 20 x 20 km (EPSG:26910, Center E=564000 N=4890000)
+# DEM: USGS 3DEP 1.0m OR_McKenzieRiver_2021_B21 | Imagery: NAIP 0.60m (2024)
+# Adaptive Quadtree LOD 0..8 (0.610 m/px full 20x20km + 0.305 m/px Lookout Creek core)
+# Keys: Wheel=Zoom (adaptive LOD streaming), Right-Drag=Orbit, Middle-Drag=Pan, K=Cycle Contours (0/1/2), Home=Reset View
+mode 3d
+tab 0
+draw 0
+ground off
+gimbal 1
+hud 1
+plot 0
+text 0
+terrain examples/demo/maps/hj_andrews_or.epack
+contours 1
+camera 0 3500 550 0.35 -0.82 0.055 1

@@ -1,5 +1,4 @@
 #include "frame/frame_int.h"
-#include "input/page.h"
 #include "vulkan/bda.h"
 
 // One command buffer: world, clear, HUD, then the acquire signal.
@@ -249,9 +248,6 @@ int record_and_submit_clear(VulkanContext *vk, FrameSlot *frame, VkSemaphore acq
                           frame->image.drm_format_modifier);
     }
     vkCmdEndRendering(frame->cmd_buf);
-    // The load runs with this buffer. A sample written after submit is
-    // still the one the dispatch observes if it has not reached the read.
-    input_page_record(frame->cmd_buf);
 
     frame_cmd_finish_present(frame->cmd_buf, vk, frame);
     gpu_timer_end_frame(frame->cmd_buf, frame);

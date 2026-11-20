@@ -430,6 +430,20 @@ bool cube_surface_hit(uint32_t heat_slot, float yaw_deg, float origin_x, float o
     if (!s_ready || ray == nullptr || heat_slot >= k_cube_heat_slots) {
         return false;
     }
+    // Instant circumsphere early-out before transforming 3,858 vertices / 7,168 triangles
+    const float bound_r = k_fillet_half * 1.88f;
+    const float rel[3]  = { ray->ox - origin_x, ray->oy - origin_y, ray->oz - origin_z };
+    const float dir[3]  = { ray->dx, ray->dy, ray->dz };
+    const float a_sph   = v3_dot(dir, dir);
+    const float b_sph   = v3_dot(rel, dir);
+    const float c_sph   = v3_dot(rel, rel) - bound_r * bound_r;
+    if (c_sph > 0.0f && b_sph > 0.0f) {
+        return false;
+    }
+    if (b_sph * b_sph - a_sph * c_sph < 0.0f) {
+        return false;
+    }
+
     cube_heat_shown_disp(heat_slot, s_disp);
     for (uint32_t i = 0; i < k_verts; ++i) {
         float disp[3];
@@ -442,7 +456,6 @@ bool cube_surface_hit(uint32_t heat_slot, float yaw_deg, float origin_x, float o
         pose_world(local, yaw_deg, origin_x, origin_y, origin_z, s_world + (size_t)i * 3u);
     }
     float origin[3] = { ray->ox, ray->oy, ray->oz };
-    float dir[3] = { ray->dx, ray->dy, ray->dz };
     float best = 0.0f;
     bool found = false;
     for (uint32_t q = 0; q < k_quads; ++q) {

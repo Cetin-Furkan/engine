@@ -40,6 +40,8 @@ typedef struct GpuCandidate {
     uint32_t                         graphics_queue_count;
     uint32_t                         compute_queue_count;
     uint32_t                         transfer_queue_count;
+    uint32_t                         graphics_ts_valid_bits;
+    uint32_t                         transfer_ts_valid_bits;
     bool                             has_graphics;
     bool                             graphics_lacks_compute;
     bool                             has_dedicated_compute;
@@ -292,23 +294,30 @@ static VulkanResult discover_queue_families(GpuCandidate *candidate) {
     candidate->graphics_queue_count = 0;
     candidate->compute_queue_count = 0;
     candidate->transfer_queue_count = 0;
+    candidate->graphics_ts_valid_bits = 0;
+    candidate->transfer_ts_valid_bits = 0;
     uint32_t count = 0;
-    vkGetPhysicalDeviceQueueFamilyProperties(candidate->device, &count, nullptr);
+    vkGetPhysicalDeviceQueueFamilyProperties2(candidate->device, &count, nullptr);
     if (count == 0) {
         return VULKAN_SUCCESS;
     }
 
-    VkQueueFamilyProperties *families = malloc(sizeof(*families) * count);
+    VkQueueFamilyProperties2 *families = malloc(sizeof(*families) * count);
     if (families == nullptr) {
         fprintf(stderr, "[Vulkan Error] Out of host memory while probing queue families\n");
         return VULKAN_ERROR_OUT_OF_HOST_MEMORY;
     }
-    vkGetPhysicalDeviceQueueFamilyProperties(candidate->device, &count, families);
+    for (uint32_t i = 0; i < count; ++i) {
+        families[i] = (VkQueueFamilyProperties2){
+            .sType = VK_STRUCTURE_TYPE_QUEUE_FAMILY_PROPERTIES_2,
+        };
+    }
+    vkGetPhysicalDeviceQueueFamilyProperties2(candidate->device, &count, families);
 
     bool saw_graphics = false;
     for (uint32_t i = 0; i < count; ++i) {
-        VkQueueFlags flags = families[i].queueFlags;
-        uint32_t queue_count = families[i].queueCount;
+        VkQueueFlags flags = families[i].queueFamilyProperties.queueFlags;
+        uint32_t queue_count = families[i].queueFamilyProperties.queueCount;
         if (queue_count == 0) {
             continue;
         }
@@ -358,8 +367,8 @@ static VulkanResult discover_queue_families(GpuCandidate *candidate) {
         uint32_t compute_family_transfer_count = 0;
 
         for (uint32_t i = 0; i < count; ++i) {
-            VkQueueFlags flags = families[i].queueFlags;
-            uint32_t queue_count = families[i].queueCount;
+            VkQueueFlags flags = families[i].queueFamilyProperties.queueFlags;
+            uint32_t queue_count = families[i].queueFamilyProperties.queueCount;
             if (queue_count == 0 || (flags & VK_QUEUE_GRAPHICS_BIT) != 0) {
                 continue;
             }
@@ -393,6 +402,15 @@ static VulkanResult discover_queue_families(GpuCandidate *candidate) {
             candidate->transfer_family = candidate->graphics_family;
             candidate->transfer_queue_count = candidate->graphics_queue_count;
         }
+    }
+
+    if (candidate->graphics_family < count) {
+        candidate->graphics_ts_valid_bits =
+            families[candidate->graphics_family].queueFamilyProperties.timestampValidBits;
+    }
+    if (candidate->transfer_family < count) {
+        candidate->transfer_ts_valid_bits =
+            families[candidate->transfer_family].queueFamilyProperties.timestampValidBits;
     }
 
     free(families);
@@ -431,8 +449,17 @@ static uint32_t score_candidate(const GpuCandidate *candidate) {
 }
 
 static VulkanResult evaluate_device(GpuCandidate *candidate) {
-    vkGetPhysicalDeviceProperties(candidate->device, &candidate->properties);
-    vkGetPhysicalDeviceMemoryProperties(candidate->device, &candidate->memory_properties);
+    VkPhysicalDeviceProperties2 props2 = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+    };
+    vkGetPhysicalDeviceProperties2(candidate->device, &props2);
+    candidate->properties = props2.properties;
+
+    VkPhysicalDeviceMemoryProperties2 mem2 = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2,
+    };
+    vkGetPhysicalDeviceMemoryProperties2(candidate->device, &mem2);
+    candidate->memory_properties = mem2.memoryProperties;
     measure_memory(candidate);
     if (candidate->properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU) {
         disqualify(candidate, "Software rasterizer (CPU device) is not used");
@@ -1121,6 +1148,10 @@ static VulkanResult open_candidate(VulkanContext *ctx, const GpuCandidate *chose
     ctx->device_info.device_id = best.properties.deviceID;
     ctx->device_info.driver_version = best.properties.driverVersion;
     ctx->device_info.api_version = best.properties.apiVersion;
+    memcpy(ctx->device_info.pipeline_cache_uuid, best.properties.pipelineCacheUUID, VK_UUID_SIZE);
+    ctx->device_info.limits = best.properties.limits;
+    ctx->device_info.graphics_ts_valid_bits = best.graphics_ts_valid_bits;
+    ctx->device_info.transfer_ts_valid_bits = best.transfer_ts_valid_bits;
     ctx->device_info.memory_properties = best.memory_properties;
     ctx->device_info.supports_dma_buf = best.supports_dma_buf;
     ctx->device_info.supports_drm_format_modifiers = best.supports_drm_modifiers;
@@ -1488,6 +1519,13 @@ static VulkanResult open_candidate(VulkanContext *ctx, const GpuCandidate *chose
         }
     }
     if (ctx->device_info.supports_push_descriptors) {
+        ctx->dispatch.vkCmdPushDescriptorSet2 =
+            (PFN_vkCmdPushDescriptorSet2)vkGetDeviceProcAddr(ctx->device, "vkCmdPushDescriptorSet2");
+        if (ctx->dispatch.vkCmdPushDescriptorSet2 == nullptr) {
+            ctx->dispatch.vkCmdPushDescriptorSet2 =
+                (PFN_vkCmdPushDescriptorSet2)vkGetDeviceProcAddr(
+                    ctx->device, "vkCmdPushDescriptorSet2KHR");
+        }
         ctx->dispatch.vkCmdPushDescriptorSet =
             (PFN_vkCmdPushDescriptorSet)vkGetDeviceProcAddr(ctx->device, "vkCmdPushDescriptorSet");
         if (ctx->dispatch.vkCmdPushDescriptorSet == nullptr) {
@@ -1541,6 +1579,7 @@ void vulkan_device_destroy(VulkanContext *ctx) {
     ctx->dispatch.vkGetDeviceFaultInfoEXT = nullptr;
     ctx->dispatch.vkSetDeviceMemoryPriorityEXT = nullptr;
     ctx->dispatch.vkCmdPushDescriptorSet = nullptr;
+    ctx->dispatch.vkCmdPushDescriptorSet2 = nullptr;
     ctx->dispatch.vkTransitionImageLayout = nullptr;
     ctx->dispatch.vkCopyMemoryToImage = nullptr;
 }

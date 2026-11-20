@@ -18,6 +18,11 @@ public static const uint k_dir_bytes            = 256u;
 public static const uint k_node_bytes           = 64u;
 public static const uint k_skirt_quads          = 64u;
 public static const uint k_skirt_verts          = 384u;
+public static const uint k_epack_v2_magic       = 0x324B5045u;
+public static const uint k_epack_v2_cut_cap     = 192u;
+public static const uint k_dir_v2_meta_off      = 23232u;
+public static const uint k_dir_v2_leaves_off    = 23288u;
+public static const uint k_indirect_cmds_word   = 200u; // byte offset 800 / 4
 
 public struct GpuMathQuadNodeGpu {
     public uint64_t rel_ssd_payload;
@@ -55,11 +60,71 @@ public GpuMathQuadNodeGpu load_quad_node(uint64_t dir_bda, uint idx) {
     return nodes[idx];
 }
 
-// Read active_leaves[leaf_i] from the 256-byte PULSE Active GPU Window (offset 112)
+// Query .epack v2 header properties from BDA page directory (fallback to v1 24km Baklan defaults)
+public bool dir_is_v2(uint64_t dir_bda) {
+    if (dir_bda == 0ull) {
+        return false;
+    }
+    uint *words = (uint *)dir_bda;
+    return words[0u] == k_epack_v2_magic && words[1u] == 2u;
+}
+
+public float dir_world_half_extent(uint64_t dir_bda) {
+    if (dir_bda == 0ull) {
+        return 12000.0;
+    }
+    float *floats = (float *)dir_bda;
+    float h = floats[4u];
+    return (h > 1.0) ? h : 12000.0;
+}
+
+public float2 dir_elev_range_m(uint64_t dir_bda) {
+    if (dir_bda == 0ull) {
+        return float2(800.0, 1720.0);
+    }
+    float *floats = (float *)dir_bda;
+    float mn = floats[5u];
+    float mx = floats[6u];
+    if (mx <= mn) {
+        return float2(800.0, 1720.0);
+    }
+    return float2(mn, mx);
+}
+
+public float dir_world_max_z(uint64_t dir_bda, float elev_base_m, float vertical_scale) {
+    float2 rng = dir_elev_range_m(dir_bda);
+    float mz = (rng.y - elev_base_m) * vertical_scale + 64.0;
+    return dir_is_v2(dir_bda) ? mz : max(mz, 1400.0);
+}
+
+// Compute local [0,1] UV and metric span inside any v2 RelPtr2D tile using embedded (lod, gx, gy)
+public float2 relptr2d_uv_and_span(uint64_t dir_bda, uint64_t rel_ptr, float2 world_xy, out float out_span) {
+    float half_ext = dir_world_half_extent(dir_bda);
+    uint  lod      = uint((rel_ptr >> 52) & 0xFu);
+    uint  gx       = uint((rel_ptr >> 16) & 0xFFFFu);
+    uint  gy       = uint(rel_ptr & 0xFFFFu);
+    float side     = float(1u << lod);
+    float span     = (2.0 * half_ext) / side;
+    float x0       = -half_ext + float(gx) * span;
+    float y0       = -half_ext + float(gy) * span;
+    out_span       = max(span, 0.25);
+    return clamp((world_xy - float2(x0, y0)) / span, float2(0.0), float2(1.0));
+}
+
+// Read active_leaves[leaf_i] from PULSE Active GPU Window (0..63 @ 112B, 64..191 @ 23288B)
 public uint load_active_leaf_index(uint64_t dir_bda, uint leaf_i) {
-    uint *packed_leaves = (uint *)(dir_bda + 112ull);
-    uint word = packed_leaves[leaf_i >> 1u];
-    return (leaf_i & 1u) != 0u ? (word >> 16u) : (word & 0xFFFFu);
+    if (leaf_i < 64u) {
+        uint *packed_leaves = (uint *)(dir_bda + 112ull);
+        uint word = packed_leaves[leaf_i >> 1u];
+        return (leaf_i & 1u) != 0u ? (word >> 16u) : (word & 0xFFFFu);
+    }
+    if (leaf_i < k_epack_v2_cut_cap) {
+        uint hi = leaf_i - 64u;
+        uint *packed_hi = (uint *)(dir_bda + uint64_t(k_dir_v2_leaves_off));
+        uint word = packed_hi[hi >> 1u];
+        return (hi & 1u) != 0u ? (word >> 16u) : (word & 0xFFFFu);
+    }
+    return 0u;
 }
 
 // Read compacted post-cull visible_nodes[inst_i] from the BDA indirect draw buffer (offset 32)
@@ -71,11 +136,11 @@ public uint load_visible_leaf_index(uint64_t dir_bda, uint64_t indirect_bda, uin
     return load_active_leaf_index(dir_bda, inst_i);
 }
 
-// Read per-instance dynamic vertex count from cmds[inst_i].vertex_count (word 72 + inst_i * 4)
+// Read per-instance dynamic vertex count from cmds[inst_i].vertex_count (word 200 + inst_i * 4)
 public uint load_visible_leaf_quads_side(uint64_t indirect_bda, uint inst_i, uint default_quads) {
     if (indirect_bda != 0ull) {
         uint *words = (uint *)indirect_bda;
-        uint vcnt = words[72u + inst_i * 4u];
+        uint vcnt = words[k_indirect_cmds_word + inst_i * 4u];
         if (vcnt <= (16u * 16u + k_skirt_quads) * 6u) {
             return 16u;
         }
@@ -385,11 +450,7 @@ float epack_sample_bilinear_ao(uint *words, float2 uv) {
     return lerp(lerp(a00, a10, fx), lerp(a01, a11, fx), fy);
 }
 
-// Fast 4-tap bilinear .epack v1 satellite imagery + 128x128 horizon AO sample
-// Branchless interior decode avoids SIMD16/32 subgroup divergence across 4x4 BC1 block borders.
-public float4 tile_sample_bilinear_imagery(uint64_t tile_bda, float2 uv) {
-    uint *words = (uint *)tile_bda;
-
+float3 epack_sample_bilinear_rgb(uint *words, float2 uv) {
     float2 tc = clamp(uv, float2(0.0), float2(1.0)) * float(k_tile_dim - 1u);
     uint x0 = uint(floor(tc.x));
     uint y0 = uint(floor(tc.y));
@@ -398,27 +459,39 @@ public float4 tile_sample_bilinear_imagery(uint64_t tile_bda, float2 uv) {
     float fx = tc.x - float(x0);
     float fy = tc.y - float(y0);
 
-    float3 rgb;
     if (x0 > 0u && x1 < (k_tile_dim - 1u) && y0 > 0u && y1 < (k_tile_dim - 1u)) {
         float3 c00 = epack_load_rgb_interior(words, x0, y0);
         float3 c10 = epack_load_rgb_interior(words, x1, y0);
         float3 c01 = epack_load_rgb_interior(words, x0, y1);
         float3 c11 = epack_load_rgb_interior(words, x1, y1);
-        rgb = lerp(lerp(c00, c10, fx), lerp(c01, c11, fx), fy);
-    } else {
-        float3 c00 = epack_load_rgb(words, x0, y0);
-        float3 c10 = epack_load_rgb(words, x1, y0);
-        float3 c01 = epack_load_rgb(words, x0, y1);
-        float3 c11 = epack_load_rgb(words, x1, y1);
-        rgb = lerp(lerp(c00, c10, fx), lerp(c01, c11, fx), fy);
+        return lerp(lerp(c00, c10, fx), lerp(c01, c11, fx), fy);
     }
+    float3 c00 = epack_load_rgb(words, x0, y0);
+    float3 c10 = epack_load_rgb(words, x1, y0);
+    float3 c01 = epack_load_rgb(words, x0, y1);
+    float3 c11 = epack_load_rgb(words, x1, y1);
+    return lerp(lerp(c00, c10, fx), lerp(c01, c11, fx), fy);
+}
+
+public float tile_sample_bilinear_ao(uint64_t tile_bda, float2 uv) {
+    if (tile_bda == 0ull) {
+        return 1.0;
+    }
+    return epack_sample_bilinear_ao((uint *)tile_bda, uv);
+}
+
+// Fast 4-tap bilinear .epack v1 satellite imagery + 128x128 horizon AO sample
+// Branchless interior decode avoids SIMD16/32 subgroup divergence across 4x4 BC1 block borders.
+public float4 tile_sample_bilinear_imagery(uint64_t tile_bda, float2 uv) {
+    uint *words = (uint *)tile_bda;
+    float3 rgb = epack_sample_bilinear_rgb(words, uv);
     float ao = epack_sample_bilinear_ao(words, uv);
     return float4(rgb, ao);
 }
 
-// 16-tap Catmull-Rom bicubic .epack v1 albedo + fused 5-tap CAS unsharp mask + bilinear 128x128 AO
-// Exploits linearity of BC1 endpoint interpolation: fuses bicubic + CAS scalar weights inside the 4x4
-// selector loop (only 12 scalar registers live!), then unpacks the 2x2 RGB565 block endpoints once at the end.
+// 16-tap Catmull-Rom bicubic .epack v1 albedo + continuous isotropic CAS unsharp mask + bilinear 128x128 AO
+// Exploits linearity of BC1 endpoint interpolation: accumulates scalar selector weights inside the 4x4
+// loop (no discrete integer-texel jumps!), unpacks the 2x2 RGB565 endpoints once, and applies smooth CAS.
 public float4 tile_sample_bicubic_imagery(uint64_t tile_bda, float2 uv, float cas_strength) {
     uint *words = (uint *)tile_bda;
 
@@ -467,17 +540,11 @@ public float4 tile_sample_bicubic_imagery(uint64_t tile_bda, float2 uv, float ca
             float2 rR    = float2(0.0);
             [unroll]
             for (uint rx = 0u; rx < 4u; ++rx) {
-                uint  cx    = x_s + rx;
-                bool  x_hi  = (cx >> 2u) != bx0;
-                uint  sel_w = x_hi ? sel_R : sel_L;
-                uint  s2    = (sel_w >> ((ly_sh | (cx & 3u)) << 1u)) & 3u;
-                float w     = wx[rx] * wy_v;
-                if (rx == 1u && ry == 1u) {
-                    w += cas_strength;
-                } else if ((rx == 1u && (ry == 0u || ry == 2u)) ||
-                           (ry == 1u && (rx == 0u || rx == 2u))) {
-                    w -= 0.25 * cas_strength;
-                }
+                uint   cx      = x_s + rx;
+                bool   x_hi    = (cx >> 2u) != bx0;
+                uint   sel_w   = x_hi ? sel_R : sel_L;
+                uint   s2      = (sel_w >> ((ly_sh | (cx & 3u)) << 1u)) & 3u;
+                float  w       = wx[rx] * wy_v;
                 float2 contrib = float2(w, w * float(s2));
                 rL += x_hi ? float2(0.0) : contrib;
                 rR += x_hi ? contrib : float2(0.0);
@@ -509,29 +576,29 @@ public float4 tile_sample_bicubic_imagery(uint64_t tile_bda, float2 uv, float ca
                    + (c0_11 * a11.x + d_11 * (a11.y * k_inv3));
         rgb = clamp(sum, float3(0.0), float3(1.0));
     } else {
-        float3 sum      = float3(0.0);
-        float3 c_center = float3(0.0);
-        float3 c_cross  = float3(0.0);
+        float3 sum = float3(0.0);
         int max_i = int(k_tile_dim) - 1;
         for (int dy = -1; dy <= 2; ++dy) {
             uint cy = uint(clamp(iy + dy, 0, max_i));
             float3 row = float3(0.0);
             for (int dx = -1; dx <= 2; ++dx) {
                 uint cx = uint(clamp(ix + dx, 0, max_i));
-                float3 tex = epack_load_rgb(words, cx, cy);
-                row += tex * wx[dx + 1];
-                if (dx == 0 && dy == 0) {
-                    c_center = tex;
-                } else if ((abs(dx) + abs(dy)) == 1) {
-                    c_cross += tex * 0.25;
-                }
+                row += epack_load_rgb(words, cx, cy) * wx[dx + 1];
             }
             sum += row * wy[dy + 1];
         }
         rgb = clamp(sum, float3(0.0), float3(1.0));
-        if (cas_strength > 0.0) {
-            rgb = clamp(rgb + (c_center - c_cross) * cas_strength, float3(0.0), float3(1.0));
-        }
+    }
+
+    if (cas_strength > 0.0) {
+        // Continuous isotropic 4-diagonal bilinear blur eliminates any integer texel stepping
+        float d_step = 0.65 / float(k_tile_dim - 1u);
+        float3 b0 = epack_sample_bilinear_rgb(words, uv + float2( d_step,  d_step));
+        float3 b1 = epack_sample_bilinear_rgb(words, uv + float2(-d_step,  d_step));
+        float3 b2 = epack_sample_bilinear_rgb(words, uv + float2( d_step, -d_step));
+        float3 b3 = epack_sample_bilinear_rgb(words, uv + float2(-d_step, -d_step));
+        float3 blur = 0.25 * (b0 + b1 + b2 + b3);
+        rgb = clamp(rgb + (rgb - blur) * cas_strength, float3(0.0), float3(1.0));
     }
 
     float ao = epack_sample_bilinear_ao(words, uv);

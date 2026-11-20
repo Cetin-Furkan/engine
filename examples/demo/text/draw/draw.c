@@ -168,11 +168,9 @@ static int text_ensure_ready(void) {
         text_shutdown(s_vk);
         return -1;
     }
-    VkPhysicalDeviceProperties props = {0};
-    vkGetPhysicalDeviceProperties(s_vk->physical_device, &props);
-    if (props.limits.maxPushConstantsSize < sizeof(TextPush)) {
+    if (s_vk->device_info.limits.maxPushConstantsSize < sizeof(TextPush)) {
         fprintf(stderr, "[Text Error] Push constants are %u bytes, text needs %zu\n",
-                props.limits.maxPushConstantsSize, sizeof(TextPush));
+                s_vk->device_info.limits.maxPushConstantsSize, sizeof(TextPush));
         text_shutdown(s_vk);
         return -1;
     }
@@ -266,11 +264,11 @@ void text_release(uint64_t signal_point) {
     }
 }
 
-static VkPipeline pick_pipeline(VkFormat format, VkFormat depth_format,
-                                VkSampleCountFlagBits samples) {
+static bool bind_pipeline(VkCommandBuffer cmd, VkFormat format, VkFormat depth_format,
+                          VkSampleCountFlagBits samples) {
     bool scene = depth_format != VK_FORMAT_UNDEFINED;
     if (scene && (depth_format != s_scene_depth || samples != s_scene_samples)) {
-        return VK_NULL_HANDLE;
+        return false;
     }
     VulkanGfxLive *live = nullptr;
     if (format == VK_FORMAT_B8G8R8A8_SRGB) {
@@ -279,9 +277,9 @@ static VkPipeline pick_pipeline(VkFormat format, VkFormat depth_format,
         live = scene ? &s_scene_unorm : &s_overlay_unorm;
     }
     if (live == nullptr) {
-        return VK_NULL_HANDLE;
+        return false;
     }
-    return vulkan_gfx_use(s_vk, live);
+    return vulkan_gfx_bind(s_vk, cmd, live);
 }
 
 void text_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height, VkFormat format,
@@ -295,8 +293,7 @@ void text_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height, VkFormat fo
     if (quads == 0u) {
         return;
     }
-    VkPipeline pipeline = pick_pipeline(format, depth_format, samples);
-    if (pipeline == VK_NULL_HANDLE) {
+    if (!bind_pipeline(cmd, format, depth_format, samples)) {
         return;
     }
     TextPush push = {
@@ -307,7 +304,6 @@ void text_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height, VkFormat fo
         .dim    = TEXT_ATLAS_DIM,
         .spread = TEXT_SDF_SPREAD,
     };
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
     vulkan_cmd_push(cmd, s_layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                     sizeof push, &push);
     vkCmdDraw(cmd, 6, quads, 0, 0);

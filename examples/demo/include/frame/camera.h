@@ -23,7 +23,7 @@ static const float k_camera_zoom_max = 10000.0f;
 typedef struct ViewPush {
     uint64_t materials;
     uint32_t mat_index;
-    uint32_t mat_pad;
+    float    persp;
     float    qx;
     float    qy;
     float    qz;
@@ -33,6 +33,8 @@ typedef struct ViewPush {
     float    cam_z;
     float    zoom;
 } ViewPush;
+
+static_assert(sizeof(ViewPush) == 48u, "ViewPush must remain 48 bytes");
 
 void camera_reset(void);
 
@@ -72,6 +74,8 @@ bool camera_snap_front(void);
 bool camera_home(void);
 void camera_set_home_pose(float x, float y, float z, float yaw, float pitch, float zoom);
 void camera_set_turntable_mode(bool enabled);
+void camera_set_scene_3d(bool turntable_z, bool perspective, bool terrain_follow);
+[[nodiscard]] bool camera_refresh_turntable_home_z(void);
 
 // Orientation only. x, y, z, and zoom stay. Refused while the flat
 // profile locks the quaternion. A second front, while the held yaw

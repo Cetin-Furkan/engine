@@ -228,9 +228,69 @@ static inline void unpack_rgb565_f(uint16_t c, float *out_r, float *out_g, float
     *out_b = (float)((c >> 11u) & 31u) * (255.0f / 31.0f);
 }
 
+static float eval_bc1_block_err(uint16_t      p0,
+                                  uint16_t      p1,
+                                  const float   r[16],
+                                  const float   g[16],
+                                  const float   b[16],
+                                  const float   wt[16],
+                                  uint32_t     *out_sel) {
+    float q0r, q0g, q0b, q1r, q1g, q1b;
+    unpack_rgb565_f(p0, &q0r, &q0g, &q0b);
+    unpack_rgb565_f(p1, &q1r, &q1g, &q1b);
+
+    float pal_r[4], pal_g[4], pal_b[4];
+    for (uint32_t s = 0u; s < 4u; ++s) {
+        float w = (float)s * (1.0f / 3.0f);
+        pal_r[s] = q0r + (q1r - q0r) * w;
+        pal_g[s] = q0g + (q1g - q0g) * w;
+        pal_b[s] = q0b + (q1b - q0b) * w;
+    }
+
+    float total_err = 0.0f;
+    uint32_t sel_mask = 0u;
+    for (uint32_t i = 0u; i < 16u; ++i) {
+        float best_err = 1.0e30f;
+        uint32_t best_s = 0u;
+        for (uint32_t s = 0u; s < 4u; ++s) {
+            float er = r[i] - pal_r[s];
+            float eg = (g[i] - pal_g[s]) * 1.25f;
+            float eb = b[i] - pal_b[s];
+            float err = er * er + eg * eg + eb * eb;
+            if (err < best_err) {
+                best_err = err;
+                best_s = s;
+            }
+        }
+        total_err += best_err * wt[i];
+        sel_mask |= (best_s << (i * 2u));
+    }
+    if (out_sel != nullptr) {
+        *out_sel = sel_mask;
+    }
+    return total_err;
+}
+
+static uint16_t bump_rgb565_chan(uint16_t c, uint32_t chan, int delta) {
+    int r5 = (int)(c & 31u);
+    int g6 = (int)((c >> 5u) & 63u);
+    int b5 = (int)((c >> 11u) & 31u);
+    if (chan == 0u) {
+        r5 = r5 + delta;
+        r5 = (r5 < 0) ? 0 : ((r5 > 31) ? 31 : r5);
+    } else if (chan == 1u) {
+        g6 = g6 + delta;
+        g6 = (g6 < 0) ? 0 : ((g6 > 63) ? 63 : g6);
+    } else {
+        b5 = b5 + delta;
+        b5 = (b5 < 0) ? 0 : ((b5 > 31) ? 31 : b5);
+    }
+    return (uint16_t)((uint32_t)r5 | ((uint32_t)g6 << 5u) | ((uint32_t)b5 << 11u));
+}
+
 static void encode_color_block_4x4(const uint32_t *rgba, uint32_t bx, uint32_t by, EpackColorBlock *out_blk) {
-    float r[16], g[16], b[16];
-    float mr = 0.0f, mg = 0.0f, mb = 0.0f;
+    float r[16], g[16], b[16], wt[16];
+    float mr = 0.0f, mg = 0.0f, mb = 0.0f, wsum = 0.0f;
     float min_r = 255.0f, min_g = 255.0f, min_b = 255.0f;
     float max_r = 0.0f, max_g = 0.0f, max_b = 0.0f;
 
@@ -238,28 +298,46 @@ static void encode_color_block_4x4(const uint32_t *rgba, uint32_t bx, uint32_t b
     for (uint32_t ly = 0u; ly < 4u; ++ly) {
         uint32_t sy = by * 4u + ly;
         for (uint32_t lx = 0u; lx < 4u; ++lx) {
-            uint32_t p = rgba[sy * k_gmpack_tile_dim + bx * 4u + lx];
+            uint32_t sx = bx * 4u + lx;
+            uint32_t p = rgba[sy * k_gmpack_tile_dim + sx];
             float pr = (float)(p & 0xFFu);
             float pg = (float)((p >> 8u) & 0xFFu);
             float pb = (float)((p >> 16u) & 0xFFu);
+            // Perimeter texels (x/y == 0 or 255) are stored losslessly in border_rgb565 and never sampled from color_blocks.
+            float w = (sx == 0u || sx == (k_gmpack_tile_dim - 1u) ||
+                       sy == 0u || sy == (k_gmpack_tile_dim - 1u)) ? 0.0f : 1.0f;
             r[k] = pr;
             g[k] = pg;
             b[k] = pb;
-            mr += pr;
-            mg += pg;
-            mb += pb;
-            if (pr < min_r) min_r = pr;
-            if (pg < min_g) min_g = pg;
-            if (pb < min_b) min_b = pb;
-            if (pr > max_r) max_r = pr;
-            if (pg > max_g) max_g = pg;
-            if (pb > max_b) max_b = pb;
+            wt[k] = w;
+            if (w > 0.0f) {
+                mr += pr * w;
+                mg += pg * w;
+                mb += pb * w;
+                wsum += w;
+                if (pr < min_r) min_r = pr;
+                if (pg < min_g) min_g = pg;
+                if (pb < min_b) min_b = pb;
+                if (pr > max_r) max_r = pr;
+                if (pg > max_g) max_g = pg;
+                if (pb > max_b) max_b = pb;
+            }
             k++;
         }
     }
-    mr *= (1.0f / 16.0f);
-    mg *= (1.0f / 16.0f);
-    mb *= (1.0f / 16.0f);
+    if (wsum < 0.5f) {
+        for (uint32_t i = 0u; i < 16u; ++i) {
+            wt[i] = 1.0f;
+            mr += r[i];
+            mg += g[i];
+            mb += b[i];
+        }
+        wsum = 16.0f;
+    }
+    float inv_wsum = 1.0f / wsum;
+    mr *= inv_wsum;
+    mg *= inv_wsum;
+    mb *= inv_wsum;
 
     float span2 = (max_r - min_r) * (max_r - min_r) +
                   (max_g - min_g) * (max_g - min_g) +
@@ -274,25 +352,30 @@ static void encode_color_block_4x4(const uint32_t *rgba, uint32_t bx, uint32_t b
         return;
     }
 
-    // 3x3 covariance + 4 power-iteration steps for chroma-preserving principal axis
+    // Perceptually green-weighted 3x3 covariance + 6 power-iteration steps for principal axis
+    const float wg = 1.25f;
     float cxx = 0.0f, cxy = 0.0f, cxz = 0.0f;
     float cyy = 0.0f, cyz = 0.0f, czz = 0.0f;
     for (uint32_t i = 0u; i < 16u; ++i) {
+        float w = wt[i];
+        if (w <= 0.0f) {
+            continue;
+        }
         float dr = r[i] - mr;
-        float dg = g[i] - mg;
+        float dg = (g[i] - mg) * wg;
         float db = b[i] - mb;
-        cxx += dr * dr;
-        cxy += dr * dg;
-        cxz += dr * db;
-        cyy += dg * dg;
-        cyz += dg * db;
-        czz += db * db;
+        cxx += w * dr * dr;
+        cxy += w * dr * dg;
+        cxz += w * dr * db;
+        cyy += w * dg * dg;
+        cyz += w * dg * db;
+        czz += w * db * db;
     }
 
     float vx = max_r - min_r;
-    float vy = max_g - min_g;
+    float vy = (max_g - min_g) * wg;
     float vz = max_b - min_b;
-    for (uint32_t it = 0u; it < 4u; ++it) {
+    for (uint32_t it = 0u; it < 6u; ++it) {
         float nx = cxx * vx + cxy * vy + cxz * vz;
         float ny = cxy * vx + cyy * vy + cyz * vz;
         float nz = cxz * vx + cyz * vy + czz * vz;
@@ -308,71 +391,89 @@ static void encode_color_block_4x4(const uint32_t *rgba, uint32_t bx, uint32_t b
     float t_min =  1.0e9f;
     float t_max = -1.0e9f;
     for (uint32_t i = 0u; i < 16u; ++i) {
-        float t = (r[i] - mr) * vx + (g[i] - mg) * vy + (b[i] - mb) * vz;
+        if (wt[i] <= 0.0f) {
+            continue;
+        }
+        float t = (r[i] - mr) * vx + ((g[i] - mg) * wg) * vy + (b[i] - mb) * vz;
         if (t < t_min) t_min = t;
         if (t > t_max) t_max = t;
     }
 
-    float c0r = mr + vx * t_min, c0g = mg + vy * t_min, c0b = mb + vz * t_min;
-    float c1r = mr + vx * t_max, c1g = mg + vy * t_max, c1b = mb + vz * t_max;
+    const float inv_wg = 1.0f / wg;
+    float c0r = mr + vx * t_min, c0g = mg + (vy * inv_wg) * t_min, c0b = mb + vz * t_min;
+    float c1r = mr + vx * t_max, c1g = mg + (vy * inv_wg) * t_max, c1b = mb + vz * t_max;
 
-    // 1-pass least-squares endpoint refinement over 2-bit weights {0, 1/3, 2/3, 1}
-    float a00 = 0.0f, a01 = 0.0f, a11 = 0.0f;
-    float b0r = 0.0f, b0g = 0.0f, b0b = 0.0f;
-    float b1r = 0.0f, b1g = 0.0f, b1b = 0.0f;
-    float d_r = c1r - c0r, d_g = c1g - c0g, d_b = c1b - c0b;
-    float d_len2 = fmaxf(d_r * d_r + d_g * d_g + d_b * d_b, 1.0e-4f);
-    for (uint32_t i = 0u; i < 16u; ++i) {
-        float u = ((r[i] - c0r) * d_r + (g[i] - c0g) * d_g + (b[i] - c0b) * d_b) / d_len2;
-        int q = (int)lrintf(fminf(fmaxf(u, 0.0f), 1.0f) * 3.0f);
-        float w1 = (float)q * (1.0f / 3.0f);
-        float w0 = 1.0f - w1;
-        a00 += w0 * w0;
-        a01 += w0 * w1;
-        a11 += w1 * w1;
-        b0r += w0 * r[i]; b0g += w0 * g[i]; b0b += w0 * b[i];
-        b1r += w1 * r[i]; b1g += w1 * g[i]; b1b += w1 * b[i];
-    }
-    float det = a00 * a11 - a01 * a01;
-    if (det > 1.0e-3f) {
-        float inv_det = 1.0f / det;
-        c0r = (a11 * b0r - a01 * b1r) * inv_det;
-        c0g = (a11 * b0g - a01 * b1g) * inv_det;
-        c0b = (a11 * b0b - a01 * b1b) * inv_det;
-        c1r = (a00 * b1r - a01 * b0r) * inv_det;
-        c1g = (a00 * b1g - a01 * b0g) * inv_det;
-        c1b = (a00 * b1b - a01 * b0b) * inv_det;
+    // 3 alternating least-squares refinement passes over 2-bit weights {0, 1/3, 2/3, 1}
+    for (uint32_t pass = 0u; pass < 3u; ++pass) {
+        float a00 = 0.0f, a01 = 0.0f, a11 = 0.0f;
+        float b0r = 0.0f, b0g = 0.0f, b0b = 0.0f;
+        float b1r = 0.0f, b1g = 0.0f, b1b = 0.0f;
+        float d_r = c1r - c0r, d_g = (c1g - c0g) * wg, d_b = c1b - c0b;
+        float d_len2 = fmaxf(d_r * d_r + d_g * d_g + d_b * d_b, 1.0e-4f);
+        for (uint32_t i = 0u; i < 16u; ++i) {
+            float w = wt[i];
+            if (w <= 0.0f) {
+                continue;
+            }
+            float u = ((r[i] - c0r) * d_r + ((g[i] - c0g) * wg) * d_g + (b[i] - c0b) * d_b) / d_len2;
+            int q = (int)lrintf(fminf(fmaxf(u, 0.0f), 1.0f) * 3.0f);
+            float w1 = (float)q * (1.0f / 3.0f);
+            float w0 = 1.0f - w1;
+            a00 += w * w0 * w0;
+            a01 += w * w0 * w1;
+            a11 += w * w1 * w1;
+            b0r += w * w0 * r[i]; b0g += w * w0 * g[i]; b0b += w * w0 * b[i];
+            b1r += w * w1 * r[i]; b1g += w * w1 * g[i]; b1b += w * w1 * b[i];
+        }
+        float det = a00 * a11 - a01 * a01;
+        if (det > 1.0e-3f) {
+            float inv_det = 1.0f / det;
+            c0r = (a11 * b0r - a01 * b1r) * inv_det;
+            c0g = (a11 * b0g - a01 * b1g) * inv_det;
+            c0b = (a11 * b0b - a01 * b1b) * inv_det;
+            c1r = (a00 * b1r - a01 * b0r) * inv_det;
+            c1g = (a00 * b1g - a01 * b0g) * inv_det;
+            c1b = (a00 * b1b - a01 * b0b) * inv_det;
+        }
     }
 
     uint16_t p0 = pack_rgb565_f(c0r, c0g, c0b);
     uint16_t p1 = pack_rgb565_f(c1r, c1g, c1b);
-    float q0r, q0g, q0b, q1r, q1g, q1b;
-    unpack_rgb565_f(p0, &q0r, &q0g, &q0b);
-    unpack_rgb565_f(p1, &q1r, &q1g, &q1b);
-
-    float pal_r[4], pal_g[4], pal_b[4];
-    for (uint32_t s = 0u; s < 4u; ++s) {
-        float w = (float)s * (1.0f / 3.0f);
-        pal_r[s] = q0r + (q1r - q0r) * w;
-        pal_g[s] = q0g + (q1g - q0g) * w;
-        pal_b[s] = q0b + (q1b - q0b) * w;
-    }
-
     uint32_t selectors = 0u;
-    for (uint32_t i = 0u; i < 16u; ++i) {
-        uint32_t best_s = 0u;
-        float best_err = 1.0e30f;
-        for (uint32_t s = 0u; s < 4u; ++s) {
-            float er = r[i] - pal_r[s];
-            float eg = (g[i] - pal_g[s]) * 1.25f; // Perceptual green weight
-            float eb = b[i] - pal_b[s];
-            float err = er * er + eg * eg + eb * eb;
-            if (err < best_err) {
-                best_err = err;
-                best_s = s;
+    float best_err = eval_bc1_block_err(p0, p1, r, g, b, wt, &selectors);
+
+    // Greedy integer RGB565 coordinate refinement eliminates quantization rounding drift on low-span patches
+    for (uint32_t sweep = 0u; sweep < 2u; ++sweep) {
+        bool improved = false;
+        for (uint32_t ch = 0u; ch < 3u; ++ch) {
+            for (int d = -1; d <= 1; d += 2) {
+                uint16_t cand_p0 = bump_rgb565_chan(p0, ch, d);
+                if (cand_p0 != p0) {
+                    uint32_t cand_sel = 0u;
+                    float err = eval_bc1_block_err(cand_p0, p1, r, g, b, wt, &cand_sel);
+                    if (err < best_err) {
+                        best_err = err;
+                        p0 = cand_p0;
+                        selectors = cand_sel;
+                        improved = true;
+                    }
+                }
+                uint16_t cand_p1 = bump_rgb565_chan(p1, ch, d);
+                if (cand_p1 != p1) {
+                    uint32_t cand_sel = 0u;
+                    float err = eval_bc1_block_err(p0, cand_p1, r, g, b, wt, &cand_sel);
+                    if (err < best_err) {
+                        best_err = err;
+                        p1 = cand_p1;
+                        selectors = cand_sel;
+                        improved = true;
+                    }
+                }
             }
         }
-        selectors |= (best_s << (i * 2u));
+        if (!improved) {
+            break;
+        }
     }
 
     *out_blk = (EpackColorBlock){
@@ -774,6 +875,88 @@ int backend_terrain_write_epack_tile(const char *epack_path, uint32_t node_index
         return -1;
     }
     int rc = pwrite_exact_fd(fd, in_tile, sizeof(EpackTileBlock), (off_t)ssd_byte_offset);
+    close(fd);
+    return rc;
+}
+
+int backend_terrain_read_epack_v2(const char           *epack_path,
+                                  GpuMathArchiveHeader *out_hdr,
+                                  EpackDiskNode       **out_nodes,
+                                  uint32_t             *out_node_count) {
+    if (epack_path == nullptr || out_hdr == nullptr ||
+        out_nodes == nullptr || out_node_count == nullptr) {
+        return -1;
+    }
+    *out_nodes      = nullptr;
+    *out_node_count = 0u;
+
+    int fd = open(epack_path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        return -1;
+    }
+    if (pread_exact(fd, out_hdr, sizeof(GpuMathArchiveHeader), 0) != 0) {
+        close(fd);
+        return -1;
+    }
+    if (!backend_archive_is_v2(out_hdr)) {
+        close(fd);
+        return -1;
+    }
+
+    const EpackV2Meta *meta = backend_epack_v2_meta_const(out_hdr);
+    uint32_t cnt = meta->total_node_count;
+    if (cnt == 0u || cnt > 2000000u ||
+        meta->disk_table_offset < k_gmpack_header_bytes ||
+        meta->tile_data_offset < meta->disk_table_offset + (uint64_t)cnt * sizeof(EpackDiskNode)) {
+        close(fd);
+        return -1;
+    }
+
+    size_t table_bytes = (size_t)cnt * sizeof(EpackDiskNode);
+    EpackDiskNode *nodes = (EpackDiskNode *)calloc((size_t)cnt, sizeof(EpackDiskNode));
+    if (nodes == nullptr) {
+        close(fd);
+        return -1;
+    }
+    if (pread_exact(fd, nodes, table_bytes, (off_t)meta->disk_table_offset) != 0) {
+        free(nodes);
+        close(fd);
+        return -1;
+    }
+    close(fd);
+
+    if (nodes[0].lod != 0u || nodes[0].has_dem == 0u || nodes[0].has_rgb == 0u ||
+        nodes[0].ssd_offset_bytes < meta->tile_data_offset) {
+        free(nodes);
+        return -1;
+    }
+
+    *out_nodes      = nodes;
+    *out_node_count = cnt;
+    return 0;
+}
+
+int backend_terrain_read_epack_tile_v2(const char          *epack_path,
+                                       const EpackDiskNode *node,
+                                       EpackTileBlock      *out_tile) {
+    if (epack_path == nullptr || node == nullptr || out_tile == nullptr ||
+        node->ssd_offset_bytes == 0ull) {
+        return -1;
+    }
+    int fd = open(epack_path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        return -1;
+    }
+    int rc = -1;
+    if (node->tile_kind == k_epack_v2_tile_rgb) {
+        memset(out_tile, 0, k_epack_v2_rgb_offset);
+        rc = pread_exact(fd, (uint8_t *)out_tile + k_epack_v2_rgb_offset,
+                         k_epack_v2_rgb_bytes, (off_t)node->ssd_offset_bytes);
+        memset(out_tile->ao_grid, 255u, k_epack_ao_samples);
+    } else {
+        rc = pread_exact(fd, out_tile, k_epack_v2_dem_rgb_bytes, (off_t)node->ssd_offset_bytes);
+        memset(out_tile->ao_grid, 214u, k_epack_ao_samples);
+    }
     close(fd);
     return rc;
 }

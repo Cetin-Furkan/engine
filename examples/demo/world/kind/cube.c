@@ -249,6 +249,16 @@ static void cube_prepare_scene(const WorldObj *o, bool live) {
     lighting_submit_proxy(&proxy);
 }
 
+static void cube_draw_shadow_obj(const WorldObj *o, VkCommandBuffer cmd,
+                                 const float light_clip_vp[16], bool live) {
+    const CubeData *c = o->data;
+    if (c == nullptr) {
+        return;
+    }
+    cube_draw_shadow(cmd, light_clip_vp, spin_deg(&c->spin, live),
+                     o->at.x, o->at.y, o->at.z, c->heat);
+}
+
 static void cube_draw_obj(const WorldObj *o, VkCommandBuffer cmd, uint32_t width, uint32_t height, bool live) {
     const CubeData *c = o->data;
     if (c == nullptr) {
@@ -346,6 +356,7 @@ static const WorldOps s_ops = {
     .on_click             = cube_on_click,
     .vertices             = cube_vertices,
     .prepare_scene        = cube_prepare_scene,
+    .draw_shadow          = cube_draw_shadow_obj,
     .draw                 = cube_draw_obj,
     .advance              = cube_advance,
     .commit               = cube_commit,
@@ -451,6 +462,34 @@ float cube_kind_restitution(const WorldObj *o) {
     }
     const CubeData *c = o->data;
     return c->restitution;
+}
+
+bool cube_kind_grab_move(WorldObj *o, Coord pos, float vx, float vy, bool release) {
+    if (o == nullptr || !o->alive || o->ops != &s_ops || o->data == nullptr) {
+        return false;
+    }
+    CubeData *c = o->data;
+    o->at = pos;
+    if (!release) {
+        c->vx    = 0.0f;
+        c->vy    = 0.0f;
+        c->vz    = 0.0f;
+        c->awake = false;
+    } else {
+        float spd = sqrtf(vx * vx + vy * vy);
+        if (spd > 1600.0f) {
+            float s = 1600.0f / spd;
+            vx *= s;
+            vy *= s;
+        }
+        c->vx    = vx;
+        c->vy    = vy;
+        c->vz    = 0.0f;
+        c->awake = true;
+    }
+    s_motion_drew = true;
+    world_note_motion_epoch();
+    return true;
 }
 
 static void cube_kind_self_check(void) {

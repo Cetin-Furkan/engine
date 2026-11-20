@@ -117,6 +117,11 @@ void world_builder_set_contours(WorldBuilder *wb, bool enabled) {
     terrain_set_contours(enabled);
 }
 
+void world_builder_set_contour_mode(WorldBuilder *wb, uint32_t mode) {
+    (void)wb;
+    terrain_set_contour_mode(mode);
+}
+
 bool world_builder_add_blueprint(WorldBuilder *wb, WorldBlueprint bp) {
     if (wb != nullptr && wb->failed) {
         return false;

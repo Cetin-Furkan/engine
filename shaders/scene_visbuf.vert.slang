@@ -56,9 +56,9 @@ VisVSOut main(uint vert_id : SV_VulkanVertexID, uint vulkan_inst_id : SV_VulkanI
 
     float4 clip;
     float3 vnrm, alb, emi;
-    float  rgh;
+    float  rgh, vz;
     scene_transform_vertex(pv, ml, inst, pc.view, pc.width, pc.height,
-                           clip, vnrm, alb, emi, rgh);
+                           clip, vnrm, alb, emi, rgh, vz);
 
     out.sv_pos = clip;
     out.vis_id = scene_visbuf_pack_id(inst_id, meshlet_id, prim_id);

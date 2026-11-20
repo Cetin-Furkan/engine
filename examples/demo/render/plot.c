@@ -57,6 +57,8 @@ typedef struct PlotPush {
     float    cam_y;
     float    cam_z;
     float    zoom;
+    float    persp;
+    uint32_t pad0;
 } PlotPush;
 
 typedef struct PlotBake {
@@ -70,7 +72,8 @@ static_assert(offsetof(PlotPush, kind) == 24u, "plot kind");
 static_assert(offsetof(PlotPush, r) == 28u, "plot color");
 static_assert(offsetof(PlotPush, qx) == 40u, "plot quat");
 static_assert(offsetof(PlotPush, zoom) == 68u, "plot zoom");
-static_assert(sizeof(PlotPush) == 72u, "plot push");
+static_assert(offsetof(PlotPush, persp) == 72u, "plot persp");
+static_assert(sizeof(PlotPush) == 80u, "plot push");
 static_assert(offsetof(PlotBake, mode) == 8u, "plot bake mode");
 static_assert(sizeof(PlotBake) == 16u, "plot bake");
 
@@ -514,21 +517,20 @@ static void draw_range(VkCommandBuffer cmd, uint32_t width, uint32_t height,
         .qx = view.qx, .qy = view.qy, .qz = view.qz, .qw = view.qw,
         .cam_x = view.cam_x, .cam_y = view.cam_y, .cam_z = view.cam_z,
         .zoom = view.zoom,
+        .persp = view.persp,
     };
     push_bytes(cmd, s_layout, VK_SHADER_STAGE_VERTEX_BIT, &push, sizeof push);
     vkCmdDraw(cmd, verts, 1, 0, 0);
 }
 
 void plot_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height) {
-    if (!plot_is_visible() || !plot_ensure_ready()) {
+    if (!plot_is_visible() || !plot_ensure_ready() ||
+        cmd == VK_NULL_HANDLE || width == 0 || height == 0 || s_draw_addr == 0) {
         return;
     }
-    VkPipeline pipeline = vulkan_gfx_use(s_vk, &s_gfx);
-    if (cmd == VK_NULL_HANDLE || width == 0 || height == 0 || pipeline == VK_NULL_HANDLE ||
-        s_draw_addr == 0) {
+    if (!vulkan_gfx_bind(s_vk, cmd, &s_gfx)) {
         return;
     }
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
     bool math_ok = s_mode != k_mode_off && s_draw_slice >= 0 &&
                    s_slice[s_draw_slice].math_ready && s_slice[s_draw_slice].mode == s_mode;
     if (math_ok) {
@@ -705,11 +707,9 @@ static bool plot_ensure_ready(void) {
         fprintf(stderr, "[Plot Error] The render pass has no depth format yet\n");
         return false;
     }
-    VkPhysicalDeviceProperties props = {0};
-    vkGetPhysicalDeviceProperties(vk->physical_device, &props);
-    if (props.limits.maxPushConstantsSize < sizeof(PlotPush)) {
+    if (vk->device_info.limits.maxPushConstantsSize < sizeof(PlotPush)) {
         fprintf(stderr, "[Plot Error] Push constants are %u bytes, the plot needs %zu\n",
-                props.limits.maxPushConstantsSize, sizeof(PlotPush));
+                vk->device_info.limits.maxPushConstantsSize, sizeof(PlotPush));
         return false;
     }
     s_queue = vk->queues.compute_queue != VK_NULL_HANDLE ? vk->queues.compute_queue : vk->queues.graphics_queue;

@@ -6,6 +6,7 @@
 #include "frame/plot.h"
 #include "frame/policy.h"
 #include "frame/sheet.h"
+#include "frame/terrain.h"
 #include "frame/text.h"
 #include "ring/ring.h"
 #include <errno.h>
@@ -60,11 +61,11 @@ static const char *k_preset_worlds[6] = {
     "sheet 1\n"
     "ground z\n"
     "smooth 0\n"
-    "solid Tetrahedron -520 260 0 yaw 25000 spin 1 inf 0 glow 1 bounce 0.45\n"
-    "solid Octahedron 520 260 0 yaw 45000 spin 1 inf 0 glow 1 bounce 0.68\n"
-    "solid Cone -520 -260 0 yaw 15000 spin 1 inf 0 glow 1 bounce 0.56\n"
-    "solid Torus 520 -260 0 yaw 65000 spin 1 inf 0 glow 1 bounce 0.82\n"
-    "cube 0 340 0 yaw 38000 spin 1 inf 0 glow 0 bounce 0.50\n",
+    "solid Tetrahedron -520 260 84 yaw 25000 spin 1 inf 0 glow 1 bounce 0.45\n"
+    "solid Octahedron 520 260 84 yaw 45000 spin 1 inf 0 glow 1 bounce 0.68\n"
+    "solid Cone -520 -260 93 yaw 15000 spin 1 inf 0 glow 1 bounce 0.56\n"
+    "solid Torus 520 -260 84 yaw 65000 spin 1 inf 0 glow 1 bounce 0.82\n"
+    "cube 0 340 201.77 yaw 38000 spin 1 inf 0 glow 0 bounce 0.50\n",
 
     // World 2: 3D-Only Gravity Drop & Elastic Non-Cube Solids (elevated drop with varied bounce)
     "mode 3d\n"
@@ -875,23 +876,37 @@ static bool match_kw(const char *p, const char *kw) {
     return p[n] == ' ' || p[n] == '\t' || p[n] == '\0';
 }
 
+static bool resolve_world_file(const char *name, char *out, size_t cap);
+
 static int place_terrain(const char *line, int number) {
+    char path[256] = {0};
     char tail = 0;
-    if (sscanf(line, "terrain %c", &tail) == 1) {
-        fprintf(stderr, "[World] %s:%d terrain takes no arguments\n", source_name(), number);
+    int got = sscanf(line, "terrain %255s %c", path, &tail);
+    if (got == 2) {
+        fprintf(stderr, "[World] %s:%d terrain takes at most 1 pack path argument\n", source_name(), number);
         return -1;
+    }
+    if (got == 1 && path[0] != '\0') {
+        char resolved[1024];
+        if (resolve_world_file(path, resolved, sizeof resolved)) {
+            terrain_set_pack_path(resolved);
+        } else {
+            terrain_set_pack_path(path);
+        }
+    } else {
+        terrain_set_pack_path(nullptr);
     }
     return terrain_kind_spawn() ? 0 : -1;
 }
 
 static int place_contours(const char *line, int number) {
-    int on = 0;
+    int mode = 0;
     char tail = 0;
-    if (sscanf(line, "contours %d %c", &on, &tail) != 1 || !flag_bit(on)) {
-        fprintf(stderr, "[World] %s:%d contours needs 0 or 1\n", source_name(), number);
+    if (sscanf(line, "contours %d %c", &mode, &tail) != 1 || mode < 0 || mode > 2) {
+        fprintf(stderr, "[World] %s:%d contours needs 0, 1, or 2\n", source_name(), number);
         return -1;
     }
-    world_builder_set_contours(nullptr, on != 0);
+    world_builder_set_contour_mode(nullptr, (uint32_t)mode);
     return 0;
 }
 
@@ -1174,6 +1189,9 @@ static int append_object(char *body, size_t cap, size_t *used, const WorldObj *o
                            yaw, spinning, infinite, glow);
     }
     if (o->ops == terrain_ops()) {
+        if (backend_is_v2_archive()) {
+            return append_line(body, cap, used, "terrain %s\n", backend_active_pack_path());
+        }
         return append_line(body, cap, used, "terrain\n");
     }
     const char *name = o->ops->name != nullptr ? o->ops->name(o) : "object";

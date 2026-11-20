@@ -11,16 +11,23 @@
 // GPU-Math & Terrain Streaming Backend Lifecycle & Ray-DEM Solver (lifecycle.c)
 // ============================================================================
 
-BackendState g_backend;
 static char  s_custom_overlay_path[1024];
+static char  s_custom_pack_path[1024];
 
 static const char *k_default_pack_rel    = "examples/demo/maps/baklan_besparmak.gmpack";
 static const char *k_default_survey_rel  = "examples/demo/maps/besparmak_survey.manifest";
 static const char *k_default_overlay_rel = "examples/demo/maps/overlay.png";
 
-static void resolve_pack_path(char *out, size_t cap) {
-    int wrote = snprintf(out, cap, "%s", k_default_pack_rel);
+static void resolve_rel_or_exe_path(const char *rel_path, char *out, size_t cap) {
+    if (rel_path == nullptr || rel_path[0] == '\0') {
+        out[0] = '\0';
+        return;
+    }
+    int wrote = snprintf(out, cap, "%s", rel_path);
     if (wrote > 0 && (size_t)wrote < cap && access(out, R_OK) == 0) {
+        return;
+    }
+    if (rel_path[0] == '/') {
         return;
     }
     char exe[1024];
@@ -33,13 +40,18 @@ static void resolve_pack_path(char *out, size_t cap) {
                 break;
             }
             *slash = '\0';
-            int w = snprintf(out, cap, "%s/%s", exe, k_default_pack_rel);
+            int w = snprintf(out, cap, "%s/%s", exe, rel_path);
             if (w > 0 && (size_t)w < cap && access(out, R_OK) == 0) {
                 return;
             }
         }
     }
-    snprintf(out, cap, "%s", k_default_pack_rel);
+    snprintf(out, cap, "%s", rel_path);
+}
+
+static void resolve_pack_path(char *out, size_t cap) {
+    const char *cand = (s_custom_pack_path[0] != '\0') ? s_custom_pack_path : k_default_pack_rel;
+    resolve_rel_or_exe_path(cand, out, cap);
 }
 
 static void resolve_epack_path(const char *pack_path, char *out, size_t cap) {
@@ -48,6 +60,10 @@ static void resolve_epack_path(const char *pack_path, char *out, size_t cap) {
         return;
     }
     const char *ext = strrchr(pack_path, '.');
+    if (ext != nullptr && strcmp(ext, ".epack") == 0) {
+        snprintf(out, cap, "%s", pack_path);
+        return;
+    }
     if (ext != nullptr && strcmp(ext, ".gmpack") == 0) {
         size_t stem_len = (size_t)(ext - pack_path);
         if (stem_len + 7u < cap) {
@@ -433,6 +449,20 @@ static GpuMathTileBlock *ensure_lifecycle_scratch(void) {
     return g_backend.fuse_scratch;
 }
 
+static void free_v2_tables(void) {
+    free(g_backend.v2_nodes);
+    free(g_backend.v2_node_inflight);
+    free(g_backend.v2_node_to_slot);
+    g_backend.v2_nodes         = nullptr;
+    g_backend.v2_node_inflight = nullptr;
+    g_backend.v2_node_to_slot  = nullptr;
+    g_backend.v2_node_count    = 0u;
+    g_backend.v2_max_lod       = 0u;
+    g_backend.v2_flags         = 0u;
+    g_backend.is_v2            = false;
+    memset(g_backend.v2_leaf_disk_ids, 0, sizeof g_backend.v2_leaf_disk_ids);
+}
+
 static bool load_archive_into_bda(void) {
     if (g_backend.gpu_hdr == nullptr || g_backend.gpu_tiles == nullptr) {
         return false;
@@ -448,6 +478,7 @@ static bool load_archive_into_bda(void) {
     memset(g_backend.node_inflight, 0, sizeof g_backend.node_inflight);
     g_backend.pending_needed_count = 0u;
     g_backend.dirty_slot_count     = 0u;
+    g_backend.dirty_slots_mask     = 0ull;
     for (uint32_t c = 0u; c < k_backend_cell_ring_cap; ++c) {
         cell64_init(&g_backend.cells[c], (uint8_t)(c + 1u));
     }
@@ -460,6 +491,107 @@ static bool load_archive_into_bda(void) {
     for (uint32_t i = 0u; i < k_gmpack_node_count; ++i) {
         free(g_backend.fused_cache[i]);
         g_backend.fused_cache[i] = nullptr;
+    }
+    free_v2_tables();
+
+    EpackDiskNode *v2_nodes = nullptr;
+    uint32_t       v2_count = 0u;
+    if (backend_terrain_read_epack_v2(g_backend.epack_path, g_backend.gpu_hdr,
+                                      &v2_nodes, &v2_count) == 0) {
+        if (backend_terrain_read_epack_tile_v2(g_backend.epack_path, &v2_nodes[0],
+                                               &g_backend.gpu_tiles[0]) != 0) {
+            free(v2_nodes);
+            return false;
+        }
+        const EpackV2Meta *meta = backend_epack_v2_meta_const(g_backend.gpu_hdr);
+        g_backend.is_v2          = true;
+        g_backend.v2_nodes       = v2_nodes;
+        g_backend.v2_node_count  = v2_count;
+        g_backend.v2_max_lod     = meta->max_lod;
+        g_backend.v2_flags       = meta->flags;
+        g_backend.v2_node_inflight = (uint8_t *)calloc(v2_count, 1u);
+        g_backend.v2_node_to_slot  = (uint32_t *)malloc((size_t)v2_count * sizeof(uint32_t));
+        if (g_backend.v2_node_inflight == nullptr || g_backend.v2_node_to_slot == nullptr) {
+            free_v2_tables();
+            return false;
+        }
+        for (uint32_t i = 0u; i < v2_count; ++i) {
+            g_backend.v2_node_to_slot[i] = UINT32_MAX;
+        }
+        g_backend.v2_node_to_slot[0] = 0u;
+        g_backend.slot_to_node[0]    = 0u;
+        g_backend.slot_lru_clock[0]  = ++g_backend.lru_tick;
+        g_backend.slot_dirty[0]      = 1u;
+        g_backend.dirty_slot_count   = 1u;
+        g_backend.dirty_slots_mask   = 1ull;
+
+        memset(g_backend.gpu_hdr->nodes, 0, sizeof g_backend.gpu_hdr->nodes);
+        float half = fmaxf(g_backend.gpu_hdr->dir.world_half_extent, 1.0f);
+        GpuMathQuadNode *root = &g_backend.gpu_hdr->nodes[0];
+        root->rel_ssd_payload = relptr2d_pack((int32_t)k_gmpack_header_blocks, 0, 0, 0u, 1u);
+        root->rel_gpu_payload = relptr2d_pack((int32_t)k_gmpack_header_blocks, 0, 0, 0u, 1u);
+        uint32_t emin_b = 0u, emax_b = 0u;
+        memcpy(&emin_b, &v2_nodes[0].elev_min_m, sizeof emin_b);
+        memcpy(&emax_b, &v2_nodes[0].elev_max_m, sizeof emax_b);
+        root->rel_children = (RelPtr2D)((uint64_t)emin_b | ((uint64_t)emax_b << 32u));
+        root->header       = gpumath_tile_header_pack(
+            k_gmpack_header_blocks, 0u, 0u, k_tile_flag_resident | k_tile_flag_pinned,
+            fmaxf(v2_nodes[0].elev_min_m, 0.0f), fmaxf(v2_nodes[0].elev_max_m, 1.0f));
+        root->world_min_x  = -half;
+        root->world_min_y  = -half;
+        root->world_max_x  = half;
+        root->world_max_y  = half;
+        root->node_index   = 0u;
+        root->parent_index = 0u;
+        root->gpu_slot     = 0u;
+        root->lod          = 0u;
+        root->resident     = 1u;
+        root->elev_mean_m  = v2_nodes[0].elev_mean_m;
+
+        g_backend.gpu_hdr->dir.resident_tile_count = 1u;
+        g_backend.gpu_hdr->dir.active_leaf_count   = 1u;
+        g_backend.gpu_hdr->dir.active_leaves[0]    = 0u;
+
+        backend_survey_dataset_free(&g_backend.survey);
+        backend_survey_dataset_init(&g_backend.survey);
+        g_backend.survey_manifest_path[0] = '\0';
+        g_backend.overlay_active          = false;
+        g_backend.gpu_hdr->overlay        = (GpuMathOrthoOverlay){0};
+        g_backend.gpu_hdr->ortho_layer_count = 0u;
+
+        float restore_fx   = g_backend.have_focus ? g_backend.last_focus_x : 0.0f;
+        float restore_fy   = g_backend.have_focus ? g_backend.last_focus_y : 0.0f;
+        float restore_zoom = g_backend.have_focus ? g_backend.last_zoom    : 0.06f;
+        g_backend.have_focus = false;
+        backend_gpu_directory_sync();
+        (void)backend_update_camera_zoom(restore_fx, restore_fy, restore_zoom);
+
+        if (g_backend.indirect_hdr != nullptr) {
+            TerrainCullParams init_cull = {
+                .width          = 1920u,
+                .height         = 1080u,
+                .elev_base_m    = backend_elev_base_m(),
+                .vertical_scale = backend_vertical_scale(),
+                .verts_per_tile = (64u * 64u + 64u) * 6u,
+                .qx             = 0.0f,
+                .qy             = 0.0f,
+                .qz             = 0.0f,
+                .qw             = 1.0f,
+                .cam_x          = restore_fx,
+                .cam_y          = restore_fy,
+                .cam_z          = 300.0f,
+                .zoom           = restore_zoom,
+            };
+            (void)backend_stream_cull_frustum(g_backend.gpu_hdr, &init_cull, g_backend.indirect_hdr);
+        }
+        return true;
+    }
+
+    if (strstr(g_backend.epack_path, "baklan") == nullptr) {
+        fprintf(stderr,
+                "[Backend] Real .epack v2 map '%s' not found or unreadable (run scripts/build_hydro_maps.py).\n",
+                g_backend.epack_path);
+        return false;
     }
 
     if (backend_terrain_read_epack_header(g_backend.epack_path, g_backend.pack_path, g_backend.gpu_hdr) != 0) {
@@ -704,24 +836,23 @@ int backend_init(VulkanContext *vk) {
     const char *uma_io_mode = !g_backend.zero_copy_uma
         ? "READ_FIXED_STAGED"
         : ((uring != nullptr && uring->uma_buf_registered) ? "READ_FIXED_ZERO_GUP" : "READ_ZERO_COPY");
-    printf("[Backend] GPU-Math Terrain Streamer ready: %s (%.2f MiB BDA arena, %u x 100 KiB .epack slots, IO=%s) | BDA=0x%llx | IndirectBDA=0x%llx | %u RelPtr2D nodes (256x256) | Baklan & Beşparmak Dağı (%.0f..%.0f m) | Survey: %u photo(s), %u GCP(s), %u tie-pt(s), %u ortho upload(s) | Bird's-Eye Overlay: %s (%ux%u @ %.0f%% transparency)\n",
+    uint32_t dir_nodes = g_backend.is_v2 ? g_backend.v2_node_count : k_gmpack_node_count;
+    printf("[Backend] GPU-Math Terrain Streamer ready: %s (%.2f MiB BDA arena, %u x 100 KiB .epack%s slots, IO=%s) | BDA=0x%llx | IndirectBDA=0x%llx | %u nodes (%.0f m half) | Elev (%.0f..%.0f m) | Survey: %u photo(s), %u GCP(s), %u tie-pt(s), %u ortho upload(s)\n",
            g_backend.epack_path,
            (double)g_backend.bda_bytes / (1024.0 * 1024.0),
            g_backend.slot_cap,
+           g_backend.is_v2 ? " v2" : "",
            uma_io_mode,
            (unsigned long long)g_backend.bda_buf.address,
            (unsigned long long)g_backend.indirect_buf.address,
-           k_gmpack_node_count,
+           dir_nodes,
+           (double)backend_world_half_extent(),
            (double)g_backend.gpu_hdr->dir.elev_min_m,
            (double)g_backend.gpu_hdr->dir.elev_max_m,
            g_backend.survey.last_stats.photos_loaded,
            g_backend.survey.last_stats.survey_points_loaded,
            g_backend.survey.last_stats.tiepoints_triangulated,
-           g_backend.survey.ortho_overlay_count,
-           g_backend.overlay_image_path,
-           g_backend.overlay_w,
-           g_backend.overlay_h,
-           (double)((1.0f - g_backend.overlay_opacity) * 100.0f));
+           g_backend.survey.ortho_overlay_count);
     fflush(stdout);
     return 0;
 }
@@ -746,6 +877,7 @@ void backend_shutdown(VulkanContext *vk) {
     g_backend.fuse_scratch = nullptr;
     free(g_backend.overlay_cpu_pixels);
     g_backend.overlay_cpu_pixels = nullptr;
+    free_v2_tables();
     backend_survey_dataset_free(&g_backend.survey);
     backend_gpu_survey_shutdown(vk);
     backend_gpu_directory_shutdown(vk);
@@ -862,37 +994,85 @@ bool backend_sample_world_xy(float wx, float wy, TerrainSampleInfo *out) {
         return false;
     }
 
-    // Find the finest resident quadtree node covering (wx, wy)
-    uint32_t best_node = 0u;
-    uint32_t leaf_cnt  = g_backend.gpu_hdr->dir.active_leaf_count;
-    for (uint32_t i = 0u; i < leaf_cnt; ++i) {
-        uint32_t idx = g_backend.gpu_hdr->dir.active_leaves[i];
-        if (idx >= k_gmpack_node_count) {
-            continue;
+    const uint32_t slot_cap = backend_slot_cap();
+    uint32_t       best_node = 0u;
+    uint32_t       slot      = 0u;
+    float          min_x     = -half;
+    float          min_y     = -half;
+    float          max_x     = half;
+    float          max_y     = half;
+    uint8_t        node_lod  = 0u;
+    uint16_t       tile_gx   = 0u;
+    uint16_t       tile_gy   = 0u;
+
+    if (g_backend.is_v2 && g_backend.v2_nodes != nullptr) {
+        uint32_t cur = 0u;
+        uint32_t best_dem_nid = 0u;
+        for (uint32_t step = 0u; step <= g_backend.v2_max_lod && cur < g_backend.v2_node_count; ++step) {
+            const EpackDiskNode *cn = &g_backend.v2_nodes[cur];
+            uint32_t cslot = g_backend.v2_node_to_slot != nullptr ? g_backend.v2_node_to_slot[cur] : UINT32_MAX;
+            if (cn->has_dem != 0u && cslot < slot_cap &&
+                g_backend.slot_to_node[cslot] == cur && g_backend.slot_inflight[cslot] == 0u) {
+                best_dem_nid = cur;
+                slot         = cslot;
+            }
+            if (cn->first_child_idx == UINT32_MAX || cn->first_child_idx + 3u >= g_backend.v2_node_count) {
+                break;
+            }
+            float span = (2.0f * half) / (float)(1u << (cn->lod & 15u));
+            float midx = -half + ((float)cn->grid_x + 0.5f) * span;
+            float midy = -half + ((float)cn->grid_y + 0.5f) * span;
+            uint32_t qx = (wx >= midx) ? 1u : 0u;
+            uint32_t qy = (wy >= midy) ? 1u : 0u;
+            cur = cn->first_child_idx + (qy * 2u + qx);
         }
-        const GpuMathQuadNode *n = &g_backend.gpu_hdr->nodes[idx];
-        if (wx >= n->world_min_x && wx <= n->world_max_x &&
-            wy >= n->world_min_y && wy <= n->world_max_y) {
-            best_node = idx;
-            break;
+        const EpackDiskNode *dn = &g_backend.v2_nodes[best_dem_nid];
+        float span = (2.0f * half) / (float)(1u << (dn->lod & 15u));
+        min_x     = -half + (float)dn->grid_x * span;
+        min_y     = -half + (float)dn->grid_y * span;
+        max_x     = min_x + span;
+        max_y     = min_y + span;
+        best_node = best_dem_nid;
+        node_lod  = dn->lod;
+        tile_gx   = dn->grid_x;
+        tile_gy   = dn->grid_y;
+    } else {
+        uint32_t leaf_cnt  = g_backend.gpu_hdr->dir.active_leaf_count;
+        for (uint32_t i = 0u; i < leaf_cnt; ++i) {
+            uint32_t idx = g_backend.gpu_hdr->dir.active_leaves[i];
+            if (idx >= k_gmpack_node_count) {
+                continue;
+            }
+            const GpuMathQuadNode *n = &g_backend.gpu_hdr->nodes[idx];
+            if (wx >= n->world_min_x && wx <= n->world_max_x &&
+                wy >= n->world_min_y && wy <= n->world_max_y) {
+                best_node = idx;
+                break;
+            }
         }
-    }
-    const GpuMathQuadNode *node = &g_backend.gpu_hdr->nodes[best_node];
-    while (node->resident == 0u && node->lod > 0u) {
-        best_node = node->parent_index;
-        node = &g_backend.gpu_hdr->nodes[best_node];
+        const GpuMathQuadNode *node = &g_backend.gpu_hdr->nodes[best_node];
+        while (node->resident == 0u && node->lod > 0u) {
+            best_node = node->parent_index;
+            node = &g_backend.gpu_hdr->nodes[best_node];
+        }
+        slot = (node->resident != 0u && node->gpu_slot < backend_slot_cap() &&
+                g_backend.slot_inflight[node->gpu_slot] == 0u)
+            ? node->gpu_slot
+            : 0u;
+        min_x    = node->world_min_x;
+        min_y    = node->world_min_y;
+        max_x    = node->world_max_x;
+        max_y    = node->world_max_y;
+        node_lod = node->lod;
+        tile_gx  = node->grid_x;
+        tile_gy  = node->grid_y;
     }
 
-    uint32_t slot = (node->resident != 0u && node->gpu_slot < backend_slot_cap() &&
-                     g_backend.slot_inflight[node->gpu_slot] == 0u)
-        ? node->gpu_slot
-        : 0u;
     const EpackTileBlock *blk = &g_backend.gpu_tiles[slot];
-
-    float span_x = fmaxf(node->world_max_x - node->world_min_x, 1.0f);
-    float span_y = fmaxf(node->world_max_y - node->world_min_y, 1.0f);
-    float u = (wx - node->world_min_x) / span_x;
-    float v = (wy - node->world_min_y) / span_y;
+    float span_x = fmaxf(max_x - min_x, 0.5f);
+    float span_y = fmaxf(max_y - min_y, 0.5f);
+    float u = (wx - min_x) / span_x;
+    float v = (wy - min_y) / span_y;
 
     float elev_m = sample_tile_bilinear_m(blk, u, v);
     float du = 1.0f / (float)(k_gmpack_tile_dim - 1u);
@@ -900,7 +1080,7 @@ bool backend_sample_world_xy(float wx, float wy, TerrainSampleInfo *out) {
     float hr = sample_tile_bilinear_m(blk, u + du, v);
     float hd = sample_tile_bilinear_m(blk, u, v - du);
     float hu = sample_tile_bilinear_m(blk, u, v + du);
-    float step_m = 24000.0f / (float)((1u << node->lod) * (k_gmpack_tile_dim - 1u));
+    float step_m = (2.0f * half) / (float)((1u << (node_lod & 15u)) * (k_gmpack_tile_dim - 1u));
     float dzdx = (hr - hl) / (2.0f * step_m);
     float dzdy = (hu - hd) / (2.0f * step_m);
     float slope_deg = atanf(sqrtf(dzdx * dzdx + dzdy * dzdy)) * 57.2957795f;
@@ -912,19 +1092,21 @@ bool backend_sample_world_xy(float wx, float wy, TerrainSampleInfo *out) {
     double lat = g_backend.gpu_hdr->dir.lat_min_deg +
                  (double)global_v * (g_backend.gpu_hdr->dir.lat_max_deg - g_backend.gpu_hdr->dir.lat_min_deg);
 
+    float vscale = backend_vertical_scale();
+    float ebase  = backend_elev_base_m();
     if (out != nullptr) {
         *out = (TerrainSampleInfo){
             .latitude_deg  = lat,
             .longitude_deg = lon,
             .world_x       = wx,
             .world_y       = wy,
-            .world_z       = (elev_m - k_besparmak_elev_min) * g_backend.gpu_hdr->dir.vertical_scale,
+            .world_z       = (elev_m - ebase) * vscale,
             .elevation_m   = elev_m,
             .slope_deg     = slope_deg,
             .node_index    = best_node,
-            .lod           = node->lod,
-            .tile_gx       = node->grid_x,
-            .tile_gy       = node->grid_y,
+            .lod           = node_lod,
+            .tile_gx       = tile_gx,
+            .tile_gy       = tile_gy,
         };
     }
     return true;
@@ -935,7 +1117,7 @@ float backend_sample_elevation_world_z(float wx, float wy) {
     if (backend_sample_world_xy(wx, wy, &info)) {
         return info.world_z;
     }
-    return 180.0f;
+    return g_backend.is_v2 ? 0.0f : 180.0f;
 }
 
 bool backend_ray_pick_terrain(float ox, float oy, float oz,
@@ -944,10 +1126,12 @@ bool backend_ray_pick_terrain(float ox, float oy, float oz,
     if (!g_backend.initialized || g_backend.gpu_hdr == nullptr) {
         return false;
     }
-    // Ray-march from the top of Beşparmak Dağı's world Z envelope down to the z=0 Baklan plain
-    float max_z = (g_backend.gpu_hdr->dir.elev_max_m - k_besparmak_elev_min) *
-                  g_backend.gpu_hdr->dir.vertical_scale + 40.0f;
-    float min_z = -200.0f;
+    float vscale = backend_vertical_scale();
+    float ebase  = backend_elev_base_m();
+    float max_z  = (g_backend.gpu_hdr->dir.elev_max_m - ebase) * vscale + 60.0f;
+    float min_z  = g_backend.is_v2
+        ? ((g_backend.gpu_hdr->dir.elev_min_m - ebase) * vscale - 60.0f)
+        : -200.0f;
     if (fabsf(dz) < 1.0e-5f) {
         return false;
     }
@@ -1485,4 +1669,62 @@ void backend_get_bench_stats(BackendBenchStats *out) {
                                  &out->surfel_count,
                                  &out->visible_surfels,
                                  &out->mvs_gpu_dispatches);
+}
+
+void backend_set_pack_path(const char *pack_path) {
+    if (pack_path == nullptr || pack_path[0] == '\0') {
+        s_custom_pack_path[0] = '\0';
+    } else {
+        snprintf(s_custom_pack_path, sizeof s_custom_pack_path, "%s", pack_path);
+    }
+    if (!g_backend.initialized) {
+        return;
+    }
+    char next_pack[1024]  = {0};
+    char next_epack[1024] = {0};
+    resolve_pack_path(next_pack, sizeof next_pack);
+    resolve_epack_path(next_pack, next_epack, sizeof next_epack);
+    if (strcmp(next_epack, g_backend.epack_path) == 0) {
+        return;
+    }
+    snprintf(g_backend.pack_path, sizeof g_backend.pack_path, "%s", next_pack);
+    snprintf(g_backend.epack_path, sizeof g_backend.epack_path, "%s", next_epack);
+    g_backend.have_focus = false;
+    g_backend.initialized = false;
+    (void)load_archive_into_bda();
+    g_backend.initialized = true;
+}
+
+const char *backend_active_pack_path(void) {
+    return g_backend.epack_path[0] != '\0' ? g_backend.epack_path : k_default_pack_rel;
+}
+
+float backend_elev_base_m(void) {
+    if (g_backend.gpu_hdr != nullptr && g_backend.is_v2) {
+        return floorf(g_backend.gpu_hdr->dir.elev_min_m);
+    }
+    return k_besparmak_elev_min;
+}
+
+float backend_vertical_scale(void) {
+    if (g_backend.gpu_hdr != nullptr && g_backend.gpu_hdr->dir.vertical_scale > 0.01f) {
+        return g_backend.gpu_hdr->dir.vertical_scale;
+    }
+    return g_backend.is_v2 ? 1.0f : 1.15f;
+}
+
+float backend_world_half_extent(void) {
+    if (g_backend.gpu_hdr != nullptr && g_backend.gpu_hdr->dir.world_half_extent > 1.0f) {
+        return g_backend.gpu_hdr->dir.world_half_extent;
+    }
+    return k_terrain_world_half;
+}
+
+bool backend_is_real_measured_map(void) {
+    return g_backend.initialized && g_backend.is_v2 &&
+           ((g_backend.v2_flags & k_epack_v2_flag_real) != 0u);
+}
+
+bool backend_is_v2_archive(void) {
+    return g_backend.initialized && g_backend.is_v2;
 }

@@ -34,6 +34,8 @@ struct VSOutput {
     float2   tile_uv      : TEXCOORD2;
     float3   elev_span    : TEXCOORD3; // x = elev_m, y = resolved_tile_world_span, z = view_pos.z
     nointerpolation uint64_t tile_rel_ptr : TEXCOORD4;
+    nointerpolation uint64_t dem_rel_ptr  : TEXCOORD5;
+    float3                   dem_uv_span  : TEXCOORD6; // xy = dem_uv, z = dem_span
 };
 
 static const uint k_default_quads_per_side = 64u;
@@ -137,21 +139,49 @@ VSOutput main(uint vert_id : SV_VulkanVertexID, uint inst_id : SV_VulkanInstance
         lerp(node.world_min_y, node.world_max_y, local_uv.y)
     );
 
-    float2 resolved_uv = local_uv;
-    uint64_t tile_rel  = 0ull;
-    uint64_t tile_bda  = 0ull;
-    float resolved_span = max(node.world_max_x - node.world_min_x, 1.0);
-    resolve_resident_tile(pc.dir_bda, node, resolved_uv, tile_rel, tile_bda, resolved_span);
+    float2 resolved_uv   = local_uv;
+    uint64_t tile_rel    = 0ull;
+    uint64_t tile_bda    = 0ull;
+    float resolved_span  = max(node.world_max_x - node.world_min_x, 0.25);
+
+    float2 dem_uv        = local_uv;
+    uint64_t dem_rel     = 0ull;
+    uint64_t dem_bda     = 0ull;
+    float dem_span       = resolved_span;
+
+    if (dir_is_v2(pc.dir_bda)) {
+        tile_rel = node.rel_gpu_payload;
+        dem_rel  = node.rel_ssd_payload;
+        if (tile_rel == 0ull || dem_rel == 0ull) {
+            GpuMathQuadNodeGpu root = load_quad_node(pc.dir_bda, 0u);
+            if (tile_rel == 0ull) {
+                tile_rel = root.rel_gpu_payload;
+            }
+            if (dem_rel == 0ull) {
+                dem_rel = root.rel_ssd_payload;
+            }
+        }
+        resolved_uv = relptr2d_uv_and_span(pc.dir_bda, tile_rel, world_xy, resolved_span);
+        dem_uv      = relptr2d_uv_and_span(pc.dir_bda, dem_rel, world_xy, dem_span);
+        tile_bda    = relptr2d_resolve_gpu(pc.dir_bda, tile_rel);
+        dem_bda     = relptr2d_resolve_gpu(pc.dir_bda, dem_rel);
+    } else {
+        resolve_resident_tile(pc.dir_bda, node, resolved_uv, tile_rel, tile_bda, resolved_span);
+        dem_rel  = tile_rel;
+        dem_bda  = tile_bda;
+        dem_uv   = resolved_uv;
+        dem_span = resolved_span;
+    }
 
     float elev_m = pc.elev_base_m;
     float3 world_nrm = float3(0.0, 0.0, 1.0);
 
-    if (tile_bda != 0ull) {
+    if (dem_bda != 0ull) {
         float2 dh_duv = float2(0.0);
         // Fast 4-tap bilinear vertex displacement (fragment shader evaluates full continuous normal per pixel)
-        elev_m = tile_sample_bilinear_height_grad_m(tile_bda, resolved_uv, dh_duv);
-        float dzdx = (dh_duv.x / resolved_span) * pc.vertical_scale;
-        float dzdy = (dh_duv.y / resolved_span) * pc.vertical_scale;
+        elev_m = tile_sample_bilinear_height_grad_m(dem_bda, dem_uv, dh_duv);
+        float dzdx = (dh_duv.x / dem_span) * pc.vertical_scale;
+        float dzdy = (dh_duv.y / dem_span) * pc.vertical_scale;
         world_nrm = normalize(float3(-dzdx, -dzdy, 1.0));
     }
 
@@ -167,5 +197,7 @@ VSOutput main(uint vert_id : SV_VulkanVertexID, uint inst_id : SV_VulkanInstance
     out.tile_uv      = resolved_uv;
     out.elev_span    = float3(elev_m, resolved_span, view_pos.z);
     out.tile_rel_ptr = tile_rel;
+    out.dem_rel_ptr  = dem_rel;
+    out.dem_uv_span  = float3(dem_uv, dem_span);
     return out;
 }

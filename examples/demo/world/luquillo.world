@@ -1,0 +1,16 @@
+# Pure Real-World Catchment Map: Luquillo / El Yunque (Puerto Rico)
+# 20 x 20 km (EPSG:26920, Center E=205000 N=2026000)
+# DEM: USGS 3DEP 1.0m PR_PuertoRicoUSVI_D24 | Imagery: NAIP 0.30m (2022)
+# Adaptive Quadtree LOD 0..8 (down to 0.305 m/px across El Yunque, Mameyes, Bisley & Icacos)
+# Keys: Wheel=Zoom (adaptive LOD streaming), Right-Drag=Orbit, Middle-Drag=Pan, K=Cycle Contours (0/1/2), Home=Reset View
+mode 3d
+tab 0
+draw 0
+ground off
+gimbal 1
+hud 1
+plot 0
+text 0
+terrain examples/demo/maps/luquillo_pr.epack
+contours 1
+camera 0 0 450 0.48 -0.82 0.055 1

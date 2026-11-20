@@ -13,8 +13,8 @@ extern "C" {
 /**
  * @brief High-granularity status and error codes for the Vulkan subsystem.
  */
-typedef enum VulkanResult {
-    VULKAN_SUCCESS = 0,
+typedef enum VulkanResult : uint32_t {
+    VULKAN_SUCCESS = 0u,
     VULKAN_ERROR_INVALID_ARGUMENT,
     VULKAN_ERROR_OUT_OF_HOST_MEMORY,
     VULKAN_ERROR_OUT_OF_DEVICE_MEMORY,
@@ -85,8 +85,9 @@ typedef struct VulkanDispatchTable {
     PFN_vkGetDeviceFaultInfoEXT         vkGetDeviceFaultInfoEXT;
     PFN_vkSetDeviceMemoryPriorityEXT    vkSetDeviceMemoryPriorityEXT;
 
-    // --- Vulkan 1.4 Core: Push Descriptors & Host Image Copy ---
+    // --- Vulkan 1.4 Core: Push Descriptors (1.4 maintenance6 + core) & Host Image Copy ---
     PFN_vkCmdPushDescriptorSet          vkCmdPushDescriptorSet;
+    PFN_vkCmdPushDescriptorSet2         vkCmdPushDescriptorSet2;
     PFN_vkTransitionImageLayout         vkTransitionImageLayout;
     PFN_vkCopyMemoryToImage             vkCopyMemoryToImage;
 } VulkanDispatchTable;
@@ -116,10 +117,10 @@ typedef struct VulkanQueueInfo {
  * @brief Hardware-adaptive execution profile selected at boot (auto-probed or
  * overridden via ENGINE_GPU_PROFILE=auto|uma|discrete|hybrid).
  */
-typedef enum VulkanExecutionProfile {
-    VULKAN_PROFILE_DISCRETE_DIRECT = 0, // Dedicated PCIe VRAM, direct display scanout
-    VULKAN_PROFILE_UMA_IGPU        = 1, // Unified system + GPU memory (zero-copy LLC/BDA)
-    VULKAN_PROFILE_HYBRID_MUXLESS  = 2, // Discrete render GPU -> PCIe PRIME copy to iGPU scanout
+typedef enum VulkanExecutionProfile : uint32_t {
+    VULKAN_PROFILE_DISCRETE_DIRECT = 0u, // Dedicated PCIe VRAM, direct display scanout
+    VULKAN_PROFILE_UMA_IGPU        = 1u, // Unified system + GPU memory (zero-copy LLC/BDA)
+    VULKAN_PROFILE_HYBRID_MUXLESS  = 2u, // Discrete render GPU -> PCIe PRIME copy to iGPU scanout
 } VulkanExecutionProfile;
 
 static inline const char *vulkan_profile_to_str(VulkanExecutionProfile profile) {
@@ -141,6 +142,10 @@ typedef struct VulkanDeviceInfo {
     uint32_t                         device_id;
     uint32_t                         driver_version;
     uint32_t                         api_version;
+    uint8_t                          pipeline_cache_uuid[VK_UUID_SIZE];
+    VkPhysicalDeviceLimits           limits;
+    uint32_t                         graphics_ts_valid_bits;
+    uint32_t                         transfer_ts_valid_bits;
     VkPhysicalDeviceMemoryProperties memory_properties;
 
     // Hardware-adaptive execution profile and tuned resource budgets (v0.2 Milestone 1).
@@ -230,11 +235,44 @@ static inline void vulkan_cmd_push(VkCommandBuffer cmd, VkPipelineLayout layout,
         .sType      = VK_STRUCTURE_TYPE_PUSH_CONSTANTS_INFO,
         .layout     = layout,
         .stageFlags = stage,
-        .offset     = 0,
+        .offset     = 0u,
         .size       = size,
         .pValues    = values,
     };
     vkCmdPushConstants2(cmd, &info);
+}
+
+// Vulkan 1.4 core push descriptors (uses maintenance6 vkCmdPushDescriptorSet2 when resolved).
+static inline void vulkan_cmd_push_descriptors(
+    const VulkanContext        *vk,
+    VkCommandBuffer             cmd,
+    VkPipelineBindPoint         bind_point,
+    VkPipelineLayout            layout,
+    uint32_t                    set,
+    uint32_t                    write_count,
+    const VkWriteDescriptorSet *writes
+) {
+    if (vk == nullptr || cmd == VK_NULL_HANDLE || writes == nullptr || write_count == 0u) {
+        return;
+    }
+    if (vk->dispatch.vkCmdPushDescriptorSet2 != nullptr) {
+        VkShaderStageFlags stages = (bind_point == VK_PIPELINE_BIND_POINT_COMPUTE)
+            ? VK_SHADER_STAGE_COMPUTE_BIT
+            : VK_SHADER_STAGE_ALL_GRAPHICS;
+        VkPushDescriptorSetInfo info = {
+            .sType                = VK_STRUCTURE_TYPE_PUSH_DESCRIPTOR_SET_INFO,
+            .stageFlags           = stages,
+            .layout               = layout,
+            .set                  = set,
+            .descriptorWriteCount = write_count,
+            .pDescriptorWrites    = writes,
+        };
+        vk->dispatch.vkCmdPushDescriptorSet2(cmd, &info);
+        return;
+    }
+    if (vk->dispatch.vkCmdPushDescriptorSet != nullptr) {
+        vk->dispatch.vkCmdPushDescriptorSet(cmd, bind_point, layout, set, write_count, writes);
+    }
 }
 
 static inline void vulkan_name_object(const VulkanContext *vk, VkObjectType type,

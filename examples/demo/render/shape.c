@@ -162,11 +162,9 @@ static bool shape_ensure_ready(void) {
         return false;
     }
 
-    VkPhysicalDeviceProperties props = {0};
-    vkGetPhysicalDeviceProperties(s_vk->physical_device, &props);
-    if (props.limits.maxPushConstantsSize < sizeof(ShapePush)) {
+    if (s_vk->device_info.limits.maxPushConstantsSize < sizeof(ShapePush)) {
         fprintf(stderr, "[Shape Error] Push constants are %u bytes, the fill needs %zu\n",
-                props.limits.maxPushConstantsSize, sizeof(ShapePush));
+                s_vk->device_info.limits.maxPushConstantsSize, sizeof(ShapePush));
         return false;
     }
 
@@ -323,8 +321,7 @@ void shape_draw_polygon(VkCommandBuffer cmd, uint32_t width, uint32_t height,
         !shape_claim_slice()) {
         return;
     }
-    VkPipeline pipeline = vulkan_gfx_use(s_vk, &s_gfx);
-    if (pipeline == VK_NULL_HANDLE) {
+    if (!vulkan_gfx_bind(s_vk, cmd, &s_gfx)) {
         return;
     }
     float *pts = geom_alloc(n * 8u, 8u);
@@ -346,8 +343,6 @@ void shape_draw_polygon(VkCommandBuffer cmd, uint32_t width, uint32_t height,
         }
         indices_addr = geom_addr(ix);
     }
-
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
 
     ShapePush push = {
         .points    = geom_addr(pts),

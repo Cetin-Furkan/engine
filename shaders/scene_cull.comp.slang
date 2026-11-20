@@ -19,7 +19,7 @@ struct SceneCullPush {
     uint     work_count;
     uint     phase;        // 0 = Phase 1, 1 = Phase 2
     uint     enable_hiz;   // 1 = Hi-Z occlusion culling active
-    uint     pad0;
+    float    persp;
 };
 
 [[vk::push_constant]] SceneCullPush pc;
@@ -43,23 +43,38 @@ bool test_hiz_occluded(float3 world_center, float world_radius, float depth_bias
         return false;
     }
 
-    float4 q   = use_prev_cam ? float4(hdr.prev_qx, hdr.prev_qy, hdr.prev_qz, hdr.prev_qw)
-                              : float4(pc.qx, pc.qy, pc.qz, pc.qw);
-    float3 cam = use_prev_cam ? float3(hdr.prev_cam_x, hdr.prev_cam_y, hdr.prev_cam_z)
-                              : float3(pc.cam_x, pc.cam_y, pc.cam_z);
-    float zoom = use_prev_cam ? hdr.prev_zoom : pc.zoom;
-    uint  fw   = hdr.full_width;
-    uint  fh   = hdr.full_height;
+    float4 q    = use_prev_cam ? float4(hdr.prev_qx, hdr.prev_qy, hdr.prev_qz, hdr.prev_qw)
+                               : float4(pc.qx, pc.qy, pc.qz, pc.qw);
+    float3 cam  = use_prev_cam ? float3(hdr.prev_cam_x, hdr.prev_cam_y, hdr.prev_cam_z)
+                               : float3(pc.cam_x, pc.cam_y, pc.cam_z);
+    float zoom  = use_prev_cam ? hdr.prev_zoom : pc.zoom;
+    float persp = use_prev_cam ? asfloat(hdr.pad0) : pc.persp;
+    uint  fw    = hdr.full_width;
+    uint  fh    = hdr.full_height;
 
     float3 vc = view_of(world_center, q, cam);
-    float  z_sphere_min = 0.5 - (vc.z + world_radius) / 4096.0 - depth_bias - 1.5e-4;
+    float  z_sphere_min;
+    float  cx_px, cy_px, r_px;
+
+    if (persp > 1.0e-7) {
+        float w_near_sph = 1.0 - (vc.z + world_radius) * persp;
+        if (w_near_sph <= k_persp_w_near) {
+            return false;
+        }
+        float w_c = max(1.0 - vc.z * persp, k_persp_w_near);
+        z_sphere_min = (k_persp_z_a - k_persp_z_b / w_near_sph) - depth_bias - 1.5e-4;
+        cx_px = 0.5 * float(fw) + (vc.x / w_c) * zoom;
+        cy_px = 0.5 * float(fh) - (vc.y / w_c) * zoom;
+        r_px  = (world_radius / w_near_sph) * zoom + 2.0;
+    } else {
+        z_sphere_min = 0.5 - (vc.z + world_radius) / 4096.0 - depth_bias - 1.5e-4;
+        cx_px = 0.5 * float(fw) + vc.x * zoom;
+        cy_px = 0.5 * float(fh) - vc.y * zoom;
+        r_px  = world_radius * zoom + 1.0;
+    }
     if (z_sphere_min <= 0.0) {
         return false;
     }
-
-    float cx_px = 0.5 * float(fw) + vc.x * zoom;
-    float cy_px = 0.5 * float(fh) - vc.y * zoom;
-    float r_px  = world_radius * zoom + 1.0;
 
     // In Phase 1 (reprojecting into frame N-1), anything crossing the old screen border
     // had unrecorded offscreen pixels in frame N-1, so treat it as immediately visible.
@@ -113,21 +128,36 @@ void compute_meshlet_world_sphere(SceneMeshlet ml, SceneInstance inst,
     out_radius = max(sxy, sz) * inst.uniform_scale * ml.radius;
 }
 
-bool test_cone_backfacing(SceneMeshlet ml, SceneInstance inst, float4 q_cam) {
+bool test_cone_backfacing(SceneMeshlet ml, SceneInstance inst, float4 q_cam,
+                          float3 world_center, float world_radius) {
     if ((inst.flags & k_scene_flag_two_sided) != 0u || ml.cone_cutoff_s16 <= -32767) {
         return false;
     }
     float cutoff = float(ml.cone_cutoff_s16) * (1.0 / 32767.0);
     float3 axis  = scene_oct_decode(ml.cone_axis_oct_x, ml.cone_axis_oct_y);
 
-    // Map view +Z direction back into model normal space: R_pose^T * S^-1 * R_view^T * (0,0,1)
     float sz  = clamp(1.0 + inst.squash, 0.45, 1.85);
     float sxy = rsqrt(sz);
-    float3 cam_dir_world = scene_inv_view_rotate(q_cam, float3(0.0, 0.0, 1.0));
+    float3 cam_dir_world;
+    float  angular_pad = 0.0;
+    if (pc.persp > 1.0e-7) {
+        float3 cam_pos = float3(pc.cam_x, pc.cam_y, pc.cam_z);
+        float3 eye_w   = cam_pos + scene_inv_view_rotate(q_cam, float3(0.0, 0.0, 1.0 / pc.persp));
+        float3 to_eye  = eye_w - world_center;
+        float  dist    = length(to_eye);
+        if (dist <= world_radius * 1.1) {
+            return false;
+        }
+        cam_dir_world = to_eye / dist;
+        angular_pad   = world_radius / dist;
+    } else {
+        cam_dir_world = scene_inv_view_rotate(q_cam, float3(0.0, 0.0, 1.0));
+    }
+
     float3 cam_dir_scaled = float3(cam_dir_world.x / sxy, cam_dir_world.y / sxy, cam_dir_world.z / sz);
     float3 w_model = normalize(scene_inv_rotate_pose(cam_dir_scaled, inst.pitch_rad, inst.yaw_rad));
 
-    return dot(axis, w_model) < cutoff;
+    return dot(axis, w_model) < (cutoff - angular_pad);
 }
 
 bool test_sphere_in_frustum(float3 world_center, float world_radius, float depth_bias) {
@@ -135,8 +165,25 @@ bool test_sphere_in_frustum(float3 world_center, float world_radius, float depth
     float3 cam = float3(pc.cam_x, pc.cam_y, pc.cam_z);
     float3 vc  = view_of(world_center, q, cam);
 
-    float half_w_world = (max(float(pc.width), 1.0) * 0.5) / max(pc.zoom, 1.0e-6);
+    float half_w_world = (max(float(pc.width),  1.0) * 0.5) / max(pc.zoom, 1.0e-6);
     float half_h_world = (max(float(pc.height), 1.0) * 0.5) / max(pc.zoom, 1.0e-6);
+
+    if (pc.persp > 1.0e-7) {
+        float w_far_sph  = 1.0 - (vc.z - world_radius) * pc.persp;
+        float w_near_sph = 1.0 - (vc.z + world_radius) * pc.persp;
+        if (w_far_sph < k_persp_w_near || w_near_sph > k_persp_w_far) {
+            return false;
+        }
+        float w_max = max(w_far_sph, k_persp_w_near);
+        float rx = world_radius * sqrt(1.0 + (half_w_world * pc.persp) * (half_w_world * pc.persp));
+        float ry = world_radius * sqrt(1.0 + (half_h_world * pc.persp) * (half_h_world * pc.persp));
+        if (vc.x + rx < -half_w_world * w_max || vc.x - rx > half_w_world * w_max ||
+            vc.y + ry < -half_h_world * w_max || vc.y - ry > half_h_world * w_max) {
+            return false;
+        }
+        return true;
+    }
+
     if (vc.x + world_radius < -half_w_world || vc.x - world_radius > half_w_world ||
         vc.y + world_radius < -half_h_world || vc.y - world_radius > half_h_world) {
         return false;
@@ -218,7 +265,7 @@ void main(uint3 gtid : SV_GroupThreadID) {
             compute_meshlet_world_sphere(ml, inst, w_center, w_radius);
 
             if (pc.phase == 0u) {
-                if (test_cone_backfacing(ml, inst, q_cam)) {
+                if (test_cone_backfacing(ml, inst, q_cam, w_center, w_radius)) {
                     c_cone = true;
                 } else if (!test_sphere_in_frustum(w_center, w_radius, inst.depth_bias)) {
                     c_frust = true;

@@ -1,19 +1,16 @@
 // Slang 2026 Split / Holographic Radiance Cascades (HRC) Compute Pass
 // Constant space-angle hierarchy c in {3, 2, 1, 0} with Lambert equal-area S^2
-// binary KD subdivision + cooperative SLM proxy cache & scalar DEM interval oracle.
+// binary KD subdivision + cooperative SLM analytical proxy cache & scalar DEM oracle.
 
 #include "lighting_gi_common.slang"
 
 [[vk::push_constant]] LightingComputePush pc;
 
 groupshared LightingFrameHeader s_hdr;
+groupshared LightingShadowBlock s_sb;
 groupshared LightingProxyGpu    s_proxies[32];
 
-// Exact Lambert Cylindrical Equal-Area S^2 KD-partition for ray m in cascade c (M_c = 4 << c):
-// - Root quadrant q = m >> c in {0, 1, 2, 3} splits azimuth [0, 2*pi) into 4 quadrants.
-// - Subsequent cascade levels alternate splitting elevation z in [-0.42, +0.94] and azimuth phi,
-//   guaranteeing Omega(c, m) = Omega(c+1, 2m) U Omega(c+1, 2m+1) with equal measure dOmega!
-float3 hrc_world_ray_dir(uint c, uint m) {
+float3 hrc_world_ray_dir_jit(uint c, uint m, uint2 probe, uint frame_idx, bool ground_probe) {
     uint q   = (m >> c) & 3u;
     uint sub = m & ((1u << c) - 1u);
 
@@ -26,7 +23,7 @@ float3 hrc_world_ray_dir(uint c, uint m) {
     for (uint lv = 1u; lv <= 3u; ++lv) {
         if (lv <= c) {
             uint bit = (sub >> (c - lv)) & 1u;
-            if ((lv & 1u) != 0u) {
+            if (lv == 2u) {
                 z_idx   = (z_idx << 1u) | bit;
                 z_bins <<= 1u;
             } else {
@@ -36,11 +33,16 @@ float3 hrc_world_ray_dir(uint c, uint m) {
         }
     }
 
-    float u_phi = (float(phi_idx) + 0.5) / float(phi_bins);
-    float u_z   = (float(z_idx)   + 0.5) / float(z_bins);
+    uint  bayer4 = ((probe.x & 1u) | ((probe.y & 1u) << 1u));
+    uint  perm   = (bayer4 ^ (bayer4 >> 1u)) + ((probe.y & 1u) != 0u ? 1u : 0u);
+    float jit_p  = frac(0.25 * (float(perm & 3u) + 0.5) + float(frame_idx & 15u) * 0.6180339887);
+    float jit_z  = frac(0.50 * float((probe.x + probe.y) & 1u) + float(frame_idx & 15u) * 0.3819660113);
+
+    float u_phi = (float(phi_idx) + 0.15 + 0.70 * jit_p) / float(phi_bins);
+    float u_z   = (float(z_idx)   + 0.25 + 0.50 * jit_z) / float(z_bins);
 
     float phi  = u_phi * (2.0 * k_gi_pi);
-    float z    = lerp(-0.42, 0.94, u_z);
+    float z    = ground_probe ? lerp(0.06, 0.54, u_z) : lerp(-0.38, 0.92, u_z);
     float r_xy = sqrt(max(1.0 - z * z, 0.0));
     return float3(r_xy * cos(phi), r_xy * sin(phi), z);
 }
@@ -108,10 +110,12 @@ void main(uint3 tid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID) {
     uint lidx = gtid.y * 8u + gtid.x;
     if (lidx == 0u) {
         s_hdr = ((LightingFrameHeader *)(pc.env_bda + k_lighting_header_offset))[0];
+        s_sb  = ((LightingShadowBlock *)(pc.env_bda + k_lighting_shadow_offset))[0];
     }
     GroupMemoryBarrierWithGroupSync();
 
     LightingFrameHeader hdr = s_hdr;
+    LightingShadowBlock sb  = s_sb;
     uint c = pc.cascade_idx;
     if (hdr.magic != k_lighting_magic || hdr.hrc_bda == 0ull || hdr.gbuf_bda == 0ull || c >= 4u) {
         return;
@@ -141,7 +145,6 @@ void main(uint3 tid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID) {
     LightingGbufTexelGpu *gbuf = (LightingGbufTexelGpu *)hdr.gbuf_bda;
     LightingGbufTexelGpu anchor = gbuf[gy * hdr.gi_width + gx];
 
-    // Search 4 cardinal GI neighbors if exact probe texel fell on sky near a silhouette edge
     if (anchor.view_z <= -1.0e19) {
         static const int2 k_cardinal[4] = { int2(1, 0), int2(-1, 0), int2(0, 1), int2(0, -1) };
         [unroll]
@@ -172,8 +175,7 @@ void main(uint3 tid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID) {
 
     float2 anchor_uv = (float2(float(gx), float(gy)) + float2(0.5)) / float2(float(hdr.gi_width), float(hdr.gi_height));
     float2 full_px   = anchor_uv * float2(float(hdr.full_width), float(hdr.full_height));
-    float2 vxy       = lighting_pixel_to_view_xy(hdr, full_px);
-    float3 view_pos  = float3(vxy.x, vxy.y, anchor.view_z);
+    float3 view_pos  = lighting_pixel_to_view_pos(hdr, sb.persp, full_px, anchor.view_z);
 
     float4 q         = float4(hdr.qx, hdr.qy, hdr.qz, hdr.qw);
     float3 view_nrm  = lighting_unpack_oct_snorm16_gpu(anchor.oct_nrm_s16);
@@ -181,7 +183,9 @@ void main(uint3 tid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID) {
     float  px_w      = 1.0 / max(hdr.zoom, 1.0e-4);
     float3 world_pos = lighting_view_to_world(hdr, view_pos) + world_nrm * (1.5 * px_w);
 
-    float3 rd      = hrc_world_ray_dir(c, dir_m);
+    bool   ground_probe = (hdr.has_ground != 0u && hdr.terrain_dir_bda == 0ull &&
+                           (anchor.alb_flags >> 24u) == 3u && world_nrm.z > 0.5);
+    float3 rd      = hrc_world_ray_dir_jit(c, dir_m, uint2(probe_x, probe_y), hdr.frame_index, ground_probe);
     float  t_start = 0.0;
     float  t_end   = 0.0;
     hrc_interval_bounds(hdr, c, t_start, t_end);
@@ -193,7 +197,7 @@ void main(uint3 tid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID) {
     float3 best_alb     = float3(0.0);
     float3 best_emi     = float3(0.0);
 
-    // 1. Evaluate 3D Proxy Volumes from on-chip SLM (or global fallback if >32 proxies)
+    // 1. Evaluate 3D Analytical Proxy Volumes from on-chip SLM (cubes + solids + meshes, zero triangle loops!)
     if (p_cnt > 0u && p_cnt <= 32u) {
         for (uint i = 0u; i < p_cnt; ++i) {
             LightingProxyGpu pr = s_proxies[i];
@@ -225,16 +229,16 @@ void main(uint3 tid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID) {
         }
     }
 
-    // 2. Evaluate World 8 Terrain DEM Heightfield over [t_start, best_t]
-    //    Skip upward sky rays that start above peak elevation (1400.0 world units)
-    if (hdr.terrain_dir_bda != 0ull && !(rd.z >= 0.0 && (world_pos.z + rd.z * t_start) > 1400.0)) {
+    // 2. Evaluate SSD-streamed Terrain DEM Heightfield over [t_start, best_t]
+    float terrain_max_z = dir_world_max_z(hdr.terrain_dir_bda, hdr.elev_base_m, hdr.vertical_scale);
+    if (hdr.terrain_dir_bda != 0ull && !(rd.z >= 0.0 && (world_pos.z + rd.z * t_start) > terrain_max_z)) {
         uint  sub_steps = hdr.oracle_mode != 0u ? 4u : 2u;
         int   dem_lod   = max(3 - int(c), 0);
         float dt        = (best_t - t_start) / float(sub_steps);
         for (uint s = 1u; s <= sub_steps; ++s) {
             float  tc = t_start + dt * float(s);
             float3 wp = world_pos + rd * tc;
-            if (wp.z > 1400.0 && rd.z >= 0.0) {
+            if (wp.z > terrain_max_z && rd.z >= 0.0) {
                 break;
             }
             float dz = 0.0;
@@ -278,14 +282,12 @@ void main(uint3 tid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID) {
         if (dot(best_wnrm, rd) > 0.0 && !hit_terrain) {
             best_wnrm = -best_wnrm;
         }
-        float3 hit_vn = normalize(view_rotate(q, best_wnrm));
-        near_rad      = lighting_eval_direct_radiance(
-            hdr, hit_wp, best_wnrm, hit_vn, best_alb, best_emi, hit_terrain);
-        near_beta     = 0.0;
+        near_rad  = lighting_eval_direct_radiance_fast(
+            hdr, sb, hit_wp, best_wnrm, best_alb, best_emi, 1.0, hit_terrain);
+        near_beta = 0.0;
     }
 
-    // Exact Split / Holographic Radiance Cascade coarse-to-fine interval merge:
-    // L_c(x, m) = L_near + beta_near * 0.5 * (I(L_{c+1, 2m}) + I(L_{c+1, 2m+1}))
+    // Exact Split / Holographic Radiance Cascade coarse-to-fine interval merge
     float3 merged_rad  = near_rad;
     float  merged_beta = near_beta;
 

@@ -93,6 +93,8 @@ static uint32_t         s_turn_sum_ms = 0;
 static uint32_t         s_period_ms = 0;
 static bool             s_visible = false;
 static bool             s_logged = false;
+static uint64_t         s_bda_t0 = 0;
+static double           s_bda_mib = 0.0;
 
 void hud_set_visible(bool visible) {
     s_visible = visible;
@@ -155,11 +157,9 @@ static bool hud_ensure_ready(void) {
     if (s_vk == nullptr || s_vk->device == VK_NULL_HANDLE || s_vk->physical_device == VK_NULL_HANDLE) {
         return false;
     }
-    VkPhysicalDeviceProperties props = {0};
-    vkGetPhysicalDeviceProperties(s_vk->physical_device, &props);
-    if (props.limits.maxPushConstantsSize < sizeof(HudPush)) {
+    if (s_vk->device_info.limits.maxPushConstantsSize < sizeof(HudPush)) {
         fprintf(stderr, "[Hud Error] Push constants are %u bytes, the readout needs %zu\n",
-                props.limits.maxPushConstantsSize, sizeof(HudPush));
+                s_vk->device_info.limits.maxPushConstantsSize, sizeof(HudPush));
         return false;
     }
     VkPushConstantRange push = {
@@ -331,9 +331,13 @@ void hud_prepare(uint32_t frame_ms, bool have_stamp, uint64_t modifier) {
     uint32_t comp_us = 0;
     uint32_t rend_us = 0;
     frame_gpu_timings(&comp_us, &rend_us, nullptr);
-    BdaStats bda = {0};
-    bda_get_stats(&bda);
-    double bda_mib = (double)(bda.device_allocated + bda.staging_allocated) / (1024.0 * 1024.0);
+    if (s_bda_t0 == 0 || now - s_bda_t0 >= 250000000ull) {
+        BdaStats bda = {0};
+        bda_get_stats(&bda);
+        s_bda_mib = (double)(bda.device_allocated + bda.staging_allocated) / (1024.0 * 1024.0);
+        s_bda_t0 = now;
+    }
+    double bda_mib = s_bda_mib;
     int wrote[k_hud_lines];
     wrote[0] = snprintf(s_line[0], sizeof s_line[0], "%u fps  %u us", fps, us);
     wrote[1] = snprintf(s_line[1], sizeof s_line[1], "miss %u  %u cq/s", s_turn_missed, cqe_rate());
@@ -355,11 +359,11 @@ void hud_prepare(uint32_t frame_ms, bool have_stamp, uint64_t modifier) {
     }
 }
 
-static VkPipeline pick_pipeline(VkFormat format, VkFormat depth_format,
-                                VkSampleCountFlagBits samples) {
+static bool bind_pipeline(VkCommandBuffer cmd, VkFormat format, VkFormat depth_format,
+                          VkSampleCountFlagBits samples) {
     bool scene = depth_format != VK_FORMAT_UNDEFINED;
     if (scene && (depth_format != s_scene_depth || samples != s_scene_samples)) {
-        return VK_NULL_HANDLE;
+        return false;
     }
     VulkanGfxLive *live = nullptr;
     if (format == VK_FORMAT_B8G8R8A8_SRGB) {
@@ -368,9 +372,9 @@ static VkPipeline pick_pipeline(VkFormat format, VkFormat depth_format,
         live = scene ? &s_scene_unorm : &s_overlay_unorm;
     }
     if (live == nullptr) {
-        return VK_NULL_HANDLE;
+        return false;
     }
-    return vulkan_gfx_use(s_vk, live);
+    return vulkan_gfx_bind(s_vk, cmd, live);
 }
 
 void hud_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height, VkFormat format,
@@ -379,8 +383,7 @@ void hud_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height, VkFormat for
         width < 80u || height < 64u || !hud_ensure_ready()) {
         return;
     }
-    VkPipeline pipeline = pick_pipeline(format, depth_format, samples);
-    if (pipeline == VK_NULL_HANDLE) return;
+    if (!bind_pipeline(cmd, format, depth_format, samples)) return;
 
     uint32_t longest = 0;
     for (uint32_t row = 0; row < k_hud_lines; ++row) {
@@ -440,7 +443,6 @@ void hud_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height, VkFormat for
     }
 
     HudPush push = { .instances = slice.gpu, .fb_w = width, .fb_h = height };
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
     vulkan_cmd_push(cmd, s_layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                     sizeof push, &push);
     vkCmdDraw(cmd, 6, count, 0, 0);

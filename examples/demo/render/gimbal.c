@@ -195,8 +195,7 @@ void gimbal_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height) {
     if (!s_want || cmd == VK_NULL_HANDLE || width == 0 || height == 0 || !gimbal_ensure_ready()) {
         return;
     }
-    VkPipeline pipeline = vulkan_gfx_use(s_vk, &s_gfx);
-    if (pipeline == VK_NULL_HANDLE) {
+    if (!vulkan_gfx_bind(s_vk, cmd, &s_gfx)) {
         return;
     }
     ViewPush view;
@@ -210,7 +209,6 @@ void gimbal_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height) {
         .fb_h = (float)height,
         .ord  = gimbal_order(view.qx, view.qy, view.qz, view.qw),
     };
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
     vulkan_cmd_push(cmd, s_layout, VK_SHADER_STAGE_VERTEX_BIT, sizeof push, &push);
     vkCmdDraw(cmd, k_gimbal_verts, 1, 0, 0);
 }

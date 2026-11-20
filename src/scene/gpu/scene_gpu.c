@@ -35,6 +35,9 @@ alignas(uint32_t) static const unsigned char k_meshlet_vert_spv[] = {
 alignas(uint32_t) static const unsigned char k_meshlet_frag_spv[] = {
 #embed "scene_meshlet.frag.spv"
 };
+alignas(uint32_t) static const unsigned char k_shadow_vert_spv[] = {
+#embed "scene_shadow.vert.spv"
+};
 
 static_assert(sizeof k_cull_comp_spv % 4u == 0u, "scene_cull.comp.spv align");
 static_assert(sizeof k_hiz_comp_spv % 4u == 0u, "scene_hiz.comp.spv align");
@@ -44,6 +47,7 @@ static_assert(sizeof k_resolve_vert_spv % 4u == 0u, "scene_visbuf_resolve.vert.s
 static_assert(sizeof k_resolve_frag_spv % 4u == 0u, "scene_visbuf_resolve.frag.spv align");
 static_assert(sizeof k_meshlet_vert_spv % 4u == 0u, "scene_meshlet.vert.spv align");
 static_assert(sizeof k_meshlet_frag_spv % 4u == 0u, "scene_meshlet.frag.spv align");
+static_assert(sizeof k_shadow_vert_spv % 4u == 0u, "scene_shadow.vert.spv align");
 
 enum : uint32_t {
     k_vert_slab_cap      = 32768u,
@@ -135,7 +139,7 @@ typedef struct SceneCullPush {
     uint32_t work_count;
     uint32_t phase;
     uint32_t enable_hiz;
-    uint32_t pad0;
+    float    persp;
 } SceneCullPush;
 
 typedef struct SceneHizPush {
@@ -146,9 +150,19 @@ typedef struct SceneHizPush {
     float    zoom;
     uint32_t mode;
     uint32_t commit_prev;
-    uint32_t pad0;
+    float    persp;
     uint32_t pad1;
 } SceneHizPush;
+
+typedef struct SceneShadowPush {
+    uint64_t meshlets_bda;
+    uint64_t vertices_bda;
+    uint64_t triangles_bda;
+    uint64_t cull_slot_bda;
+    float    light_vp[16];
+} SceneShadowPush;
+
+static_assert(sizeof(SceneShadowPush) == 96u, "SceneShadowPush size");
 
 typedef struct SceneDrawPush {
     uint64_t        meshlets_bda;
@@ -203,6 +217,17 @@ typedef struct SceneTargetImage {
     uint32_t       height;
 } SceneTargetImage;
 
+enum : uint32_t {
+    k_scene_retire_cap = 8u,
+};
+
+typedef struct SceneRetiredRes {
+    SceneTargetImage img;
+    DaBuffer         buf;
+    uint64_t         retire_point;
+    bool             active;
+} SceneRetiredRes;
+
 static VulkanContext        *s_vk              = nullptr;
 static VkFormat              s_pass_depth_fmt  = VK_FORMAT_UNDEFINED;
 static VkSampleCountFlagBits s_pass_samples    = VK_SAMPLE_COUNT_1_BIT;
@@ -216,6 +241,8 @@ static bool                  s_used_hiz_this_frame = false;
 static DaBuffer              s_geom_slab       = {0};
 static DaBuffer              s_cull_buf        = {0};
 static DaBuffer              s_hiz_buf         = {0};
+static SceneRetiredRes       s_retired_res[k_scene_retire_cap];
+static uint64_t              s_screen_last_pt  = 0u;
 
 static SceneMeshRecord       s_meshes[K_SCENE_MAX_MESHES];
 static uint32_t              s_mesh_count      = 0u;
@@ -228,22 +255,27 @@ static SceneTargetImage      s_vis_color       = {0};
 static SceneHizHeader        s_hiz_hdr_cpu     = {0};
 static bool                  s_hiz_header_dirty = true;
 
-static VkDescriptorSetLayout s_tex_set_layout  = VK_NULL_HANDLE;
-static VkPipelineLayout      s_cull_layout     = VK_NULL_HANDLE;
-static VkPipeline            s_cull_pipe       = VK_NULL_HANDLE;
-static VkPipelineLayout      s_hiz_layout      = VK_NULL_HANDLE;
-static VkPipeline            s_hiz_pipe        = VK_NULL_HANDLE;
-static VkPipelineLayout      s_draw_layout     = VK_NULL_HANDLE;
-static VulkanGfxLive         s_depth_only_gfx  = {0};
-static VulkanGfxLive         s_visbuf_gfx      = {0};
-static VkPipelineLayout      s_resolve_layout  = VK_NULL_HANDLE;
-static VulkanGfxLive         s_resolve_gfx     = {0};
-static VulkanGfxLive         s_meshlet_gfx     = {0};
+static VkDescriptorSetLayout s_tex_set_layout     = VK_NULL_HANDLE;
+static VkDescriptorSetLayout s_resolve_set_layout = VK_NULL_HANDLE;
+static VkPipelineLayout      s_cull_layout        = VK_NULL_HANDLE;
+static VkPipeline            s_cull_pipe          = VK_NULL_HANDLE;
+static VkPipelineLayout      s_hiz_layout         = VK_NULL_HANDLE;
+static VkPipeline            s_hiz_pipe           = VK_NULL_HANDLE;
+static VkPipelineLayout      s_draw_layout        = VK_NULL_HANDLE;
+static VkPipelineLayout      s_meshlet_layout     = VK_NULL_HANDLE;
+static VkPipelineLayout      s_shadow_layout      = VK_NULL_HANDLE;
+static VulkanGfxLive         s_depth_only_gfx     = {0};
+static VulkanGfxLive         s_visbuf_gfx         = {0};
+static VkPipelineLayout      s_resolve_layout     = VK_NULL_HANDLE;
+static VulkanGfxLive         s_resolve_gfx        = {0};
+static VulkanGfxLive         s_meshlet_gfx        = {0};
+static VulkanGfxLive         s_shadow_gfx         = {0};
 
 static uint32_t              s_frame_slot      = 0u;
 static uint64_t              s_frame_counter   = 0u;
 static uint32_t              s_cur_instances   = 0u;
 static uint32_t              s_cur_work_items  = 0u;
+static float                 s_inst_bounds[K_SCENE_MAX_INSTANCES][4];
 static SceneViewParams       s_cur_view        = {0};
 static bool                  s_prepared_this_frame = false;
 static ScenePendingUpload    s_pending_uploads[K_SCENE_MAX_PENDING_UPLOADS];
@@ -308,10 +340,16 @@ static int create_target_image(VulkanContext *vk, uint32_t width, uint32_t heigh
         return -1;
     }
 
-    VkMemoryRequirements reqs = {0};
-    vkGetImageMemoryRequirements(vk->device, out->image, &reqs);
+    VkImageMemoryRequirementsInfo2 req_info = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2,
+        .image = out->image,
+    };
+    VkMemoryRequirements2 reqs2 = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2,
+    };
+    vkGetImageMemoryRequirements2(vk->device, &req_info, &reqs2);
     uint32_t mem_type = 0u;
-    if (vulkan_find_memory_type(vk, reqs.memoryTypeBits,
+    if (vulkan_find_memory_type(vk, reqs2.memoryRequirements.memoryTypeBits,
                                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &mem_type) != VULKAN_SUCCESS) {
         destroy_target_image(vk, out);
         return -1;
@@ -321,11 +359,20 @@ static int create_target_image(VulkanContext *vk, uint32_t width, uint32_t heigh
     VkMemoryAllocateInfo alloc_info = {
         .sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
         .pNext           = vulkan_chain_memory_priority(vk, &prio_info, 1.0f, nullptr),
-        .allocationSize  = reqs.size,
+        .allocationSize  = reqs2.memoryRequirements.size,
         .memoryTypeIndex = mem_type,
     };
-    if (vkAllocateMemory(vk->device, &alloc_info, nullptr, &out->memory) != VK_SUCCESS ||
-        vkBindImageMemory(vk->device, out->image, out->memory, 0u) != VK_SUCCESS) {
+    if (vkAllocateMemory(vk->device, &alloc_info, nullptr, &out->memory) != VK_SUCCESS) {
+        destroy_target_image(vk, out);
+        return -1;
+    }
+    VkBindImageMemoryInfo bind_info = {
+        .sType        = VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_INFO,
+        .image        = out->image,
+        .memory       = out->memory,
+        .memoryOffset = 0u,
+    };
+    if (vkBindImageMemory2(vk->device, 1u, &bind_info) != VK_SUCCESS) {
         destroy_target_image(vk, out);
         return -1;
     }
@@ -353,6 +400,74 @@ static int create_target_image(VulkanContext *vk, uint32_t width, uint32_t heigh
     return 0;
 }
 
+static bool scene_point_retired(uint64_t point);
+
+static void reap_retired_screen(VulkanContext *vk, bool force_all) {
+    if (vk == nullptr || vk->device == VK_NULL_HANDLE) {
+        return;
+    }
+    for (uint32_t i = 0u; i < k_scene_retire_cap; ++i) {
+        if (!s_retired_res[i].active) {
+            continue;
+        }
+        if (force_all || scene_point_retired(s_retired_res[i].retire_point)) {
+            destroy_target_image(vk, &s_retired_res[i].img);
+            da_buffer_destroy(vk, &s_retired_res[i].buf);
+            s_retired_res[i] = (SceneRetiredRes){0};
+        }
+    }
+}
+
+static void retire_screen_image(VulkanContext *vk, SceneTargetImage *img, uint64_t pt) {
+    if (vk == nullptr || img == nullptr || img->image == VK_NULL_HANDLE) {
+        return;
+    }
+    reap_retired_screen(vk, false);
+    for (uint32_t i = 0u; i < k_scene_retire_cap; ++i) {
+        if (!s_retired_res[i].active) {
+            s_retired_res[i] = (SceneRetiredRes){ .img = *img, .retire_point = pt, .active = true };
+            *img = (SceneTargetImage){0};
+            return;
+        }
+    }
+    if (s_upload_sem != VK_NULL_HANDLE && s_retired_res[0].retire_point > 0u) {
+        VkSemaphoreWaitInfo wi = {
+            .sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
+            .semaphoreCount = 1u, .pSemaphores = &s_upload_sem, .pValues = &s_retired_res[0].retire_point,
+        };
+        (void)vkWaitSemaphores(vk->device, &wi, 3000000000ull);
+    }
+    destroy_target_image(vk, &s_retired_res[0].img);
+    da_buffer_destroy(vk, &s_retired_res[0].buf);
+    s_retired_res[0] = (SceneRetiredRes){ .img = *img, .retire_point = pt, .active = true };
+    *img = (SceneTargetImage){0};
+}
+
+static void retire_screen_buf(VulkanContext *vk, DaBuffer *buf, uint64_t pt) {
+    if (vk == nullptr || buf == nullptr || buf->buffer == VK_NULL_HANDLE) {
+        return;
+    }
+    reap_retired_screen(vk, false);
+    for (uint32_t i = 0u; i < k_scene_retire_cap; ++i) {
+        if (!s_retired_res[i].active) {
+            s_retired_res[i] = (SceneRetiredRes){ .buf = *buf, .retire_point = pt, .active = true };
+            *buf = (DaBuffer){0};
+            return;
+        }
+    }
+    if (s_upload_sem != VK_NULL_HANDLE && s_retired_res[0].retire_point > 0u) {
+        VkSemaphoreWaitInfo wi = {
+            .sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
+            .semaphoreCount = 1u, .pSemaphores = &s_upload_sem, .pValues = &s_retired_res[0].retire_point,
+        };
+        (void)vkWaitSemaphores(vk->device, &wi, 3000000000ull);
+    }
+    destroy_target_image(vk, &s_retired_res[0].img);
+    da_buffer_destroy(vk, &s_retired_res[0].buf);
+    s_retired_res[0] = (SceneRetiredRes){ .buf = *buf, .retire_point = pt, .active = true };
+    *buf = (DaBuffer){0};
+}
+
 static int ensure_screen_resources(uint32_t width, uint32_t height,
                                    bool need_vis_color, bool need_hiz_buf) {
     if (s_vk == nullptr || width == 0u || height == 0u) {
@@ -371,9 +486,8 @@ static int ensure_screen_resources(uint32_t width, uint32_t height,
         return 0;
     }
 
-    (void)vkDeviceWaitIdle(s_vk->device);
-
     if (!depth_ok) {
+        retire_screen_image(s_vk, &s_vis_depth, s_screen_last_pt);
         if (create_target_image(s_vk, width, height, VK_FORMAT_D32_SFLOAT,
                                 VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
                                 VK_IMAGE_USAGE_SAMPLED_BIT,
@@ -383,6 +497,7 @@ static int ensure_screen_resources(uint32_t width, uint32_t height,
     }
 
     if (need_vis_color && !color_ok) {
+        retire_screen_image(s_vk, &s_vis_color, s_screen_last_pt);
         if (create_target_image(s_vk, width, height, VK_FORMAT_R32_UINT,
                                 VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
                                 VK_IMAGE_USAGE_SAMPLED_BIT,
@@ -427,6 +542,7 @@ static int ensure_screen_resources(uint32_t width, uint32_t height,
     VkDeviceSize needed_bytes = 256ull + (VkDeviceSize)float_off * sizeof(float);
     needed_bytes = (needed_bytes + 255ull) & ~255ull;
     if (s_hiz_buf.buffer == VK_NULL_HANDLE || s_hiz_buf.bytes < needed_bytes) {
+        retire_screen_buf(s_vk, &s_hiz_buf, s_screen_last_pt);
         if (da_buffer_replace(s_vk, &s_hiz_buf, needed_bytes,
                               VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
                               VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
@@ -798,7 +914,7 @@ static bool scene_ensure_gpu_ready(void) {
         }
     }
 
-    // 3. Shared Draw Pipeline Layout (Depth-Only Prepass, 1x R32_UINT VisBuf, and MSAA Meshlet)
+    // 3. Draw Pipeline Layouts (Depth/VisBuf push-only, Meshlet + Shadow push descriptor, Shadow Map)
     VkPushConstantRange draw_range = {
         .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
         .offset     = 0u,
@@ -812,6 +928,49 @@ static bool scene_ensure_gpu_ready(void) {
     if (vkCreatePipelineLayout(vk->device, &draw_li, nullptr, &s_draw_layout) != VK_SUCCESS) {
         return false;
     }
+
+    VkDescriptorSetLayout shadow_dsl = lighting_shadow_set_layout();
+    VkPipelineLayoutCreateInfo ml_li = {
+        .sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .setLayoutCount         = shadow_dsl != VK_NULL_HANDLE ? 1u : 0u,
+        .pSetLayouts            = shadow_dsl != VK_NULL_HANDLE ? &shadow_dsl : nullptr,
+        .pushConstantRangeCount = 1u,
+        .pPushConstantRanges    = &draw_range,
+    };
+    if (vkCreatePipelineLayout(vk->device, &ml_li, nullptr, &s_meshlet_layout) != VK_SUCCESS) {
+        return false;
+    }
+
+    VkPushConstantRange sh_range = {
+        .stageFlags = VK_SHADER_STAGE_VERTEX_BIT,
+        .offset     = 0u,
+        .size       = sizeof(SceneShadowPush),
+    };
+    VkPipelineLayoutCreateInfo sh_li = {
+        .sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .pushConstantRangeCount = 1u,
+        .pPushConstantRanges    = &sh_range,
+    };
+    if (vkCreatePipelineLayout(vk->device, &sh_li, nullptr, &s_shadow_layout) != VK_SUCCESS) {
+        return false;
+    }
+
+    VulkanGfxPipe shadow_cfg = {
+        .vert              = k_shadow_vert_spv,
+        .vert_bytes        = sizeof k_shadow_vert_spv,
+        .frag              = nullptr,
+        .frag_bytes        = 0u,
+        .layout            = s_shadow_layout,
+        .depth_format      = VK_FORMAT_D32_SFLOAT,
+        .samples           = VK_SAMPLE_COUNT_1_BIT,
+        .cull              = VK_CULL_MODE_NONE,
+        .depth_test        = VK_TRUE,
+        .depth_write       = VK_TRUE,
+        .depth_compare     = VK_COMPARE_OP_LESS_OR_EQUAL,
+        .blend             = VK_FALSE,
+        .depth_bias_enable = true,
+    };
+    vulkan_gfx_arm(&s_shadow_gfx, &shadow_cfg, VK_FORMAT_UNDEFINED, nullptr);
 
     VulkanGfxPipe depth_only_cfg = {
         .vert          = k_visbuf_vert_spv,
@@ -850,7 +1009,7 @@ static bool scene_ensure_gpu_ready(void) {
         .vert_bytes    = sizeof k_meshlet_vert_spv,
         .frag          = k_meshlet_frag_spv,
         .frag_bytes    = sizeof k_meshlet_frag_spv,
-        .layout        = s_draw_layout,
+        .layout        = s_meshlet_layout,
         .depth_format  = s_pass_depth_fmt,
         .samples       = s_pass_samples,
         .cull          = VK_CULL_MODE_BACK_BIT,
@@ -861,12 +1020,35 @@ static bool scene_ensure_gpu_ready(void) {
     };
     vulkan_gfx_arm(&s_meshlet_gfx, &meshlet_cfg, VK_FORMAT_B8G8R8A8_SRGB, nullptr);
 
-    // 4. Fullscreen R32_UINT Visibility Buffer Analytical Resolve Pipeline
+    // 4. Fullscreen R32_UINT Visibility Buffer Analytical Resolve Pipeline (vis_tex@0 + shadow_map@1)
     if (s_can_hiz_push) {
+        VkDescriptorSetLayoutBinding res_binds[2] = {
+            {
+                .binding         = 0u,
+                .descriptorType  = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+                .descriptorCount = 1u,
+                .stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT,
+            },
+            {
+                .binding         = 1u,
+                .descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                .descriptorCount = 1u,
+                .stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT,
+            },
+        };
+        VkDescriptorSetLayoutCreateInfo res_dsl_ci = {
+            .sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+            .flags        = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT,
+            .bindingCount = 2u,
+            .pBindings    = res_binds,
+        };
+        if (vkCreateDescriptorSetLayout(vk->device, &res_dsl_ci, nullptr, &s_resolve_set_layout) != VK_SUCCESS) {
+            return false;
+        }
         VkPipelineLayoutCreateInfo res_li = {
             .sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
             .setLayoutCount         = 1u,
-            .pSetLayouts            = &s_tex_set_layout,
+            .pSetLayouts            = &s_resolve_set_layout,
             .pushConstantRangeCount = 1u,
             .pPushConstantRanges    = &draw_range,
         };
@@ -907,6 +1089,7 @@ void scene_shutdown(VulkanContext *vk) {
     vulkan_gfx_disarm(dev_vk, &s_visbuf_gfx);
     vulkan_gfx_disarm(dev_vk, &s_resolve_gfx);
     vulkan_gfx_disarm(dev_vk, &s_meshlet_gfx);
+    vulkan_gfx_disarm(dev_vk, &s_shadow_gfx);
 
     if (dev_vk != nullptr && dev_vk->device != VK_NULL_HANDLE) {
         if (s_cull_pipe != VK_NULL_HANDLE) {
@@ -914,6 +1097,12 @@ void scene_shutdown(VulkanContext *vk) {
         }
         if (s_hiz_pipe != VK_NULL_HANDLE) {
             vulkan_pipe_release(dev_vk, s_hiz_pipe);
+        }
+        if (s_shadow_layout != VK_NULL_HANDLE) {
+            vkDestroyPipelineLayout(dev_vk->device, s_shadow_layout, nullptr);
+        }
+        if (s_meshlet_layout != VK_NULL_HANDLE) {
+            vkDestroyPipelineLayout(dev_vk->device, s_meshlet_layout, nullptr);
         }
         if (s_resolve_layout != VK_NULL_HANDLE) {
             vkDestroyPipelineLayout(dev_vk->device, s_resolve_layout, nullptr);
@@ -927,12 +1116,16 @@ void scene_shutdown(VulkanContext *vk) {
         if (s_cull_layout != VK_NULL_HANDLE) {
             vkDestroyPipelineLayout(dev_vk->device, s_cull_layout, nullptr);
         }
+        if (s_resolve_set_layout != VK_NULL_HANDLE) {
+            vkDestroyDescriptorSetLayout(dev_vk->device, s_resolve_set_layout, nullptr);
+        }
         if (s_tex_set_layout != VK_NULL_HANDLE) {
             vkDestroyDescriptorSetLayout(dev_vk->device, s_tex_set_layout, nullptr);
         }
     }
 
     reap_pending_uploads(dev_vk, true);
+    reap_retired_screen(dev_vk, true);
     destroy_target_image(dev_vk, &s_vis_depth);
     destroy_target_image(dev_vk, &s_vis_color);
     da_buffer_destroy(dev_vk, &s_hiz_buf);
@@ -940,13 +1133,17 @@ void scene_shutdown(VulkanContext *vk) {
     da_buffer_destroy(dev_vk, &s_geom_slab);
 
     memset(s_meshes, 0, sizeof s_meshes);
-    s_mesh_count       = 0u;
-    s_slab_ml_cursor   = 0u;
-    s_slab_vx_cursor   = 0u;
-    s_slab_tr_cursor   = 0u;
-    s_upload_sem       = VK_NULL_HANDLE;
-    s_cur_signal_point = 0u;
-    s_cull_pipe        = VK_NULL_HANDLE;
+    s_mesh_count         = 0u;
+    s_slab_ml_cursor     = 0u;
+    s_slab_vx_cursor     = 0u;
+    s_slab_tr_cursor     = 0u;
+    s_upload_sem         = VK_NULL_HANDLE;
+    s_cur_signal_point   = 0u;
+    s_screen_last_pt     = 0u;
+    s_cull_pipe          = VK_NULL_HANDLE;
+    s_shadow_layout      = VK_NULL_HANDLE;
+    s_meshlet_layout     = VK_NULL_HANDLE;
+    s_resolve_set_layout = VK_NULL_HANDLE;
     s_hiz_pipe         = VK_NULL_HANDLE;
     s_resolve_layout   = VK_NULL_HANDLE;
     s_draw_layout      = VK_NULL_HANDLE;
@@ -1078,6 +1275,7 @@ void scene_claim_frame(VkSemaphore acquire, uint64_t signal_point) {
         return;
     }
     reap_pending_uploads(s_vk, false);
+    reap_retired_screen(s_vk, false);
     for (uint32_t i = 0u; i < K_SCENE_MAX_PENDING_UPLOADS; ++i) {
         if (s_pending_uploads[i].in_use && s_pending_uploads[i].recorded &&
             s_pending_uploads[i].signal_point == 0u) {
@@ -1157,7 +1355,7 @@ void scene_submit_instance(uint32_t mesh_id, float origin_x, float origin_y, flo
         slot->work_pairs[s_cur_work_items++] = (inst_idx << 16u) | (rec->first_meshlet + m);
     }
 
-    // Submit 3D analytical occluder & emitter proxy to Core Engine Lighting (HRC + G-Buffer)
+    // Compute conservative world bounding sphere for real-geometry raytracing in Core Lighting
     {
         float cx = cosf(pitch_rad), sx = sinf(pitch_rad);
         float cy = cosf(yaw_rad),   sy = sinf(yaw_rad);
@@ -1171,36 +1369,40 @@ void scene_submit_instance(uint32_t mesh_id, float origin_x, float origin_y, flo
         float sz  = fminf(fmaxf(1.0f + squash, 0.45f), 1.85f);
         float sxy = 1.0f / sqrtf(sz);
 
-        float center[3] = {
-            origin_x + wx * uniform_scale * sxy,
-            origin_y + wy * uniform_scale * sxy,
-            origin_z + wz * uniform_scale * sz,
-        };
-        float extents[3] = {
-            rec->half_extents[0] * uniform_scale * sxy,
-            rec->half_extents[1] * uniform_scale * sxy,
-            rec->half_extents[2] * uniform_scale * sz,
-        };
+        float c_world_x = origin_x + wx * uniform_scale * sxy;
+        float c_world_y = origin_y + wy * uniform_scale * sxy;
+        float c_world_z = origin_z + wz * uniform_scale * sz;
 
-        float sel = fminf(fmaxf(selected, 0.0f), 1.0f) * 0.42f;
-        float alb[3] = {
-            rec->avg_albedo[0] + (1.0f - rec->avg_albedo[0]) * sel,
-            rec->avg_albedo[1] + (1.0f - rec->avg_albedo[1]) * sel,
-            rec->avg_albedo[2] + (1.0f - rec->avg_albedo[2]) * sel,
-        };
+        float hx = rec->half_extents[0];
+        float hy = rec->half_extents[1];
+        float hz = rec->half_extents[2];
+        float scale_max = fmaxf(sxy, sz) * fabsf(uniform_scale);
+        float bound_r   = sqrtf(hx * hx + hy * hy + hz * hz) * scale_max * 1.04f + 0.5f;
+
+        s_inst_bounds[inst_idx][0] = c_world_x;
+        s_inst_bounds[inst_idx][1] = c_world_y;
+        s_inst_bounds[inst_idx][2] = c_world_z;
+        s_inst_bounds[inst_idx][3] = bound_r;
+
+        // Submit fast analytical ellipsoid proxy for SSILVB + Split HRC GI (zero triangle ray loops!)
         float emi[3] = {0};
         lighting_material_get_emissive(mat_index, emi);
-        float rgh = roughness > 0.0f ? roughness : rec->avg_roughness;
-
-        // When squash is active on an isotropic sphere, world-space Z squash is axis-aligned
-        bool  iso_squash = fabsf(squash) > 1.0e-3f &&
-                           fabsf(rec->half_extents[0] - rec->half_extents[2]) < 0.08f * rec->half_extents[0];
-        float pr = iso_squash ? 0.0f : pitch_rad;
-        float yr = iso_squash ? 0.0f : yaw_rad;
-
+        float sel = fminf(fmaxf(selected, 0.0f), 1.0f);
+        float alb[3] = {
+            rec->avg_albedo[0] + (1.0f - rec->avg_albedo[0]) * (sel * 0.42f),
+            rec->avg_albedo[1] + (1.0f - rec->avg_albedo[1]) * (sel * 0.42f),
+            rec->avg_albedo[2] + (1.0f - rec->avg_albedo[2]) * (sel * 0.42f),
+        };
+        const float p_center[3] = { c_world_x, c_world_y, c_world_z };
+        const float p_ext[3] = {
+            fmaxf(hx * fabsf(uniform_scale) * sxy, 1.0f),
+            fmaxf(hy * fabsf(uniform_scale) * sxy, 1.0f),
+            fmaxf(hz * fabsf(uniform_scale) * sz,  1.0f),
+        };
         LightingProxy proxy = {0};
-        lighting_proxy_fill(&proxy, LIGHTING_PROXY_ELLIPSOID, center, extents,
-                            pr, yr, rgh, alb, emi);
+        lighting_proxy_fill(&proxy, LIGHTING_PROXY_ELLIPSOID, p_center, p_ext,
+                            pitch_rad, yaw_rad, roughness > 0.0f ? roughness : rec->avg_roughness,
+                            alb, emi);
         lighting_submit_proxy(&proxy);
     }
 }
@@ -1223,10 +1425,51 @@ static void cmd_push_sampled_image(VkCommandBuffer cmd, VkPipelineBindPoint bind
         .descriptorType  = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
         .pImageInfo      = &img_info,
     };
-    s_vk->dispatch.vkCmdPushDescriptorSet(cmd, bind_point, layout, 0u, 1u, &write);
+    vulkan_cmd_push_descriptors(s_vk, cmd, bind_point, layout, 0u, 1u, &write);
 }
 
-static void emit_indirect_draws(VkCommandBuffer cmd, VkPipeline pipeline, uint32_t phase,
+static void cmd_push_resolve_descriptors(VkCommandBuffer cmd, VkPipelineLayout layout, VkImageView vis_view) {
+    VkImageView   sh_view    = VK_NULL_HANDLE;
+    VkSampler     sh_sampler = VK_NULL_HANDLE;
+    VkImageLayout sh_layout  = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    lighting_shadow_get_descriptor(&sh_view, &sh_sampler, &sh_layout);
+
+    VkDescriptorImageInfo vis_info = {
+        .sampler     = VK_NULL_HANDLE,
+        .imageView   = vis_view,
+        .imageLayout = s_vk->device_info.supports_unified_image_layouts
+            ? VK_IMAGE_LAYOUT_GENERAL
+            : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+    };
+    VkDescriptorImageInfo sh_info = {
+        .sampler     = sh_sampler,
+        .imageView   = sh_view,
+        .imageLayout = sh_layout,
+    };
+    VkWriteDescriptorSet writes[2] = {
+        {
+            .sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet          = VK_NULL_HANDLE,
+            .dstBinding      = 0u,
+            .dstArrayElement = 0u,
+            .descriptorCount = 1u,
+            .descriptorType  = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+            .pImageInfo      = &vis_info,
+        },
+        {
+            .sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet          = VK_NULL_HANDLE,
+            .dstBinding      = 1u,
+            .dstArrayElement = 0u,
+            .descriptorCount = 1u,
+            .descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .pImageInfo      = &sh_info,
+        },
+    };
+    vulkan_cmd_push_descriptors(s_vk, cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0u, 2u, writes);
+}
+
+static void emit_indirect_draws(VkCommandBuffer cmd, VkPipelineLayout layout, uint32_t phase,
                                 uint32_t width, uint32_t height) {
     const bool full_indirect = s_vk->device_info.supports_draw_indirect_count &&
                                s_vk->device_info.supports_multi_draw_indirect &&
@@ -1244,8 +1487,7 @@ static void emit_indirect_draws(VkCommandBuffer cmd, VkPipeline pipeline, uint32
         .view           = s_cur_view,
     };
 
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-    vulkan_cmd_push(cmd, s_draw_layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+    vulkan_cmd_push(cmd, layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                     sizeof push, &push);
 
     VkDeviceSize base_off = cull_slot_buf_offset(s_frame_slot);
@@ -1266,10 +1508,8 @@ static void emit_indirect_draws(VkCommandBuffer cmd, VkPipeline pipeline, uint32
 
 static void record_offscreen_pass(VkCommandBuffer cmd, uint32_t width, uint32_t height,
                                   uint32_t phase, bool clear_attachments) {
-    VkPipeline pipe = s_visbuf_enabled
-        ? vulkan_gfx_use(s_vk, &s_visbuf_gfx)
-        : vulkan_gfx_use(s_vk, &s_depth_only_gfx);
-    if (pipe == VK_NULL_HANDLE) {
+    VulkanGfxLive *gfx = s_visbuf_enabled ? &s_visbuf_gfx : &s_depth_only_gfx;
+    if (!vulkan_gfx_bind(s_vk, cmd, gfx)) {
         return;
     }
 
@@ -1308,7 +1548,7 @@ static void record_offscreen_pass(VkCommandBuffer cmd, uint32_t width, uint32_t 
     VkRect2D sc = { .offset = { 0, 0 }, .extent = { width, height } };
     vkCmdSetViewport(cmd, 0u, 1u, &vp);
     vkCmdSetScissor(cmd, 0u, 1u, &sc);
-    emit_indirect_draws(cmd, pipe, phase, width, height);
+    emit_indirect_draws(cmd, s_draw_layout, phase, width, height);
     vkCmdEndRendering(cmd);
 }
 
@@ -1334,6 +1574,7 @@ static void record_hiz_pyramid(VkCommandBuffer cmd, bool commit_prev) {
         .zoom          = s_cur_view.zoom,
         .mode          = 0u,
         .commit_prev   = commit_prev ? 1u : 0u,
+        .persp         = s_cur_view.persp,
     };
     vulkan_cmd_push(cmd, s_hiz_layout, VK_SHADER_STAGE_COMPUTE_BIT, sizeof p0, &p0);
     uint32_t wg_x = (s_hiz_hdr_cpu.mips[0].width + 15u) / 16u;
@@ -1373,6 +1614,15 @@ void scene_prepare_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height) {
         return;
     }
     flush_pending_uploads(cmd);
+    if (s_cur_instances > 0u && s_geom_slab.address != 0ull) {
+        lighting_set_scene_geom(
+            s_geom_slab.address + k_slab_off_meshlets,
+            s_geom_slab.address + k_slab_off_vertices,
+            s_geom_slab.address + k_slab_off_triangles,
+            cull_slot_bda(s_frame_slot) + offsetof(SceneCullSlot, instances),
+            s_cur_instances,
+            s_inst_bounds);
+    }
     if (width == 0u || height == 0u || s_cur_work_items == 0u) {
         return;
     }
@@ -1435,7 +1685,7 @@ void scene_prepare_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height) {
         .work_count    = s_cur_work_items,
         .phase         = 0u,
         .enable_hiz    = use_hiz ? 1u : 0u,
-        .pad0          = 0u,
+        .persp         = s_cur_view.persp,
     };
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_cull_pipe);
     vulkan_cmd_push(cmd, s_cull_layout, VK_SHADER_STAGE_COMPUTE_BIT, sizeof cull_p1, &cull_p1);
@@ -1689,10 +1939,31 @@ void scene_prepare_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height) {
 
     record_hiz_pyramid(cmd, true);
     lighting_set_scene_hiz(s_hiz_buf.address);
+    s_screen_last_pt = s_cur_signal_point;
 
     s_used_hiz_this_frame = true;
     s_prepared_this_frame = true;
     s_frame_counter++;
+}
+
+void scene_draw_shadow(VkCommandBuffer cmd, const float light_clip_vp[16]) {
+    if (!s_ready || !s_gpu_ready || cmd == VK_NULL_HANDLE ||
+        light_clip_vp == nullptr || s_cur_work_items == 0u ||
+        s_geom_slab.address == 0ull || s_cull_buf.address == 0ull) {
+        return;
+    }
+    if (!vulkan_gfx_bind(s_vk, cmd, &s_shadow_gfx)) {
+        return;
+    }
+    SceneShadowPush push = {
+        .meshlets_bda  = s_geom_slab.address + k_slab_off_meshlets,
+        .vertices_bda  = s_geom_slab.address + k_slab_off_vertices,
+        .triangles_bda = s_geom_slab.address + k_slab_off_triangles,
+        .cull_slot_bda = cull_slot_bda(s_frame_slot),
+    };
+    memcpy(push.light_vp, light_clip_vp, sizeof push.light_vp);
+    vulkan_cmd_push(cmd, s_shadow_layout, VK_SHADER_STAGE_VERTEX_BIT, sizeof push, &push);
+    vkCmdDraw(cmd, K_SCENE_MESHLET_MAX_TRIS * 3u, s_cur_work_items, 0u, 0u);
 }
 
 void scene_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height) {
@@ -1702,8 +1973,7 @@ void scene_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height) {
     }
 
     if (s_visbuf_enabled && s_vis_color.view != VK_NULL_HANDLE) {
-        VkPipeline resolve_pipe = vulkan_gfx_use(s_vk, &s_resolve_gfx);
-        if (resolve_pipe == VK_NULL_HANDLE) {
+        if (!vulkan_gfx_bind(s_vk, cmd, &s_resolve_gfx)) {
             return;
         }
         SceneDrawPush push = {
@@ -1717,21 +1987,21 @@ void scene_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height) {
             .pad0           = 0u,
             .view           = s_cur_view,
         };
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, resolve_pipe);
-        cmd_push_sampled_image(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_resolve_layout, s_vis_color.view);
+        cmd_push_resolve_descriptors(cmd, s_resolve_layout, s_vis_color.view);
         vulkan_cmd_push(cmd, s_resolve_layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                         sizeof push, &push);
         vkCmdDraw(cmd, 3u, 1u, 0u, 0u);
+        s_screen_last_pt = s_cur_signal_point;
         return;
     }
 
-    VkPipeline meshlet_pipe = vulkan_gfx_use(s_vk, &s_meshlet_gfx);
-    if (meshlet_pipe == VK_NULL_HANDLE) {
+    if (!vulkan_gfx_bind(s_vk, cmd, &s_meshlet_gfx)) {
         return;
     }
-    emit_indirect_draws(cmd, meshlet_pipe, 0u, width, height);
+    lighting_bind_shadow(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_meshlet_layout);
+    emit_indirect_draws(cmd, s_meshlet_layout, 0u, width, height);
     if (s_used_hiz_this_frame) {
-        emit_indirect_draws(cmd, meshlet_pipe, 1u, width, height);
+        emit_indirect_draws(cmd, s_meshlet_layout, 1u, width, height);
     }
 }
 

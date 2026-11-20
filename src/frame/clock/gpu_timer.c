@@ -69,37 +69,14 @@ void gpu_timer_init(VulkanContext *vk) {
     if (vk == nullptr || vk->device == VK_NULL_HANDLE || vk->physical_device == VK_NULL_HANDLE) {
         return;
     }
-    VkPhysicalDeviceProperties props = {0};
-    vkGetPhysicalDeviceProperties(vk->physical_device, &props);
-    if (props.limits.timestampPeriod <= 0.0f) {
+    const float ts_period = vk->device_info.limits.timestampPeriod;
+    if (ts_period <= 0.0f) {
         fprintf(stderr, "[Engine] GPU timestamp queries are unavailable on this device.\n");
         return;
     }
 
-    uint32_t qf_count = 0u;
-    vkGetPhysicalDeviceQueueFamilyProperties(vk->physical_device, &qf_count, nullptr);
-    if (qf_count == 0u) {
-        return;
-    }
-    VkQueueFamilyProperties stack_qf[16];
-    VkQueueFamilyProperties *qfs = qf_count <= 16u
-        ? stack_qf
-        : malloc(sizeof(*qfs) * qf_count);
-    if (qfs == nullptr) {
-        return;
-    }
-    vkGetPhysicalDeviceQueueFamilyProperties(vk->physical_device, &qf_count, qfs);
-    uint32_t gfx_bits = 0u;
-    uint32_t xfer_bits = 0u;
-    if (vk->queues.graphics_family_index < qf_count) {
-        gfx_bits = qfs[vk->queues.graphics_family_index].timestampValidBits;
-    }
-    if (vk->queues.transfer_family_index < qf_count) {
-        xfer_bits = qfs[vk->queues.transfer_family_index].timestampValidBits;
-    }
-    if (qfs != stack_qf) {
-        free(qfs);
-    }
+    const uint32_t gfx_bits  = vk->device_info.graphics_ts_valid_bits;
+    const uint32_t xfer_bits = vk->device_info.transfer_ts_valid_bits;
     if (gfx_bits == 0u) {
         fprintf(stderr, "[Engine] Graphics queue family lacks hardware timestamps.\n");
         return;
@@ -117,7 +94,7 @@ void gpu_timer_init(VulkanContext *vk) {
     }
     vulkan_name_object(vk, VK_OBJECT_TYPE_QUERY_POOL, (uint64_t)frame_state.ts_pool,
                        "Frame:TimestampPool");
-    frame_state.ts_period_ns       = props.limits.timestampPeriod;
+    frame_state.ts_period_ns       = ts_period;
     frame_state.ts_valid_bits      = gfx_bits;
     frame_state.ts_xfer_valid_bits = xfer_bits;
     frame_state.ts_host_reset      = vk->device_info.supports_host_query_reset;

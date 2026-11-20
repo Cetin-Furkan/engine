@@ -190,6 +190,17 @@ void table_prepare_scene(bool live) {
     }
 }
 
+void table_draw_shadow(VkCommandBuffer cmd, const float light_clip_vp[16], bool live) {
+    for (int i = 0; i < s_n; ++i) {
+        const WorldObj *o = &s_obj[i];
+        bool up = live ? o->alive : o->shown_alive;
+        if (!up || o->ops == nullptr || o->ops->draw_shadow == nullptr) {
+            continue;
+        }
+        o->ops->draw_shadow(o, cmd, light_clip_vp, live);
+    }
+}
+
 void table_draw(VkCommandBuffer cmd, uint32_t width, uint32_t height, bool live) {
     for (int i = 0; i < s_n; ++i) {
         WorldObj *o = &s_obj[i];

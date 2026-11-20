@@ -1,0 +1,16 @@
+# Pure Real-World Catchment Map: Alptal & Erlenbach (Schwyz, Switzerland)
+# 20 x 20 km (EPSG:2056, Center E=2697000 N=1212000)
+# DEM: swisstopo swissALTI3D 0.5m LiDAR | Imagery: SWISSIMAGE DOP10 0.10m COG
+# Adaptive Quadtree LOD 0..10 (down to 0.076 m/px in Erlenbach gauge core)
+# Keys: Wheel=Zoom (adaptive LOD streaming), Right-Drag=Orbit, Middle-Drag=Pan, K=Cycle Contours (0/1/2), Home=Reset View
+mode 3d
+tab 0
+draw 0
+ground off
+gimbal 1
+hud 1
+plot 0
+text 0
+terrain examples/demo/maps/alptal_ch.epack
+contours 1
+camera 0 -900 750 0.42 -0.82 0.055 1

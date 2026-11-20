@@ -25,6 +25,7 @@ struct Push {
     float cam_y;
     float cam_z;
     float zoom;
+    float persp;
 
     property float4 q { get { return float4(qx, qy, qz, qw); } }
     property float3 cam { get { return float3(cam_x, cam_y, cam_z); } }
@@ -98,6 +99,6 @@ VSOutput main(uint vert_id : SV_VulkanVertexID) {
     }
 
     float pz = (corner == 0 || corner == 3) ? view_a.z : view_b.z;
-    out.sv_pos = view_ndc(float3(quad[corner], pz), zoom, pc.width, pc.height, 0.0);
+    out.sv_pos = view_ndc_persp(float3(quad[corner], pz), zoom, pc.persp, pc.width, pc.height, 0.0);
     return out;
 }

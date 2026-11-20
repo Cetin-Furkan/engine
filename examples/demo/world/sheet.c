@@ -1234,51 +1234,488 @@ static float soft_strain(const Soft *p) {
     return worst;
 }
 
-static void push_soft_out(Soft *p) {
-    uint32_t n = p->cols * p->rows;
-    Poly solids[k_poly_cap];
-    uint32_t sn = gather(solids);
-    for (uint32_t k = 0; k < n; ++k) {
-        for (uint32_t s = 0; s < sn; ++s) {
-            const Poly *poly = &solids[s];
-            if (!inside_poly(poly->x, poly->y, poly->n, p->x[k], p->y[k])) {
-                continue;
-            }
-            float best = 1.0e30f;
-            float nx = 0.0f;
-            float ny = 1.0f;
-            for (uint32_t e = 0; e < poly->n; ++e) {
-                uint32_t j = e + 1u < poly->n ? e + 1u : 0u;
-                float ex = poly->x[j] - poly->x[e];
-                float ey = poly->y[j] - poly->y[e];
-                float len = hypotf(ex, ey);
-                if (len < 1.0e-4f) {
-                    continue;
-                }
-                float ox = ey / len;
-                float oy = -ex / len;
-                float dist = (p->x[k] - poly->x[e]) * ox + (p->y[k] - poly->y[e]) * oy;
-                float pen = -dist;
-                if (pen < best) {
-                    best = pen;
-                    nx = ox;
-                    ny = oy;
-                }
-            }
-            if (best < 1.0e20f && best > 0.0f) {
-                p->x[k] += nx * (best + k_slop);
-                p->y[k] += ny * (best + k_slop);
-                float vn = p->vx[k] * nx + p->vy[k] * ny;
-                if (vn < 0.0f) {
-                    float reb = (-vn > k_sleep * 2.5f) ? clamp_bounce(0.5f * (p->bounce + poly->bounce)) : 0.0f;
-                    p->vx[k] -= (1.0f + reb) * vn * nx;
-                    p->vy[k] -= (1.0f + reb) * vn * ny;
-                }
-                p->awake = true;
-                mark_moved();
+static void poly_escape(const Poly *poly, float px, float py,
+                        float *out_nx, float *out_ny, float *out_pen) {
+    float best = 1.0e30f;
+    float nx = 0.0f;
+    float ny = 1.0f;
+    for (uint32_t e = 0; e < poly->n; ++e) {
+        uint32_t j = e + 1u < poly->n ? e + 1u : 0u;
+        float ex = poly->x[j] - poly->x[e];
+        float ey = poly->y[j] - poly->y[e];
+        float len = hypotf(ex, ey);
+        if (len < 1.0e-4f) {
+            continue;
+        }
+        float ox = ey / len;
+        float oy = -ex / len;
+        float dist = (px - poly->x[e]) * ox + (py - poly->y[e]) * oy;
+        float pen = -dist;
+        if (pen < best) {
+            best = pen;
+            nx = ox;
+            ny = oy;
+        }
+    }
+    *out_nx  = nx;
+    *out_ny  = ny;
+    *out_pen = (best < 1.0e20f && best > 0.0f) ? best : 0.0f;
+}
+
+static bool point_in_tri_2d(float px, float py,
+                            float ax, float ay,
+                            float bx, float by,
+                            float cx, float cy,
+                            float out_bary[3]) {
+    float det = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
+    if (fabsf(det) < 1.0e-4f) {
+        return false;
+    }
+    float inv_det = 1.0f / det;
+    float u = ((bx - px) * (cy - py) - (by - py) * (cx - px)) * inv_det;
+    float v = ((cx - px) * (ay - py) - (cy - py) * (ax - px)) * inv_det;
+    float w = 1.0f - u - v;
+    if (u < -1.0e-3f || v < -1.0e-3f || w < -1.0e-3f) {
+        return false;
+    }
+    u = fmaxf(u, 0.0f);
+    v = fmaxf(v, 0.0f);
+    w = fmaxf(w, 0.0f);
+    float sum = u + v + w;
+    if (sum < 1.0e-6f) {
+        out_bary[0] = out_bary[1] = out_bary[2] = 1.0f / 3.0f;
+    } else {
+        float inv_s = 1.0f / sum;
+        out_bary[0] = u * inv_s;
+        out_bary[1] = v * inv_s;
+        out_bary[2] = w * inv_s;
+    }
+    return true;
+}
+
+static bool soft_point_hit(const Soft *p, float px, float py,
+                           uint32_t out_tri[3], float out_bary[3],
+                           float *out_nx, float *out_ny, float *out_pen) {
+    uint32_t count = p->cols * p->rows;
+    if (count == 0u || p->cols < 2u || p->rows < 2u) {
+        return false;
+    }
+    float minx = p->x[0], maxx = p->x[0], miny = p->y[0], maxy = p->y[0];
+    for (uint32_t k = 1u; k < count; ++k) {
+        if (p->x[k] < minx) minx = p->x[k];
+        if (p->x[k] > maxx) maxx = p->x[k];
+        if (p->y[k] < miny) miny = p->y[k];
+        if (p->y[k] > maxy) maxy = p->y[k];
+    }
+    if (px < minx - 1.0f || px > maxx + 1.0f || py < miny - 1.0f || py > maxy + 1.0f) {
+        return false;
+    }
+
+    bool hit = false;
+    for (uint32_t r = 0u; r + 1u < p->rows && !hit; ++r) {
+        for (uint32_t c = 0u; c + 1u < p->cols && !hit; ++c) {
+            uint32_t i00 = r * p->cols + c;
+            uint32_t i10 = i00 + 1u;
+            uint32_t i01 = i00 + p->cols;
+            uint32_t i11 = i01 + 1u;
+            if (point_in_tri_2d(px, py,
+                                p->x[i00], p->y[i00], p->x[i10], p->y[i10], p->x[i11], p->y[i11],
+                                out_bary)) {
+                out_tri[0] = i00; out_tri[1] = i10; out_tri[2] = i11;
+                hit = true;
+            } else if (point_in_tri_2d(px, py,
+                                       p->x[i00], p->y[i00], p->x[i11], p->y[i11], p->x[i01], p->y[i01],
+                                       out_bary)) {
+                out_tri[0] = i00; out_tri[1] = i11; out_tri[2] = i01;
+                hit = true;
             }
         }
     }
+    if (!hit) {
+        return false;
+    }
+
+    // Shortest escape vector to soft mesh perimeter edges (CCW outer loop)
+    uint32_t perim_n = 0u;
+    uint32_t ea[k_soft_pts];
+    uint32_t eb[k_soft_pts];
+    for (uint32_t c = 0u; c + 1u < p->cols; ++c) {
+        ea[perim_n] = c; eb[perim_n] = c + 1u; perim_n++;
+    }
+    for (uint32_t r = 0u; r + 1u < p->rows; ++r) {
+        ea[perim_n] = r * p->cols + (p->cols - 1u);
+        eb[perim_n] = (r + 1u) * p->cols + (p->cols - 1u);
+        perim_n++;
+    }
+    for (uint32_t c = p->cols - 1u; c > 0u; --c) {
+        ea[perim_n] = (p->rows - 1u) * p->cols + c;
+        eb[perim_n] = (p->rows - 1u) * p->cols + (c - 1u);
+        perim_n++;
+    }
+    for (uint32_t r = p->rows - 1u; r > 0u; --r) {
+        ea[perim_n] = r * p->cols;
+        eb[perim_n] = (r - 1u) * p->cols;
+        perim_n++;
+    }
+
+    float best_d2 = 1.0e30f;
+    float best_nx = 0.0f;
+    float best_ny = 1.0f;
+    for (uint32_t e = 0u; e < perim_n; ++e) {
+        float ax = p->x[ea[e]], ay = p->y[ea[e]];
+        float bx = p->x[eb[e]], by = p->y[eb[e]];
+        float abx = bx - ax, aby = by - ay;
+        float ab2 = abx * abx + aby * aby;
+        float t = ab2 > 1.0e-6f ? ((px - ax) * abx + (py - ay) * aby) / ab2 : 0.0f;
+        if (t < 0.0f) t = 0.0f;
+        if (t > 1.0f) t = 1.0f;
+        float qx = ax + abx * t;
+        float qy = ay + aby * t;
+        float dx = qx - px;
+        float dy = qy - py;
+        float d2 = dx * dx + dy * dy;
+        if (d2 < best_d2) {
+            best_d2 = d2;
+            if (d2 > 1.0e-6f) {
+                float inv_d = 1.0f / sqrtf(d2);
+                best_nx = dx * inv_d;
+                best_ny = dy * inv_d;
+            } else {
+                float elen = sqrtf(ab2);
+                best_nx = elen > 1.0e-4f ? (aby / elen) : 0.0f;
+                best_ny = elen > 1.0e-4f ? (-abx / elen) : 1.0f;
+            }
+        }
+    }
+    *out_nx  = best_nx;
+    *out_ny  = best_ny;
+    *out_pen = sqrtf(best_d2);
+    return true;
+}
+
+static void apply_pair_impulse(float *avx, float *avy,
+                               float *bvx, float *bvy,
+                               float nx, float ny,
+                               float w_a, float w_b, float bounce) {
+    float vrel_n = (*avx - *bvx) * nx + (*avy - *bvy) * ny;
+    if (vrel_n >= 0.0f) {
+        return;
+    }
+    float w_sum = w_a + w_b;
+    if (w_sum <= 1.0e-6f) {
+        return;
+    }
+    float e  = (-vrel_n > k_sleep * 2.5f) ? clamp_bounce(bounce) : 0.0f;
+    float jn = -(1.0f + e) * vrel_n / w_sum;
+    float tx = -ny;
+    float ty = nx;
+    float vrel_t = (*avx - *bvx) * tx + (*avy - *bvy) * ty;
+    float jt = -vrel_t * 0.22f / w_sum;
+    float f_lim = jn * 0.35f;
+    if (jt > f_lim)  jt = f_lim;
+    if (jt < -f_lim) jt = -f_lim;
+    float imp_x = jn * nx + jt * tx;
+    float imp_y = jn * ny + jt * ty;
+    if (w_a > 0.0f) {
+        *avx += imp_x * w_a;
+        *avy += imp_y * w_a;
+    }
+    if (w_b > 0.0f) {
+        *bvx -= imp_x * w_b;
+        *bvy -= imp_y * w_b;
+    }
+}
+
+static bool unfold_soft_tri(Soft *p, uint32_t ia, uint32_t ib, uint32_t ic, float min_area2) {
+    float ax = p->x[ia], ay = p->y[ia];
+    float bx = p->x[ib], by = p->y[ib];
+    float cx = p->x[ic], cy = p->y[ic];
+    float cross = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
+    if (cross >= min_area2) {
+        return false;
+    }
+    float ex = cx - bx;
+    float ey = cy - by;
+    float len = hypotf(ex, ey);
+    if (len < 1.0e-4f) {
+        return false;
+    }
+    float in_nx = -ey / len;
+    float in_ny =  ex / len;
+    float corr  = ((min_area2 - cross) / (len * 2.0f)) * 0.55f;
+    float max_c = p->spacing * 0.45f;
+    if (corr > max_c) {
+        corr = max_c;
+    }
+    p->x[ia] += in_nx * corr;
+    p->y[ia] += in_ny * corr;
+    p->x[ib] -= in_nx * (corr * 0.5f);
+    p->y[ib] -= in_ny * (corr * 0.5f);
+    p->x[ic] -= in_nx * (corr * 0.5f);
+    p->y[ic] -= in_ny * (corr * 0.5f);
+
+    float rvx = p->vx[ia] - 0.5f * (p->vx[ib] + p->vx[ic]);
+    float rvy = p->vy[ia] - 0.5f * (p->vy[ib] + p->vy[ic]);
+    float vn  = rvx * in_nx + rvy * in_ny;
+    if (vn < 0.0f) {
+        p->vx[ia] -= vn * in_nx * 0.5f;
+        p->vy[ia] -= vn * in_ny * 0.5f;
+        p->vx[ib] += vn * in_nx * 0.25f;
+        p->vy[ib] += vn * in_ny * 0.25f;
+        p->vx[ic] += vn * in_nx * 0.25f;
+        p->vy[ic] += vn * in_ny * 0.25f;
+    }
+    return true;
+}
+
+static void enforce_soft_self_unfold(Soft *p) {
+    if (p == nullptr || !p->alive || p->cols < 2u || p->rows < 2u || !(p->spacing > 1.0e-3f)) {
+        return;
+    }
+    bool changed = false;
+    uint32_t count = p->cols * p->rows;
+    float min_sep  = p->spacing * 0.36f;
+    float min_sep2 = min_sep * min_sep;
+
+    for (uint32_t a = 0u; a < count; ++a) {
+        for (uint32_t b = a + 1u; b < count; ++b) {
+            float dx = p->x[b] - p->x[a];
+            float dy = p->y[b] - p->y[a];
+            float d2 = dx * dx + dy * dy;
+            if (d2 >= min_sep2) {
+                continue;
+            }
+            float nx, ny, dist;
+            if (d2 > 1.0e-6f) {
+                dist = sqrtf(d2);
+                nx   = dx / dist;
+                ny   = dy / dist;
+            } else {
+                dist = 0.0f;
+                float rdx = p->rx[b] - p->rx[a];
+                float rdy = p->ry[b] - p->ry[a];
+                float rl  = hypotf(rdx, rdy);
+                nx = rl > 1.0e-4f ? (rdx / rl) : 1.0f;
+                ny = rl > 1.0e-4f ? (rdy / rl) : 0.0f;
+            }
+            float half = 0.5f * (min_sep - dist);
+            p->x[a] -= nx * half;
+            p->y[a] -= ny * half;
+            p->x[b] += nx * half;
+            p->y[b] += ny * half;
+            apply_pair_impulse(&p->vx[b], &p->vy[b], &p->vx[a], &p->vy[a], nx, ny, 1.0f, 1.0f, 0.1f);
+            changed = true;
+        }
+    }
+
+    float min_area2 = 0.16f * p->spacing * p->spacing;
+    for (uint32_t r = 0u; r + 1u < p->rows; ++r) {
+        for (uint32_t c = 0u; c + 1u < p->cols; ++c) {
+            uint32_t i00 = r * p->cols + c;
+            uint32_t i10 = i00 + 1u;
+            uint32_t i01 = i00 + p->cols;
+            uint32_t i11 = i01 + 1u;
+            if (unfold_soft_tri(p, i00, i10, i11, min_area2)) changed = true;
+            if (unfold_soft_tri(p, i00, i11, i01, min_area2)) changed = true;
+        }
+    }
+    if (changed) {
+        p->awake = true;
+        mark_moved();
+    }
+}
+
+static void collide_soft_poly(Soft *p, Poly *poly, bool soft_frozen) {
+    if (p == nullptr || !p->alive || poly == nullptr) {
+        return;
+    }
+    float w_s    = soft_frozen ? 0.0f : 1.0f;
+    float w_p    = poly->fixed ? 0.0f : 0.25f;
+    float w_sum  = w_s + w_p;
+    if (w_sum <= 1.0e-6f) {
+        return;
+    }
+    float bounce = clamp_bounce(0.5f * (p->bounce + poly->bounce));
+    uint32_t n   = p->cols * p->rows;
+
+    // 1. Soft vertices inside convex Poly
+    for (uint32_t k = 0u; k < n; ++k) {
+        if (!inside_poly(poly->x, poly->y, poly->n, p->x[k], p->y[k])) {
+            continue;
+        }
+        float nx = 0.0f, ny = 1.0f, pen = 0.0f;
+        poly_escape(poly, p->x[k], p->y[k], &nx, &ny, &pen);
+        if (pen <= 0.0f) {
+            continue;
+        }
+        float frac_s = w_s / w_sum;
+        float frac_p = w_p / w_sum;
+        float sep    = pen + k_slop * 0.5f;
+        if (!soft_frozen) {
+            p->x[k] += nx * (sep * frac_s);
+            p->y[k] += ny * (sep * frac_s);
+            p->awake = true;
+        }
+        if (!poly->fixed) {
+            float pdx = -nx * (pen * frac_p);
+            float pdy = -ny * (pen * frac_p);
+            *poly->cx += pdx;
+            *poly->cy += pdy;
+            for (uint32_t v = 0u; v < poly->n; ++v) {
+                poly->x[v] += pdx;
+                poly->y[v] += pdy;
+            }
+            *poly->awake = true;
+        }
+        float dummy_vx = *poly->vx, dummy_vy = *poly->vy;
+        float svx = p->vx[k], svy = p->vy[k];
+        apply_pair_impulse(&svx, &svy, &dummy_vx, &dummy_vy, nx, ny, w_s, w_p, bounce);
+        if (!soft_frozen) {
+            p->vx[k] = svx;
+            p->vy[k] = svy;
+        }
+        if (!poly->fixed) {
+            *poly->vx = dummy_vx;
+            *poly->vy = dummy_vy;
+        }
+        mark_moved();
+    }
+
+    // 2. Poly vertices & edge midpoints inside Soft mesh triangles
+    uint32_t sample_cnt = poly->n * 2u;
+    for (uint32_t si = 0u; si < sample_cnt; ++si) {
+        float px, py;
+        if (si < poly->n) {
+            px = poly->x[si];
+            py = poly->y[si];
+        } else {
+            uint32_t e0 = si - poly->n;
+            uint32_t e1 = (e0 + 1u < poly->n) ? (e0 + 1u) : 0u;
+            px = 0.5f * (poly->x[e0] + poly->x[e1]);
+            py = 0.5f * (poly->y[e0] + poly->y[e1]);
+        }
+        uint32_t tri[3];
+        float    bary[3];
+        float    nx = 0.0f, ny = 1.0f, pen = 0.0f;
+        if (!soft_point_hit(p, px, py, tri, bary, &nx, &ny, &pen)) {
+            continue;
+        }
+        float frac_s = w_s / w_sum;
+        float frac_p = w_p / w_sum;
+        float sep    = pen + k_slop * 0.5f;
+        if (!poly->fixed) {
+            float pdx = nx * (sep * frac_p);
+            float pdy = ny * (sep * frac_p);
+            *poly->cx += pdx;
+            *poly->cy += pdy;
+            for (uint32_t v = 0u; v < poly->n; ++v) {
+                poly->x[v] += pdx;
+                poly->y[v] += pdy;
+            }
+            *poly->awake = true;
+        }
+        float bsum2 = bary[0] * bary[0] + bary[1] * bary[1] + bary[2] * bary[2];
+        float inv_b2 = bsum2 > 1.0e-4f ? (1.0f / bsum2) : 1.0f;
+        float tri_vx = bary[0] * p->vx[tri[0]] + bary[1] * p->vx[tri[1]] + bary[2] * p->vx[tri[2]];
+        float tri_vy = bary[0] * p->vy[tri[0]] + bary[1] * p->vy[tri[1]] + bary[2] * p->vy[tri[2]];
+        float poly_vx = *poly->vx, poly_vy = *poly->vy;
+        float old_tvx = tri_vx, old_tvy = tri_vy;
+        apply_pair_impulse(&poly_vx, &poly_vy, &tri_vx, &tri_vy, nx, ny, w_p, w_s, bounce);
+        float dtvx = tri_vx - old_tvx;
+        float dtvy = tri_vy - old_tvy;
+
+        if (!soft_frozen) {
+            for (int vi = 0; vi < 3; ++vi) {
+                float wv = bary[vi] * inv_b2;
+                p->x[tri[vi]]  -= nx * (sep * frac_s * wv);
+                p->y[tri[vi]]  -= ny * (sep * frac_s * wv);
+                p->vx[tri[vi]] += dtvx * bary[vi];
+                p->vy[tri[vi]] += dtvy * bary[vi];
+            }
+            p->awake = true;
+        }
+        if (!poly->fixed) {
+            *poly->vx = poly_vx;
+            *poly->vy = poly_vy;
+        }
+        mark_moved();
+    }
+}
+
+static void collide_soft_soft_dir(Soft *a, Soft *b, bool a_frozen, bool b_frozen) {
+    float w_a = a_frozen ? 0.0f : 1.0f;
+    float w_b = b_frozen ? 0.0f : 1.0f;
+    float w_sum = w_a + w_b;
+    if (w_sum <= 1.0e-6f) {
+        return;
+    }
+    float bounce = clamp_bounce(0.5f * (a->bounce + b->bounce));
+    uint32_t na = a->cols * a->rows;
+    for (uint32_t k = 0u; k < na; ++k) {
+        uint32_t tri[3];
+        float    bary[3];
+        float    nx = 0.0f, ny = 1.0f, pen = 0.0f;
+        if (!soft_point_hit(b, a->x[k], a->y[k], tri, bary, &nx, &ny, &pen)) {
+            continue;
+        }
+        float sep    = pen + k_slop * 0.5f;
+        float frac_a = w_a / w_sum;
+        float frac_b = w_b / w_sum;
+        if (!a_frozen) {
+            a->x[k] += nx * (sep * frac_a);
+            a->y[k] += ny * (sep * frac_a);
+            a->awake = true;
+        }
+        float avx = a->vx[k], avy = a->vy[k];
+        float bvx = bary[0] * b->vx[tri[0]] + bary[1] * b->vx[tri[1]] + bary[2] * b->vx[tri[2]];
+        float bvy = bary[0] * b->vy[tri[0]] + bary[1] * b->vy[tri[1]] + bary[2] * b->vy[tri[2]];
+        float old_bvx = bvx, old_bvy = bvy;
+        apply_pair_impulse(&avx, &avy, &bvx, &bvy, nx, ny, w_a, w_b, bounce);
+        float dbvx = bvx - old_bvx, dbvy = bvy - old_bvy;
+        if (!a_frozen) {
+            a->vx[k] = avx;
+            a->vy[k] = avy;
+        }
+        if (!b_frozen) {
+            float bsum2 = bary[0] * bary[0] + bary[1] * bary[1] + bary[2] * bary[2];
+            float inv_b2 = bsum2 > 1.0e-4f ? (1.0f / bsum2) : 1.0f;
+            for (int vi = 0; vi < 3; ++vi) {
+                float wv = bary[vi] * inv_b2;
+                b->x[tri[vi]]  -= nx * (sep * frac_b * wv);
+                b->y[tri[vi]]  -= ny * (sep * frac_b * wv);
+                b->vx[tri[vi]] += dbvx * bary[vi];
+                b->vy[tri[vi]] += dbvy * bary[vi];
+            }
+            b->awake = true;
+        }
+        mark_moved();
+    }
+}
+
+static void collide_soft_soft(Soft *a, Soft *b, bool a_frozen, bool b_frozen) {
+    if (a == nullptr || b == nullptr || a == b || !a->alive || !b->alive) {
+        return;
+    }
+    collide_soft_soft_dir(a, b, a_frozen, b_frozen);
+    collide_soft_soft_dir(b, a, b_frozen, a_frozen);
+}
+
+static void resolve_soft_collisions_one(Soft *p) {
+    if (p == nullptr || !p->alive) {
+        return;
+    }
+    Poly solids[k_poly_cap];
+    uint32_t sn = gather(solids);
+    for (uint32_t s = 0u; s < sn; ++s) {
+        collide_soft_poly(p, &solids[s], false);
+    }
+    for (uint32_t j = 0u; j < k_soft_cap; ++j) {
+        Soft *other = &s_sheet.soft[j];
+        if (other != p && other->alive) {
+            collide_soft_soft(p, other, false, false);
+        }
+    }
+    enforce_soft_self_unfold(p);
 }
 
 static void clamp_bounds(void) {
@@ -1523,6 +1960,45 @@ bool sheet_integrate(float dt) {
                                           p->cols, p->rows, p->spacing, stiff,
                                           s_gpu_verts[qslot], &gvn,
                                           s_gpu_cons[qslot], &gcn);
+                if (gvn > 0u && s_sheet.has_bounds) {
+                    const float bx = s_sheet.bound_x;
+                    const float by = s_sheet.bound_y;
+                    const float margin = fmaxf(p->spacing * 1.5f, 24.0f);
+                    for (uint32_t k = 0u; k < gvn && gcn < K_AVBD_MAX_CONS; ++k) {
+                        float px = p->x[k] + p->vx[k] * step_dt;
+                        float py = p->y[k] + p->vy[k] * step_dt;
+                        if (py - margin < -by && gcn < K_AVBD_MAX_CONS) {
+                            s_gpu_cons[qslot][gcn++] = (AvbdConstraint){
+                                .kind = AVBD_CON_CONTACT_PLANE, .vert_a = k, .vert_b = UINT32_MAX,
+                                .hash_key = 0x70010000u + k, .normal_or_target = { 0.0f, 1.0f, 0.0f },
+                                .rest_or_offset = -by, .stiffness_min = 1.0e5f,
+                                .stiffness_max = 1.0e9f, .penalty_k = 1.0e5f, .beta_ramp = 8.0f,
+                            };
+                        } else if (py + margin > by && gcn < K_AVBD_MAX_CONS) {
+                            s_gpu_cons[qslot][gcn++] = (AvbdConstraint){
+                                .kind = AVBD_CON_CONTACT_PLANE, .vert_a = k, .vert_b = UINT32_MAX,
+                                .hash_key = 0x70020000u + k, .normal_or_target = { 0.0f, -1.0f, 0.0f },
+                                .rest_or_offset = -by, .stiffness_min = 1.0e5f,
+                                .stiffness_max = 1.0e9f, .penalty_k = 1.0e5f, .beta_ramp = 8.0f,
+                            };
+                        }
+                        if (px - margin < -bx && gcn < K_AVBD_MAX_CONS) {
+                            s_gpu_cons[qslot][gcn++] = (AvbdConstraint){
+                                .kind = AVBD_CON_CONTACT_PLANE, .vert_a = k, .vert_b = UINT32_MAX,
+                                .hash_key = 0x70030000u + k, .normal_or_target = { 1.0f, 0.0f, 0.0f },
+                                .rest_or_offset = -bx, .stiffness_min = 1.0e5f,
+                                .stiffness_max = 1.0e9f, .penalty_k = 1.0e5f, .beta_ramp = 8.0f,
+                            };
+                        } else if (px + margin > bx && gcn < K_AVBD_MAX_CONS) {
+                            s_gpu_cons[qslot][gcn++] = (AvbdConstraint){
+                                .kind = AVBD_CON_CONTACT_PLANE, .vert_a = k, .vert_b = UINT32_MAX,
+                                .hash_key = 0x70040000u + k, .normal_or_target = { -1.0f, 0.0f, 0.0f },
+                                .rest_or_offset = -bx, .stiffness_min = 1.0e5f,
+                                .stiffness_max = 1.0e9f, .penalty_k = 1.0e5f, .beta_ramp = 8.0f,
+                            };
+                        }
+                    }
+                }
                 if (gvn > 0u) {
                     s_gpu_soft_idx[qslot] = i;
                     s_gpu_epoch[qslot]    = s_sheet_epoch;
@@ -1563,12 +2039,23 @@ bool sheet_integrate(float dt) {
                 separate(&solids[i], &solids[j]);
             }
         }
-        clamp_bounds();
-    }
-    if (!s_gpu_pose_owner) {
-        for (uint32_t i = 0; i < k_soft_cap; ++i) {
-            if (s_sheet.soft[i].alive) {
-                push_soft_out(&s_sheet.soft[i]);
+        for (uint32_t s = 0u; s < k_soft_cap; ++s) {
+            Soft *ps = &s_sheet.soft[s];
+            if (!ps->alive) {
+                continue;
+            }
+            for (uint32_t j = 0u; j < n; ++j) {
+                collide_soft_poly(ps, &solids[j], s_gpu_pose_owner);
+            }
+        }
+        if (!s_gpu_pose_owner) {
+            for (uint32_t i = 0u; i < k_soft_cap; ++i) {
+                for (uint32_t j = i + 1u; j < k_soft_cap; ++j) {
+                    collide_soft_soft(&s_sheet.soft[i], &s_sheet.soft[j], false, false);
+                }
+            }
+            for (uint32_t i = 0u; i < k_soft_cap; ++i) {
+                enforce_soft_self_unfold(&s_sheet.soft[i]);
             }
         }
         clamp_bounds();
@@ -1609,8 +2096,9 @@ bool sheet_apply_gpu_soft_step(uint32_t          soft_index,
         }
     }
     p->awake = true;
-    push_soft_out(p);
+    resolve_soft_collisions_one(p);
     clamp_soft_bounds_one(p);
+    clamp_bounds();
     mark_moved();
     fall_asleep();
     if (s_moved && !sheet_busy()) {

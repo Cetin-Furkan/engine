@@ -432,6 +432,14 @@ static int demo_configure(int argc, char **argv) {
         }
         if (parse_world_arg(val, &chosen)) {
             custom_path = nullptr;
+        } else if (strcmp(val, "alptal") == 0) {
+            custom_path = "examples/demo/world/alptal.world";
+        } else if (strcmp(val, "luquillo") == 0) {
+            custom_path = "examples/demo/world/luquillo.world";
+        } else if (strcmp(val, "hj_andrews") == 0) {
+            custom_path = "examples/demo/world/hj_andrews.world";
+        } else if (strcmp(val, "wuestebach") == 0) {
+            custom_path = "examples/demo/world/wuestebach.world";
         } else if (has_world_suffix_or_sep(val)) {
             custom_path = val;
         } else {
@@ -509,6 +517,7 @@ static void demo_prepare_draw(VkCommandBuffer cmd, VkImage depth_image) {
 static void demo_claim_frame(VkSemaphore acquire, uint64_t signal_point) {
     // Rewind this frame's timeline-guarded quarter of the transient bump.
     bda_transient_begin_frame(acquire, signal_point);
+    lighting_claim_frame(acquire, signal_point);
     physics_claim_frame(acquire, signal_point);
     scene_claim_frame(acquire, signal_point);
     cube_bind_acquire(acquire);
@@ -585,7 +594,10 @@ static bool demo_advance(uint32_t time_ms, const FrameStep *step) {
     int32_t py = 0;
     bool have = pointer_client_xy(&px, &py);
     text_arm_tick(text_is_visible() && pointer_key_down(KEY_T), have, px, py);
-    bool moved = world_advance(time_ms);
+    bool moved = world_pointer_drag_poll();
+    if (world_advance(time_ms)) {
+        moved = true;
+    }
     if (s_bench_target > 0u && !s_bench_done) {
         uint32_t wid = world_selected_id();
         if (wid == 8u) {
@@ -645,7 +657,7 @@ static uint8_t demo_route_key(uint32_t key) {
         key == KEY_7 || key == KEY_8) {
         return ENGINE_KEY_TAP;
     }
-    if (world_selected_id() == 8u) {
+    if (terrain_is_active()) {
         if (key == KEY_O || key == KEY_P ||
             key == KEY_W || key == KEY_A || key == KEY_S || key == KEY_D ||
             key == KEY_I || key == KEY_U || key == KEY_J || key == KEY_N ||
@@ -694,7 +706,7 @@ static bool demo_key(uint32_t key, EngineKeyContext *ctx) {
     if (key == KEY_8) {
         return physics_toggle_gpu();
     }
-    if (world_selected_id() == 8u) {
+    if (terrain_is_active()) {
         bool shift = demo_shift_down();
         if (key == KEY_O) {
             // 'o' key -> more transparent (+5% transparency)
@@ -850,7 +862,11 @@ static bool demo_key(uint32_t key, EngineKeyContext *ctx) {
             return false;
         }
         if (policy_active()->lock_2d_quat) {
+            camera_set_scene_3d(false, false, false);
             (void)camera_snap_front();
+        } else if (!terrain_is_active()) {
+            camera_set_scene_3d(true, true, false);
+            (void)camera_home();
         }
         return true;
     default:
@@ -862,7 +878,7 @@ static bool demo_camera_active(void) {
     if (s_bench_target > 0u && !s_bench_done) {
         return true;
     }
-    if (world_selected_id() == 8u && !demo_shift_down()) {
+    if (terrain_is_active() && !demo_shift_down()) {
         if (pointer_key_down(KEY_W) || pointer_key_down(KEY_A) ||
             pointer_key_down(KEY_S) || pointer_key_down(KEY_D)) {
             return true;
@@ -872,7 +888,7 @@ static bool demo_camera_active(void) {
 }
 
 static bool demo_drag(float dx, float dy, uint32_t buttons) {
-    return camera_pointer_drag(dx, dy, buttons);
+    return world_pointer_drag(dx, dy, buttons);
 }
 
 static const EngineApp s_app = {

@@ -606,6 +606,32 @@ static void push_grid_spring(AvbdConstraint *cons,
     };
 }
 
+static void push_self_contact_pair(AvbdConstraint *cons,
+                                   uint32_t       *io_count,
+                                   uint32_t        cap,
+                                   uint32_t        va,
+                                   uint32_t        vb,
+                                   float           nx,
+                                   float           ny,
+                                   float           min_sep,
+                                   float           k_min) {
+    if (*io_count >= cap) {
+        return;
+    }
+    cons[(*io_count)++] = (AvbdConstraint){
+        .kind             = AVBD_CON_CONTACT_PAIR,
+        .vert_a           = va,
+        .vert_b           = vb,
+        .hash_key         = avbd_hash_u32(AVBD_CON_CONTACT_PAIR, va, vb),
+        .normal_or_target = { nx, ny, 0.0f },
+        .rest_or_offset   = min_sep,
+        .stiffness_min    = k_min,
+        .stiffness_max    = 1.0e8f,
+        .penalty_k        = k_min,
+        .beta_ramp        = 4.0f,
+    };
+}
+
 void avbd_prepare_soft_grid_2d(const float    *in_x,
                                const float    *in_y,
                                const float    *in_vx,
@@ -639,9 +665,9 @@ void avbd_prepare_soft_grid_2d(const float    *in_x,
         out_verts[k].inv_mass = 1.0f;
     }
 
-    const float k_base  = fmaxf(spring_stiff, 4.0f) * 18.0f;
-    const float k_shear = k_base * 0.85f;
-    const float k_bend  = k_base * 0.35f;
+    const float k_base  = fmaxf(spring_stiff, 4.0f) * 24.0f;
+    const float k_shear = k_base * 0.90f;
+    const float k_bend  = k_base * 0.55f;
     const float diag    = spacing * 1.41421356237f;
     uint32_t    con_cnt = 0u;
 
@@ -677,6 +703,38 @@ void avbd_prepare_soft_grid_2d(const float    *in_x,
         for (uint32_t c = 0u; c < cols; ++c) {
             uint32_t a = r * cols + c;
             push_grid_spring(out_cons, &con_cnt, K_AVBD_MAX_CONS, a, a + 2u * cols, spacing * 2.0f, k_bend);
+        }
+    }
+    // 4. Unilateral self-collision contact pairs when vertices compress closer than 48% spacing
+    const float    min_sep     = spacing * 0.48f;
+    const float    min_sep_sq  = min_sep * min_sep;
+    const uint32_t safe_con_hi = K_AVBD_MAX_CONS - 32u;
+    if (spacing > 1.0e-3f) {
+        for (uint32_t a = 0u; a < count && con_cnt < safe_con_hi; ++a) {
+            uint32_t ra = a / cols, ca = a % cols;
+            for (uint32_t b = a + 1u; b < count && con_cnt < safe_con_hi; ++b) {
+                float dx = in_x[b] - in_x[a];
+                float dy = in_y[b] - in_y[a];
+                float d2 = dx * dx + dy * dy;
+                if (d2 >= min_sep_sq) {
+                    continue;
+                }
+                float nx, ny;
+                if (d2 > 1.0e-6f) {
+                    float inv_d = 1.0f / sqrtf(d2);
+                    nx = dx * inv_d;
+                    ny = dy * inv_d;
+                } else {
+                    uint32_t rb = b / cols, cb = b % cols;
+                    float rx = (float)((int32_t)cb - (int32_t)ca);
+                    float ry = (float)((int32_t)rb - (int32_t)ra);
+                    float rl = hypotf(rx, ry);
+                    nx = rl > 1.0e-4f ? (rx / rl) : 1.0f;
+                    ny = rl > 1.0e-4f ? (ry / rl) : 0.0f;
+                }
+                push_self_contact_pair(out_cons, &con_cnt, safe_con_hi,
+                                       a, b, nx, ny, min_sep, k_base * 6.0f);
+            }
         }
     }
 

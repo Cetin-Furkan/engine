@@ -116,4 +116,12 @@ typedef struct BackendBenchStats {
 
 void               backend_get_bench_stats(BackendBenchStats *out);
 
+void               backend_set_pack_path(const char *pack_path);
+[[nodiscard]] const char *backend_active_pack_path(void);
+[[nodiscard]] float       backend_elev_base_m(void);
+[[nodiscard]] float       backend_vertical_scale(void);
+[[nodiscard]] float       backend_world_half_extent(void);
+[[nodiscard]] bool        backend_is_real_measured_map(void);
+[[nodiscard]] bool        backend_is_v2_archive(void);
+
 #endif /* ENGINE_BACKEND_H */

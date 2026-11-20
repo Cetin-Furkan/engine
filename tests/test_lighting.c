@@ -199,6 +199,17 @@ static void test_rotated_proxy_ray_oracles(void) {
           "squashed ellipsoid exact Z-apex intersection at z = center.z + rz");
 }
 
+static void test_scene_geom_abi_layout(void) {
+    CHECK(sizeof(LightingSceneGeom) == 64u, "LightingSceneGeom must stay 64 bytes");
+    CHECK(sizeof(LightingFrameHeader) == 256u, "LightingFrameHeader must stay 256 bytes");
+    CHECK(offsetof(LightingFrameHeader, scene_geom_bda) == 240u, "scene_geom_bda offset == 240");
+    CHECK(offsetof(LightingFrameHeader, scene_inst_count) == 248u, "scene_inst_count offset == 248");
+    CHECK(offsetof(LightingFrameHeader, scene_flags) == 252u, "scene_flags offset == 252");
+    CHECK(K_LIGHTING_SCENE_OFFSET == 10496u, "K_LIGHTING_SCENE_OFFSET == 10496");
+    CHECK(K_LIGHTING_BOUNDS_OFFSET == 10560u, "K_LIGHTING_BOUNDS_OFFSET == 10560");
+    CHECK(K_LIGHTING_ENV_SLICE_SIZE == 12608u, "K_LIGHTING_ENV_SLICE_SIZE == 12608");
+}
+
 int main(void) {
     CHECK(lighting_self_check(), "lighting_self_check()");
     test_fp16_and_rgb9e5_codecs();
@@ -206,6 +217,7 @@ int main(void) {
     test_ssilvb_32bit_visibility_bitmask();
     test_hrc_cascade_merge_and_multibounce();
     test_rotated_proxy_ray_oracles();
+    test_scene_geom_abi_layout();
 
     if (s_failures != 0) {
         fprintf(stderr, "[test_lighting] %d assertion(s) failed!\n", s_failures);

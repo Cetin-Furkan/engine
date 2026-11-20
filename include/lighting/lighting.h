@@ -14,14 +14,57 @@
 // ============================================================================
 
 enum : uint32_t {
-    K_LIGHTING_MAGIC          = 0x4C474934u, // "LGI4"
-    K_LIGHTING_MAT_SLOTS      = 64u,
-    K_LIGHTING_MAX_PROXIES    = 128u,
-    K_LIGHTING_MAX_CASCADES   = 4u,
-    K_LIGHTING_HEADER_OFFSET  = 2048u,
-    K_LIGHTING_PROXIES_OFFSET = 2304u,
-    K_LIGHTING_ENV_SLICE_SIZE = 10496u,      // 2048 + 256 + 128*64 (41 * 256B)
+    K_LIGHTING_MAGIC            = 0x4C474934u, // "LGI4"
+    K_LIGHTING_MAT_SLOTS        = 64u,
+    K_LIGHTING_MAX_PROXIES      = 128u,
+    K_LIGHTING_MAX_SCENE_INST   = 128u,
+    K_LIGHTING_MAX_CASCADES     = 4u,
+    K_LIGHTING_HEADER_OFFSET    = 2048u,
+    K_LIGHTING_PROXIES_OFFSET   = 2304u,
+    K_LIGHTING_SCENE_OFFSET     = 10496u,      // 2304 + 128*64
+    K_LIGHTING_BOUNDS_OFFSET    = 10560u,      // 10496 + 64
+    K_LIGHTING_ENV_SLICE_SIZE   = 12608u,      // 10560 + 128*16 (preserved ABI)
+    K_LIGHTING_SHADOW_OFFSET    = 12608u,      // LightingShadowBlock tail
+    K_LIGHTING_ENV_ALLOC_STRIDE = 12800u,      // 256-byte aligned ring stride
 };
+
+enum : uint32_t {
+    K_LIGHTING_FLAG_HAS_SHADOW   = 1u << 0,
+    K_LIGHTING_FLAG_FILT_IN_GBUF = 1u << 1,
+};
+
+// 144-byte directional shadow map + studio sky & perspective block at env_bda + 12608.
+typedef struct LightingShadowBlock {
+    alignas(16) float light_vp[16]; // Row-major world -> (u, v, depth, 1)
+    float             sun_dir[3];
+    float             inv_shadow_res;
+    float             sun_color[3];
+    float             persp;
+    float             sky_top[3];
+    float             prev_persp;
+    float             sky_horizon[3];
+    float             normal_bias;
+    float             sky_ground[3];
+    uint32_t          shadow_enabled;
+} LightingShadowBlock;
+
+static_assert(sizeof(LightingShadowBlock) == 144u, "LightingShadowBlock must be 144 bytes");
+static_assert(K_LIGHTING_SHADOW_OFFSET + sizeof(LightingShadowBlock) <= K_LIGHTING_ENV_ALLOC_STRIDE,
+              "LightingShadowBlock fits in env ring stride");
+
+// 64-byte scene meshlet geometry table pointer block located at K_LIGHTING_SCENE_OFFSET.
+typedef struct LightingSceneGeom {
+    alignas(16) uint64_t meshlets_bda;
+    uint64_t vertices_bda;
+    uint64_t triangles_bda;
+    uint64_t instances_bda;
+    uint64_t bounds_bda;
+    uint32_t inst_count;
+    uint32_t pad0;
+    uint64_t pad1;
+} LightingSceneGeom;
+
+static_assert(sizeof(LightingSceneGeom) == 64u, "LightingSceneGeom must be 64 bytes");
 
 enum : uint32_t {
     LIGHTING_PROXY_OBB       = 0u,
@@ -123,7 +166,9 @@ typedef struct LightingFrameHeader {
     float    ssilvb_radius_px;
     float    thickness_world;
     uint32_t hrc_offset_rays[4];
-    uint32_t reserved[4];
+    uint64_t scene_geom_bda;
+    uint32_t scene_inst_count;
+    uint32_t scene_flags;
 } LightingFrameHeader;
 
 static_assert(offsetof(LightingFrameHeader, proxies_bda) == 64u, "proxies_bda offset");
@@ -135,6 +180,7 @@ typedef struct LightingCameraParams {
     float qx, qy, qz, qw;
     float cam_x, cam_y, cam_z;
     float zoom;
+    float persp;
 } LightingCameraParams;
 
 typedef struct LightingSsilvbSample {
@@ -234,15 +280,28 @@ void lighting_material_set(uint32_t slot, float emit_r, float emit_g, float emit
 void lighting_material_get_emissive(uint32_t slot, float out_emit[3]);
 VkDeviceAddress lighting_env_bda(void);
 
+void lighting_claim_frame(VkSemaphore acquire, uint64_t signal_point);
 void lighting_begin_frame(uint32_t width, uint32_t height, const LightingCameraParams *cam);
 void lighting_set_ground_plane(bool enabled, float z_height, const float base_albedo[3]);
 void lighting_set_terrain_field(uint64_t terrain_dir_bda, float elev_base_m, float vertical_scale);
 void lighting_set_scene_hiz(uint64_t scene_hiz_bda);
+void lighting_set_scene_geom(uint64_t meshlets_bda,
+                             uint64_t vertices_bda,
+                             uint64_t triangles_bda,
+                             uint64_t instances_bda,
+                             uint32_t inst_count,
+                             const float (*inst_bounds)[4]);
 void lighting_submit_proxy(const LightingProxy *proxy);
+
+// Vulkan 1.4 hardware directional shadow map (D32_SFLOAT + push descriptor set 0, binding 1)
+[[nodiscard]] VkDescriptorSetLayout lighting_shadow_set_layout(void);
+void lighting_bind_shadow(VkCommandBuffer cmd, VkPipelineBindPoint bind_point, VkPipelineLayout layout);
+void lighting_shadow_get_descriptor(VkImageView *out_view, VkSampler *out_sampler, VkImageLayout *out_layout);
+[[nodiscard]] bool lighting_shadow_begin(VkCommandBuffer cmd, float out_light_clip_vp[16]);
+void lighting_shadow_end(VkCommandBuffer cmd);
 
 void lighting_prepare(VkCommandBuffer cmd, uint32_t width, uint32_t height);
 
-bool lighting_gi_active(void);
 bool lighting_toggle_gi(void);
 void lighting_get_stats(LightingBenchStats *out_stats);
 

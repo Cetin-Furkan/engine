@@ -10,7 +10,12 @@
 // Cache file: magic, vendor, device, pipelineCacheUUID, then the blob.
 // A mismatch starts an empty cache. A missing file is the same.
 
-enum : uint32_t { k_pipe_magic = 0x43504741u }; // 'AGPC' little-endian
+enum : uint32_t {
+    k_pipe_magic = 0x43504741u, // 'AGPC' little-endian
+    k_bank_cap   = 128u,
+    k_spec_bytes = VULKAN_GFX_SPEC_BYTES,
+    k_spec_maps  = VULKAN_GFX_SPEC_MAPS,
+};
 
 typedef struct PipeHeader {
     uint32_t magic;
@@ -21,43 +26,32 @@ typedef struct PipeHeader {
 
 static_assert(sizeof(PipeHeader) == 28u, "pipeline cache header");
 
-// One bank slot is one VkPipeline. The key is the SPIR-V, the layout, and
-// the fixed state. Two draws of the same situation share the pipeline.
-// A full bank fails the create. In-use pipelines are not evicted.
-enum : uint32_t {
-    k_bank_cap   = 128u,
-    k_spec_bytes = VULKAN_GFX_SPEC_BYTES,
-    k_spec_maps  = VULKAN_GFX_SPEC_MAPS,
-};
-
+// One bank slot is one compiled VkPipeline. Cull mode and depth test/write/compare
+// are Vulkan 1.4 Extended Dynamic State, so PSOs only key on SPIR-V, layout,
+// attachment formats, MSAA samples, blend, depth-bias enable, and specialization.
 typedef struct PipeSlot {
-    bool                  used;
-    bool                  compute;
-    uint32_t              ref;
-    uint64_t              hash;
-    const void           *code_a;
-    size_t                code_a_bytes;
-    const void           *code_b;
-    size_t                code_b_bytes;
-    VkPipelineLayout      layout;
-    VkFormat              color;
-    VkFormat              depth;
-    VkSampleCountFlagBits samples;
-    VkCullModeFlags       cull;
-    VkBool32              depth_test;
-    VkBool32              depth_write;
-    VkCompareOp           compare;
-    VkBool32              blend;
-    uint32_t              spec_bytes;
-    uint32_t              spec_maps;
-    uint8_t               spec[k_spec_bytes];
+    bool                     used;
+    bool                     compute;
+    bool                     depth_bias;
+    uint32_t                 ref;
+    uint64_t                 hash;
+    const void              *code_a;
+    size_t                   code_a_bytes;
+    const void              *code_b;
+    size_t                   code_b_bytes;
+    VkPipelineLayout         layout;
+    VkFormat                 color;
+    VkFormat                 depth;
+    VkSampleCountFlagBits    samples;
+    VkBool32                 blend;
+    uint32_t                 spec_bytes;
+    uint32_t                 spec_maps;
+    uint8_t                  spec[k_spec_bytes];
     VkSpecializationMapEntry maps[k_spec_maps];
-    VkPipeline            pipeline;
+    VkPipeline               pipeline;
 } PipeSlot;
 
 static PipeSlot s_bank[k_bank_cap];
-
-static void bank_drop_all(VulkanContext *vk);
 
 static void cache_path(char *dst, size_t cap) {
     const char *base = getenv("XDG_CACHE_HOME");
@@ -74,8 +68,8 @@ static void cache_path(char *dst, size_t cap) {
 }
 
 static bool read_full(int fd, void *buf, size_t n) {
-    uint8_t *p = (uint8_t *)buf;
-    size_t got = 0;
+    uint8_t *p = buf;
+    size_t got = 0u;
     while (got < n) {
         ssize_t r = read(fd, p + got, n - got);
         if (r < 0) {
@@ -93,8 +87,8 @@ static bool read_full(int fd, void *buf, size_t n) {
 }
 
 static bool write_full(int fd, const void *buf, size_t n) {
-    const uint8_t *p = (const uint8_t *)buf;
-    size_t sent = 0;
+    const uint8_t *p = buf;
+    size_t sent = 0u;
     while (sent < n) {
         ssize_t w = write(fd, p + sent, n - sent);
         if (w < 0) {
@@ -122,10 +116,10 @@ static void mkdir_p(const char *dir) {
     char tmp[512];
     snprintf(tmp, sizeof tmp, "%s", dir);
     size_t n = strlen(tmp);
-    if (n == 0) {
+    if (n == 0u) {
         return;
     }
-    for (size_t i = 1; i < n; ++i) {
+    for (size_t i = 1u; i < n; ++i) {
         if (tmp[i] != '/') {
             continue;
         }
@@ -136,22 +130,20 @@ static void mkdir_p(const char *dir) {
     mkdir(tmp, 0700);
 }
 
-static bool header_matches(const PipeHeader *hdr, const VkPhysicalDeviceProperties *props) {
+static bool header_matches(const PipeHeader *hdr, const VulkanDeviceInfo *info) {
     return hdr->magic == k_pipe_magic &&
-           hdr->vendor == props->vendorID &&
-           hdr->device == props->deviceID &&
-           memcmp(hdr->uuid, props->pipelineCacheUUID, VK_UUID_SIZE) == 0;
+           hdr->vendor == info->vendor_id &&
+           hdr->device == info->device_id &&
+           memcmp(hdr->uuid, info->pipeline_cache_uuid, VK_UUID_SIZE) == 0;
 }
 
 void vulkan_pipe_cache_open(VulkanContext *vk) {
     if (vk == nullptr || vk->device == VK_NULL_HANDLE || vk->pipe_cache != VK_NULL_HANDLE) {
         return;
     }
-    VkPhysicalDeviceProperties props = {0};
-    vkGetPhysicalDeviceProperties(vk->physical_device, &props);
 
     void *blob = nullptr;
-    size_t blob_bytes = 0;
+    size_t blob_bytes = 0u;
     char path[512];
     cache_path(path, sizeof path);
     int fd = open(path, O_RDONLY | O_CLOEXEC);
@@ -159,14 +151,14 @@ void vulkan_pipe_cache_open(VulkanContext *vk) {
         struct stat st;
         if (fstat(fd, &st) == 0 && (size_t)st.st_size > sizeof(PipeHeader)) {
             PipeHeader hdr = {0};
-            if (read_full(fd, &hdr, sizeof hdr) && header_matches(&hdr, &props)) {
+            if (read_full(fd, &hdr, sizeof hdr) && header_matches(&hdr, &vk->device_info)) {
                 blob_bytes = (size_t)st.st_size - sizeof hdr;
                 blob = malloc(blob_bytes);
                 if (blob != nullptr) {
                     if (!read_full(fd, blob, blob_bytes)) {
                         free(blob);
                         blob = nullptr;
-                        blob_bytes = 0;
+                        blob_bytes = 0u;
                     }
                 }
             }
@@ -195,10 +187,7 @@ static bool bytes_match(const void *a, size_t a_n, const void *b, size_t b_n) {
     if (a_n != b_n) {
         return false;
     }
-    if (a_n == 0u) {
-        return true;
-    }
-    if (a == b) {
+    if (a_n == 0u || a == b) {
         return true;
     }
     if (a == nullptr || b == nullptr) {
@@ -209,7 +198,7 @@ static bool bytes_match(const void *a, size_t a_n, const void *b, size_t b_n) {
 
 static uint64_t fnv_mem(uint64_t h, const void *p, size_t n) {
     const uint8_t *b = p;
-    for (size_t i = 0; i < n; ++i) {
+    for (size_t i = 0u; i < n; ++i) {
         h ^= b[i];
         h *= 1099511628211ull;
     }
@@ -276,24 +265,19 @@ static bool spec_match(const PipeSlot *slot, const VkSpecializationInfo *spec) {
     return true;
 }
 
-static uint64_t hash_key(bool compute, const void *a, size_t a_n, const void *b, size_t b_n,
-                         VkPipelineLayout layout, VkFormat color, VkFormat depth,
-                         VkSampleCountFlagBits samples, VkCullModeFlags cull,
-                         VkBool32 depth_test, VkBool32 depth_write, VkCompareOp compare,
+static uint64_t hash_key(bool compute, bool depth_bias, const void *a, size_t a_n,
+                         const void *b, size_t b_n, VkPipelineLayout layout,
+                         VkFormat color, VkFormat depth, VkSampleCountFlagBits samples,
                          VkBool32 blend, const PipeSlot *spec_slot) {
     uint64_t h = 14695981039346656037ull;
-    uint32_t flag = compute ? 1u : 0u;
-    h = fnv_mem(h, &flag, sizeof flag);
+    uint32_t flags = (compute ? 1u : 0u) | (depth_bias ? 2u : 0u);
+    h = fnv_mem(h, &flags, sizeof flags);
     h = fnv_mem(h, a, a_n);
     h = fnv_mem(h, b, b_n);
     h = fnv_mem(h, &layout, sizeof layout);
     h = fnv_mem(h, &color, sizeof color);
     h = fnv_mem(h, &depth, sizeof depth);
     h = fnv_mem(h, &samples, sizeof samples);
-    h = fnv_mem(h, &cull, sizeof cull);
-    h = fnv_mem(h, &depth_test, sizeof depth_test);
-    h = fnv_mem(h, &depth_write, sizeof depth_write);
-    h = fnv_mem(h, &compare, sizeof compare);
     h = fnv_mem(h, &blend, sizeof blend);
     if (spec_slot != nullptr && spec_slot->spec_bytes > 0u) {
         h = fnv_mem(h, spec_slot->spec, spec_slot->spec_bytes);
@@ -302,19 +286,18 @@ static uint64_t hash_key(bool compute, const void *a, size_t a_n, const void *b,
     return h;
 }
 
-static PipeSlot *bank_find(uint64_t hash, bool compute, const void *a, size_t a_n,
+static PipeSlot *bank_find(uint64_t hash, bool compute, bool depth_bias, const void *a, size_t a_n,
                            const void *b, size_t b_n, VkPipelineLayout layout,
                            VkFormat color, VkFormat depth, VkSampleCountFlagBits samples,
-                           VkCullModeFlags cull, VkBool32 depth_test, VkBool32 depth_write,
-                           VkCompareOp compare, VkBool32 blend, const VkSpecializationInfo *spec) {
+                           VkBool32 blend, const VkSpecializationInfo *spec) {
     for (uint32_t i = 0u; i < k_bank_cap; ++i) {
         PipeSlot *slot = &s_bank[i];
-        if (!slot->used || slot->hash != hash || slot->compute != compute) {
+        if (!slot->used || slot->hash != hash || slot->compute != compute ||
+            slot->depth_bias != depth_bias) {
             continue;
         }
         if (slot->layout != layout || slot->color != color || slot->depth != depth ||
-            slot->samples != samples || slot->cull != cull || slot->depth_test != depth_test ||
-            slot->depth_write != depth_write || slot->compare != compare || slot->blend != blend) {
+            slot->samples != samples || slot->blend != blend) {
             continue;
         }
         if (!bytes_match(slot->code_a, slot->code_a_bytes, a, a_n) ||
@@ -375,12 +358,11 @@ void vulkan_pipe_release(VulkanContext *vk, VkPipeline pipeline) {
 }
 
 static VkShaderModuleCreateInfo module_info(const void *code, size_t bytes) {
-    VkShaderModuleCreateInfo info = {
+    return (VkShaderModuleCreateInfo){
         .sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
         .codeSize = bytes,
-        .pCode    = (const uint32_t *)code,
+        .pCode    = code,
     };
-    return info;
 }
 
 static VkPipeline create_graphics(VulkanContext *vk, const VulkanGfxPipe *info, VkFormat format,
@@ -415,19 +397,17 @@ static VkPipeline create_graphics(VulkanContext *vk, const VulkanGfxPipe *info, 
     };
     VkPipelineViewportStateCreateInfo viewport = {
         .sType         = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
-        .viewportCount = 1,
-        .scissorCount  = 1,
+        .viewportCount = 1u,
+        .scissorCount  = 1u,
     };
     VkSampleCountFlagBits samples = info->samples == 0 ? VK_SAMPLE_COUNT_1_BIT : info->samples;
-    VkCompareOp compare = info->custom_depth_compare
-        ? info->depth_compare
-        : (info->depth_compare == 0 ? VK_COMPARE_OP_LESS : info->depth_compare);
     VkPipelineRasterizationStateCreateInfo raster = {
-        .sType       = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
-        .polygonMode = VK_POLYGON_MODE_FILL,
-        .cullMode    = info->cull,
-        .frontFace   = VK_FRONT_FACE_COUNTER_CLOCKWISE,
-        .lineWidth   = 1.0f,
+        .sType           = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+        .polygonMode     = VK_POLYGON_MODE_FILL,
+        .cullMode        = info->cull,
+        .frontFace       = VK_FRONT_FACE_COUNTER_CLOCKWISE,
+        .depthBiasEnable = info->depth_bias_enable ? VK_TRUE : VK_FALSE,
+        .lineWidth       = 1.0f,
     };
     VkPipelineMultisampleStateCreateInfo sample_state = {
         .sType                = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
@@ -437,7 +417,7 @@ static VkPipeline create_graphics(VulkanContext *vk, const VulkanGfxPipe *info, 
         .sType            = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
         .depthTestEnable  = info->depth_test,
         .depthWriteEnable = info->depth_write,
-        .depthCompareOp   = compare,
+        .depthCompareOp   = VK_COMPARE_OP_LESS,
     };
     VkPipelineColorBlendAttachmentState blend_att = {
         .blendEnable         = info->blend,
@@ -455,10 +435,19 @@ static VkPipeline create_graphics(VulkanContext *vk, const VulkanGfxPipe *info, 
         .attachmentCount = has_color ? 1u : 0u,
         .pAttachments    = has_color ? &blend_att : nullptr,
     };
-    VkDynamicState dynamics[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+    VkDynamicState dynamics[8] = {
+        VK_DYNAMIC_STATE_VIEWPORT,
+        VK_DYNAMIC_STATE_SCISSOR,
+        VK_DYNAMIC_STATE_CULL_MODE,
+        VK_DYNAMIC_STATE_FRONT_FACE,
+        VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE,
+        VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE,
+        VK_DYNAMIC_STATE_DEPTH_COMPARE_OP,
+        VK_DYNAMIC_STATE_DEPTH_BIAS,
+    };
     VkPipelineDynamicStateCreateInfo dynamic = {
         .sType             = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
-        .dynamicStateCount = 2,
+        .dynamicStateCount = info->depth_bias_enable ? 8u : 7u,
         .pDynamicStates    = dynamics,
     };
     VkPipelineRenderingCreateInfo rendering = {
@@ -483,7 +472,7 @@ static VkPipeline create_graphics(VulkanContext *vk, const VulkanGfxPipe *info, 
         .layout              = info->layout,
     };
     VkPipeline out = VK_NULL_HANDLE;
-    VkResult res = vkCreateGraphicsPipelines(vk->device, vk->pipe_cache, 1, &pipe, nullptr, &out);
+    VkResult res = vkCreateGraphicsPipelines(vk->device, vk->pipe_cache, 1u, &pipe, nullptr, &out);
     if (res != VK_SUCCESS) {
         if (out != VK_NULL_HANDLE) {
             vkDestroyPipeline(vk->device, out, nullptr);
@@ -511,7 +500,7 @@ static VkPipeline create_compute(VulkanContext *vk, const void *spv, size_t byte
         .layout = layout,
     };
     VkPipeline out = VK_NULL_HANDLE;
-    VkResult res = vkCreateComputePipelines(vk->device, vk->pipe_cache, 1, &pipe, nullptr, &out);
+    VkResult res = vkCreateComputePipelines(vk->device, vk->pipe_cache, 1u, &pipe, nullptr, &out);
     if (res != VK_SUCCESS) {
         if (out != VK_NULL_HANDLE) {
             vkDestroyPipeline(vk->device, out, nullptr);
@@ -526,19 +515,16 @@ static VkPipeline create_compute(VulkanContext *vk, const void *spv, size_t byte
 static VkPipeline bank_hold_graphics(VulkanContext *vk, const VulkanGfxPipe *info, VkFormat format,
                                      const VkSpecializationInfo *spec) {
     VkSampleCountFlagBits samples = info->samples == 0 ? VK_SAMPLE_COUNT_1_BIT : info->samples;
-    VkCompareOp compare = info->custom_depth_compare
-        ? info->depth_compare
-        : (info->depth_compare == 0 ? VK_COMPARE_OP_LESS : info->depth_compare);
     PipeSlot spec_tmp = {0};
     if (!spec_store(spec, &spec_tmp)) {
         return VK_NULL_HANDLE;
     }
-    uint64_t hash = hash_key(false, info->vert, info->vert_bytes, info->frag, info->frag_bytes,
-                             info->layout, format, info->depth_format, samples, info->cull,
-                             info->depth_test, info->depth_write, compare, info->blend, &spec_tmp);
-    PipeSlot *hit = bank_find(hash, false, info->vert, info->vert_bytes, info->frag, info->frag_bytes,
-                              info->layout, format, info->depth_format, samples, info->cull,
-                              info->depth_test, info->depth_write, compare, info->blend, spec);
+    uint64_t hash = hash_key(false, info->depth_bias_enable,
+                             info->vert, info->vert_bytes, info->frag, info->frag_bytes,
+                             info->layout, format, info->depth_format, samples, info->blend, &spec_tmp);
+    PipeSlot *hit = bank_find(hash, false, info->depth_bias_enable,
+                              info->vert, info->vert_bytes, info->frag, info->frag_bytes,
+                              info->layout, format, info->depth_format, samples, info->blend, spec);
     if (hit != nullptr) {
         hit->ref++;
         return hit->pipeline;
@@ -552,37 +538,33 @@ static VkPipeline bank_hold_graphics(VulkanContext *vk, const VulkanGfxPipe *inf
         return VK_NULL_HANDLE;
     }
     *slot = spec_tmp;
-    slot->used = true;
-    slot->compute = false;
-    slot->ref = 1u;
-    slot->hash = hash;
-    slot->code_a = info->vert;
+    slot->used         = true;
+    slot->compute      = false;
+    slot->depth_bias   = info->depth_bias_enable;
+    slot->ref          = 1u;
+    slot->hash         = hash;
+    slot->code_a       = info->vert;
     slot->code_a_bytes = info->vert_bytes;
-    slot->code_b = info->frag;
+    slot->code_b       = info->frag;
     slot->code_b_bytes = info->frag_bytes;
-    slot->layout = info->layout;
-    slot->color = format;
-    slot->depth = info->depth_format;
-    slot->samples = samples;
-    slot->cull = info->cull;
-    slot->depth_test = info->depth_test;
-    slot->depth_write = info->depth_write;
-    slot->compare = compare;
-    slot->blend = info->blend;
-    slot->pipeline = pipe;
-    printf("[Vulkan] Graphics pipeline created (color %d, depth %d)\n", (int)format, (int)info->depth_format);
+    slot->layout       = info->layout;
+    slot->color        = format;
+    slot->depth        = info->depth_format;
+    slot->samples      = samples;
+    slot->blend        = info->blend;
+    slot->pipeline     = pipe;
+    printf("[Vulkan] Graphics pipeline created (color %d, depth %d, EDS 1.4)\n",
+           (int)format, (int)info->depth_format);
     fflush(stdout);
     return pipe;
 }
 
 static VkPipeline bank_hold_compute(VulkanContext *vk, const void *spv, size_t bytes,
                                     VkPipelineLayout layout) {
-    uint64_t hash = hash_key(true, spv, bytes, nullptr, 0u, layout, VK_FORMAT_UNDEFINED,
-                             VK_FORMAT_UNDEFINED, VK_SAMPLE_COUNT_1_BIT, 0, VK_FALSE, VK_FALSE,
-                             VK_COMPARE_OP_NEVER, VK_FALSE, nullptr);
-    PipeSlot *hit = bank_find(hash, true, spv, bytes, nullptr, 0u, layout, VK_FORMAT_UNDEFINED,
-                              VK_FORMAT_UNDEFINED, VK_SAMPLE_COUNT_1_BIT, 0, VK_FALSE, VK_FALSE,
-                              VK_COMPARE_OP_NEVER, VK_FALSE, nullptr);
+    uint64_t hash = hash_key(true, false, spv, bytes, nullptr, 0u, layout, VK_FORMAT_UNDEFINED,
+                             VK_FORMAT_UNDEFINED, VK_SAMPLE_COUNT_1_BIT, VK_FALSE, nullptr);
+    PipeSlot *hit = bank_find(hash, true, false, spv, bytes, nullptr, 0u, layout, VK_FORMAT_UNDEFINED,
+                              VK_FORMAT_UNDEFINED, VK_SAMPLE_COUNT_1_BIT, VK_FALSE, nullptr);
     if (hit != nullptr) {
         hit->ref++;
         return hit->pipeline;
@@ -595,19 +577,19 @@ static VkPipeline bank_hold_compute(VulkanContext *vk, const void *spv, size_t b
     if (pipe == VK_NULL_HANDLE) {
         return VK_NULL_HANDLE;
     }
-    *slot = (PipeSlot){0};
-    slot->used = true;
-    slot->compute = true;
-    slot->ref = 1u;
-    slot->hash = hash;
-    slot->code_a = spv;
-    slot->code_a_bytes = bytes;
-    slot->layout = layout;
-    slot->color = VK_FORMAT_UNDEFINED;
-    slot->depth = VK_FORMAT_UNDEFINED;
-    slot->samples = VK_SAMPLE_COUNT_1_BIT;
-    slot->compare = VK_COMPARE_OP_NEVER;
-    slot->pipeline = pipe;
+    *slot = (PipeSlot){
+        .used         = true,
+        .compute      = true,
+        .ref          = 1u,
+        .hash         = hash,
+        .code_a       = spv,
+        .code_a_bytes = bytes,
+        .layout       = layout,
+        .color        = VK_FORMAT_UNDEFINED,
+        .depth        = VK_FORMAT_UNDEFINED,
+        .samples      = VK_SAMPLE_COUNT_1_BIT,
+        .pipeline     = pipe,
+    };
     printf("[Vulkan] Compute pipeline created\n");
     fflush(stdout);
     return pipe;
@@ -618,15 +600,13 @@ void vulkan_pipe_cache_close(VulkanContext *vk) {
         return;
     }
     if (vk->pipe_cache != VK_NULL_HANDLE) {
-        size_t bytes = 0;
+        size_t bytes = 0u;
         VkResult res = vkGetPipelineCacheData(vk->device, vk->pipe_cache, &bytes, nullptr);
-        if (res == VK_SUCCESS && bytes > 0) {
+        if (res == VK_SUCCESS && bytes > 0u) {
             void *blob = malloc(bytes);
             if (blob != nullptr) {
                 res = vkGetPipelineCacheData(vk->device, vk->pipe_cache, &bytes, blob);
                 if (res == VK_SUCCESS) {
-                    VkPhysicalDeviceProperties props = {0};
-                    vkGetPhysicalDeviceProperties(vk->physical_device, &props);
                     char dir[512];
                     char path[512];
                     cache_dir(dir, sizeof dir);
@@ -638,10 +618,10 @@ void vulkan_pipe_cache_close(VulkanContext *vk) {
                     if (out_fd >= 0) {
                         PipeHeader hdr = {
                             .magic  = k_pipe_magic,
-                            .vendor = props.vendorID,
-                            .device = props.deviceID,
+                            .vendor = vk->device_info.vendor_id,
+                            .device = vk->device_info.device_id,
                         };
-                        memcpy(hdr.uuid, props.pipelineCacheUUID, VK_UUID_SIZE);
+                        memcpy(hdr.uuid, vk->device_info.pipeline_cache_uuid, VK_UUID_SIZE);
                         bool ok = write_full(out_fd, &hdr, sizeof hdr) &&
                                   write_full(out_fd, blob, bytes);
                         close(out_fd);
@@ -661,42 +641,9 @@ void vulkan_pipe_cache_close(VulkanContext *vk) {
     }
 }
 
-int vulkan_gfx_pipelines(VulkanContext *vk, const VulkanGfxPipe *info,
-                         const VkFormat *formats, const VkSpecializationInfo *const *specs,
-                         uint32_t count, VkPipeline *out) {
-    if (vk == nullptr || info == nullptr || formats == nullptr || out == nullptr ||
-        count == 0u || count > 4u || info->vert == nullptr ||
-        info->layout == VK_NULL_HANDLE) {
-        return -1;
-    }
-    for (uint32_t i = 0u; i < count; ++i) {
-        if (formats[i] != VK_FORMAT_UNDEFINED && info->frag == nullptr) {
-            return -1;
-        }
-    }
-    for (uint32_t i = 0u; i < count; ++i) {
-        out[i] = VK_NULL_HANDLE;
-    }
-    for (uint32_t i = 0u; i < count; ++i) {
-        const VkSpecializationInfo *spec = info->frag_spec;
-        if (specs != nullptr) {
-            spec = specs[i];
-        }
-        out[i] = bank_hold_graphics(vk, info, formats[i], spec);
-        if (out[i] == VK_NULL_HANDLE) {
-            for (uint32_t j = 0u; j < i; ++j) {
-                vulkan_pipe_release(vk, out[j]);
-                out[j] = VK_NULL_HANDLE;
-            }
-            return -1;
-        }
-    }
-    return 0;
-}
-
 VkPipeline vulkan_compute_pipeline(VulkanContext *vk, const void *spv, size_t bytes,
                                    VkPipelineLayout layout) {
-    if (vk == nullptr || spv == nullptr || bytes == 0 || layout == VK_NULL_HANDLE) {
+    if (vk == nullptr || spv == nullptr || bytes == 0u || layout == VK_NULL_HANDLE) {
         return VK_NULL_HANDLE;
     }
     return bank_hold_compute(vk, spv, bytes, layout);
@@ -734,27 +681,40 @@ void vulkan_gfx_arm(VulkanGfxLive *live, const VulkanGfxPipe *info, VkFormat for
     }
 }
 
-VkPipeline vulkan_gfx_use(VulkanContext *vk, VulkanGfxLive *live) {
-    if (live == nullptr || !live->armed || live->failed) {
-        return VK_NULL_HANDLE;
+bool vulkan_gfx_bind(VulkanContext *vk, VkCommandBuffer cmd, VulkanGfxLive *live) {
+    if (vk == nullptr || cmd == VK_NULL_HANDLE || live == nullptr || !live->armed || live->failed) {
+        return false;
     }
-    if (live->pipeline != VK_NULL_HANDLE) {
-        return live->pipeline;
+    if (live->pipeline == VK_NULL_HANDLE) {
+        if (live->info.vert == nullptr || live->info.layout == VK_NULL_HANDLE ||
+            (live->format != VK_FORMAT_UNDEFINED && live->info.frag == nullptr)) {
+            live->failed = true;
+            return false;
+        }
+        const VkSpecializationInfo *spec = nullptr;
+        if (live->has_spec) {
+            live->owned_spec.pMapEntries = live->spec_maps;
+            live->owned_spec.pData       = live->spec_data;
+            spec                         = &live->owned_spec;
+        }
+        live->pipeline = bank_hold_graphics(vk, &live->info, live->format, spec);
+        if (live->pipeline == VK_NULL_HANDLE) {
+            live->failed = true;
+            return false;
+        }
     }
-    VkPipeline out = VK_NULL_HANDLE;
-    const VkSpecializationInfo *specs[1] = { nullptr };
-    if (live->has_spec) {
-        live->owned_spec.pMapEntries = live->spec_maps;
-        live->owned_spec.pData       = live->spec_data;
-        specs[0]                     = &live->owned_spec;
-    }
-    if (vulkan_gfx_pipelines(vk, &live->info, &live->format, live->has_spec ? specs : nullptr,
-                             1u, &out) != 0) {
-        live->failed = true;
-        return VK_NULL_HANDLE;
-    }
-    live->pipeline = out;
-    return out;
+
+    VkCompareOp compare = live->info.custom_depth_compare
+        ? live->info.depth_compare
+        : (live->info.depth_compare == 0 ? VK_COMPARE_OP_LESS : live->info.depth_compare);
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, live->pipeline);
+    vkCmdSetCullMode(cmd, live->info.cull);
+    vkCmdSetFrontFace(cmd, VK_FRONT_FACE_COUNTER_CLOCKWISE);
+    vkCmdSetDepthTestEnable(cmd, live->info.depth_test);
+    vkCmdSetDepthWriteEnable(cmd, live->info.depth_write);
+    vkCmdSetDepthCompareOp(cmd, compare);
+    return true;
 }
 
 void vulkan_gfx_disarm(VulkanContext *vk, VulkanGfxLive *live) {

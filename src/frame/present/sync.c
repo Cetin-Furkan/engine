@@ -22,19 +22,14 @@ bool wait_acquire_point(VulkanContext *vk, uint64_t point) {
 }
 
 bool acquire_point_retired(VulkanContext *vk, uint64_t point) {
-    if (point == 0 || frame_state.acquire == VK_NULL_HANDLE ||
+    if (point == 0u || frame_state.acquire == VK_NULL_HANDLE ||
         vk == nullptr || vk->device == VK_NULL_HANDLE) {
         return true;
     }
-    // Timeout 0 does not block. It retires the submit that signaled this
-    // point so that image's command buffer can be recorded again.
-    VkSemaphoreWaitInfo wait_info = {
-        .sType          = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
-        .semaphoreCount = 1,
-        .pSemaphores    = &frame_state.acquire,
-        .pValues        = &point,
-    };
-    return vkWaitSemaphores(vk->device, &wait_info, 0) == VK_SUCCESS;
+    // Lock-free Vulkan 1.2+ timeline counter query avoids a kernel wait ioctl.
+    uint64_t done = 0u;
+    return vkGetSemaphoreCounterValue(vk->device, frame_state.acquire, &done) == VK_SUCCESS &&
+           done >= point;
 }
 
 static bool dmabuf_fences_idle(int dmabuf_fd, int timeout_ms) {

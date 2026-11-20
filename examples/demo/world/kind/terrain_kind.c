@@ -226,10 +226,13 @@ static const WorldOps s_ops = {
 
 void terrain_kind_reset(void) {
     s_terrain = (TerrainKindState){0};
+    terrain_set_active(false);
+    terrain_set_pack_path(nullptr);
 }
 
 bool terrain_kind_spawn(void) {
     if (s_terrain.up) {
+        terrain_set_active(true);
         return true;
     }
     s_terrain = (TerrainKindState){0};
@@ -244,8 +247,10 @@ bool terrain_kind_spawn(void) {
     int idx = table_add(&s_ops, &s_terrain, (Coord){ 0.0f, 0.0f, 0.0f }, &s_terrain.spin);
     if (idx < 0) {
         s_terrain.up = false;
+        terrain_set_active(false);
         return false;
     }
+    terrain_set_active(true);
     return true;
 }
 

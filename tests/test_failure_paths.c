@@ -163,7 +163,6 @@ void drm_syncobj_destroy(int drm_fd, uint32_t *handle) {
         *handle = 0u;
     }
 }
-void input_page_record(VkCommandBuffer cmd) { (void)cmd; }
 
 void gpu_timer_init(VulkanContext *vk) { (void)vk; }
 void gpu_timer_shutdown(VulkanContext *vk) { (void)vk; }

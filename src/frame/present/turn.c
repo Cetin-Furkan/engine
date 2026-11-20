@@ -146,9 +146,9 @@ static int present_spare(WaylandContext *wl, VulkanContext *vk, bool *queued) {
         wl->has_presentation_clk && wl->presentation_clk_id == 1u &&
         wl->last_present_ns != 0ull && wl->last_refresh_ns >= 1000000u) {
         uint64_t now_ns = ring_mono_ns();
-        // Half-refresh slop margin: strictly after VBlank N so the update cannot
-        // tear or double-latch early, while comfortably ahead of VBlank N+1's latch.
-        uint64_t not_before = wl->last_present_ns + (uint64_t)(wl->last_refresh_ns / 2u);
+        // Minimal post-VBlank guard (1/8 refresh ~2 ms at 60 Hz): prevents early
+        // double-latch without adding artificial half-frame input latency.
+        uint64_t not_before = wl->last_present_ns + (uint64_t)(wl->last_refresh_ns / 8u);
         uint64_t stale_cut  = wl->last_present_ns + (uint64_t)wl->last_refresh_ns;
         wl->target_present_ns = (now_ns < stale_cut && not_before > now_ns) ? not_before : 0ull;
     } else {

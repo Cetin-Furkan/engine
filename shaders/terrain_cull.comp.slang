@@ -22,21 +22,37 @@ struct CullPush {
 
 [[vk::push_constant]] CullPush pc;
 
-groupshared uint s_vis[64];
-groupshared uint s_node[64];
-groupshared uint s_verts[64];
+groupshared uint s_vis[192];
+groupshared uint s_node[192];
+groupshared uint s_verts[192];
+groupshared uint s_slot[192];
+groupshared uint s_total_vis;
 
-bool tile_aabb_in_frustum(GpuMathQuadNodeGpu node, out uint out_tile_verts) {
+bool tile_aabb_in_frustum(uint64_t dir_bda, bool is_v2, GpuMathQuadNodeGpu node, out uint out_tile_verts) {
     out_tile_verts = pc.tile_verts;
-    // Unpack Lilliput 64-bit unified tile header quantized min/max elevation (bits [9:0] and [19:10], 2m step)
-    float min_elev_m = float(node.header & 0x3FFu) * 2.0;
-    float max_elev_m = float((node.header >> 10u) & 0x3FFu) * 2.0;
-    if (max_elev_m <= min_elev_m) {
-        min_elev_m = 800.0;
-        max_elev_m = 1720.0;
+    float min_elev_m;
+    float max_elev_m;
+    if (is_v2) {
+        min_elev_m = asfloat(uint(node.rel_children & 0xFFFFFFFFull));
+        max_elev_m = asfloat(uint(node.rel_children >> 32u));
+        if (max_elev_m <= min_elev_m) {
+            float2 rng = dir_elev_range_m(dir_bda);
+            min_elev_m = rng.x;
+            max_elev_m = rng.y;
+        }
+        min_elev_m -= 24.0;
+        max_elev_m += 24.0;
     } else {
-        min_elev_m = max(min_elev_m - 32.0, 0.0);
-        max_elev_m = max_elev_m + 32.0;
+        // Unpack Lilliput 64-bit unified tile header quantized min/max elevation (bits [9:0] and [19:10], 2m step)
+        min_elev_m = float(node.header & 0x3FFu) * 2.0;
+        max_elev_m = float((node.header >> 10u) & 0x3FFu) * 2.0;
+        if (max_elev_m <= min_elev_m) {
+            min_elev_m = 800.0;
+            max_elev_m = 1720.0;
+        } else {
+            min_elev_m = max(min_elev_m - 32.0, 0.0);
+            max_elev_m = max_elev_m + 32.0;
+        }
     }
 
     float z0 = (min_elev_m - pc.elev_base_m) * pc.vertical_scale;
@@ -86,49 +102,63 @@ bool tile_aabb_in_frustum(GpuMathQuadNodeGpu node, out uint out_tile_verts) {
 [shader("compute")]
 [numthreads(64, 1, 1)]
 void main(uint3 tid : SV_DispatchThreadID) {
-    uint i = tid.x;
+    uint lane = tid.x;
     if (pc.dir_bda == 0ull || pc.indirect_bda == 0ull) {
         return;
     }
 
-    uint count  = min(pc.leaf_count, 64u);
-    uint vis    = 0u;
-    uint nidx   = 0u;
-    uint tverts = pc.tile_verts;
+    uint count = min(pc.leaf_count, k_epack_v2_cut_cap);
+    bool is_v2 = dir_is_v2(pc.dir_bda);
 
-    if (i < count) {
-        nidx = load_active_leaf_index(pc.dir_bda, i);
-        GpuMathQuadNodeGpu node = load_quad_node(pc.dir_bda, nidx);
-        vis = tile_aabb_in_frustum(node, tverts) ? 1u : 0u;
+    [unroll]
+    for (uint pass = 0u; pass < 3u; ++pass) {
+        uint idx    = lane + pass * 64u;
+        uint vis    = 0u;
+        uint nidx   = 0u;
+        uint tverts = pc.tile_verts;
+
+        if (idx < count) {
+            nidx = load_active_leaf_index(pc.dir_bda, idx);
+            GpuMathQuadNodeGpu node = load_quad_node(pc.dir_bda, nidx);
+            vis = tile_aabb_in_frustum(pc.dir_bda, is_v2, node, tverts) ? 1u : 0u;
+        }
+
+        s_vis[idx]   = vis;
+        s_node[idx]  = nidx;
+        s_verts[idx] = tverts;
     }
+    GroupMemoryBarrierWithGroupSync();
 
-    s_vis[i]   = vis;
-    s_node[i]  = nidx;
-    s_verts[i] = tverts;
+    if (lane == 0u) {
+        uint accum = 0u;
+        for (uint j = 0u; j < count; ++j) {
+            s_slot[j] = accum;
+            accum += s_vis[j];
+        }
+        s_total_vis = accum;
+    }
     GroupMemoryBarrierWithGroupSync();
 
     uint *words = (uint *)pc.indirect_bda;
 
-    if (i < count && vis != 0u) {
-        uint slot = 0u;
-        for (uint j = 0u; j < i; ++j) {
-            slot += s_vis[j];
+    [unroll]
+    for (uint pass = 0u; pass < 3u; ++pass) {
+        uint idx = lane + pass * 64u;
+        if (idx < count && s_vis[idx] != 0u) {
+            uint slot = s_slot[idx];
+            // visible_nodes[] starts at byte offset 32 (word 8)
+            words[8u + slot] = s_node[idx];
+            // cmds[] starts at byte offset 800 (word 200), 4 words (16B) per VkDrawIndirectCommand
+            uint cmd_word = k_indirect_cmds_word + slot * 4u;
+            words[cmd_word + 0u] = s_verts[idx];
+            words[cmd_word + 1u] = 1u;
+            words[cmd_word + 2u] = 0u;
+            words[cmd_word + 3u] = slot;
         }
-        // visible_nodes[] starts at byte offset 32 (word 8)
-        words[8u + slot] = nidx;
-        // cmds[] starts at byte offset 288 (word 72), 4 words (16B) per VkDrawIndirectCommand
-        uint cmd_word = 72u + slot * 4u;
-        words[cmd_word + 0u] = s_verts[i];
-        words[cmd_word + 1u] = 1u;
-        words[cmd_word + 2u] = 0u;
-        words[cmd_word + 3u] = slot;
     }
 
-    if (i == 0u) {
-        uint total_vis = 0u;
-        for (uint j = 0u; j < count; ++j) {
-            total_vis += s_vis[j];
-        }
+    if (lane == 0u) {
+        uint total_vis = s_total_vis;
         // Header words 0..3: draw_count, culled_count, active_leaf_total, pad0
         words[0u] = total_vis;
         words[1u] = count - total_vis;

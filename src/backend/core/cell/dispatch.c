@@ -1,5 +1,8 @@
+#include "backend/internal.h"
 #include "backend/math/cell64.h"
 #include "backend/terrain/pack.h"
+
+BackendState g_backend;
 
 // ============================================================================
 // 64-Byte Stateful Function Cell Dispatcher (Single-Cache-Line Flat Closure)

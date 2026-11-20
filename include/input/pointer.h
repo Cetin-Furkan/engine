@@ -80,6 +80,13 @@ bool pointer_key_down(uint32_t key);
 // the pointer has entered this surface.
 bool pointer_client_xy(int32_t *x, int32_t *y);
 
+// Starting client-surface position of an active left-button drag (after the 4px
+// deadzone was crossed), in physical surface pixels. False when no left drag is active.
+bool pointer_left_drag_origin(int32_t *x, int32_t *y);
+
+// Current pressed pointer button bitmask (ENG_BUTTON_LEFT | RIGHT | MIDDLE).
+uint32_t pointer_buttons(void);
+
 // Queues a repeated UTF-8 string when the compositor delay has elapsed.
 // Repeat does not queue the evdev key again. The clock is CLOCK_MONOTONIC.
 void pointer_pump_text(void);

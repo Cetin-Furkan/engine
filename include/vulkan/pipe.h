@@ -4,12 +4,11 @@
 #include "vulkan/types.h"
 #include <stddef.h>
 
-// Vulkan 1.4 maintenance5. SPIR-V is chained as VkShaderModuleCreateInfo.
-// There is no VkShaderModule. Pipelines are created the first time a
-// situation is drawn, then reused from a bank. The device pipeline cache
-// is shared, so a second process start does not compile the same key again.
-// Viewport and scissor stay dynamic. Other state is part of the key, because
-// the draws do not set it on the command buffer.
+// Vulkan 1.4 maintenance5 + Extended Dynamic State pipeline bank.
+// SPIR-V is chained directly as VkShaderModuleCreateInfo (zero VkShaderModule).
+// Viewport, scissor, cull mode, front face, depth test/write/compare (and
+// optional depth bias) are bound dynamically per draw via Vulkan 1.4 core
+// dynamic state, collapsing PSO permutations to shader + format + blend + MSAA.
 
 enum : uint32_t {
     VULKAN_GFX_SPEC_BYTES = 32u,
@@ -31,12 +30,12 @@ typedef struct VulkanGfxPipe {
     VkCompareOp                  depth_compare;
     VkBool32                     blend;
     bool                         custom_depth_compare;
+    bool                         depth_bias_enable;
     const VkSpecializationInfo  *frag_spec;
 } VulkanGfxPipe;
 
-// One graphics situation. Armed at init, created on the first draw of this
-// format, depth, and specialization. SPIR-V bytes must outlive the armed
-// record; specialization constants and map entries are deep-copied inline.
+// One armed graphics situation. Created lazily on first bind and cached in the
+// shared device pipeline bank + disk VkPipelineCache.
 typedef struct VulkanGfxLive {
     VulkanGfxPipe                info;
     VkFormat                     format;
@@ -49,26 +48,19 @@ typedef struct VulkanGfxLive {
     bool                         failed;
 } VulkanGfxLive;
 
-// Creates one graphics pipeline per color format. Same SPIR-V, same state.
-// specs is null, or one entry per format (each entry may be null).
-// out[i] matches formats[i]. A matching bank entry is reused and its
-// reference count goes up. On failure every out[i] is null.
-[[nodiscard]] int vulkan_gfx_pipelines(VulkanContext *vk, const VulkanGfxPipe *info,
-                                       const VkFormat *formats,
-                                       const VkSpecializationInfo *const *specs,
-                                       uint32_t count, VkPipeline *out);
-
 [[nodiscard]] VkPipeline vulkan_compute_pipeline(VulkanContext *vk, const void *spv,
                                                  size_t bytes, VkPipelineLayout layout);
 
 void vulkan_gfx_arm(VulkanGfxLive *live, const VulkanGfxPipe *info, VkFormat format,
                     const VkSpecializationInfo *spec);
-// Creates the pipeline on the first call. Later calls return the same one.
-[[nodiscard]] VkPipeline vulkan_gfx_use(VulkanContext *vk, VulkanGfxLive *live);
+
+// Lazily creates/reuses the graphics PSO, binds it, and emits Vulkan 1.4
+// Extended Dynamic State (cull, front face, depth test/write/compare).
+[[nodiscard]] bool vulkan_gfx_bind(VulkanContext *vk, VkCommandBuffer cmd, VulkanGfxLive *live);
+
 void vulkan_gfx_disarm(VulkanContext *vk, VulkanGfxLive *live);
 
 // Drops one bank reference. The pipeline is destroyed at zero.
-// A null handle is ignored.
 void vulkan_pipe_release(VulkanContext *vk, VkPipeline pipeline);
 
 void vulkan_pipe_cache_open(VulkanContext *vk);
